@@ -1,4 +1,7 @@
-# GwenLand - EXPERIMENTAL
+# GwenLand
+
+> ⚠️ **Experimental:** Active development. 
+> Core benchmarks verified, full pipeline in progress.
 
 > **"Speed is Everything, but Precise is more than Everything."**
 
