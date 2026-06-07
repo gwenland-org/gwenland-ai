@@ -36,6 +36,9 @@ tempfile = "3"
 keyring = "3"
 gwenland-gui = { path = "../gui/src-tauri", optional = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 # Integration-test helpers — not shipped in release binaries.
 # tokio/reqwest/etc. are already in [dependencies] so Cargo deduplicates them;
