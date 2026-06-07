@@ -55,7 +55,7 @@ jobs:
 
     defaults:
       run:
-        working-directory: gwen-cli
+        working-directory: .
 
     steps:
       # =======================================================================
