@@ -166,6 +166,8 @@ jobs:
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDOR: 1
 
       # =====================================================================
       # 7. Prepare dist/ folder and rename binary to the canonical name

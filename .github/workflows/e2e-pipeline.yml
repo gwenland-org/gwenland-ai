@@ -117,6 +117,8 @@ jobs:
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDOR: 1
 
       # Expose the built binary on PATH for subsequent steps
       - name: Add gwen binary to PATH (Unix)

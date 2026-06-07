@@ -113,6 +113,8 @@ jobs:
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDOR: 1
 
       # =======================================================================
       # 6. Run integration tests
