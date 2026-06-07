@@ -19,7 +19,7 @@ ratatui = "0.30"
 crossterm = "0.28"
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
-reqwest-eventsource = "0.6"
+reqwest-eventsource = { version = "0.6", default-features = false }
 futures-util = "0.3"
 atty = "0.2"
 dirs = "5"
@@ -42,7 +42,7 @@ gwenland-gui = { path = "../gui/src-tauri", optional = true }
 # listing them here pins the feature set used in tests.
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-reqwest-eventsource = "0.6"
+reqwest-eventsource = { version = "0.6", default-features = false }
 futures-util = "0.3"
 serde_json = "1"
 

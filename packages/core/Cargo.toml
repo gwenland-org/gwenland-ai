@@ -50,7 +50,7 @@ lazy_static = "1"
 serde_yaml = "0.9"
 tempfile = "3"
 tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
-hf-hub = { version = "0.5.0", features = ["tokio"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls"] }
 # Candle: always compiled (no feature flag since Cycle 6).
 # cuda/metal features are left disabled here so the crate compiles on all
 # platforms without requiring the CUDA toolkit or macOS SDK. Users who want
