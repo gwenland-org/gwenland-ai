@@ -67,6 +67,7 @@ directories = "5"
 
 [features]
 default = []
+legacy = []
 nvidia = ["nvml-wrapper"]
 
 [dependencies.nvml-wrapper]
