@@ -123,12 +123,12 @@ jobs:
       # Expose the built binary on PATH for subsequent steps
       - name: Add gwen binary to PATH (Unix)
         if: runner.os != 'Windows'
-        run: echo "${{ github.workspace }}/gwen-cli/target/release" >> $GITHUB_PATH
+        run: echo "${{ github.workspace }}/target/release" >> $GITHUB_PATH
 
       - name: Add gwen binary to PATH (Windows)
         if: runner.os == 'Windows'
         run: |
-          echo "${{ github.workspace }}\gwen-cli\target\release" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          echo "${{ github.workspace }}\target\release" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
         shell: pwsh
 
       # Verify binary is reachable
