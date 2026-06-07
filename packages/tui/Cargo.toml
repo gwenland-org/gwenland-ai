@@ -18,7 +18,7 @@ clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 crossterm = "0.28"
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
 reqwest-eventsource = "0.6"
 futures-util = "0.3"
 atty = "0.2"
@@ -41,7 +41,7 @@ gwenland-gui = { path = "../gui/src-tauri", optional = true }
 # tokio/reqwest/etc. are already in [dependencies] so Cargo deduplicates them;
 # listing them here pins the feature set used in tests.
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 reqwest-eventsource = "0.6"
 futures-util = "0.3"
 serde_json = "1"
