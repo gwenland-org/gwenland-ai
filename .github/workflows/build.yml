@@ -149,8 +149,8 @@ jobs:
       # =====================================================================
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
+        run: cargo install cross --git https://github.com/cross-rs/cross --force
+      
       # =====================================================================
       # 6. Build the binary in release mode
       #    Uses `cross` for ARM64 Linux, `cargo` for everything else.
