@@ -47,6 +47,18 @@ pub enum GgufDtype {
     /// Layout per block: [scale: f16][nibbles: u8 × 16]
     /// Values are signed 4-bit integers packed as two per byte (low nibble first).
     Q4_0,
+    /// 4-bit K-quant: superblocks of 256 elements, 8 sub-blocks of 32.
+    /// Layout: [d: f16][dmin: f16][scales: u8×12][nibbles: u8×128] = 144 bytes.
+    /// Formula: W = d * scale[j] * q - dmin * min[j], q ∈ [0, 15].
+    Q4_K,
+    /// 5-bit K-quant: superblocks of 256 elements, 8 sub-blocks of 32.
+    /// Layout: [d: f16][dmin: f16][scales: u8×12][qh: u8×32][ql: u8×128] = 176 bytes.
+    /// Formula: W = d * scale[j] * q - dmin * min[j], q ∈ [0, 31].
+    Q5_K,
+    /// 6-bit K-quant: superblocks of 256 elements, 16 sub-blocks of 16.
+    /// Layout: [ql: u8×128][qh: u8×64][scales: i8×16][d: f16] = 210 bytes.
+    /// Formula: W = d * scales[j] * q, q ∈ [-32, 31].
+    Q6_K,
 }
 
 /// Metadata for a single tensor extracted from the GGUF header.
@@ -252,8 +264,12 @@ fn ggml_type_to_dtype(raw: u32, tensor_name: &str) -> Result<GgufDtype, String> 
         1  => Ok(GgufDtype::F16),
         6  => Ok(GgufDtype::Q4_0),
         8  => Ok(GgufDtype::Q8_0),
+        12 => Ok(GgufDtype::Q4_K),
+        13 => Ok(GgufDtype::Q5_K),
+        14 => Ok(GgufDtype::Q6_K),
         other => Err(format!(
-            "tensor '{}' has unsupported ggml_type {} (only F32/F16/Q4_0/Q8_0 are supported)",
+            "tensor '{}' has unsupported ggml_type {} \
+             (supported: F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)",
             tensor_name, other
         )),
     }
@@ -262,8 +278,7 @@ fn ggml_type_to_dtype(raw: u32, tensor_name: &str) -> Result<GgufDtype, String> 
 /// Compute the number of raw bytes a tensor occupies on disk given its dtype
 /// and total element count.
 ///
-/// Q4_0 and Q8_0 both use 32-element blocks with a leading f16 scale. The
-/// block header bytes are included so the caller can allocate the exact read
+/// Block header bytes are included so the caller can allocate the exact read
 /// buffer without guessing.
 fn raw_size_bytes(dtype: GgufDtype, n_elements: usize) -> usize {
     match dtype {
@@ -278,6 +293,24 @@ fn raw_size_bytes(dtype: GgufDtype, n_elements: usize) -> usize {
             // Each block: 2 bytes (f16 scale) + 16 bytes (nibble-packed i4 values) = 18 bytes per 32 elements.
             let n_blocks = (n_elements + GGML_QK - 1) / GGML_QK;
             n_blocks * (2 + GGML_QK / 2)
+        }
+        GgufDtype::Q4_K => {
+            // Superblock of 256 elements: 2 (d) + 2 (dmin) + 12 (scales) + 128 (nibbles) = 144 bytes.
+            const SB: usize = 256;
+            let n_blocks = (n_elements + SB - 1) / SB;
+            n_blocks * 144
+        }
+        GgufDtype::Q5_K => {
+            // Superblock of 256 elements: 2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (ql) = 176 bytes.
+            const SB: usize = 256;
+            let n_blocks = (n_elements + SB - 1) / SB;
+            n_blocks * 176
+        }
+        GgufDtype::Q6_K => {
+            // Superblock of 256 elements: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210 bytes.
+            const SB: usize = 256;
+            let n_blocks = (n_elements + SB - 1) / SB;
+            n_blocks * 210
         }
     }
 }
