@@ -8,7 +8,22 @@ While others use Python, we use Rust. Not because it's easy — because it's pre
 
 A unified CLI for the full LLM lifecycle — **fetch → train → serve → chat** — with dataset tooling and HuggingFace Hub integration built in. All inference runs locally. No data leaves your machine.
 
-> Version: `1.0.0` — Actively developed
+<div align="center">
+
+![GwenLand Banner](assets/benchmark.png)
+
+[![Build](https://github.com/JinXSuper/gwenland/actions/workflows/build.yml/badge.svg)](https://github.com/JinXSuper/gwenland/actions/workflows/build.yml)
+[![Version](https://img.shields.io/badge/version-1.0.0--experimental-FF8C42.svg)]()
+[![License](https://img.shields.io/badge/license-MIT--Commons--Clause-orange.svg)](./LICENSE.txt)
+[![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+
+**Local-first AI toolkit in pure Rust.**
+~10MB binary · ~9ms cold start · Zero Python · Zero Ollama
+
+</div>
+
+---
 
 ---
 
