@@ -40,6 +40,7 @@ futures-util = "0.3"
 actix-web = "4"
 bytes = "1"
 anyhow = "1"
+thiserror = "1"
 dirs = "5"
 fs2 = "0.4"
 which = "6"
@@ -64,15 +65,24 @@ keyring = "3"
 indicatif = "0.18"
 toml = "0.8"
 directories = "5"
+memmap2 = "0.9"
 
 [features]
 default = []
 legacy = []
 nvidia = ["nvml-wrapper"]
+mistralrs-backend = ["dep:mistralrs"]
+candle-backend = []
+test-utils = []
 
 [dependencies.nvml-wrapper]
 version = "0.10"
 optional = true
+
+[dependencies.mistralrs]
+version = "0.8"
+optional = true
+default-features = false
 
 [profile.release]
 opt-level = 3
@@ -85,7 +95,17 @@ opt-level = 1
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+quickcheck = "1"
+quickcheck_macros = "1"
 
 [[bench]]
 name = "core_bench"
 harness = false
+
+[[bin]]
+name = "validate_dequant"
+path = "src/bin/validate_dequant.rs"
+
+[[bin]]
+name = "bench_ggqr"
+path = "src/bin/bench_ggqr.rs"

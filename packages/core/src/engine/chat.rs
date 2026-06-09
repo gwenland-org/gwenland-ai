@@ -15,6 +15,7 @@ use anyhow::{bail, Result};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::storage::config::{read_last_used_model, save_last_used_model};
@@ -430,9 +431,44 @@ pub struct HeadlessChatConfig {
     pub system: Option<String>,
     pub json_mode: bool,
     pub messages: Vec<String>,
+    // None = use SSE fallback (default). Set both to activate native path.
+    pub native_backend: Option<Arc<dyn crate::engine::inference::InferenceBackend>>,
+    pub native_params: Option<crate::engine::inference::InferParams>,
 }
 
 pub async fn run_headless_chat(cfg: HeadlessChatConfig) -> i32 {
+    // Native inference path — bypasses SSE entirely when both fields are set.
+    if let (Some(backend), Some(params)) = (&cfg.native_backend, &cfg.native_params) {
+        let mut session = ChatSession::new();
+        if let Some(sys) = &cfg.system {
+            session.push(ChatMessage {
+                role: MessageRole::System,
+                content: sys.clone(),
+            });
+        }
+        for user_input in &cfg.messages {
+            session.push(ChatMessage {
+                role: MessageRole::User,
+                content: user_input.clone(),
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+            stream_chat_native(&mut session, Arc::clone(backend), params, tx).await;
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    ChatEvent::Token(t) => print!("{}", t),
+                    ChatEvent::Done => println!(),
+                    ChatEvent::Error(e) => {
+                        eprintln!("error: {}", e);
+                        return EXIT_ERROR;
+                    }
+                }
+            }
+        }
+        persist_session_model(&cfg.model);
+        return EXIT_OK;
+    }
+
+    // SSE fallback path — unchanged.
     if !probe_server(cfg.port).await {
         eprintln!("{}", server_unreachable_message(cfg.port));
         return EXIT_SERVER_UNREACHABLE;
@@ -476,4 +512,211 @@ pub async fn run_headless_chat(cfg: HeadlessChatConfig) -> i32 {
 
     persist_session_model(&cfg.model);
     EXIT_OK
+}
+
+// ── native inference path ─────────────────────────────────────────────────────
+
+/// Build a prompt string from the current session history.
+///
+/// Uses the `<|system|>` / `<|user|>` / `<|assistant|>` chat template, which
+/// is compatible with Qwen3, LLaMA 3, and Mistral instruction-tuned models.
+fn build_prompt_from_session(session: &ChatSession) -> String {
+    let mut prompt = String::new();
+    for msg in session.messages() {
+        match msg.role {
+            MessageRole::System => {
+                prompt.push_str(&format!("<|system|>\n{}\n", msg.content));
+            }
+            MessageRole::User => {
+                prompt.push_str(&format!("<|user|>\n{}\n", msg.content));
+            }
+            MessageRole::Assistant => {
+                prompt.push_str(&format!("<|assistant|>\n{}\n", msg.content));
+            }
+        }
+    }
+    prompt.push_str("<|assistant|>\n");
+    prompt
+}
+
+/// Stream a single chat turn using the native `InferenceBackend` directly.
+///
+/// Bypasses the SSE proxy entirely. Sends `ChatEvent::Token` for each yielded
+/// token, `ChatEvent::Done` on completion, and `ChatEvent::Error` on failure.
+/// The assistant response is committed to `session` history before `Done`.
+pub async fn stream_chat_native(
+    session: &mut ChatSession,
+    backend: Arc<dyn crate::engine::inference::InferenceBackend>,
+    params: &crate::engine::inference::InferParams,
+    tx: UnboundedSender<ChatEvent>,
+) {
+    let prompt = build_prompt_from_session(session);
+
+    match backend.stream_infer(&prompt, params) {
+        Ok(mut stream) => {
+            let mut assistant_buf = String::new();
+            while let Some(token) = stream.next().await {
+                assistant_buf.push_str(&token);
+                let _ = tx.send(ChatEvent::Token(token));
+            }
+            session.finalize_assistant_turn(assistant_buf);
+            let _ = tx.send(ChatEvent::Done);
+        }
+        Err(e) => {
+            let _ = tx.send(ChatEvent::Error(e.to_string()));
+        }
+    }
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::inference::mock_backend::MockBackend;
+    use crate::engine::inference::InferParams;
+
+    fn make_session(msgs: &[(MessageRole, &str)]) -> ChatSession {
+        let mut s = ChatSession::new();
+        for (role, content) in msgs {
+            s.push(ChatMessage {
+                role: role.clone(),
+                content: content.to_string(),
+            });
+        }
+        s
+    }
+
+    // 1. System message formatted correctly
+    #[test]
+    fn build_prompt_includes_system() {
+        let s = make_session(&[(MessageRole::System, "You are helpful.")]);
+        let p = build_prompt_from_session(&s);
+        assert!(p.contains("<|system|>\nYou are helpful.\n"));
+    }
+
+    // 2. User message formatted correctly
+    #[test]
+    fn build_prompt_includes_user() {
+        let s = make_session(&[(MessageRole::User, "Hello!")]);
+        let p = build_prompt_from_session(&s);
+        assert!(p.contains("<|user|>\nHello!\n"));
+    }
+
+    // 3. Always ends with <|assistant|>\n
+    #[test]
+    fn build_prompt_ends_with_assistant_tag() {
+        let s = make_session(&[(MessageRole::User, "Hi")]);
+        let p = build_prompt_from_session(&s);
+        assert!(p.ends_with("<|assistant|>\n"));
+    }
+
+    // 4. Multi-turn: user + assistant + user formats all roles
+    #[test]
+    fn build_prompt_multi_turn() {
+        let s = make_session(&[
+            (MessageRole::User, "First"),
+            (MessageRole::Assistant, "Reply"),
+            (MessageRole::User, "Second"),
+        ]);
+        let p = build_prompt_from_session(&s);
+        assert!(p.contains("<|user|>\nFirst\n"));
+        assert!(p.contains("<|assistant|>\nReply\n"));
+        assert!(p.contains("<|user|>\nSecond\n"));
+        assert!(p.ends_with("<|assistant|>\n"));
+    }
+
+    // 5. HeadlessChatConfig native fields default to None
+    #[test]
+    fn headless_config_default_native_none() {
+        let cfg = HeadlessChatConfig {
+            model: "test".to_string(),
+            port: 1136,
+            system: None,
+            json_mode: false,
+            messages: vec![],
+            native_backend: None,
+            native_params: None,
+        };
+        assert!(cfg.native_backend.is_none());
+        assert!(cfg.native_params.is_none());
+    }
+
+    // 6. stream_chat_native with MockBackend yields all tokens via tx
+    #[tokio::test]
+    async fn stream_chat_native_mock_yields_tokens() {
+        let tokens = vec!["Hello".to_string(), " world".to_string()];
+        let backend: Arc<dyn crate::engine::inference::InferenceBackend> =
+            Arc::new(MockBackend::new(tokens.clone()));
+        let params = InferParams::default();
+        let mut session = make_session(&[(MessageRole::User, "Hi")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+
+        stream_chat_native(&mut session, backend, &params, tx).await;
+
+        let mut received = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let ChatEvent::Token(t) = ev {
+                received.push(t);
+            }
+        }
+        assert_eq!(received, tokens);
+    }
+
+    // 7. stream_chat_native sends Done after stream completes
+    #[tokio::test]
+    async fn stream_chat_native_mock_sends_done() {
+        let backend: Arc<dyn crate::engine::inference::InferenceBackend> =
+            Arc::new(MockBackend::new(vec!["tok".to_string()]));
+        let params = InferParams::default();
+        let mut session = make_session(&[(MessageRole::User, "Hi")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+
+        stream_chat_native(&mut session, backend, &params, tx).await;
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Done)));
+    }
+
+    // 8. stream_chat_native with a backend that errors on stream_infer sends Error
+    #[tokio::test]
+    async fn stream_chat_native_error_sends_error_event() {
+        // MockBackend::with_fail_on_load fails load_model, not stream_infer.
+        // Use a custom backend that always errors on stream_infer.
+        use std::path::Path;
+        use std::pin::Pin;
+        use futures_util::Stream;
+
+        struct ErrorBackend;
+        impl crate::engine::inference::InferenceBackend for ErrorBackend {
+            fn load_model(&self, _: &Path) -> anyhow::Result<()> { Ok(()) }
+            fn infer(&self, _: &str, _: &InferParams) -> anyhow::Result<String> {
+                anyhow::bail!("infer error")
+            }
+            fn stream_infer(
+                &self,
+                _: &str,
+                _: &InferParams,
+            ) -> anyhow::Result<Pin<Box<dyn Stream<Item = String> + Send>>> {
+                anyhow::bail!("stream error")
+            }
+            fn unload(&self) -> anyhow::Result<()> { Ok(()) }
+            fn name(&self) -> &'static str { "error" }
+        }
+
+        let backend: Arc<dyn crate::engine::inference::InferenceBackend> =
+            Arc::new(ErrorBackend);
+        let params = InferParams::default();
+        let mut session = make_session(&[(MessageRole::User, "Hi")]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChatEvent>();
+
+        stream_chat_native(&mut session, backend, &params, tx).await;
+
+        let events: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Error(_))));
+    }
 }

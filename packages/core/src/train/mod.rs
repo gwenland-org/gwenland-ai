@@ -5,6 +5,9 @@
 
 pub mod config;
 pub mod dataset;
+pub mod lora_bridge;
+pub mod lora_cli;
+pub mod lora_merger;
 pub mod dry_run;
 pub mod lora;
 pub mod native_runner;

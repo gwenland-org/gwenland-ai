@@ -1,11 +1,19 @@
 pub mod chat;
 pub mod context_tree;
+pub mod gguf_loader;
 pub mod inference;
+pub mod loader;
 pub mod memory_guard;
 pub mod runtime;
 pub mod stream;
 pub mod tokenizer;
 pub mod windowing;
+
+pub use gguf_loader::load_gguf;
+pub use gguf_loader::load_gguf_with_mode;
+pub use gguf_loader::dequant_all;
+pub use gguf_loader::load_and_dequant;
+pub use loader::LoadMode;
 
 /// Runtime output/interaction mode. Constructed from CLI global flags and
 /// auto-detected from stdout (pipe-safe: non-TTY → non_interactive = true).

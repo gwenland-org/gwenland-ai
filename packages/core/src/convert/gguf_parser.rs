@@ -47,6 +47,14 @@ pub enum GgufDtype {
     /// Layout per block: [scale: f16][nibbles: u8 × 16]
     /// Values are signed 4-bit integers packed as two per byte (low nibble first).
     Q4_0,
+    /// 2-bit K-quant: superblocks of 256 elements, 16 sub-blocks of 16.
+    /// Layout: [scales: u8×16][qs: u8×64][d: f16][dmin: f16] = 84 bytes.
+    /// Formula: W = d * scale_index[j] * q - dmin * min_index[j], q ∈ [0, 3].
+    Q2_K,
+    /// 3-bit K-quant: superblocks of 256 elements, 16 sub-blocks of 16.
+    /// Layout: [qs: u8×64][hmask: u8×32][scales: u8×12][d: f16] = 110 bytes.
+    /// Formula: W = d * (scale_index[j] / 63.0) * q, q ∈ [-4, 3].
+    Q3_K,
     /// 4-bit K-quant: superblocks of 256 elements, 8 sub-blocks of 32.
     /// Layout: [d: f16][dmin: f16][scales: u8×12][nibbles: u8×128] = 144 bytes.
     /// Formula: W = d * scale[j] * q - dmin * min[j], q ∈ [0, 15].
@@ -87,6 +95,7 @@ pub struct TensorInfo {
 }
 
 /// Parsed GGUF file: header metadata plus per-tensor descriptors with data.
+#[derive(Debug)]
 pub struct GgufFile {
     /// GGUF format version (1, 2, or 3).
     pub version: u32,
@@ -264,12 +273,14 @@ fn ggml_type_to_dtype(raw: u32, tensor_name: &str) -> Result<GgufDtype, String> 
         1  => Ok(GgufDtype::F16),
         6  => Ok(GgufDtype::Q4_0),
         8  => Ok(GgufDtype::Q8_0),
+        10 => Ok(GgufDtype::Q2_K),
+        11 => Ok(GgufDtype::Q3_K),
         12 => Ok(GgufDtype::Q4_K),
         13 => Ok(GgufDtype::Q5_K),
         14 => Ok(GgufDtype::Q6_K),
         other => Err(format!(
             "tensor '{}' has unsupported ggml_type {} \
-             (supported: F32/F16/Q4_0/Q8_0/Q4_K/Q5_K/Q6_K)",
+             (supported: F32/F16/Q4_0/Q8_0/Q2_K/Q3_K/Q4_K/Q5_K/Q6_K)",
             tensor_name, other
         )),
     }
@@ -293,6 +304,18 @@ fn raw_size_bytes(dtype: GgufDtype, n_elements: usize) -> usize {
             // Each block: 2 bytes (f16 scale) + 16 bytes (nibble-packed i4 values) = 18 bytes per 32 elements.
             let n_blocks = (n_elements + GGML_QK - 1) / GGML_QK;
             n_blocks * (2 + GGML_QK / 2)
+        }
+        GgufDtype::Q2_K => {
+            // Superblock of 256 elements: 16 (scales) + 64 (qs) + 2 (d) + 2 (dmin) = 84 bytes.
+            const SB: usize = 256;
+            let n_blocks = (n_elements + SB - 1) / SB;
+            n_blocks * 84
+        }
+        GgufDtype::Q3_K => {
+            // Superblock of 256 elements: 64 (qs) + 32 (hmask) + 12 (scales) + 2 (d) = 110 bytes.
+            const SB: usize = 256;
+            let n_blocks = (n_elements + SB - 1) / SB;
+            n_blocks * 110
         }
         GgufDtype::Q4_K => {
             // Superblock of 256 elements: 2 (d) + 2 (dmin) + 12 (scales) + 128 (nibbles) = 144 bytes.

@@ -1,10 +1,9 @@
-/// ⚠️  EXPERIMENTAL — Q4_K / Q5_K / Q6_K dequantisation paths are experimental.
-///     Bit-manipulation has been verified against the GGML reference but has NOT
-///     been validated against real GGUF model files end-to-end. The test helper
-///     `build_q4k_block` / `build_q5k_block` only round-trips correctly for
-///     sub-block scale/min values < 16. Do not use in production without
-///     running `cargo test -p gwenland-core convert` and cross-checking output
-///     against a known-good dequantiser (e.g. llama.cpp).
+/// ⚠️  EXPERIMENTAL — Q2_K / Q3_K / Q4_K / Q5_K / Q6_K dequantisation paths
+///     are experimental. Bit-manipulation has been verified against the GGML
+///     reference but has NOT been validated against real GGUF model files
+///     end-to-end. Do not use in production without running
+///     `cargo test -p gwenland-core convert` and cross-checking output against
+///     a known-good dequantiser (e.g. llama.cpp or validate_dequant binary).
 ///
 /// Dequantisation — two modes: Standard (linear) and Euler (cosine projection).
 ///
@@ -21,9 +20,11 @@
 ///   F32, F16          — pass-through / upcast (stable)
 ///   Q8_0              — 8-bit symmetric, 32-element blocks (stable)
 ///   Q4_0              — 4-bit symmetric, 32-element blocks (stable)
-///   Q4_K              — 4-bit K-quant superblock (256 elements, 8 sub-blocks) [EXPERIMENTAL]
-///   Q5_K              — 5-bit K-quant superblock (256 elements, 8 sub-blocks) [EXPERIMENTAL]
-///   Q6_K              — 6-bit K-quant superblock (256 elements, single scale) [EXPERIMENTAL]
+///   Q2_K              — 2-bit K-quant superblock (256 elements, 16 sub-blocks) [EXPERIMENTAL]
+///   Q3_K              — 3-bit K-quant superblock (256 elements, 16 sub-blocks) [EXPERIMENTAL]
+///   Q4_K              — 4-bit K-quant superblock (256 elements, 8 sub-blocks)  [EXPERIMENTAL]
+///   Q5_K              — 5-bit K-quant superblock (256 elements, 8 sub-blocks)  [EXPERIMENTAL]
+///   Q6_K              — 6-bit K-quant superblock (256 elements, 16 sub-blocks) [EXPERIMENTAL]
 use super::gguf_parser::{GgufDtype, TensorInfo, read_f16_as_f32};
 
 /// Dequantisation mode, chosen by the user via `--euler` flag.
@@ -56,6 +57,14 @@ pub fn dequantize(tensor: &TensorInfo, mode: DequantMode) -> Result<Vec<f32>, St
         GgufDtype::Q4_0 => match mode {
             DequantMode::Standard => dequant_q4_0_standard(&tensor.raw_data, n_elements),
             DequantMode::Euler    => dequant_q4_0_euler(&tensor.raw_data, n_elements),
+        },
+        GgufDtype::Q2_K => match mode {
+            DequantMode::Standard => dequant_q2_k_standard(&tensor.raw_data, n_elements),
+            DequantMode::Euler    => dequant_q2_k_euler(&tensor.raw_data, n_elements),
+        },
+        GgufDtype::Q3_K => match mode {
+            DequantMode::Standard => dequant_q3_k_standard(&tensor.raw_data, n_elements),
+            DequantMode::Euler    => dequant_q3_k_euler(&tensor.raw_data, n_elements),
         },
         GgufDtype::Q4_K => match mode {
             DequantMode::Standard => dequant_q4_k_standard(&tensor.raw_data, n_elements),
@@ -339,6 +348,269 @@ fn dequant_q4_0_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 /// attention heads), max_bound = 0 and the division would be undefined. In that
 /// case we output 0.0 for every element — the block carries no information and
 /// its GwenTensor reconstruction is identically zero regardless of mode.
+// ── Q2_K — Standard ───────────────────────────────────────────────────────────
+
+/// Q2_K standard linear dequantisation.
+///
+/// Superblock layout (84 bytes per 256 elements):
+///   [scales: u8 × 16 (16 bytes)] — 4-bit scale index + 4-bit min index per sub-block
+///   [qs:     u8 × 64 (64 bytes)] — 2-bit packed quants, 4 per byte
+///   [d:      f16 (2 bytes)]      — superblock scale for quantised scales
+///   [dmin:   f16 (2 bytes)]      — superblock scale for quantised mins
+///
+/// Sub-block structure: 16 sub-blocks × 16 elements each.
+/// Per sub-block j (0..15):
+///   scale_index[j] = scales[j] & 0x0F   (low nibble, unsigned [0, 15])
+///   min_index[j]   = scales[j] >> 4     (high nibble, unsigned [0, 15])
+///
+/// 2-bit extraction per element i:
+///   q2 = (qs[i / 4] >> ((i % 4) * 2)) & 0x03   → unsigned [0, 3]
+///   j  = i / 16
+///   W  = d * scale_index[j] * q2 - dmin * min_index[j]
+fn dequant_q2_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    const SUPERBLOCK_ELEMENTS: usize = 256;
+    const N_SUBBLOCKS: usize = 16;
+    const SUBBLOCK_ELEMENTS: usize = SUPERBLOCK_ELEMENTS / N_SUBBLOCKS; // 16
+
+    // Layout: 16 (scales) + 64 (qs) + 2 (d) + 2 (dmin) = 84 bytes.
+    const BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
+
+    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    if raw.len() < n_blocks * BLOCK_BYTES {
+        return Err(format!(
+            "Q2_K data truncated: need {} bytes, got {}",
+            n_blocks * BLOCK_BYTES,
+            raw.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(n_elements);
+
+    // Stack buffers for decoded 4-bit scale and min indices.
+    let mut scale_idx = [0u8; N_SUBBLOCKS];
+    let mut min_idx   = [0u8; N_SUBBLOCKS];
+
+    for b in 0..n_blocks {
+        let base = b * BLOCK_BYTES;
+
+        // Decode 16 sub-block scale/min nibbles.
+        let scales_base = base;
+        for j in 0..N_SUBBLOCKS {
+            scale_idx[j] = raw[scales_base + j] & 0x0F;
+            min_idx[j]   = raw[scales_base + j] >> 4;
+        }
+
+        // Superblock scale factors (f16 → f32).
+        // Layout: scales(16) + qs(64) = 80 bytes before d.
+        let d    = read_f16_as_f32(&raw[base + 80..]);
+        let dmin = read_f16_as_f32(&raw[base + 82..]);
+
+        let qs_base = base + 16; // 64 bytes of 2-bit packed quants.
+
+        let block_elem_count =
+            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+
+        for i in 0..block_elem_count {
+            let q2  = (raw[qs_base + i / 4] >> ((i % 4) * 2)) & 0x03;
+            let j   = i / SUBBLOCK_ELEMENTS;
+            let w   = d * scale_idx[j] as f32 * q2 as f32
+                    - dmin * min_idx[j] as f32;
+            out.push(w);
+        }
+    }
+    Ok(out)
+}
+
+// ── Q2_K — Euler ──────────────────────────────────────────────────────────────
+
+/// Q2_K Euler cosine-projection dequantisation.
+///
+/// Extracts 2-bit unsigned integers identically to Standard mode, then passes
+/// them through `euler_dequant_block` using the superblock `d` as δ_b.
+/// The sub-block min term is NOT applied in Euler mode.
+fn dequant_q2_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    const SUPERBLOCK_ELEMENTS: usize = 256;
+    const BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
+
+    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    if raw.len() < n_blocks * BLOCK_BYTES {
+        return Err(format!(
+            "Q2_K data truncated: need {} bytes, got {}",
+            n_blocks * BLOCK_BYTES,
+            raw.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(n_elements);
+    let mut ivalues = Vec::with_capacity(SUPERBLOCK_ELEMENTS);
+
+    for b in 0..n_blocks {
+        let base    = b * BLOCK_BYTES;
+        let delta_b = read_f16_as_f32(&raw[base + 80..]);
+        let qs_base = base + 16;
+
+        let block_elem_count =
+            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+
+        ivalues.clear();
+        for i in 0..block_elem_count {
+            let q2 = (raw[qs_base + i / 4] >> ((i % 4) * 2)) & 0x03;
+            ivalues.push(q2 as i32);
+        }
+
+        let weights = euler_dequant_block(&ivalues, delta_b);
+        out.extend_from_slice(&weights);
+    }
+    Ok(out)
+}
+
+// ── Q3_K — Standard ───────────────────────────────────────────────────────────
+
+/// Extract 16 × 6-bit scale indices from the 12-byte Q3_K scales region.
+///
+/// Each index is in [0, 63]. The 16 values are packed contiguously at 6 bits
+/// per index = 96 bits = 12 bytes. Extraction spans byte boundaries when the
+/// 6-bit window is not byte-aligned.
+///
+/// Verified against gguf-py/gguf/quants.py Q3_K dequantize_blocks.
+fn extract_q3k_scales(scales: &[u8]) -> [u8; 16] {
+    debug_assert!(scales.len() >= 12);
+    let mut out = [0u8; 16];
+    for j in 0..16usize {
+        let bit_pos    = j * 6;
+        let byte_index = bit_pos / 8;
+        let bit_offset = bit_pos % 8;
+        out[j] = if bit_offset <= 2 {
+            (scales[byte_index] >> bit_offset) & 0x3F
+        } else {
+            let lo = scales[byte_index] as u16 >> bit_offset;
+            let hi = (scales[byte_index + 1] as u16) << (8 - bit_offset);
+            ((lo | hi) & 0x3F) as u8
+        };
+    }
+    out
+}
+
+/// Q3_K standard linear dequantisation.
+///
+/// Superblock layout (110 bytes per 256 elements):
+///   [qs:     u8 × 64  (64 bytes)]  — low 2 bits of each 3-bit value, 4 per byte
+///   [hmask:  u8 × 32  (32 bytes)]  — high (3rd) bit of each value, 1 per element packed 8/byte
+///   [scales: u8 × 12  (12 bytes)]  — 16 × 6-bit scale indices packed contiguously
+///   [d:      f16 (2 bytes)]        — superblock scale
+///
+/// 3-bit reconstruction per element i:
+///   low2   = (qs[i / 4]    >> ((i % 4) * 2)) & 0x03
+///   bit2   = (hmask[i / 8] >>  (i % 8))      & 0x01
+///   q3_raw = low2 | (bit2 << 2)               → unsigned [0, 7]
+///   q3     = q3_raw as i32 - 4               → signed [-4, 3]
+///
+/// Sub-block structure: 16 sub-blocks × 16 elements each.
+/// Per sub-block j:
+///   actual_scale[j] = d * (scale_index[j] as f32 / 63.0)
+///   W[i]            = actual_scale[j] * q3[i]
+///
+/// Q3_K is symmetric (no dmin / zero_point = 0).
+fn dequant_q3_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    const SUPERBLOCK_ELEMENTS: usize = 256;
+    const N_SUBBLOCKS: usize = 16;
+    const SUBBLOCK_ELEMENTS: usize = SUPERBLOCK_ELEMENTS / N_SUBBLOCKS; // 16
+
+    // Layout: 64 (qs) + 32 (hmask) + 12 (scales) + 2 (d) = 110 bytes.
+    const BLOCK_BYTES: usize = 64 + 32 + 12 + 2;
+
+    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    if raw.len() < n_blocks * BLOCK_BYTES {
+        return Err(format!(
+            "Q3_K data truncated: need {} bytes, got {}",
+            n_blocks * BLOCK_BYTES,
+            raw.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(n_elements);
+
+    for b in 0..n_blocks {
+        let base        = b * BLOCK_BYTES;
+        let qs_base     = base;       // 64 bytes: low 2 bits
+        let hmask_base  = base + 64;  // 32 bytes: high bit
+        let scales_base = base + 96;  // 12 bytes: 6-bit scale indices
+        let d_base      = base + 108; // 2 bytes:  f16
+
+        let d = read_f16_as_f32(&raw[d_base..]);
+
+        // Decode 16 × 6-bit scale indices from the 12-byte packed region.
+        let scale_indices = extract_q3k_scales(&raw[scales_base..scales_base + 12]);
+
+        let block_elem_count =
+            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+
+        for i in 0..block_elem_count {
+            // Reconstruct 3-bit value.
+            let low2   = (raw[qs_base    + i / 4] >> ((i % 4) * 2)) & 0x03;
+            let bit2   = (raw[hmask_base + i / 8] >>  (i % 8))      & 0x01;
+            let q3_raw = low2 | (bit2 << 2);          // unsigned [0, 7]
+            let q3     = (q3_raw as i32) - 4;         // signed   [-4, 3]
+
+            // Sub-block scale.
+            let j             = i / SUBBLOCK_ELEMENTS;
+            let actual_scale  = d * (scale_indices[j] as f32 / 63.0);
+
+            out.push(actual_scale * q3 as f32);
+        }
+    }
+    Ok(out)
+}
+
+// ── Q3_K — Euler ──────────────────────────────────────────────────────────────
+
+/// Q3_K Euler cosine-projection dequantisation.
+///
+/// Reconstructs signed 3-bit integers identically to Standard mode, then
+/// passes them through `euler_dequant_block` using the superblock `d` as δ_b.
+/// Sub-block scales are NOT applied in Euler mode.
+fn dequant_q3_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
+    const SUPERBLOCK_ELEMENTS: usize = 256;
+    const BLOCK_BYTES: usize = 64 + 32 + 12 + 2;
+
+    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    if raw.len() < n_blocks * BLOCK_BYTES {
+        return Err(format!(
+            "Q3_K data truncated: need {} bytes, got {}",
+            n_blocks * BLOCK_BYTES,
+            raw.len()
+        ));
+    }
+
+    let mut out = Vec::with_capacity(n_elements);
+    let mut ivalues = Vec::with_capacity(SUPERBLOCK_ELEMENTS);
+
+    for b in 0..n_blocks {
+        let base       = b * BLOCK_BYTES;
+        let qs_base    = base;
+        let hmask_base = base + 64;
+        let d_base     = base + 108;
+
+        let delta_b = read_f16_as_f32(&raw[d_base..]);
+
+        let block_elem_count =
+            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+
+        ivalues.clear();
+        for i in 0..block_elem_count {
+            let low2   = (raw[qs_base    + i / 4] >> ((i % 4) * 2)) & 0x03;
+            let bit2   = (raw[hmask_base + i / 8] >>  (i % 8))      & 0x01;
+            let q3_raw = low2 | (bit2 << 2);
+            let q3     = (q3_raw as i32) - 4;
+            ivalues.push(q3);
+        }
+
+        let weights = euler_dequant_block(&ivalues, delta_b);
+        out.extend_from_slice(&weights);
+    }
+    Ok(out)
+}
+
 // ── Q4_K — Standard ───────────────────────────────────────────────────────────
 
 /// Q4_K standard linear dequantisation.
@@ -1170,6 +1442,216 @@ mod tests {
     fn test_q5k_euler_output_bounded() {
         let raw = build_q5k_block(1.0, 0.0, 1, 0, 0xA5, 0x5A);
         let out = dequant_q5_k_euler(&raw, 256).unwrap();
+        for &w in &out {
+            assert!(
+                w >= -0.619 && w <= 0.619,
+                "Euler output out of bounds: {w}"
+            );
+        }
+    }
+
+    // ── Q2_K tests ────────────────────────────────────────────────────────────
+
+    /// Build a minimal single-superblock Q2_K raw buffer.
+    ///
+    /// Layout: [scales: u8×16][qs: u8×64][d: f16][dmin: f16] = 84 bytes.
+    /// Each scales byte = (min_nibble << 4) | (scale_nibble & 0x0F).
+    fn build_q2k_block(
+        d_val: f32,
+        dmin_val: f32,
+        scale_nibble: u8,
+        min_nibble: u8,
+        qs_fill: u8,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 84];
+        // scales[0..16]: low nibble = scale_nibble, high nibble = min_nibble.
+        let scale_byte = (min_nibble << 4) | (scale_nibble & 0x0F);
+        for b in buf[0..16].iter_mut() { *b = scale_byte; }
+        // qs[16..80]: 2-bit packed quants.
+        for b in buf[16..80].iter_mut() { *b = qs_fill; }
+        // d at bytes 80..82, dmin at bytes 82..84.
+        let d_bits  = le16(f32_to_f16_bits(d_val));
+        let dm_bits = le16(f32_to_f16_bits(dmin_val));
+        buf[80] = d_bits[0];  buf[81] = d_bits[1];
+        buf[82] = dm_bits[0]; buf[83] = dm_bits[1];
+        buf
+    }
+
+    #[test]
+    fn test_q2k_zero_quants_zero_output() {
+        // qs=0x00 → q2=0 everywhere; scale_nibble=1, min_nibble=0, d=1.0, dmin=0.0
+        // W = 1.0 * 1 * 0 - 0.0 * 0 = 0.0
+        let raw = build_q2k_block(1.0, 0.0, 1, 0, 0x00);
+        let out = dequant_q2_k_standard(&raw, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for &w in &out {
+            assert_eq!(w, 0.0, "expected 0.0, got {w}");
+        }
+    }
+
+    #[test]
+    fn test_q2k_max_quant_value() {
+        // qs=0xFF → q2=3 everywhere; scale_nibble=1, min_nibble=0, d=1.0, dmin=0.0
+        // W = 1.0 * 1 * 3 = 3.0
+        let raw = build_q2k_block(1.0, 0.0, 1, 0, 0xFF);
+        let out = dequant_q2_k_standard(&raw, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for &w in &out {
+            assert!(
+                (w - 3.0).abs() < 1e-4,
+                "expected 3.0, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_q2k_min_subtraction() {
+        // qs=0x00 → q2=0; scale_nibble=1, min_nibble=5, d=1.0, dmin=1.0
+        // W = 1.0 * 1 * 0 - 1.0 * 5 = -5.0
+        let raw = build_q2k_block(1.0, 1.0, 1, 5, 0x00);
+        let out = dequant_q2_k_standard(&raw, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for &w in &out {
+            assert!(
+                (w - (-5.0)).abs() < 1e-4,
+                "expected -5.0, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_q2k_truncated_data_error() {
+        let raw = vec![0u8; 20];
+        assert!(dequant_q2_k_standard(&raw, 256).is_err());
+    }
+
+    #[test]
+    fn test_q2k_euler_output_bounded() {
+        // Euler output must be in [-0.618, 0.618] for any input.
+        let raw = build_q2k_block(1.0, 0.0, 1, 0, 0xA5);
+        let out = dequant_q2_k_euler(&raw, 256).unwrap();
+        for &w in &out {
+            assert!(
+                w >= -0.619 && w <= 0.619,
+                "Euler output out of bounds: {w}"
+            );
+        }
+    }
+
+    // ── Q3_K tests ────────────────────────────────────────────────────────────
+
+    /// Pack 16 copies of a uniform 6-bit value into 12 bytes for Q3_K scales.
+    ///
+    /// Inverse of `extract_q3k_scales`: packs `val` (6-bit, [0,63]) at every
+    /// 6-bit slot so that `extract_q3k_scales` returns `[val; 16]`.
+    fn pack_uniform_q3k_scales(val: u8) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        for j in 0..16usize {
+            let bit_pos    = j * 6;
+            let byte_index = bit_pos / 8;
+            let bit_offset = bit_pos % 8;
+            let v = val as u16;
+            buf[byte_index] |= ((v << bit_offset) & 0xFF) as u8;
+            if bit_offset > 2 && byte_index + 1 < 12 {
+                buf[byte_index + 1] |= (v >> (8 - bit_offset)) as u8;
+            }
+        }
+        buf
+    }
+
+    /// Build a minimal single-superblock Q3_K raw buffer.
+    ///
+    /// Layout: [qs: u8×64][hmask: u8×32][scales: u8×12][d: f16] = 110 bytes.
+    fn build_q3k_block(
+        d_val: f32,
+        scale_index: u8,
+        qs_fill: u8,
+        hmask_fill: u8,
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 110];
+        // qs[0..64]
+        for b in buf[0..64].iter_mut()   { *b = qs_fill; }
+        // hmask[64..96]
+        for b in buf[64..96].iter_mut()  { *b = hmask_fill; }
+        // scales[96..108]: pack uniform scale_index into 6-bit contiguous format.
+        let packed = pack_uniform_q3k_scales(scale_index);
+        buf[96..108].copy_from_slice(&packed);
+        // d at bytes 108..110.
+        let d_bits = le16(f32_to_f16_bits(d_val));
+        buf[108] = d_bits[0]; buf[109] = d_bits[1];
+        buf
+    }
+
+    #[test]
+    fn test_q3k_scale_extraction_roundtrip() {
+        // Verify pack_uniform_q3k_scales → extract_q3k_scales round-trips
+        // for all boundary values.
+        for val in [0u8, 1, 31, 62, 63] {
+            let packed    = pack_uniform_q3k_scales(val);
+            let extracted = extract_q3k_scales(&packed);
+            for (j, &s) in extracted.iter().enumerate() {
+                assert_eq!(
+                    s, val,
+                    "scale_index[{j}] round-trip failed for val={val}: got {s}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_q3k_all_zero_qs_zero_hmask_gives_minus4() {
+        // qs=0x00, hmask=0x00 → low2=0, bit2=0 → q3_raw=0 → q3=-4
+        // d=1.0, scale_index=63 → actual_scale = 1.0 * (63/63.0) = 1.0
+        // W = 1.0 * (-4) = -4.0
+        let raw = build_q3k_block(1.0, 63, 0x00, 0x00);
+        let out = dequant_q3_k_standard(&raw, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for &w in &out {
+            assert!(
+                (w - (-4.0)).abs() < 1e-4,
+                "expected -4.0, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_q3k_max_value() {
+        // qs=0xFF → low2=3 everywhere; hmask=0xFF → bit2=1 everywhere
+        // q3_raw=7 → q3=3; d=1.0, scale_index=63 → W = 3.0
+        let raw = build_q3k_block(1.0, 63, 0xFF, 0xFF);
+        let out = dequant_q3_k_standard(&raw, 256).unwrap();
+        assert_eq!(out.len(), 256);
+        for &w in &out {
+            assert!(
+                (w - 3.0).abs() < 1e-4,
+                "expected 3.0, got {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_q3k_signed_range() {
+        // With scale_index=63 and d=1.0, output spans [-4.0, 3.0].
+        let raw_min = build_q3k_block(1.0, 63, 0x00, 0x00); // q3=-4
+        let raw_max = build_q3k_block(1.0, 63, 0xFF, 0xFF); // q3=3
+        let out_min = dequant_q3_k_standard(&raw_min, 256).unwrap();
+        let out_max = dequant_q3_k_standard(&raw_max, 256).unwrap();
+        let min_val = out_min.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_val = out_max.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        assert!((min_val - (-4.0)).abs() < 1e-3, "min should be -4.0, got {min_val}");
+        assert!((max_val -   3.0 ).abs() < 1e-3, "max should be  3.0, got {max_val}");
+    }
+
+    #[test]
+    fn test_q3k_truncated_data_error() {
+        let raw = vec![0u8; 30];
+        assert!(dequant_q3_k_standard(&raw, 256).is_err());
+    }
+
+    #[test]
+    fn test_q3k_euler_output_bounded() {
+        let raw = build_q3k_block(1.0, 31, 0xA5, 0x5A);
+        let out = dequant_q3_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
                 w >= -0.619 && w <= 0.619,

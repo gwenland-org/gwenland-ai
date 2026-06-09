@@ -1,4 +1,4 @@
-# Math Theory — Q4_K, Q5_K, Q6_K Dequantisation
+# Math Theory — Q2_K, Q3_K, Q4_K, Q5_K, Q6_K Dequantisation
 
 This document mirrors the style of the existing Q8_0/Q4_0 theory and covers
 the three K-quant formats added in the GGQR-CF-mmap dequantisation engine.
@@ -198,3 +198,106 @@ The rationale is identical to Q8_0/Q4_0 Euler mode: the cosine projection
 already encodes relative magnitude through the `d` amplitude term, and adding
 an asymmetric per-sub-block offset (the `min` term) would break the symmetry
 assumption of the GwenTensor fixed-point accumulator.
+
+---
+
+## Q2_K — 2-bit K-Quant
+
+**Superblock:** 256 elements, 16 sub-blocks × 16 elements.
+**Layout:** `[scales: u8×16][qs: u8×64][d: f16][dmin: f16]` = 84 bytes (**2.625 bpw**)
+
+### Scale packing
+
+Each `scales[j]` byte encodes one sub-block's scale index (low nibble) and min
+index (high nibble):
+
+```
+scale_index[j] = scales[j] & 0x0F   → unsigned [0, 15]
+min_index[j]   = scales[j] >> 4     → unsigned [0, 15]
+```
+
+### 2-bit extraction
+
+Four 2-bit values are packed per byte, LSB first:
+
+```
+q2 = (qs[i / 4] >> ((i % 4) * 2)) & 0x03   → unsigned [0, 3]
+```
+
+### Formula
+
+```
+W[i] = d × scale_index[j] × q2 − dmin × min_index[j]
+```
+
+where `j = i / 16` is the sub-block index.
+
+**Output range:** unbounded f32. With `scale_index ∈ [0,15]`, `q2 ∈ [0,3]`,
+and `min_index ∈ [0,15]`, the range before scaling is `[−15, 45]`.
+
+---
+
+## Q3_K — 3-bit K-Quant
+
+**Superblock:** 256 elements, 16 sub-blocks × 16 elements.
+**Layout:** `[qs: u8×64][hmask: u8×32][scales: u8×12][d: f16]` = 110 bytes (**3.4375 bpw**)
+
+### 3-bit reconstruction
+
+Each 3-bit value is split across two regions:
+
+```
+low2   = (qs[i / 4]    >> ((i % 4) * 2)) & 0x03   // 2 bits from qs
+bit2   = (hmask[i / 8] >>  (i % 8))      & 0x01   // 1 bit from hmask
+q3_raw = low2 | (bit2 << 2)                        // unsigned [0, 7]
+q3     = q3_raw − 4                                // signed   [−4, 3]
+```
+
+The `hmask` region packs 8 high bits per byte in natural order (bit 0 = element 0
+within the byte group). This is the same pattern as Q5_K's `qh` region.
+
+### Scale packing
+
+The 12-byte `scales` region encodes 16 × 6-bit indices packed **contiguously**
+at 6 bits per index = 96 bits = 12 bytes. Extraction spans byte boundaries:
+
+```
+bit_pos    = j × 6
+byte_index = bit_pos / 8
+bit_offset = bit_pos % 8
+
+if bit_offset ≤ 2:
+    scale_index[j] = (scales[byte_index] >> bit_offset) & 0x3F
+else:
+    lo = scales[byte_index]     >> bit_offset
+    hi = scales[byte_index + 1] << (8 − bit_offset)
+    scale_index[j] = (lo | hi) & 0x3F
+```
+
+Each `scale_index[j]` is in `[0, 63]`.
+
+### Formula
+
+```
+actual_scale[j] = d × (scale_index[j] / 63.0)
+W[i]            = actual_scale[j] × q3
+```
+
+Q3_K is **symmetric** — there is no `dmin` term (zero_point = 0).
+Dividing by 63.0 normalises the 6-bit index to `[0.0, 1.0]`, so
+`actual_scale[j] ∈ [0, d]`.
+
+**Output range:** unbounded f32. With `scale_index = 63` and `d = 1.0`,
+output spans `[−4.0, 3.0]`.
+
+---
+
+## Full Comparison Table
+
+| Format | bpw    | Superblock | Sub-blocks | q range  | Formula                        |
+|--------|--------|------------|------------|----------|--------------------------------|
+| Q2_K   | 2.625  | 256        | 16 × 16    | [0, 3]   | d·s·q − dmin·m                 |
+| Q3_K   | 3.4375 | 256        | 16 × 16    | [−4, 3]  | d·(s/63)·q  *(symmetric)*      |
+| Q4_K   | 4.5    | 256        | 8 × 32     | [0, 15]  | d·s·q − dmin·m                 |
+| Q5_K   | 5.5    | 256        | 8 × 32     | [0, 31]  | d·s·q − dmin·m                 |
+| Q6_K   | 6.5625 | 256        | 16 × 16    | [−32, 31]| d·s·q  *(symmetric)*           |

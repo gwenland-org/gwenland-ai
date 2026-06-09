@@ -194,8 +194,23 @@ fn apply_token_budget(
 
     for w in windows {
         let cost = estimate_tokens(&w.3);
-        if kept.is_empty() || used + cost <= budget {
-            // @KEEP — always include at least one window (the highest-score)
+        if kept.is_empty() {
+            // Always include the highest-score window, but cap its content to
+            // the full budget so a single giant merged window cannot overflow.
+            if cost <= budget {
+                used += cost;
+                kept.push(w);
+            } else {
+                // Truncate content to fit within budget (budget * 4 chars).
+                let char_limit = budget * 4;
+                let truncated: String = w.3.chars().take(char_limit).collect();
+                used = estimate_tokens(&truncated);
+                // Recompute end_line to match the truncated content line count.
+                let kept_lines = truncated.lines().count().saturating_sub(1);
+                let new_end = w.0 + kept_lines;
+                kept.push((w.0, new_end, w.2, truncated));
+            }
+        } else if used + cost <= budget {
             used += cost;
             kept.push(w);
         }
