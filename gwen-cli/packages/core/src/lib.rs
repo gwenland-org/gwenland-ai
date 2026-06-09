@@ -1,3 +1,6 @@
+pub mod error;
+pub use error::GwenError;
+
 pub mod engine;
 pub use engine::*;
 

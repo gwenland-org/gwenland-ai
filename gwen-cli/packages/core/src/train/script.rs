@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::path::Path;
 
+#[cfg(feature = "legacy")]
 const BASE_TRAIN_PY: &str = include_str!("../../assets/base_train.py");
 
 /// Write the training script to a temp file and return it.
@@ -15,7 +16,16 @@ pub fn write_train_script(custom: Option<&Path>) -> Result<tempfile::NamedTempFi
     let content = match custom {
         Some(path) => std::fs::read_to_string(path)
             .with_context(|| format!("cannot read custom script: {}", path.display()))?,
-        None => BASE_TRAIN_PY.to_string(),
+        None => {
+            #[cfg(feature = "legacy")]
+            {
+                BASE_TRAIN_PY.to_string()
+            }
+            #[cfg(not(feature = "legacy"))]
+            {
+                anyhow::bail!("Legacy base_train.py missing. Provide a custom script or enable the 'legacy' feature.")
+            }
+        }
     };
 
     let mut tmp = tempfile::Builder::new()

@@ -1,5 +1,8 @@
 # GwenLand
 
+> ⚠️ **Experimental:** Active development. 
+> Core benchmarks verified, full pipeline in progress.
+
 > **"Speed is Everything, but Precise is more than Everything."**
 
 **AI all-in-one toolkit. Local-first. &lt;50MB. Privacy-first.**

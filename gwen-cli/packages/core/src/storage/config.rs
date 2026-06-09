@@ -56,6 +56,8 @@ pub struct GwenConfig {
     pub general: GeneralConfig,
     pub ai: AiConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
+    pub inference: crate::engine::inference::config::InferenceConfig,
 }
 
 impl GwenConfig {
@@ -113,6 +115,11 @@ impl GwenConfig {
             "ai.compression"          => Ok(self.ai.compression.to_string()),
             "ai.token_budget"         => Ok(self.ai.token_budget.to_string()),
             "ai.strategy"             => Ok(self.ai.strategy.clone()),
+            "inference.backend"       => Ok(self.inference.backend.clone()),
+            "inference.model"         => Ok(self.inference.model.clone()),
+            "inference.params.temperature" => Ok(self.inference.params.temperature.to_string()),
+            "inference.params.top_p"  => Ok(self.inference.params.top_p.to_string()),
+            "inference.params.max_tokens" => Ok(self.inference.params.max_tokens.to_string()),
             _ => anyhow::bail!("unknown config key: {}", key),
         }
     }
@@ -140,6 +147,27 @@ impl GwenConfig {
             }
             "ai.strategy" => {
                 self.ai.strategy = value.to_string();
+            }
+            "inference.backend" => {
+                self.inference.backend = value.to_string();
+            }
+            "inference.model" => {
+                self.inference.model = value.to_string();
+            }
+            "inference.params.temperature" => {
+                self.inference.params.temperature = value
+                    .parse::<f32>()
+                    .context("temperature must be a float")?;
+            }
+            "inference.params.top_p" => {
+                self.inference.params.top_p = value
+                    .parse::<f32>()
+                    .context("top_p must be a float")?;
+            }
+            "inference.params.max_tokens" => {
+                self.inference.params.max_tokens = value
+                    .parse::<usize>()
+                    .context("max_tokens must be an unsigned integer")?;
             }
             _ => anyhow::bail!("unknown config key: {}", key),
         }
@@ -197,4 +225,11 @@ pub fn set(key: &str, value: &str) -> Result<()> {
     let mut cfg = GwenConfig::load();
     cfg.set(key, value)?;
     cfg.save()
+}
+
+/// Load just the inference configuration section.
+///
+/// Convenience function for modules that only need inference config.
+pub fn load_inference_config() -> crate::engine::inference::config::InferenceConfig {
+    GwenConfig::load().inference
 }

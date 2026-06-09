@@ -135,6 +135,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
+            pkg-config \
             libvulkan-dev \
             libwayland-dev \
             libxkbcommon-dev \
@@ -148,8 +149,8 @@ jobs:
       # =====================================================================
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
-
+        run: cargo install cross --git https://github.com/cross-rs/cross --force
+      
       # =====================================================================
       # 6. Build the binary in release mode
       #    Uses `cross` for ARM64 Linux, `cargo` for everything else.
@@ -163,6 +164,10 @@ jobs:
             cargo build --release --target ${{ matrix.target }} --package gwenland-tui
           fi
         shell: bash
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDOR: 1
 
       # =====================================================================
       # 7. Prepare dist/ folder and rename binary to the canonical name
