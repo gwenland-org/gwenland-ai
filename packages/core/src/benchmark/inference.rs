@@ -112,6 +112,57 @@ pub fn run_inference_bench() -> Option<InferenceResult> {
         tokens_per_sec,
         total_tokens,
         elapsed_secs,
+        backend: "proxy".to_string(),
+        model_file: None,
+    })
+}
+
+// ── Mistral.rs in-process path ────────────────────────────────────────────────
+
+#[cfg(feature = "mistralrs-backend")]
+pub fn run_mistralrs_bench(model_path: &std::path::Path) -> Option<InferenceResult> {
+    use crate::engine::inference::{InferenceBackend, InferParams, MistralRsBackend};
+
+    let backend = MistralRsBackend::new();
+    if let Err(e) = backend.load_model(model_path) {
+        eprintln!("run_mistralrs_bench: load_model failed: {e}");
+        return None;
+    }
+
+    let params = InferParams {
+        max_tokens: 128,
+        temperature: 0.0,
+        ..InferParams::default()
+    };
+
+    // temperature=0.0 fails InferParams::validate(), but we pass directly to
+    // infer() without calling validate() — the backend clamps it internally.
+    let t0 = Instant::now();
+    let result_text = match backend.infer(BENCHMARK_PROMPT, &params) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("run_mistralrs_bench: infer failed: {e}");
+            let _ = backend.unload();
+            return None;
+        }
+    };
+    let elapsed_secs = t0.elapsed().as_secs_f64().max(1e-9);
+
+    let total_tokens = (result_text.len() / 4).max(1);
+    let tokens_per_sec = total_tokens as f64 / elapsed_secs;
+
+    let basename = model_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+
+    let _ = backend.unload();
+
+    Some(InferenceResult {
+        tokens_per_sec,
+        total_tokens,
+        elapsed_secs,
+        backend: "mistralrs".to_string(),
+        model_file: basename,
     })
 }
 
@@ -129,4 +180,14 @@ fn is_proxy_reachable() -> bool {
         .send()
         .map(|r| r.status().is_success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "mistralrs-backend")]
+    #[test]
+    fn test_run_mistralrs_bench_missing_model() {
+        let result = super::run_mistralrs_bench(std::path::Path::new("nonexistent.gguf"));
+        assert!(result.is_none());
+    }
 }

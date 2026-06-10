@@ -372,49 +372,12 @@ impl TrainingLoop {
         Ok((input, target))
     }
 
-    /// Apply gradients from multiple backward passes by averaging them.
-    ///
-    /// Candle produces a fresh `GradStore` per `.backward()` call; to simulate
-    /// accumulation we average the gradient tensors across all stores in the
-    /// window, then call `AdamW::step` once with the averaged store.
+    /// Delegate to the free-function implementation.
     fn step_accumulated(
         &mut self,
         stores: &[candle_core::backprop::GradStore],
     ) -> Result<()> {
-        if stores.is_empty() {
-            return Ok(());
-        }
-        if stores.len() == 1 {
-            // Fast path: no averaging needed.
-            return self.adamw.step(&stores[0]).context("AdamW step failed");
-        }
-
-        // Candle's GradStore does not expose a public constructor for injecting
-        // pre-averaged tensors, so we cannot build a single averaged store.
-        //
-        // Instead we use the fact that AdamW::step accepts any &GradStore:
-        // we temporarily lower the learning rate by 1/n, step once per store
-        // (so the net parameter update equals one normal step with averaged
-        // gradients), then restore the original lr.
-        //
-        // This is numerically equivalent to averaging the gradients because
-        // AdamW's update rule scales the step by lr, so dividing lr by n and
-        // stepping n times produces the same update as averaging n grad stores
-        // and stepping once at full lr.
-        let n = stores.len() as f64;
-        // equivalent to averaging when the learning rate is divided by n.
-        //
-        // Simplest correct approach: temporarily lower the lr by 1/n, call
-        // step once per store, then restore the lr.
-        let original_lr = self.adamw.learning_rate();
-        self.adamw.set_learning_rate(original_lr / n);
-
-        for store in stores {
-            self.adamw.step(store).context("AdamW accumulated step failed")?;
-        }
-
-        self.adamw.set_learning_rate(original_lr);
-        Ok(())
+        step_accumulated(&mut self.adamw, stores)
     }
 
     /// Write a safetensors checkpoint of the LoRA weights (lora_a + lora_b).
@@ -444,6 +407,38 @@ impl TrainingLoop {
 }
 
 // ── utilities ─────────────────────────────────────────────────────────────────
+
+/// Apply accumulated gradients from multiple backward passes by averaging them.
+///
+/// Candle produces a fresh `GradStore` per `.backward()` call; to simulate
+/// accumulation we temporarily divide the learning rate by `n`, step once per
+/// store, then restore it.  This is numerically equivalent to averaging `n`
+/// gradient stores and stepping once at full lr because AdamW's update scales
+/// by lr.
+///
+/// Callable from sibling modules (e.g. `LayeredTrainingLoop`) via `pub(crate)`.
+pub(crate) fn step_accumulated(
+    adamw:  &mut AdamW,
+    stores: &[candle_core::backprop::GradStore],
+) -> Result<()> {
+    if stores.is_empty() {
+        return Ok(());
+    }
+    if stores.len() == 1 {
+        return adamw.step(&stores[0]).context("AdamW step failed");
+    }
+
+    let n = stores.len() as f64;
+    let original_lr = adamw.learning_rate();
+    adamw.set_learning_rate(original_lr / n);
+
+    for store in stores {
+        adamw.step(store).context("AdamW accumulated step failed")?;
+    }
+
+    adamw.set_learning_rate(original_lr);
+    Ok(())
+}
 
 /// Extract a scalar f32 from a 0-D or 1-element Tensor.
 fn scalar_f32(t: &Tensor) -> Result<f32> {

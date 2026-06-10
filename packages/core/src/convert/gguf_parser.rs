@@ -13,9 +13,10 @@ use std::path::Path;
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// GGUF magic number: the four literal bytes 'G', 'G', 'U', 'F'.
+/// GGUF magic number: the four literal bytes 'G', 'G', 'U', 'F' (0x47 0x47 0x55 0x46).
 /// Present at byte offset 0 in every valid GGUF file.
-const GGUF_MAGIC: u32 = 0x4647_4755; // little-endian "GGUF"
+/// Value is read_u32_le([0x47, 0x47, 0x55, 0x46]) = 0x4655_4747.
+const GGUF_MAGIC: u32 = 0x4655_4747; // little-endian bytes G G U F
 
 /// GGUF supports versions 1, 2, and 3. All three share the same header layout
 /// for the fields we read; version affects only KV value alignment in v3.
@@ -101,6 +102,9 @@ pub struct GgufFile {
     pub version: u32,
     /// All tensor metadata entries, in the order they appear in the file.
     pub tensors: Vec<TensorInfo>,
+    /// Absolute byte offset of the data segment within the file.
+    /// `TensorInfo::data_offset` values are relative to this base.
+    pub data_base: u64,
 }
 
 // ── Parser entry point ────────────────────────────────────────────────────────
@@ -186,7 +190,7 @@ fn parse_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufFile, Strin
         tensors_out.push(info);
     }
 
-    Ok(GgufFile { version, tensors: tensors_out })
+    Ok(GgufFile { version, tensors: tensors_out, data_base })
 }
 
 // ── Tensor info reader ────────────────────────────────────────────────────────

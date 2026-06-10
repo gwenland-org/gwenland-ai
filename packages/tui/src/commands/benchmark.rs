@@ -91,7 +91,7 @@ pub fn run_benchmark_cmd(args: BenchmarkArgs) {
         }
     });
 
-    let result = run_benchmarks(filter, Some(&progress_cb));
+    let result = run_benchmarks(filter, Some(&progress_cb), None);
 
     println!();
     print_report(&result);

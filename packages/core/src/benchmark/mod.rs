@@ -17,7 +17,11 @@
 pub mod cold_start;
 pub mod convert_bench;
 pub mod inference;
+pub mod layer_load_bench;
 pub mod memory;
+pub mod report;
+
+pub use layer_load_bench::{LayerLoadResult, LayerLoadSample};
 
 use std::time::Instant;
 
@@ -49,7 +53,7 @@ pub struct ColdStartResult {
 /// Uses the 4-chars/token heuristic (same as eval/metrics.rs and dry_run.rs)
 /// because the native proxy stream format does not return a discrete token
 /// count in the non-streaming response at the eval-relevant prompt lengths.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct InferenceResult {
     /// Tokens per second (response_chars / 4 / elapsed_secs).
     pub tokens_per_sec: f64,
@@ -57,6 +61,10 @@ pub struct InferenceResult {
     pub total_tokens: usize,
     /// Wall-clock seconds from request dispatch to response receipt.
     pub elapsed_secs: f64,
+    /// Which inference backend produced this result. Defaults to "proxy".
+    pub backend: String,
+    /// Path basename of the model file used, if known.
+    pub model_file: Option<String>,
 }
 
 /// Timing results for the in-process dequantisation micro-benchmark.
@@ -100,6 +108,21 @@ pub struct BenchmarkResult {
     pub memory: Option<MemoryResult>,
     /// Total wall-clock seconds for the entire benchmark run.
     pub total_elapsed_secs: f64,
+    /// Layer-load timing (None unless explicitly invoked via run_layer_load_bench).
+    pub layer_load: Option<LayerLoadResult>,
+}
+
+// ── Report format ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub enum OutputFormat {
+    Json,
+    Text,
+}
+
+/// Render a `BenchmarkResult` as a String in the given format.
+pub fn format_benchmark_report(result: &BenchmarkResult, fmt: OutputFormat) -> String {
+    report::format_benchmark_report(result, fmt)
 }
 
 // ── Filter flags passed from the TUI layer ────────────────────────────────────
@@ -173,6 +196,7 @@ pub type ProgressCallback = Box<dyn Fn(usize, usize, &str, bool)>;
 pub fn run_benchmarks(
     filter: BenchmarkFilter,
     progress: Option<&ProgressCallback>,
+    model_path: Option<&std::path::Path>,
 ) -> BenchmarkResult {
     let wall_start = Instant::now();
 
@@ -202,9 +226,20 @@ pub fn run_benchmarks(
     let inference_result = if filter.run_inference() {
         suite_idx += 1;
         emit_progress(&progress, suite_idx, suite_count, "Token Generation", false);
-        let r = inference::run_inference_bench();
+        let r = {
+            #[cfg(feature = "mistralrs-backend")]
+            let result = if let Some(mp) = model_path {
+                let r = inference::run_mistralrs_bench(mp);
+                if r.is_some() { r } else { inference::run_inference_bench() }
+            } else {
+                inference::run_inference_bench()
+            };
+            #[cfg(not(feature = "mistralrs-backend"))]
+            let result = inference::run_inference_bench();
+            result
+        };
         emit_progress(&progress, suite_idx, suite_count, "Token Generation", true);
-        r // already Option<InferenceResult> — None means proxy not running
+        r
     } else {
         None
     };
@@ -236,6 +271,7 @@ pub fn run_benchmarks(
         convert: convert_result,
         memory: memory_result,
         total_elapsed_secs: wall_start.elapsed().as_secs_f64(),
+        layer_load: None,
     }
 }
 

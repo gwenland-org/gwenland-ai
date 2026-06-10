@@ -156,6 +156,13 @@ impl MmapLoader {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
+
+    /// Return a reference to the underlying `Mmap` for callers that need to
+    /// issue madvise calls on specific byte ranges (e.g. `LoadedLayer`).
+    #[inline]
+    pub fn mmap(&self) -> &memmap2::Mmap {
+        &self.data
+    }
 }
 
 // ── madvise helpers ───────────────────────────────────────────────────────────

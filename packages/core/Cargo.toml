@@ -98,6 +98,16 @@ criterion = { version = "0.5", features = ["html_reports"] }
 quickcheck = "1"
 quickcheck_macros = "1"
 
+[[test]]
+name = "gwen216_integration"
+path = "tests/gwen216_integration.rs"
+required-features = ["test-utils"]
+
+[[test]]
+name = "gwen214_e2e"
+path = "tests/gwen214_e2e.rs"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "core_bench"
 harness = false
@@ -109,3 +119,7 @@ path = "src/bin/validate_dequant.rs"
 [[bin]]
 name = "bench_ggqr"
 path = "src/bin/bench_ggqr.rs"
+
+[[bin]]
+name = "bench_layer_loader"
+path = "src/bin/bench_layer_loader.rs"
