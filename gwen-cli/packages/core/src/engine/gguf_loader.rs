@@ -109,7 +109,7 @@ mod tests {
 
     /// Helper: build a minimal GgufFile with the given tensors.
     fn make_model(tensors: Vec<TensorInfo>) -> GgufFile {
-        GgufFile { version: 3, tensors }
+        GgufFile { version: 3, tensors, data_base: 0 }
     }
 
     /// Helper: build a TensorInfo with pre-filled F32 raw data for N elements.

@@ -10,6 +10,8 @@
 /.agents/
 /.claude/
 /skills-lock.json
+/.kiro/
+/.md
 
 # -----------------------------------------------------------------------------
 # Local docs, notes, and experiments
