@@ -1,0 +1,24 @@
+# Local fine-tune config — real model, real dataset, 1 epoch.
+# Run from gwen-cli/: cargo run --release -- train --config tests/fixtures/local_train_config.yaml
+
+model: ../Qwen3-1.7B-Q8_0.gguf
+dataset: tests/fixtures/sample_100.jsonl
+output: ../fine-tune-output
+
+epochs: 1
+batch_size: 1
+grad_accum: 8
+learning_rate: 0.00001
+max_seq_len: 256
+
+lora_r: 4
+lora_alpha: 8
+lora_dropout: 0.05
+lora_target: "q_proj,v_proj"
+qlora: true
+
+optimizer: adamw_8bit
+scheduler: cosine
+weight_decay: 0.01
+fp16: false
+max_grad_norm: 1.0

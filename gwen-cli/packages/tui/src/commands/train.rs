@@ -182,18 +182,22 @@ async fn run_train_inner(
     // No subcommand: normal training flow.
     let dry_run = args.dry_run || mode.dry_run;
 
-    // ── path 1: dry-run ───────────────────────────────────────────────────────
+    // ── path 1: config-driven flow (incl. native local-GGUF dry-run) ─────────
+    // A --config run carries the model in the YAML, so its dry-run must go
+    // through run_train_with_opts (which performs a real native 1-step pass for
+    // local GGUF models). Only the no-config dry-run uses the HF estimation
+    // table below.
+    if args.custom_script.is_some() || args.config.is_some() {
+        return run_legacy_path(&args, &mode).await;
+    }
+
+    // ── path 2: dry-run estimation (no config; needs --model/--dataset) ──────
     if dry_run {
         let config = build_train_config_from_args(&args)?;
         let result = dry_run::run(&config)
             .context("dry-run analysis failed")?;
         print_dry_run_table(&result, &config);
         return Ok(());
-    }
-
-    // ── path 2: legacy Python subprocess ─────────────────────────────────────
-    if args.custom_script.is_some() || args.config.is_some() {
-        return run_legacy_path(&args, &mode).await;
     }
 
     // ── path 3: native Candle training ────────────────────────────────────────
@@ -312,7 +316,12 @@ async fn run_legacy_path(
     };
     config.apply_overrides(&overrides);
 
-    let use_tui = !args.verbose
+    let dry_run = args.dry_run || mode.dry_run;
+
+    // Dry-run never enters the interactive TUI — it runs a single native step
+    // (for local GGUF) or the estimation report and exits.
+    let use_tui = !dry_run
+        && !args.verbose
         && mode.is_tui()
         && atty::is(atty::Stream::Stdout);
 
@@ -324,7 +333,7 @@ async fn run_legacy_path(
     } else {
         run_train_with_opts(
             &config,
-            false,
+            dry_run,
             args.verbose,
             mode.json,
             args.custom_script.as_deref(),
@@ -544,6 +553,7 @@ fn build_train_config_from_args(args: &TrainArgs) -> Result<TrainConfig> {
         scheduler:     "cosine".to_string(),
         fp16:          false,
         weight_decay:  0.01,
+        max_grad_norm: 1.0,
     })
 }
 
@@ -567,6 +577,7 @@ fn synthetic_train_config(config: &NewTrainConfig) -> TrainConfig {
         scheduler:     "cosine".to_string(),
         fp16:          false,
         weight_decay:  0.01,
+        max_grad_norm: config.max_grad_norm,
     }
 }
 

@@ -48,9 +48,16 @@ pub async fn preflight_and_spawn(
         );
     }
 
-    let registry = ModelRegistry::load()?;
-    if registry.find(&config.model).is_none() {
-        check_model_on_hub(&config.model).await?;
+    if !is_local_model_path(&config.model) {
+        let registry = ModelRegistry::load()?;
+        if registry.find(&config.model).is_none() {
+            check_model_on_hub(&config.model).await?;
+        }
+    } else {
+        let resolved = resolve_local_model_path(&config.model);
+        if !resolved.exists() {
+            bail!("local model file not found: {}", resolved.display());
+        }
     }
 
     check_output_dir(&config.output)?;
@@ -92,28 +99,57 @@ pub async fn run_train_with_opts(
         );
     }
 
-    // 3. Check model in registry or HF Hub
-    let registry = ModelRegistry::load()?;
-    if registry.find(&config.model).is_none() {
-        check_model_on_hub(&config.model).await?;
+    // 3. Check model — skip registry/HF for local file paths
+    if !is_local_model_path(&config.model) {
+        let registry = ModelRegistry::load()?;
+        if registry.find(&config.model).is_none() {
+            check_model_on_hub(&config.model).await?;
+        }
+    } else {
+        let resolved = resolve_local_model_path(&config.model);
+        if !resolved.exists() {
+            bail!("local model file not found: {}", resolved.display());
+        }
     }
 
     // 4. Check output dir + disk space
     check_output_dir(&config.output)?;
 
-    // 5. --dry-run: full pre-flight report + VRAM breakdown, then exit
+    // 5. --dry-run for local GGUF: run a real native 1-step pass and report
+    //    memory + loss. For remote/HF models, fall back to the estimation table.
+    if dry_run && is_local_model_path(&config.model) {
+        let gguf_path = resolve_local_model_path(&config.model);
+        let native_cfg = train_config_to_native(config, true);
+        crate::train::native_runner::run_native_local(&native_cfg, &gguf_path, None, None)?;
+        return Ok(());
+    }
     if dry_run {
         emit_dry_run_report(config, &val, json_output)?;
         return Ok(());
     }
 
-    // 6. Write train script to temp file (caller-held; dropped = deleted)
-    let _script = write_train_script(custom_script)?;
+    // 6. Dispatch: native Rust path for local GGUF, Python script path otherwise
+    if is_local_model_path(&config.model) {
+        let gguf_path = resolve_local_model_path(&config.model);
+        let native_cfg = train_config_to_native(config, false);
+        let (tx, _rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            while let Ok(msg) = _rx.recv() {
+                println!("{}", msg);
+            }
+        });
+        crate::train::native_runner::run_native_local(
+            &native_cfg,
+            &gguf_path,
+            None,
+            Some(tx),
+        )?;
+    } else {
+        let _script = write_train_script(custom_script)?;
+        spawn_training(config, _script.path(), verbose).await?;
+    }
 
-    // 7. Spawn subprocess + pipe stdout
-    spawn_training(config, _script.path(), verbose).await?;
-
-    // 8. Update registry on success
+    // 7. Update registry on success
     register_trained_model(config)?;
 
     Ok(())
@@ -282,6 +318,24 @@ fn print_dry_run_report(
 }
 
 // ── pre-flight helpers ───────────────────────────────────────────────────────
+
+/// Returns true when `model` looks like a local file path rather than a HF model ID.
+/// Triggers on: leading `.` (relative), `/` (absolute), `~` (home), or `.gguf` suffix.
+fn is_local_model_path(model: &str) -> bool {
+    model.starts_with('.') || model.starts_with('/') || model.starts_with('~')
+        || model.ends_with(".gguf")
+}
+
+/// Resolve a local model path: expand `~` to home dir and make relative paths absolute
+/// relative to the current working directory.
+fn resolve_local_model_path(model: &str) -> PathBuf {
+    if let Some(rest) = model.strip_prefix("~/") {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(model)
+}
 
 /// HEAD request to HF Hub to verify the model exists without downloading it.
 async fn check_model_on_hub(model_id: &str) -> Result<()> {
@@ -453,4 +507,33 @@ fn register_trained_model(config: &TrainConfig) -> Result<()> {
         format!("training succeeded but could not update model registry for '{}'", id)
     })?;
     Ok(())
+}
+
+/// Convert the YAML-backed `TrainConfig` to the candle-native `NewTrainConfig`.
+///
+/// When `dry_run` is set, `max_steps` is capped to 1 so the native runner runs
+/// a single forward/backward/step and reports memory + loss, then exits.
+fn train_config_to_native(cfg: &TrainConfig, dry_run: bool) -> crate::train::config::NewTrainConfig {
+    crate::train::config::NewTrainConfig {
+        model_id:     cfg.model.clone(),
+        dataset_path: cfg.dataset.clone(),
+        epochs:       cfg.epochs as usize,
+        batch_size:   cfg.batch_size as usize,
+        grad_accum:   cfg.grad_accum as usize,
+        lr:           cfg.learning_rate,
+        max_grad_norm: cfg.max_grad_norm,
+        lora: crate::train::config::LoraConfig {
+            r:              cfg.lora_r as usize,
+            alpha:          cfg.lora_alpha as f32,
+            dropout:        cfg.lora_dropout,
+            target_modules: cfg.lora_target
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect(),
+        },
+        dry_run,
+        max_steps:     if dry_run { Some(1) } else { None },
+        output_path:   cfg.output.clone(),
+        custom_script: None,
+    }
 }

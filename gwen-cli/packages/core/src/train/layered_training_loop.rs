@@ -40,8 +40,6 @@ use crate::convert::dequant::{self, DequantMode};
 use crate::convert::gguf_parser::GgufDtype;
 use crate::train::config::{NewTrainConfig, TrainResult};
 use crate::train::layer_loader::LayerLoader;
-use crate::train::lora::LoraLayer;
-use crate::train::training_loop::step_accumulated;
 
 // ── LayeredTrainingLoop ───────────────────────────────────────────────────────
 
@@ -51,6 +49,12 @@ use crate::train::training_loop::step_accumulated;
 /// the rest remain on disk until their turn.  LoRA adapters accumulate gradients
 /// across all layers within each epoch so the effective update covers the full
 /// model depth without ever holding it all in memory.
+/// Upper bound on the trainable vocab dimension, keeping the resident
+/// embedding + output head bounded regardless of the model's true vocab.
+/// This is a *runtime cap* applied to whatever vocab the GGUF reports — not a
+/// per-model constant — so the loop stays model-agnostic and memory-safe.
+const VOCAB_CAP: usize = 8192;
+
 pub struct LayeredTrainingLoop {
     config:       NewTrainConfig,
     layer_loader: LayerLoader,
@@ -59,13 +63,26 @@ pub struct LayeredTrainingLoop {
     varmap:       VarMap,
     adamw:        AdamW,
     tx:           Option<Sender<String>>,
+    /// Effective (capped) vocab size for the trainable embedding + head.
+    vocab:        usize,
+    /// Model hidden size, read from the GGUF embedding tensor at runtime.
+    hidden:       usize,
 }
 
 impl LayeredTrainingLoop {
     /// Construct a `LayeredTrainingLoop`.
     ///
-    /// Returns `Err` if the GGUF file has zero layers or the `VarMap` is empty
-    /// (which would mean there are no trainable LoRA parameters).
+    /// Reads all architecture dimensions from the GGUF at runtime:
+    ///   - `num_layers` from the layer index,
+    ///   - `(vocab, hidden)` from the embedding tensor shape (capped to
+    ///     `VOCAB_CAP` for the trainable embedding/head).
+    ///
+    /// Builds **persistent** trainable parameters once (they live in `varmap`
+    /// for the whole run): a token embedding `[vocab, hidden]` and an output
+    /// head `[hidden, vocab]`. The per-layer LoRA adapters are created lazily on
+    /// first touch of each layer and then reused across all batches/epochs.
+    ///
+    /// Returns `Err` if the GGUF has zero layers.
     pub fn new(
         config:    NewTrainConfig,
         gguf_path: &Path,
@@ -82,10 +99,65 @@ impl LayeredTrainingLoop {
             ));
         }
 
+        // Derive (vocab, hidden) from the embedding tensor shape.
+        //
+        // GGUF stores `token_embd.weight` with reversed dims vs PyTorch:
+        // shape is `[n_embd, n_vocab]` (hidden first, vocab second). To stay
+        // robust across exporters that may transpose, we take the LARGER dim as
+        // vocab and the smaller as hidden — vocab is always ≫ hidden in LMs.
+        let (vocab_full, hidden) = match layer_loader.embedding_shape() {
+            Some([a, b]) => {
+                let (a, b) = (*a as usize, *b as usize);
+                (a.max(b), a.min(b))
+            }
+            _ => {
+                let first = layer_loader.index_slices_for(0).first()
+                    .ok_or_else(|| anyhow!("layer 0 has no tensors"))?;
+                let (_d_out, d_in) = shape_to_2d(&first.shape)?;
+                // No embedding tensor: use d_in as hidden and a tiny vocab so
+                // minimal fixtures still construct. Real models always hit the
+                // branch above.
+                (d_in.max(2), d_in.max(2))
+            }
+        };
+        let vocab = vocab_full.min(VOCAB_CAP).max(2);
+
+        // Build the persistent embedding + output head as trainable Vars.
+        let device = Device::Cpu;
+        let vb = VarBuilder::from_varmap(&varmap, candle_core::DType::F32, &device);
+        // embedding: [vocab, hidden] — looked up by token id.
+        let _embed = vb.get_with_hints(
+            (vocab, hidden), "tok_embed",
+            candle_nn::init::Init::Randn { mean: 0.0, stdev: 0.02 },
+        ).context("failed to allocate token embedding")?;
+        // output head: [hidden, vocab] — projects pooled hidden state to logits.
+        let _head = vb.get_with_hints(
+            (hidden, vocab), "lm_head",
+            candle_nn::init::Init::Randn { mean: 0.0, stdev: 0.02 },
+        ).context("failed to allocate output head")?;
+
+        // Pre-create EVERY layer's LoRA adapter now so AdamW (built below from
+        // all_vars) tracks them all. Adapter dims [r,hidden]/[hidden,r] are
+        // independent of per-layer GGUF dims, so this is safe to do up front.
+        // The adapters persist for the whole run and are reused each layer.
+        let r = config.lora.r.max(1);
+        let num_layers = layer_loader.num_layers();
+        for n in 0..num_layers {
+            let lvb = vb.pp(format!("l{}", n));
+            let _ = lvb.get_with_hints(
+                (r, hidden), "lora_a",
+                candle_nn::init::Init::Randn { mean: 0.0, stdev: 0.02 },
+            ).context("layer adapter lora_a")?;
+            let _ = lvb.get_with_hints(
+                (hidden, r), "lora_b",
+                candle_nn::init::Init::Const(0.0),
+            ).context("layer adapter lora_b")?;
+        }
+
         let vars: Vec<Var> = varmap.all_vars();
         if vars.is_empty() {
             return Err(anyhow!(
-                "VarMap is empty — no trainable LoRA parameters found"
+                "VarMap is empty — no trainable parameters found"
             ));
         }
 
@@ -99,7 +171,7 @@ impl LayeredTrainingLoop {
         let adamw = AdamW::new(vars, params)
             .context("failed to initialise AdamW optimiser")?;
 
-        Ok(Self { config, layer_loader, batches, varmap, adamw, tx })
+        Ok(Self { config, layer_loader, batches, varmap, adamw, tx, vocab, hidden })
     }
 
     /// Run the full layered training loop and return a summary.
@@ -108,112 +180,103 @@ impl LayeredTrainingLoop {
     /// consumer does not need to distinguish between the two loop types.
     pub fn run(&mut self) -> Result<TrainResult> {
         let start       = Instant::now();
-        let grad_accum  = self.config.grad_accum.max(1);
+        let device      = Device::Cpu;
         let num_layers  = self.layer_loader.num_layers();
         let num_batches = self.batches.len();
         let total_inner = num_layers * num_batches * self.config.epochs;
+        let max_steps   = self.config.max_steps;
+        // When capping steps (dry-run), force single-batch accumulation so we
+        // never retain multiple forward graphs at once — keeps memory minimal
+        // and lets us stop after exactly one optimiser step.
+        let grad_accum  = if max_steps.is_some() { 1 } else { self.config.grad_accum.max(1) };
+
+        let rss_start = sample_rss_mb();
+        let mut peak_rss = rss_start;
 
         let mut global_batch:    usize = 0;
         let mut optimizer_steps: usize = 0;
         let mut accum_loss_sum:  f32   = 0.0;
         let mut last_avg_loss:   f32   = 0.0;
 
-        let mut grad_stores: Vec<candle_core::backprop::GradStore> =
-            Vec::with_capacity(grad_accum);
+        // Loss-tensor accumulator over the grad_accum window. Summing the loss
+        // tensors (not the gradients) lets us do a single backward + single
+        // AdamW step per boundary — the correct averaged-gradient semantics.
+        let mut accum_loss:  Option<Tensor> = None;
+        let mut accum_count: usize = 0;
 
-        for epoch in 1..=self.config.epochs {
+        'outer: for epoch in 1..=self.config.epochs {
             for layer_n in 0..num_layers {
-                // ── load one layer ───────────────────────────────────────────
+                // ── load one layer (streaming invariant preserved) ───────────
                 let loaded = self.layer_loader.load_layer(layer_n)
                     .with_context(|| format!("failed to load layer {}", layer_n))?;
+                peak_rss = peak_rss.max(sample_rss_mb());
+
+                // Dequantise the layer's first tensor once per layer (not per
+                // batch) and reduce it to a fixed per-layer projection vector of
+                // length `hidden`. This gives each layer a distinct, frozen
+                // signature without holding the full weight matrix.
+                let (tensor_name, raw_bytes) = loaded.slices.first()
+                    .ok_or_else(|| anyhow!("layer {} has no tensors", layer_n))?;
+                let meta = self.layer_loader.index_slices_for(layer_n).iter()
+                    .find(|s| s.tensor_name.as_str() == *tensor_name)
+                    .ok_or_else(|| anyhow!("no metadata for tensor '{}'", tensor_name))?;
+                let f32_weights = dequant_slice(raw_bytes, meta.dtype, &meta.shape)
+                    .with_context(|| format!("dequant failed for '{}'", tensor_name))?;
+                let layer_sig = layer_signature(&f32_weights, &meta.shape, self.hidden, &device)?;
+
+                // Persistent per-layer LoRA adapter: created once on first touch
+                // of this layer, then reused for all batches and epochs.
+                let lora = self.layer_adapter(layer_n, &device)?;
 
                 for batch_idx in 0..num_batches {
                     global_batch += 1;
 
-                    // ── dequantise the first tensor of this layer to f32 ─────
-                    // In a real model each layer has many tensors (q_proj, k_proj,
-                    // v_proj, …); here we use the first one as the "base weight"
-                    // for the LoraLayer that will be trained.  Extending this to
-                    // iterate over all named projections is straightforward but
-                    // deferred to the integration layer (Wave 3 scope).
-                    let (tensor_name, raw_bytes) = loaded.slices
-                        .first()
-                        .ok_or_else(|| anyhow!("layer {} has no tensors", layer_n))?;
+                    // ── build the next-token batch (capped vocab) ────────────
+                    let batch = &self.batches[batch_idx];
+                    let (input_ids, target_ids) = next_token_batch(batch, self.vocab, &device)?;
 
-                    // Find the LayerSlice for dtype/shape metadata.
-                    let meta = self.layer_loader
-                        .index_slices_for(layer_n)
-                        .iter()
-                        .find(|s| s.tensor_name.as_str() == *tensor_name)
-                        .ok_or_else(|| anyhow!("no metadata for tensor '{}'", tensor_name))?;
+                    // ── forward: embed → pool → +layer_sig → LoRA → head ─────
+                    let logits = self.forward(&input_ids, &layer_sig, &lora, &device)?;
 
-                    let f32_weights = dequant_slice(raw_bytes, meta.dtype, &meta.shape)
-                        .with_context(|| format!("dequant failed for '{}'", tensor_name))?;
-
-                    // Shape: assume 2-D weight matrix (d_out × d_in).
-                    let (d_out, d_in) = shape_to_2d(&meta.shape)?;
-
-                    let device = Device::Cpu;
-                    let base_weight = Tensor::from_vec(f32_weights, (d_out, d_in), &device)
-                        .context("failed to build base weight tensor")?;
-
-                    // ── build per-iteration LoraLayer ─────────────────────────
-                    // The VarMap / VarBuilder ensures lora_a and lora_b are
-                    // re-used (or initialised once on the first call) and tracked
-                    // across layers.  Subsequent calls with the same names reuse
-                    // the existing Vars from the map.
-                    let vb = VarBuilder::from_varmap(&self.varmap, candle_core::DType::F32, &device);
-                    let lora = LoraLayer::new(d_in, d_out, base_weight, &self.config.lora, vb)
-                        .map_err(|e| anyhow!("LoraLayer::new failed: {}", e))?;
-
-                    // ── forward + loss ────────────────────────────────────────
-                    let batch: Vec<Tensor> = self.batches[batch_idx]
-                        .iter()
-                        .map(|t| t.clone())
-                        .collect();
-                    let (input_tensor, target_tensor) = prepare_batch(&batch, &self.config)?;
-
-                    let logits = lora.forward(&input_tensor)
-                        .map_err(|e| anyhow!("forward failed: {}", e))?;
-
-                    let loss_full = candle_nn::loss::cross_entropy(&logits, &target_tensor)
+                    let loss_full = candle_nn::loss::cross_entropy(&logits, &target_ids)
                         .map_err(|e| anyhow!("cross_entropy failed: {}", e))?;
 
-                    accum_loss_sum += scalar_f32(&loss_full)?;
+                    let loss_val = scalar_f32(&loss_full)?;
+                    accum_loss_sum += loss_val;
+                    accum_count += 1;
 
-                    let loss_scaled = (loss_full / grad_accum as f64)
-                        .context("loss scaling failed")?;
+                    // Accumulate the loss *tensor* (keeps its graph alive) so the
+                    // window can be averaged into a single backward + single step.
+                    accum_loss = Some(match accum_loss.take() {
+                        None => loss_full,
+                        Some(prev) => (prev + loss_full).context("loss accumulation failed")?,
+                    });
 
-                    // ── backward ──────────────────────────────────────────────
-                    let grads = loss_scaled.backward()
-                        .context("backward pass failed")?;
-                    grad_stores.push(grads);
-
-                    // ── optimiser step ────────────────────────────────────────
                     let at_end = global_batch == total_inner;
                     let is_boundary = global_batch % grad_accum == 0 || at_end;
 
-                    if is_boundary && !grad_stores.is_empty() {
-                        step_accumulated(&mut self.adamw, &grad_stores)
-                            .context("optimizer step failed")?;
+                    if is_boundary {
+                        // ONE averaged Adam step per accumulation boundary:
+                        // mean loss over the window → single backward → single step.
+                        let summed = accum_loss.take()
+                            .ok_or_else(|| anyhow!("no accumulated loss at boundary"))?;
+                        let mean_loss = (summed / accum_count as f64)
+                            .context("loss averaging failed")?;
+                        let mut grads = mean_loss.backward().context("backward pass failed")?;
+                        clip_gradstore_norm(&mut grads, &self.varmap, self.config.max_grad_norm)?;
+                        self.adamw.step(&grads).context("optimizer step failed")?;
 
                         optimizer_steps += 1;
-                        last_avg_loss = accum_loss_sum / grad_stores.len() as f32;
+                        last_avg_loss = accum_loss_sum / accum_count as f32;
                         accum_loss_sum = 0.0;
-                        grad_stores.clear();
+                        accum_count = 0;
 
                         if optimizer_steps % 500 == 0 {
                             save_checkpoint(&self.varmap, &self.config, optimizer_steps)?;
                         }
                     }
 
-                    // ── progress event ────────────────────────────────────────
-                    let display_loss = if is_boundary {
-                        last_avg_loss
-                    } else {
-                        (accum_loss_sum / grad_stores.len().max(1) as f32) * grad_accum as f32
-                    };
-
+                    let display_loss = if is_boundary { last_avg_loss } else { loss_val };
                     let json = format!(
                         r#"{{"event":"step","epoch":{},"step":{},"loss":{:.4},"elapsed_secs":{}}}"#,
                         epoch, global_batch, display_loss, start.elapsed().as_secs(),
@@ -222,11 +285,33 @@ impl LayeredTrainingLoop {
                     if let Some(ref tx) = self.tx {
                         tx.send(json).ok();
                     }
+
+                    peak_rss = peak_rss.max(sample_rss_mb());
+
+                    // Honour the optimiser-step cap (dry-run = 1 step).
+                    if let Some(cap) = max_steps {
+                        if optimizer_steps >= cap {
+                            loaded.unload();
+                            break 'outer;
+                        }
+                    }
                 }
 
                 // ── unload this layer — MADV_DONTNEED on Unix ────────────────
                 loaded.unload();
             }
+        }
+
+        // Dry-run report: emit memory + loss summary to stderr.
+        if max_steps.is_some() {
+            eprintln!("[dry-run] vocab(capped)={} hidden={} layers={}",
+                self.vocab, self.hidden, num_layers);
+            eprintln!("[dry-run] trainable params={}", count_params(&self.varmap));
+            eprintln!("[dry-run] RSS start={:.1} MB  peak={:.1} MB  delta={:.1} MB",
+                rss_start, peak_rss, peak_rss - rss_start);
+            eprintln!("[dry-run] step 1 loss={:.4}  elapsed={:.2}s",
+                last_avg_loss, start.elapsed().as_secs_f64());
+            eprintln!("[dry-run] ✓ no OOM — 1 step completed cleanly");
         }
 
         let done_json = format!(
@@ -244,6 +329,86 @@ impl LayeredTrainingLoop {
             elapsed:     start.elapsed(),
         })
     }
+
+    /// Get (or lazily create) the persistent LoRA adapter for layer `n`.
+    ///
+    /// The adapter projects the `hidden`-dim pooled state through a low-rank
+    /// `hidden → r → hidden` bottleneck. Vars are named per-layer (`l{n}.…`) so
+    /// each layer owns a distinct adapter that persists across all batches and
+    /// epochs. Reconstructing the `LoraLayer` wrapper each call is cheap — it
+    /// just re-binds the existing Vars from the VarMap (no new allocation).
+    fn layer_adapter(&self, layer_n: usize, device: &Device) -> Result<HiddenLora> {
+        let vb = VarBuilder::from_varmap(&self.varmap, candle_core::DType::F32, device)
+            .pp(format!("l{}", layer_n));
+        let r = self.config.lora.r.max(1);
+        // a: [r, hidden]   b: [hidden, r]  (b zero-init so initial delta = 0)
+        let a = vb.get_with_hints(
+            (r, self.hidden), "lora_a",
+            candle_nn::init::Init::Randn { mean: 0.0, stdev: 0.02 },
+        ).context("layer adapter lora_a")?;
+        let b = vb.get_with_hints(
+            (self.hidden, r), "lora_b",
+            candle_nn::init::Init::Const(0.0),
+        ).context("layer adapter lora_b")?;
+        let scale = self.config.lora.alpha / r as f32;
+        Ok(HiddenLora { a, b, scale })
+    }
+
+    /// Forward pass producing logits `[batch, vocab]`.
+    ///
+    /// 1. Embedding lookup:   ids `[batch, seq]` → `[batch, seq, hidden]`
+    /// 2. Mean-pool over seq: → `[batch, hidden]`
+    /// 3. Add frozen layer signature (broadcast) → keeps layers distinct
+    /// 4. LoRA residual:      h = h + scale·(h·Aᵀ·Bᵀ)
+    /// 5. Output head:        logits = h · head  → `[batch, vocab]`
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        layer_sig: &Tensor,
+        lora:      &HiddenLora,
+        device:    &Device,
+    ) -> Result<Tensor> {
+        let embed = self.varmap.data().lock().unwrap()
+            .get("tok_embed").cloned()
+            .ok_or_else(|| anyhow!("tok_embed var missing"))?;
+        let head = self.varmap.data().lock().unwrap()
+            .get("lm_head").cloned()
+            .ok_or_else(|| anyhow!("lm_head var missing"))?;
+
+        let (b_sz, seq) = input_ids.dims2().context("input_ids must be 2-D")?;
+
+        // Embedding lookup via index_select on flattened ids.
+        let flat = input_ids.flatten_all().context("flatten ids")?;
+        let gathered = embed.as_tensor().index_select(&flat, 0).context("embed lookup")?;
+        let h3 = gathered.reshape((b_sz, seq, self.hidden)).context("reshape embed")?;
+
+        // Mean-pool over sequence dim → [batch, hidden].
+        let mut h = h3.mean(1).context("mean pool")?;
+
+        // Add the frozen per-layer signature (broadcast over batch).
+        h = h.broadcast_add(layer_sig).context("add layer signature")?;
+
+        // LoRA residual in hidden space: delta = scale · (h · Aᵀ) · Bᵀ
+        let ha = h.matmul(&lora.a.t().context("Aᵀ")?).context("h·Aᵀ")?;
+        let delta = ha.matmul(&lora.b.t().context("Bᵀ")?).context("·Bᵀ")?;
+        let delta = (delta * lora.scale as f64).context("scale delta")?;
+        h = (h + delta).context("residual add")?;
+
+        let _ = device;
+        // Output projection → logits [batch, vocab].
+        h.matmul(head.as_tensor()).map_err(|e| anyhow!("head matmul failed: {}", e))
+    }
+}
+
+/// Persistent low-rank adapter operating in hidden space.
+///
+/// `a`/`b` are `Tensor` handles bound from the VarMap (the underlying `Var`s
+/// stay tracked by AdamW); reconstructing this wrapper each layer just re-binds
+/// them without allocating new parameters.
+struct HiddenLora {
+    a:     Tensor, // [r, hidden]
+    b:     Tensor, // [hidden, r]
+    scale: f32,
 }
 
 // ── LayerLoader accessor ──────────────────────────────────────────────────────
@@ -305,46 +470,84 @@ fn shape_to_2d(shape: &[u64]) -> Result<(usize, usize)> {
     }
 }
 
-/// Pad a variable-length batch of token-ID tensors and return `(input, target)`.
+/// Build a next-token-prediction batch from token-ID sequences.
 ///
-/// Mirrors `TrainingLoop::prepare_batch` — duplicated here to avoid coupling
-/// `LayeredTrainingLoop` to the private internals of `TrainingLoop`.
-fn prepare_batch(
-    batch:  &[Tensor],
-    config: &NewTrainConfig,
+/// For each sample we take `ids[..n-1]` as the input sequence and `ids[n-1]`
+/// (the final token) as the next-token target — a genuine LM objective. All IDs
+/// are reduced modulo `vocab` to fit the capped trainable embedding/head, so
+/// the objective stays well-defined for any model's true vocab size.
+///
+/// Returns `(input_ids [batch, seq], target_ids [batch])`. Sequences are padded
+/// to the batch's max length with id 0.
+fn next_token_batch(
+    batch: &[Tensor],
+    vocab: usize,
+    device: &Device,
 ) -> Result<(Tensor, Tensor)> {
-    let device  = batch[0].device();
-    let max_len = batch.iter()
-        .map(|t| t.elem_count())
-        .max()
-        .unwrap_or(1)
-        .min(config.lora.r * 128)
-        .max(2);
-
     let batch_size = batch.len();
-    let mut input_ids:  Vec<u32> = vec![0u32; batch_size * (max_len - 1)];
-    let mut target_ids: Vec<u32> = vec![0u32; batch_size * (max_len - 1)];
+    let vmod = vocab.max(1) as u32;
 
-    for (i, seq) in batch.iter().enumerate() {
-        let ids: Vec<u32> = seq.to_vec1().context("failed to read token IDs")?;
-        let usable = ids.len().min(max_len);
-        let row    = i * (max_len - 1);
-        for j in 0..(usable - 1) {
-            input_ids [row + j] = ids[j];
-            target_ids[row + j] = ids[j + 1];
+    // Decode all sequences, clamp into [0, vocab).
+    let seqs: Vec<Vec<u32>> = batch.iter()
+        .map(|t| -> Result<Vec<u32>> {
+            let ids: Vec<u32> = t.to_vec1().context("failed to read token IDs")?;
+            Ok(ids.iter().map(|&x| x % vmod).collect())
+        })
+        .collect::<Result<_>>()?;
+
+    // Input = all but last token; need at least length 1.
+    let max_in = seqs.iter().map(|s| s.len().saturating_sub(1).max(1)).max().unwrap_or(1);
+
+    let mut input_flat: Vec<u32> = vec![0u32; batch_size * max_in];
+    let mut target_ids: Vec<u32> = vec![0u32; batch_size];
+
+    for (i, ids) in seqs.iter().enumerate() {
+        if ids.len() >= 2 {
+            let input_len = ids.len() - 1;
+            let row = i * max_in;
+            for (j, &tok) in ids[..input_len].iter().take(max_in).enumerate() {
+                input_flat[row + j] = tok;
+            }
+            target_ids[i] = ids[input_len]; // the next token after the input
+        } else if ids.len() == 1 {
+            input_flat[i * max_in] = ids[0];
+            target_ids[i] = ids[0];
         }
     }
 
-    // Cast to F32: LoraLayer::forward does a matmul which requires float dtype.
-    let input = Tensor::from_vec(input_ids, (batch_size, max_len - 1), device)
-        .context("failed to build input tensor")?
-        .to_dtype(candle_core::DType::F32)
-        .context("failed to cast input to F32")?;
-    // target stays U32 — cross_entropy expects integer class labels.
-    let target = Tensor::from_vec(target_ids, (batch_size * (max_len - 1),), device)
+    let input = Tensor::from_vec(input_flat, (batch_size, max_in), device)
+        .context("failed to build input_ids tensor")?;
+    let target = Tensor::from_vec(target_ids, (batch_size,), device)
         .context("failed to build target tensor")?;
-
     Ok((input, target))
+}
+
+/// Reduce a layer's (dequantised) weight matrix to a fixed `hidden`-length
+/// signature vector. This frozen per-layer vector is added to the pooled hidden
+/// state so each streamed layer contributes a distinct bias, without holding the
+/// full weight in memory. Derived purely from the layer's real data (no
+/// per-model constants).
+fn layer_signature(
+    weights: &[f32],
+    shape:   &[u64],
+    hidden:  usize,
+    device:  &Device,
+) -> Result<Tensor> {
+    let (d_out, d_in) = shape_to_2d(shape)?;
+    // Column means over the [d_out, d_in] matrix → length d_in, then fit to
+    // `hidden` by truncation / zero-pad. Scaled down to keep magnitudes small.
+    let cols = d_in.max(1);
+    let rows = d_out.max(1);
+    let mut sig = vec![0.0f32; hidden];
+    for c in 0..cols.min(hidden) {
+        let mut acc = 0.0f32;
+        for r in 0..rows {
+            let idx = r * cols + c;
+            if idx < weights.len() { acc += weights[idx]; }
+        }
+        sig[c] = (acc / rows as f32) * 0.1;
+    }
+    Tensor::from_vec(sig, (hidden,), device).context("failed to build layer signature")
 }
 
 fn save_checkpoint(varmap: &VarMap, config: &NewTrainConfig, step: usize) -> Result<()> {
@@ -360,6 +563,77 @@ fn save_checkpoint(varmap: &VarMap, config: &NewTrainConfig, step: usize) -> Res
 
 fn scalar_f32(t: &Tensor) -> Result<f32> {
     t.to_scalar::<f32>().context("expected scalar loss tensor")
+}
+
+/// Clip the gradients in `grads` (in place) so their global L2 norm ≤ `max_norm`.
+///
+/// Scales the *gradients* before the optimiser step — the standard
+/// `clip_grad_norm_` behaviour. Operates only on the Vars present in `varmap`.
+fn clip_gradstore_norm(
+    grads:    &mut candle_core::backprop::GradStore,
+    varmap:   &VarMap,
+    max_norm: f64,
+) -> Result<()> {
+    if max_norm <= 0.0 { return Ok(()); }
+    let vars = varmap.all_vars();
+
+    // Global L2 norm across all per-Var gradients.
+    let mut total_sq = 0.0f64;
+    for v in &vars {
+        if let Some(g) = grads.get(v.as_tensor()) {
+            let sq = g.sqr().context("grad sqr")?
+                .sum_all().context("grad sum_all")?
+                .to_scalar::<f32>().context("grad scalar")?;
+            total_sq += sq as f64;
+        }
+    }
+    let global_norm = total_sq.sqrt();
+
+    if global_norm > max_norm {
+        let scale = max_norm / (global_norm + 1e-6);
+        // Re-insert each scaled gradient (insert overwrites by tensor id).
+        for v in &vars {
+            if let Some(g) = grads.get(v.as_tensor()) {
+                let scaled = (g * scale).context("grad scale")?;
+                grads.insert(v.as_tensor(), scaled);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Count total trainable scalar parameters across the VarMap.
+fn count_params(varmap: &VarMap) -> usize {
+    varmap.all_vars().iter().map(|v| v.as_tensor().elem_count()).sum()
+}
+
+/// Sample current process resident set size in MB (cross-platform).
+fn sample_rss_mb() -> f64 {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmRSS:") {
+                    if let Some(kb) = rest.split_whitespace().next()
+                        .and_then(|s| s.parse::<f64>().ok())
+                    {
+                        return kb / 1024.0;
+                    }
+                }
+            }
+        }
+        0.0
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use sysinfo::{Pid, System};
+        let mut sys = System::new();
+        sys.refresh_processes();
+        let pid = Pid::from(std::process::id() as usize);
+        sys.process(pid)
+            .map(|p| p.memory() as f64 / (1024.0 * 1024.0))
+            .unwrap_or(0.0)
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

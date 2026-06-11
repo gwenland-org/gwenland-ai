@@ -54,8 +54,12 @@ pub struct NewTrainConfig {
     pub batch_size: usize,
     pub grad_accum: usize,
     pub lr: f64,
+    pub max_grad_norm: f64,
     pub lora: LoraConfig,
     pub dry_run: bool,
+    /// Hard cap on optimiser steps. `Some(n)` stops after `n` steps (used by the
+    /// native 1-step dry-run); `None` runs the full schedule.
+    pub max_steps: Option<usize>,
     pub output_path: PathBuf,
     pub custom_script: Option<PathBuf>,
 }
@@ -69,8 +73,10 @@ impl Default for NewTrainConfig {
             batch_size: 1,
             grad_accum: 16,
             lr: 1e-4,
+            max_grad_norm: 1.0,
             lora: LoraConfig::default(),
             dry_run: false,
+            max_steps: None,
             output_path: PathBuf::new(),
             custom_script: None,
         }
@@ -118,6 +124,7 @@ fn default_true() -> bool { true }
 fn default_optimizer() -> String { "adamw_8bit".to_string() }
 fn default_scheduler() -> String { "cosine".to_string() }
 fn default_weight_decay() -> f64 { 0.01 }
+fn default_max_grad_norm() -> f64 { 1.0 }
 
 // ── struct ───────────────────────────────────────────────────────────────────
 
@@ -156,6 +163,8 @@ pub struct TrainConfig {
     pub fp16: bool,
     #[serde(default = "default_weight_decay")]
     pub weight_decay: f64,
+    #[serde(default = "default_max_grad_norm")]
+    pub max_grad_norm: f64,
 }
 
 impl TrainConfig {

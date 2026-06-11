@@ -434,6 +434,7 @@ mod tests {
             scheduler:      "cosine".to_string(),
             fp16:           false,
             weight_decay:   0.01,
+            max_grad_norm:  1.0,
         };
         let lora = build_lora_config(&cfg);
         assert_eq!(lora.target_modules, vec!["q_proj", "v_proj", "k_proj"]);

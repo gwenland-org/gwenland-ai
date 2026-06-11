@@ -61,15 +61,18 @@ pub struct LayerIndex {
 impl LayerIndex {
     /// Scan `file.tensors` and build a `LayerIndex`.
     ///
-    /// Only tensors whose names start with `"model.layers."` are indexed; all
-    /// others (embeddings, norms, lm_head, …) are silently skipped.
+    /// Handles both naming conventions used in real GGUF files:
+    ///   - `model.layers.{N}.*`  — HuggingFace-style exports
+    ///   - `blk.{N}.*`           — llama.cpp-style (Qwen, Llama, Mistral, etc.)
+    /// All other tensors (embeddings, norms, lm_head, …) are silently skipped.
     pub fn scan(file: &GgufFile) -> Self {
         let mut slices: Vec<LayerSlice> = file
             .tensors
             .iter()
             .filter_map(|t| {
-                let rest = t.name.strip_prefix("model.layers.")?;
-                // Next segment up to the first '.' is the decimal layer index.
+                // Try both prefixes; extract the decimal layer index from the first segment.
+                let rest = t.name.strip_prefix("model.layers.")
+                    .or_else(|| t.name.strip_prefix("blk."))?;
                 let dot = rest.find('.')?;
                 let idx: usize = rest[..dot].parse().ok()?;
                 Some(LayerSlice {
@@ -154,6 +157,29 @@ impl<'mmap> Drop for LoadedLayer<'mmap> {
     }
 }
 
+/// Find the token-embedding tensor's shape, model-agnostically.
+///
+/// Different exporters name the embedding differently:
+///   - llama.cpp:     `token_embd.weight`
+///   - HuggingFace:   `model.embed_tokens.weight`
+///   - misc/generic:  any tensor whose name contains `embed`
+///
+/// We try the well-known names first, then fall back to a substring match so
+/// new architectures work without code changes. Returns the row-major shape
+/// (`[vocab, hidden]`) or `None` if no embedding tensor is present.
+fn find_embedding_shape(file: &GgufFile) -> Option<Vec<u64>> {
+    const KNOWN: [&str; 2] = ["token_embd.weight", "model.embed_tokens.weight"];
+    for name in KNOWN {
+        if let Some(t) = file.tensors.iter().find(|t| t.name == name) {
+            return Some(t.shape.clone());
+        }
+    }
+    file.tensors
+        .iter()
+        .find(|t| t.name.to_lowercase().contains("embed"))
+        .map(|t| t.shape.clone())
+}
+
 // ── LayerLoader ───────────────────────────────────────────────────────────────
 
 /// Zero-copy, one-layer-at-a-time loader for GGUF weight files.
@@ -165,6 +191,10 @@ impl<'mmap> Drop for LoadedLayer<'mmap> {
 pub struct LayerLoader {
     mmap:  MmapLoader,
     index: LayerIndex,
+    /// Shape of the token-embedding tensor, if present. Read generically from
+    /// the GGUF at open time so callers can derive vocab/hidden dims at runtime
+    /// without hardcoding per-architecture values. `[vocab, hidden]` row-major.
+    embed_shape: Option<Vec<u64>>,
 }
 
 impl LayerLoader {
@@ -178,7 +208,14 @@ impl LayerLoader {
         let gguf = gguf_parser::parse(path)
             .map_err(|e| anyhow!("{}", e))?;
         let index = LayerIndex::scan(&gguf);
-        Ok(LayerLoader { mmap, index })
+        let embed_shape = find_embedding_shape(&gguf);
+        Ok(LayerLoader { mmap, index, embed_shape })
+    }
+
+    /// Shape of the token-embedding tensor (`[vocab, hidden]`), if the GGUF has
+    /// one under a recognised name. Used to derive vocab/hidden at runtime.
+    pub fn embedding_shape(&self) -> Option<&[u64]> {
+        self.embed_shape.as_deref()
     }
 
     /// Number of transformer layers found in the GGUF index.
