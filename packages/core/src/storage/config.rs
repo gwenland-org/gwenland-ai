@@ -24,6 +24,23 @@ impl Default for GeneralConfig {
     }
 }
 
+/// [benchmark] section — optional overrides for `gwen benchmark` defaults.
+///
+/// All fields are `Option` so that missing keys in config.toml are skipped
+/// during serde deserialisation without causing parse errors.
+#[derive(Debug, Deserialize, Serialize, Clone, Default)]
+#[serde(default)]
+pub struct BenchmarkConfig {
+    /// Default GGUF model path for `--model` / `--layer-load` flags.
+    pub model: Option<std::path::PathBuf>,
+    /// Default number of layers to sample (0 = all).
+    pub layer_load: Option<u32>,
+    /// Default quantization format (e.g. "Q8_0").
+    pub quantization: Option<String>,
+    /// Default output directory for benchmark result files.
+    pub output_dir: Option<std::path::PathBuf>,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
 pub struct AiConfig {
@@ -58,6 +75,8 @@ pub struct GwenConfig {
     pub auth: AuthConfig,
     #[serde(default)]
     pub inference: crate::engine::inference::config::InferenceConfig,
+    #[serde(default)]
+    pub benchmark: BenchmarkConfig,
 }
 
 impl GwenConfig {
@@ -120,6 +139,13 @@ impl GwenConfig {
             "inference.params.temperature" => Ok(self.inference.params.temperature.to_string()),
             "inference.params.top_p"  => Ok(self.inference.params.top_p.to_string()),
             "inference.params.max_tokens" => Ok(self.inference.params.max_tokens.to_string()),
+            "benchmark.model"        => Ok(self.benchmark.model.as_ref()
+                .map(|p| p.display().to_string()).unwrap_or_default()),
+            "benchmark.layer_load"   => Ok(self.benchmark.layer_load
+                .map(|v| v.to_string()).unwrap_or_default()),
+            "benchmark.quantization" => Ok(self.benchmark.quantization.clone().unwrap_or_default()),
+            "benchmark.output_dir"   => Ok(self.benchmark.output_dir.as_ref()
+                .map(|p| p.display().to_string()).unwrap_or_default()),
             _ => anyhow::bail!("unknown config key: {}", key),
         }
     }
@@ -168,6 +194,22 @@ impl GwenConfig {
                 self.inference.params.max_tokens = value
                     .parse::<usize>()
                     .context("max_tokens must be an unsigned integer")?;
+            }
+            "benchmark.model" => {
+                self.benchmark.model = if value.is_empty() { None }
+                    else { Some(std::path::PathBuf::from(value)) };
+            }
+            "benchmark.layer_load" => {
+                self.benchmark.layer_load = if value.is_empty() { None }
+                    else { Some(value.parse::<u32>().context("layer_load must be a u32")?) };
+            }
+            "benchmark.quantization" => {
+                self.benchmark.quantization = if value.is_empty() { None }
+                    else { Some(value.to_string()) };
+            }
+            "benchmark.output_dir" => {
+                self.benchmark.output_dir = if value.is_empty() { None }
+                    else { Some(std::path::PathBuf::from(value)) };
             }
             _ => anyhow::bail!("unknown config key: {}", key),
         }

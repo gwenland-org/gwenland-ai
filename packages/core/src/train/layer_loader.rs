@@ -61,15 +61,18 @@ pub struct LayerIndex {
 impl LayerIndex {
     /// Scan `file.tensors` and build a `LayerIndex`.
     ///
-    /// Only tensors whose names start with `"model.layers."` are indexed; all
-    /// others (embeddings, norms, lm_head, …) are silently skipped.
+    /// Handles both naming conventions used in real GGUF files:
+    ///   - `model.layers.{N}.*`  — HuggingFace-style exports
+    ///   - `blk.{N}.*`           — llama.cpp-style (Qwen, Llama, Mistral, etc.)
+    /// All other tensors (embeddings, norms, lm_head, …) are silently skipped.
     pub fn scan(file: &GgufFile) -> Self {
         let mut slices: Vec<LayerSlice> = file
             .tensors
             .iter()
             .filter_map(|t| {
-                let rest = t.name.strip_prefix("model.layers.")?;
-                // Next segment up to the first '.' is the decimal layer index.
+                // Try both prefixes; extract the decimal layer index from the first segment.
+                let rest = t.name.strip_prefix("model.layers.")
+                    .or_else(|| t.name.strip_prefix("blk."))?;
                 let dot = rest.find('.')?;
                 let idx: usize = rest[..dot].parse().ok()?;
                 Some(LayerSlice {
