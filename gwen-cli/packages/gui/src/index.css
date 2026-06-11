@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+/* Self-hosted Geist (variable) fonts — copied from the `geist` npm package
+   into public/fonts/. Registers the families "Geist" and "Geist Mono". */
+@font-face {
+  font-family: "Geist";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/Geist-Variable.woff2") format("woff2");
+}
+@font-face {
+  font-family: "Geist Mono";
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url("/fonts/GeistMono-Variable.woff2") format("woff2");
+}
+
+:root {
+  --bg:             #0f0d1a;
+  --sidebar:        #151222;
+  --card:           #1e1a2e;
+  --orange:         #FF8C42;
+  --orange-dim:     rgba(255, 140, 66, 0.12);
+  --text-primary:   #e8e6f0;
+  --text-secondary: #7a7890;
+  --text-mono:      #a09db8;
+  --border:         rgba(255, 255, 255, 0.06);
+
+  --space-1:  2px;
+  --space-2:  4px;
+  --space-3:  6px;
+  --space-4:  8px;
+  --space-6:  12px;
+  --space-8:  16px;
+  --space-10: 20px;
+  --space-12: 24px;
+  --space-16: 32px;
+
+  --text-xs:   11px;
+  --text-sm:   13px;
+  --text-base: 14px;
+  --text-lg:   16px;
+  --text-stat: 28px;
+
+  --radius-sm:      4px;
+  --radius-btn:     6px;
+  --radius-input:   8px;
+  --radius-card:    10px;
+  --radius-sidebar: 16px;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: 'Geist', sans-serif;
+  font-size: var(--text-base);
+  height: 100vh;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* animate-pulse — used by SseBadge (streaming dot) and StreamCursor (caret).
+   Defined here rather than relying on Tailwind's utility so it works on
+   elements that use inline styles instead of class names. */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.25; }
+}
+
+/* spin — used by the delete-in-progress spinner in ModelCard */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

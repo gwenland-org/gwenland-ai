@@ -1,0 +1,28 @@
+# CI-only training config — intentionally minimal.
+# Used exclusively in e2e-pipeline.yml with --dry-run.
+# DANGER: Never run this config without --dry-run in CI; max-steps cap is
+# enforced by passing --dry-run to `gwen train`, not by this file.
+
+model: tinyllama/TinyLlama-1.1B
+dataset: tests/fixtures/sample_100.jsonl
+output: /tmp/gwen-ci-output
+
+# 1 epoch × 5-step cap enforced via --dry-run in CI workflow.
+# If somehow run live, 1 epoch on 100 samples stays fast.
+epochs: 1
+batch_size: 1
+grad_accum: 1
+learning_rate: 0.0001
+max_seq_len: 256
+
+# LoRA — minimal rank to reduce parameter count
+lora_r: 4
+lora_alpha: 8
+lora_dropout: 0.05
+lora_target: "q_proj,v_proj"
+qlora: true
+
+optimizer: adamw_8bit
+scheduler: cosine
+weight_decay: 0.01
+fp16: true

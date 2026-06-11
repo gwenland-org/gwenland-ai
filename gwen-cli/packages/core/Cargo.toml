@@ -1,0 +1,120 @@
+[package]
+name = "gwenland-core"
+version = "1.0.0"
+authors = ["JinXSuper <jinxsuper@vercel.app>"]
+edition = "2024"
+description = "GwenLand — AI toolkit. Local-first, <50MB, zero Python."
+homepage = "https://jinxsuper.vercel.app"
+documentation = "https://gwenland.vercel.app"
+repository = "https://github.com/JinXSuper/gwenland"
+readme = "README.md"
+license-file = "LICENSE.txt"
+publish = true
+keywords = ["gwenland", "ai", "trainer", "tester", "modular", "orchestration", "rust"]
+categories = ["command-line-interface", "development-tools", "artificial-intelligence"]
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[lib]
+name = "gwenland_core"
+crate-type = ["rlib"]
+
+[dependencies]
+pico-args = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+spinners = "4.1"
+rayon = "1.10"
+sysinfo = "0.30"
+wgpu = { version = "22", features = ["wgsl"] }
+pollster = "0.3"
+walkdir = "2"
+ignore = "0.4"
+colored = "3.1.1"
+regex = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "blocking"] }
+futures-util = "0.3"
+actix-web = "4"
+bytes = "1"
+anyhow = "1"
+thiserror = "1"
+dirs = "5"
+fs2 = "0.4"
+which = "6"
+backtrace = "0.3"
+async-stream = "0.3.6"
+rand = "0.8"
+lazy_static = "1"
+serde_yaml = "0.9"
+tempfile = "3"
+tokenizers = { version = "0.21", default-features = false, features = ["http", "fancy-regex"] }
+hf-hub = { version = "0.5.0", default-features = false, features = ["tokio", "rustls-tls", "ureq"] }
+# Candle: always compiled (no feature flag since Cycle 6).
+# cuda/metal features are left disabled here so the crate compiles on all
+# platforms without requiring the CUDA toolkit or macOS SDK. Users who want
+# GPU acceleration can set CANDLE_CUDA=1 or CANDLE_METAL=1 environment
+# variables at runtime — candle picks them up dynamically.
+candle-core = "0.9"
+candle-nn = "0.9"
+candle-transformers = "0.9"
+safetensors = "0.4"
+keyring = "3"
+indicatif = "0.18"
+toml = "0.8"
+directories = "5"
+memmap2 = "0.9"
+
+[features]
+default = []
+legacy = []
+nvidia = ["nvml-wrapper"]
+mistralrs-backend = ["dep:mistralrs"]
+candle-backend = []
+test-utils = []
+
+[dependencies.nvml-wrapper]
+version = "0.10"
+optional = true
+
+[dependencies.mistralrs]
+version = "0.8"
+optional = true
+default-features = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+quickcheck = "1"
+quickcheck_macros = "1"
+
+[[test]]
+name = "gwen216_integration"
+path = "tests/gwen216_integration.rs"
+required-features = ["test-utils"]
+
+[[bench]]
+name = "core_bench"
+harness = false
+
+[[bin]]
+name = "validate_dequant"
+path = "src/bin/validate_dequant.rs"
+
+[[bin]]
+name = "bench_ggqr"
+path = "src/bin/bench_ggqr.rs"
+
+[[bin]]
+name = "bench_layer_loader"
+path = "src/bin/bench_layer_loader.rs"

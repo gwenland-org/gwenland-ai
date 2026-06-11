@@ -1,0 +1,5 @@
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:main"
+
+[build.env]
+passthrough = ["CARGO_NET_GIT_FETCH_WITH_CLI", "OPENSSL_STATIC", "OPENSSL_VENDOR"]

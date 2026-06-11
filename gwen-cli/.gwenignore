@@ -1,0 +1,11 @@
+# GwenCLI ignore rules
+# Syntax is identical to .gitignore
+
+node_modules/
+target/
+dist/
+.next/
+.turbo/
+*.lock
+*.log
+.env*
