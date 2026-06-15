@@ -73,20 +73,51 @@ fn parse_candle_key(key: &str) -> Option<(usize, &str)> {
     Some((layer_idx, proj))
 }
 
-/// Parse `model.layers.{N}.{module}.{proj}_proj.weight` → (layer_idx, proj).
+/// Parse a base-weight tensor key → (layer_idx, bare proj name).
+///
+/// Accepts BOTH naming conventions GwenLand encounters:
+///   - HF/transformers: `model.layers.{N}.{module}.{proj}_proj.weight`
+///   - llama.cpp/GGUF:   `blk.{N}.{attn_q|attn_k|attn_v|attn_output|ffn_gate|
+///                         ffn_up|ffn_down}.weight`
+///
+/// Real GGUF files (e.g. Qwen3-1.7B Q8_0) ship llama.cpp `blk.*` names, so the
+/// `blk.*` branch is what makes a trained adapter actually mergeable into a
+/// downloaded GGUF — the HF branch alone never matches those tensors.
 ///
 /// @INFO The module segment (self_attn / mlp) is consumed but not returned;
 /// it is fully determined by the projection name via `attn_or_mlp`.
-fn parse_gguf_key(key: &str) -> Option<(usize, &str)> {
-    let rest = key.strip_prefix("model.layers.")?;
-    let dot = rest.find('.')?;
-    let layer_idx: usize = rest[..dot].parse().ok()?;
-    let rest = &rest[dot + 1..];
-    let dot2 = rest.find('.')?;
-    let rest = &rest[dot2 + 1..];
-    let proj_weight = rest.strip_suffix(".weight")?;
-    let proj = proj_weight.strip_suffix("_proj")?;
-    Some((layer_idx, proj))
+pub(crate) fn parse_gguf_key(key: &str) -> Option<(usize, &str)> {
+    // HF / transformers naming.
+    if let Some(rest) = key.strip_prefix("model.layers.") {
+        let dot = rest.find('.')?;
+        let layer_idx: usize = rest[..dot].parse().ok()?;
+        let rest = &rest[dot + 1..];
+        let dot2 = rest.find('.')?;
+        let rest = &rest[dot2 + 1..];
+        let proj_weight = rest.strip_suffix(".weight")?;
+        let proj = proj_weight.strip_suffix("_proj")?;
+        return Some((layer_idx, proj));
+    }
+
+    // llama.cpp / GGUF naming: `blk.{N}.{tensor}.weight`.
+    if let Some(rest) = key.strip_prefix("blk.") {
+        let dot = rest.find('.')?;
+        let layer_idx: usize = rest[..dot].parse().ok()?;
+        let tensor = rest[dot + 1..].strip_suffix(".weight")?;
+        let proj = match tensor {
+            "attn_q" => "q",
+            "attn_k" => "k",
+            "attn_v" => "v",
+            "attn_output" => "o",
+            "ffn_gate" => "gate",
+            "ffn_up" => "up",
+            "ffn_down" => "down",
+            _ => return None, // norms, biases, etc. — not LoRA targets
+        };
+        return Some((layer_idx, proj));
+    }
+
+    None
 }
 
 /// Map a projection name to its GGUF module segment.
@@ -131,7 +162,11 @@ pub fn quantize_q8_0(weights: &[f32]) -> candle_core::Result<Vec<u8>> {
 
     for block in weights.chunks_exact(Q8_0_BLOCK) {
         let max_abs = block.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
-        let scale = if max_abs == 0.0 { 1.0f32 } else { max_abs / 127.0 };
+        let scale = if max_abs == 0.0 {
+            1.0f32
+        } else {
+            max_abs / 127.0
+        };
 
         let scale_f16_bits = f32_to_f16_bits(scale);
         out[out_pos] = (scale_f16_bits & 0xFF) as u8;
@@ -352,8 +387,7 @@ impl LoraMerger {
         let mut sys = System::new_all();
 
         // Collect processed tensor bytes in order.
-        let mut processed_tensors: Vec<(String, Vec<u8>)> =
-            Vec::with_capacity(gguf.tensors.len());
+        let mut processed_tensors: Vec<(String, Vec<u8>)> = Vec::with_capacity(gguf.tensors.len());
         let mut merged_count: usize = 0;
 
         for tensor in &gguf.tensors {
@@ -401,10 +435,10 @@ impl LoraMerger {
 
                 // Shape check: delta and base weights must have the same element count.
                 if delta_f32.len() != base_f32.len() {
-                    let base_shape: Vec<usize> =
-                        tensor.shape.iter().map(|&d| d as usize).collect();
+                    let base_shape: Vec<usize> = tensor.shape.iter().map(|&d| d as usize).collect();
                     let adapter_shape = adapter.lora_b.dims().to_vec();
                     return Err(GwenError::ShapeMismatch {
+                        adapter_key: tensor.name.clone(),
                         adapter: adapter_shape,
                         base: base_shape,
                     });
@@ -435,8 +469,8 @@ impl LoraMerger {
                     merged.extend(std::iter::repeat(0.0f32).take(Q8_0_BLOCK - remainder));
                 }
 
-                let out = quantize_q8_0(&merged)
-                    .map_err(|e| GwenError::CandleError(e.to_string()))?;
+                let out =
+                    quantize_q8_0(&merged).map_err(|e| GwenError::CandleError(e.to_string()))?;
 
                 merged_count += 1;
                 eprintln!(
@@ -667,8 +701,7 @@ fn write_output_gguf(
     let mut out_bytes = base_bytes;
 
     // Patch each tensor's region in the output buffer.
-    for ((tensor_name, new_data), tensor_info) in
-        processed_tensors.iter().zip(gguf.tensors.iter())
+    for ((tensor_name, new_data), tensor_info) in processed_tensors.iter().zip(gguf.tensors.iter())
     {
         debug_assert_eq!(
             tensor_name, &tensor_info.name,
@@ -800,10 +833,18 @@ fn skip_kv_cursor(c: &mut std::io::Cursor<&[u8]>) -> Option<()> {
 /// Skip a GGUF KV value by type tag.
 fn skip_kv_value_cursor(c: &mut std::io::Cursor<&[u8]>, vtype: u32) -> Option<()> {
     match vtype {
-        0 | 1 | 7 => { read_u8_cursor(c)?; }    // UINT8 / INT8 / BOOL
-        2 | 3 => { c.seek(SeekFrom::Current(2)).ok()?; }   // UINT16 / INT16
-        4 | 5 | 6 => { c.seek(SeekFrom::Current(4)).ok()?; } // UINT32 / INT32 / F32
-        8 => { skip_gguf_string_cursor(c)?; }   // STRING
+        0 | 1 | 7 => {
+            read_u8_cursor(c)?;
+        } // UINT8 / INT8 / BOOL
+        2 | 3 => {
+            c.seek(SeekFrom::Current(2)).ok()?;
+        } // UINT16 / INT16
+        4 | 5 | 6 => {
+            c.seek(SeekFrom::Current(4)).ok()?;
+        } // UINT32 / INT32 / F32
+        8 => {
+            skip_gguf_string_cursor(c)?;
+        } // STRING
         9 => {
             let elem_type = read_u32_le_cursor(c)?;
             let count = read_u64_le_cursor(c)? as usize;
@@ -811,7 +852,9 @@ fn skip_kv_value_cursor(c: &mut std::io::Cursor<&[u8]>, vtype: u32) -> Option<()
                 skip_kv_value_cursor(c, elem_type)?;
             }
         }
-        10 | 11 | 12 => { c.seek(SeekFrom::Current(8)).ok()?; } // UINT64 / INT64 / F64
+        10 | 11 | 12 => {
+            c.seek(SeekFrom::Current(8)).ok()?;
+        } // UINT64 / INT64 / F64
         _ => return None, // unknown type — bail
     }
     Some(())
@@ -900,6 +943,99 @@ mod tests {
         }
     }
 
+    /// GWEN-219: llama.cpp `blk.N.*` GGUF tensor names (as shipped by real
+    /// Qwen3 GGUF files) must map to the same candle adapter keys the exporter
+    /// writes. Without this, a trained adapter merges into ZERO tensors.
+    #[test]
+    fn gguf_to_candle_accepts_llamacpp_blk_names() {
+        let cases = [
+            ("blk.0.attn_q.weight", "lora_layer_0_q_proj"),
+            ("blk.0.attn_k.weight", "lora_layer_0_k_proj"),
+            ("blk.0.attn_v.weight", "lora_layer_0_v_proj"),
+            ("blk.0.attn_output.weight", "lora_layer_0_o_proj"),
+            ("blk.3.ffn_gate.weight", "lora_layer_3_gate_proj"),
+            ("blk.3.ffn_up.weight", "lora_layer_3_up_proj"),
+            ("blk.27.ffn_down.weight", "lora_layer_27_down_proj"),
+        ];
+        for (gguf, expected) in cases {
+            let got = KeyMapper::gguf_to_candle(gguf)
+                .unwrap_or_else(|e| panic!("gguf_to_candle({gguf}) failed: {e}"));
+            assert_eq!(got, expected, "blk mapping mismatch for {gguf}");
+        }
+
+        // Non-projection blk tensors (norms etc.) must NOT match — they are
+        // copied verbatim during merge, not adapted.
+        assert!(KeyMapper::gguf_to_candle("blk.0.attn_norm.weight").is_err());
+        assert!(KeyMapper::gguf_to_candle("blk.0.ffn_norm.weight").is_err());
+        assert!(KeyMapper::gguf_to_candle("token_embd.weight").is_err());
+    }
+
+    /// GWEN-219 end-to-end bridge: a LayeredTrainingLoop-style checkpoint must
+    /// export to an adapter file whose entries are keyed exactly as the merge
+    /// loop looks them up from a real (llama.cpp `blk.*`) GGUF — and the LoRA
+    /// scale must be baked into the exported `lora_b`.
+    #[test]
+    fn layered_checkpoint_exports_to_mergeable_adapter() {
+        use crate::train::lora_bridge::{LoraConfig, LoraExporter};
+        use candle_nn::VarMap;
+
+        let dev = &Device::Cpu;
+        let varmap = VarMap::new();
+        // Two projections, all-ones A and B so the baked scale is observable.
+        // rank=8, d_in=d_out=64. Default LoraConfig: alpha=16 → scale=alpha/rank=2.0.
+        for (var_key, _) in [("attn_q", "q"), ("ffn_down", "down")] {
+            let mut data = varmap.data().lock().unwrap();
+            data.insert(
+                format!("l0.{var_key}.lora_a"),
+                candle_core::Var::from_tensor(
+                    &Tensor::ones((8, 64), candle_core::DType::F32, dev).unwrap(),
+                )
+                .unwrap(),
+            );
+            data.insert(
+                format!("l0.{var_key}.lora_b"),
+                candle_core::Var::from_tensor(
+                    &Tensor::ones((64, 8), candle_core::DType::F32, dev).unwrap(),
+                )
+                .unwrap(),
+            );
+        }
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        LoraExporter::new(LoraConfig::default())
+            .export_safetensors(&varmap, tmp.path())
+            .expect("export_safetensors");
+
+        let adapters = load_adapter_safetensors(tmp.path()).expect("load adapter");
+
+        // The merge loop keys lookups by gguf_to_candle(<gguf tensor name>).
+        for gguf in ["blk.0.attn_q.weight", "blk.0.ffn_down.weight"] {
+            let key = KeyMapper::gguf_to_candle(gguf).unwrap();
+            let adapter = adapters
+                .get(&key)
+                .unwrap_or_else(|| panic!("no adapter for {gguf} (key {key})"));
+
+            // lora_a is unscaled (still 1.0); lora_b carries the baked scale 2.0.
+            let a0 = adapter
+                .lora_a
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[0];
+            let b0 = adapter
+                .lora_b
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()[0];
+            assert!(
+                (a0 - 1.0).abs() < 1e-6,
+                "lora_a should be unscaled, got {a0}"
+            );
+            assert!((b0 - 2.0).abs() < 1e-6, "lora_b scale not baked, got {b0}");
+        }
+    }
+
     // ── Task 4.1 tests: Q8_0 quantization ────────────────────────────────────
 
     /// All-zero input must dequantize back to all zeros.
@@ -951,10 +1087,10 @@ mod tests {
     // ── Task 4.3: quantization round-trip error bound property test ───────────
 
     fn assert_q8_0_error_bound(label: &str, weights: &[f32]) {
-        let encoded = quantize_q8_0(weights)
-            .unwrap_or_else(|e| panic!("{label}: quantize failed: {e}"));
-        let decoded = dequantize_q8_0(&encoded)
-            .unwrap_or_else(|e| panic!("{label}: dequantize failed: {e}"));
+        let encoded =
+            quantize_q8_0(weights).unwrap_or_else(|e| panic!("{label}: quantize failed: {e}"));
+        let decoded =
+            dequantize_q8_0(&encoded).unwrap_or_else(|e| panic!("{label}: dequantize failed: {e}"));
 
         assert_eq!(decoded.len(), weights.len(), "{label}: length mismatch");
 
@@ -964,7 +1100,11 @@ mod tests {
             .enumerate()
         {
             let max_abs = orig_block.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
-            let scale_f32 = if max_abs == 0.0 { 1.0f32 } else { max_abs / 127.0 };
+            let scale_f32 = if max_abs == 0.0 {
+                1.0f32
+            } else {
+                max_abs / 127.0
+            };
             let tolerance = scale_f32 / 2.0 + 1e-6;
 
             for (i, (&orig, &dec)) in orig_block.iter().zip(dec_block.iter()).enumerate() {
@@ -982,18 +1122,18 @@ mod tests {
     fn test_quantization_roundtrip_error_bounds() {
         assert_q8_0_error_bound("all-zeros", &vec![0.0f32; 64]);
         assert_q8_0_error_bound("all-ones", &vec![1.0f32; 64]);
-        let alternating: Vec<f32> = (0..64).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let alternating: Vec<f32> = (0..64)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         assert_q8_0_error_bound("alternating", &alternating);
         let mixed: Vec<f32> = [
-            0.1f32, 0.5, -0.3, 0.8, -0.7, 0.2, -0.9, 0.4,
-            0.6, -0.1, 0.3, -0.5, 0.9, -0.4, 0.7, -0.2,
-            -0.8, 0.15, -0.35, 0.65, 0.45, -0.25, 0.85, -0.55,
-            0.05, -0.75, 0.95, -0.15, 0.55, -0.45, 0.25, -0.65,
-            0.01, 0.05, -0.03, 0.08, -0.07, 0.02, -0.09, 0.04,
-            0.06, -0.01, 0.03, -0.05, 0.09, -0.04, 0.07, -0.02,
-            -0.08, 0.015, -0.035, 0.065, 0.045, -0.025, 0.085, -0.055,
-            0.005, -0.075, 0.095, -0.015, 0.055, -0.045, 0.025, -0.065,
-        ].to_vec();
+            0.1f32, 0.5, -0.3, 0.8, -0.7, 0.2, -0.9, 0.4, 0.6, -0.1, 0.3, -0.5, 0.9, -0.4, 0.7,
+            -0.2, -0.8, 0.15, -0.35, 0.65, 0.45, -0.25, 0.85, -0.55, 0.05, -0.75, 0.95, -0.15,
+            0.55, -0.45, 0.25, -0.65, 0.01, 0.05, -0.03, 0.08, -0.07, 0.02, -0.09, 0.04, 0.06,
+            -0.01, 0.03, -0.05, 0.09, -0.04, 0.07, -0.02, -0.08, 0.015, -0.035, 0.065, 0.045,
+            -0.025, 0.085, -0.055, 0.005, -0.075, 0.095, -0.015, 0.055, -0.045, 0.025, -0.065,
+        ]
+        .to_vec();
         assert_q8_0_error_bound("mixed-seed", &mixed);
         assert!(quantize_q8_0(&[0.0f32; 31]).is_err());
         assert!(quantize_q8_0(&[0.0f32; 33]).is_err());
@@ -1032,7 +1172,12 @@ mod tests {
             &tmp.path().join("out.gguf"),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("base model path does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("base model path does not exist")
+        );
     }
 
     /// merge_into_gguf must reject a non-existent adapter_path.
@@ -1048,7 +1193,12 @@ mod tests {
             &tmp.path().join("out.gguf"),
         );
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("adapter path does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("adapter path does not exist")
+        );
     }
 
     /// merge_into_gguf must reject an output_path whose parent does not exist.
@@ -1060,13 +1210,15 @@ mod tests {
         std::fs::write(&base, b"fake-gguf").unwrap();
         let adapter = tmp.path().join("adapter.safetensors");
         std::fs::write(&adapter, b"fake-adapter").unwrap();
-        let result = merger.merge_into_gguf(
-            &base,
-            &adapter,
-            Path::new("/nonexistent/subdir/out.gguf"),
-        );
+        let result =
+            merger.merge_into_gguf(&base, &adapter, Path::new("/nonexistent/subdir/out.gguf"));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("output parent directory does not exist"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("output parent directory does not exist")
+        );
     }
 
     // ── Wave 4 helpers: synthetic GGUF builder ────────────────────────────────
@@ -1079,9 +1231,11 @@ mod tests {
     fn build_minimal_gguf(tensor_name: &str, weights_q8_0: &[u8], n_elements: usize) -> Vec<u8> {
         let mut buf: Vec<u8> = Vec::new();
 
-        // Magic: gguf_parser reads a u32 LE and compares to 0x4647_4755.
-        // So file bytes must be [0x55, 0x47, 0x47, 0x46] = "UGGF".
-        buf.extend_from_slice(&0x4647_4755u32.to_le_bytes());
+        // Magic: the GGUF spec magic is the ASCII string "GGUF", i.e. bytes
+        // [0x47, 0x47, 0x55, 0x46], which read back as the u32 LE 0x4655_4747.
+        // (The previous value 0x4647_4755 wrote "UGGF" and the parser rejected
+        // every fixture, masking the whole merge path — GWEN-219 fix.)
+        buf.extend_from_slice(b"GGUF");
         buf.extend_from_slice(&3u32.to_le_bytes());
         // tensor_count = 1
         buf.extend_from_slice(&1u64.to_le_bytes());
@@ -1199,15 +1353,19 @@ mod tests {
 
         let adapter_bytes = build_adapter_safetensors(
             candle_name,
-            &lora_a_data, &[rank, d_in],
-            &lora_b_data, &[d_out, rank],
+            &lora_a_data,
+            &[rank, d_in],
+            &lora_b_data,
+            &[d_out, rank],
         );
         let adapter_path = tmp.path().join("adapter.safetensors");
         std::fs::write(&adapter_path, &adapter_bytes).unwrap();
 
         let output_path = tmp.path().join("out.gguf");
         let merger = LoraMerger::new();
-        merger.merge_into_gguf(&base_path, &adapter_path, &output_path).unwrap();
+        merger
+            .merge_into_gguf(&base_path, &adapter_path, &output_path)
+            .unwrap();
 
         // Read merged output and locate the tensor data.
         let out_bytes = std::fs::read(&output_path).unwrap();
@@ -1220,7 +1378,10 @@ mod tests {
         // After round-tripping through Q8_0 twice, error should be small.
         for (i, (&m, &b)) in merged_f32.iter().zip(base_f32_rt.iter()).enumerate() {
             let err = (m - b).abs();
-            assert!(err < 0.05, "identity merge mismatch at {i}: merged={m} base={b} err={err}");
+            assert!(
+                err < 0.05,
+                "identity merge mismatch at {i}: merged={m} base={b} err={err}"
+            );
         }
     }
 
@@ -1232,22 +1393,21 @@ mod tests {
         // Base GGUF: 64 Q8_0 elements.
         let base_weights = vec![0.1f32; 64];
         let base_q8 = quantize_q8_0(&base_weights).unwrap();
-        let gguf_bytes = build_minimal_gguf(
-            "model.layers.0.self_attn.q_proj.weight",
-            &base_q8, 64,
-        );
+        let gguf_bytes = build_minimal_gguf("model.layers.0.self_attn.q_proj.weight", &base_q8, 64);
         let base_path = tmp.path().join("base.gguf");
         std::fs::write(&base_path, &gguf_bytes).unwrap();
 
         // Adapter with wrong shape: rank=4, d_in=8, d_out=4 → delta has 32 elements,
         // but base has 64 → ShapeMismatch.
         let rank = 4usize;
-        let lora_a = vec![0.1f32; rank * 8];   // (4, 8)
-        let lora_b = vec![0.1f32; 4 * rank];    // (4, 4) → delta (4,8) = 32 elements ≠ 64
+        let lora_a = vec![0.1f32; rank * 8]; // (4, 8)
+        let lora_b = vec![0.1f32; 4 * rank]; // (4, 4) → delta (4,8) = 32 elements ≠ 64
         let adapter_bytes = build_adapter_safetensors(
             "lora_layer_0_q_proj",
-            &lora_a, &[rank, 8],
-            &lora_b, &[4, rank],
+            &lora_a,
+            &[rank, 8],
+            &lora_b,
+            &[4, rank],
         );
         let adapter_path = tmp.path().join("adapter.safetensors");
         std::fs::write(&adapter_path, &adapter_bytes).unwrap();
@@ -1272,10 +1432,7 @@ mod tests {
         // Base GGUF: 64 Q8_0 elements.
         let base_weights = vec![0.1f32; 64];
         let base_q8 = quantize_q8_0(&base_weights).unwrap();
-        let gguf_bytes = build_minimal_gguf(
-            "model.layers.0.self_attn.q_proj.weight",
-            &base_q8, 64,
-        );
+        let gguf_bytes = build_minimal_gguf("model.layers.0.self_attn.q_proj.weight", &base_q8, 64);
         let base_path = tmp.path().join("base.gguf");
         std::fs::write(&base_path, &gguf_bytes).unwrap();
 
@@ -1290,8 +1447,10 @@ mod tests {
 
         let adapter_bytes = build_adapter_safetensors(
             "lora_layer_0_q_proj",
-            &lora_a, &[rank, d_in],
-            &lora_b, &[d_out, rank],
+            &lora_a,
+            &[rank, d_in],
+            &lora_b,
+            &[d_out, rank],
         );
         let adapter_path = tmp.path().join("adapter.safetensors");
         std::fs::write(&adapter_path, &adapter_bytes).unwrap();
@@ -1305,6 +1464,53 @@ mod tests {
             matches!(result, Err(GwenError::InvalidMergedWeights { .. })),
             "expected InvalidMergedWeights, got: {:?}",
             result.err()
+        );
+    }
+
+    /// GWEN-219 end-to-end: merging into a real-world llama.cpp `blk.*`-named
+    /// GGUF tensor (as Qwen3 ships) must actually apply the adapter delta. This
+    /// is the "drop-in mergeable" acceptance check at the merge layer — before
+    /// the blk mapping it merged into ZERO tensors and silently copied the base.
+    #[test]
+    fn test_merge_blk_named_tensor_applies_delta() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        // Base: 64 Q8_0 weights, all zero so the merged result equals the delta.
+        let base_q8 = quantize_q8_0(&[0.0f32; 64]).unwrap();
+        // llama.cpp / Qwen3 tensor name — NOT the HF `model.layers.*` form.
+        let gguf_bytes = build_minimal_gguf("blk.0.attn_q.weight", &base_q8, 64);
+        let base_path = tmp.path().join("base.gguf");
+        std::fs::write(&base_path, &gguf_bytes).unwrap();
+
+        // Adapter delta = B @ A. With A = 0.1·(rank=4, d_in=16) and
+        // B = 0.1·(d_out=4, rank=4): each delta element = 4 × 0.1 × 0.1 = 0.04.
+        let rank = 4usize;
+        let lora_a = vec![0.1f32; rank * 16];
+        let lora_b = vec![0.1f32; 4 * rank];
+        let adapter_bytes = build_adapter_safetensors(
+            "lora_layer_0_q_proj",
+            &lora_a,
+            &[rank, 16],
+            &lora_b,
+            &[4, rank],
+        );
+        let adapter_path = tmp.path().join("adapter.safetensors");
+        std::fs::write(&adapter_path, &adapter_bytes).unwrap();
+
+        let output_path = tmp.path().join("out.gguf");
+        LoraMerger::new()
+            .merge_into_gguf(&base_path, &adapter_path, &output_path)
+            .expect("merge into blk-named GGUF");
+
+        let out_bytes = std::fs::read(&output_path).unwrap();
+        let data_start = find_data_segment_start(&out_bytes).unwrap();
+        let merged = dequantize_q8_0(&out_bytes[data_start..data_start + base_q8.len()]).unwrap();
+
+        // Delta must have been applied (≈0.04), not a verbatim zero copy.
+        let mean: f32 = merged.iter().sum::<f32>() / merged.len() as f32;
+        assert!(
+            (mean - 0.04).abs() < 0.01,
+            "blk adapter delta not applied: mean={mean} (expected ≈0.04)",
         );
     }
 }

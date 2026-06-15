@@ -9,7 +9,7 @@ use std::path::Path;
 
 use candle_core::{Result, Tensor};
 use candle_nn::VarMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::GwenError;
 
@@ -145,7 +145,15 @@ impl LoraExporter {
         let mut lora_b_map: HashMap<(usize, String), Tensor> = HashMap::new();
 
         for (name, var) in data.iter() {
-            if let Some((side, layer_idx, proj)) = parse_lora_key(name) {
+            // Accept BOTH checkpoint layouts:
+            //   - the LayeredTrainingLoop layout `l{N}.{proj}.lora_{a|b}` (GWEN-219)
+            //   - the legacy flat layout `lora_{a|b}_layer_{N}_{proj}`
+            // `proj` is normalised to its bare form (`q`, `gate`, …) so the
+            // produced `layer_name` round-trips through the merger's KeyMapper.
+            if let Some((side, layer_idx, proj)) =
+                parse_layered_lora_key(name).or_else(|| parse_lora_key(name))
+            {
+                let proj = proj.strip_suffix("_proj").unwrap_or(&proj).to_string();
                 let tensor = var.as_tensor().clone();
                 match side {
                     Side::A => lora_a_map.insert((layer_idx, proj), tensor),
@@ -164,11 +172,17 @@ impl LoraExporter {
                 .remove(&(layer_idx, proj.clone()))
                 .ok_or(GwenError::MissingLoraPair { layer_idx })?;
 
+            // Rank is the inner dimension of lora_a (`[rank, d_in]`), derived
+            // from the tensor itself rather than `config.rank`. This is required
+            // for the GWEN-219 `--gdtqp` path where rank varies per projection,
+            // and also keeps `validate_shapes()` self-consistent.
+            let rank = lora_a.dims().first().copied().unwrap_or(self.config.rank);
+
             adapters.push(LoraAdapter {
                 layer_name: format!("lora_layer_{}_{}_proj", layer_idx, proj),
                 lora_a,
                 lora_b,
-                rank: self.config.rank,
+                rank,
                 alpha: self.config.alpha,
             });
         }
@@ -200,11 +214,15 @@ impl LoraExporter {
         let mut entries: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
 
         for adapter in &adapters {
+            // LoRA scale (alpha / rank) is baked into the exported `lora_b` here.
+            // The merge loader (lora_merger::load_adapter_safetensors) applies an
+            // unscaled delta B @ A (effective scale 1.0), so the trained scaling
+            // must live in the weights themselves — otherwise the merged delta is
+            // off by a factor of `alpha/rank`.
+            let scale = adapter.alpha / adapter.rank.max(1) as f32;
+
             for (suffix, tensor) in [("lora_a", &adapter.lora_a), ("lora_b", &adapter.lora_b)] {
-                if !matches!(
-                    tensor.device().location(),
-                    candle_core::DeviceLocation::Cpu
-                ) {
+                if !matches!(tensor.device().location(), candle_core::DeviceLocation::Cpu) {
                     return Err(GwenError::CandleError(format!(
                         "tensor '{}.{}' must be on CPU for SafeTensors export",
                         adapter.layer_name, suffix
@@ -216,9 +234,15 @@ impl LoraExporter {
                 let flat = tensor
                     .flatten_all()
                     .map_err(|e| GwenError::CandleError(e.to_string()))?;
-                let data = flat
+                let mut data = flat
                     .to_vec1::<f32>()
                     .map_err(|e| GwenError::CandleError(e.to_string()))?;
+
+                if suffix == "lora_b" && (scale - 1.0).abs() > f32::EPSILON {
+                    for v in &mut data {
+                        *v *= scale;
+                    }
+                }
 
                 entries.push((format!("{}.{}", adapter.layer_name, suffix), shape, data));
             }
@@ -249,19 +273,15 @@ impl LoraExporter {
             );
         }
 
-        let header_json =
-            serde_json::to_string(&Value::Object(header_map)).map_err(|e| {
-                GwenError::CandleError(format!("SafeTensors header serialization failed: {e}"))
-            })?;
+        let header_json = serde_json::to_string(&Value::Object(header_map)).map_err(|e| {
+            GwenError::CandleError(format!("SafeTensors header serialization failed: {e}"))
+        })?;
         let header_bytes = header_json.as_bytes();
         let header_len = header_bytes.len() as u64;
 
         // Write file: 8-byte LE header length + header + data blobs.
         let file = std::fs::File::create(output_path).map_err(|e| {
-            GwenError::CandleError(format!(
-                "failed to create {}: {e}",
-                output_path.display()
-            ))
+            GwenError::CandleError(format!("failed to create {}: {e}", output_path.display()))
         })?;
         let mut writer = BufWriter::new(file);
 
@@ -299,7 +319,10 @@ fn validate_safetensors_header(path: &Path) -> std::result::Result<(), GwenError
     use std::io::Read;
 
     let mut file = std::fs::File::open(path).map_err(|e| {
-        GwenError::CandleError(format!("validation open failed for {}: {e}", path.display()))
+        GwenError::CandleError(format!(
+            "validation open failed for {}: {e}",
+            path.display()
+        ))
     })?;
 
     let mut len_buf = [0u8; 8];
@@ -309,13 +332,11 @@ fn validate_safetensors_header(path: &Path) -> std::result::Result<(), GwenError
 
     let header_len = u64::from_le_bytes(len_buf) as usize;
     let mut header_bytes = vec![0u8; header_len];
-    file.read_exact(&mut header_bytes).map_err(|e| {
-        GwenError::CandleError(format!("validation read header body failed: {e}"))
-    })?;
+    file.read_exact(&mut header_bytes)
+        .map_err(|e| GwenError::CandleError(format!("validation read header body failed: {e}")))?;
 
-    serde_json::from_slice::<Value>(&header_bytes).map_err(|e| {
-        GwenError::CandleError(format!("validation header JSON parse failed: {e}"))
-    })?;
+    serde_json::from_slice::<Value>(&header_bytes)
+        .map_err(|e| GwenError::CandleError(format!("validation header JSON parse failed: {e}")))?;
 
     Ok(())
 }
@@ -344,6 +365,38 @@ fn parse_lora_key(name: &str) -> Option<(Side, usize, String)> {
     let layer_idx: usize = idx_str.parse().ok()?;
     // proj_str is e.g. "q_proj" or "gate_proj" — keep as-is
     Some((side, layer_idx, proj_str.to_string()))
+}
+
+/// Parse a `LayeredTrainingLoop` checkpoint key of the form
+/// `l{N}.{var_key}.lora_{a|b}` (GWEN-219), mapping the projection `var_key`
+/// (`attn_q`, `ffn_down`, …) to the bare projection name (`q`, `down`, …) used
+/// by the merger's `KeyMapper`.
+///
+/// Returns None for non-adapter keys (`tok_embed`, `lm_head`) and for the
+/// single-tensor fallback layout `l{N}.lora_{a|b}` (no per-projection var_key),
+/// which has no inference-engine module to merge into.
+fn parse_layered_lora_key(name: &str) -> Option<(Side, usize, String)> {
+    let rest = name.strip_prefix('l')?;
+    let (idx_str, rest) = rest.split_once('.')?;
+    let layer_idx: usize = idx_str.parse().ok()?;
+    // rest is `{var_key}.lora_{a|b}` — split off the trailing side.
+    let (var_key, side_str) = rest.rsplit_once('.')?;
+    let side = match side_str {
+        "lora_a" => Side::A,
+        "lora_b" => Side::B,
+        _ => return None,
+    };
+    let proj = match var_key {
+        "attn_q" => "q",
+        "attn_k" => "k",
+        "attn_v" => "v",
+        "attn_o" => "o",
+        "ffn_gate" => "gate",
+        "ffn_up" => "up",
+        "ffn_down" => "down",
+        _ => return None,
+    };
+    Some((side, layer_idx, proj.to_string()))
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -378,17 +431,13 @@ mod tests {
         let mut data = varmap.data().lock().unwrap();
         data.insert(
             format!("lora_a_layer_{layer}_{proj}_proj"),
-            candle_core::Var::from_tensor(
-                &Tensor::zeros((rank, d_in), DType::F32, dev).unwrap(),
-            )
-            .unwrap(),
+            candle_core::Var::from_tensor(&Tensor::zeros((rank, d_in), DType::F32, dev).unwrap())
+                .unwrap(),
         );
         data.insert(
             format!("lora_b_layer_{layer}_{proj}_proj"),
-            candle_core::Var::from_tensor(
-                &Tensor::zeros((d_out, rank), DType::F32, dev).unwrap(),
-            )
-            .unwrap(),
+            candle_core::Var::from_tensor(&Tensor::zeros((d_out, rank), DType::F32, dev).unwrap())
+                .unwrap(),
         );
     }
 
@@ -406,9 +455,9 @@ mod tests {
             assert_eq!(adapter.lora_a.dim(0).unwrap(), rank);
             assert_eq!(adapter.lora_b.dim(1).unwrap(), rank);
 
-            adapter.validate_shapes().unwrap_or_else(|e| {
-                panic!("validate_shapes failed for rank={}: {}", rank, e)
-            });
+            adapter
+                .validate_shapes()
+                .unwrap_or_else(|e| panic!("validate_shapes failed for rank={}: {}", rank, e));
 
             let delta = adapter.compute_delta().unwrap();
             assert_eq!(delta.dims(), &[d_out, d_in], "rank={}", rank);
@@ -488,6 +537,92 @@ mod tests {
         assert_eq!(adapters.len(), 1);
         assert_eq!(adapters[0].rank, 4);
         adapters[0].validate_shapes().unwrap();
+    }
+
+    // ── GWEN-219: LayeredTrainingLoop checkpoint layout ───────────────────────
+
+    /// Insert a layered-loop per-projection pair `l{N}.{var_key}.lora_{a|b}`.
+    fn insert_layered_pair(
+        varmap: &VarMap,
+        layer: usize,
+        var_key: &str,
+        rank: usize,
+        d_in: usize,
+        d_out: usize,
+    ) {
+        let dev = &Device::Cpu;
+        let mut data = varmap.data().lock().unwrap();
+        data.insert(
+            format!("l{layer}.{var_key}.lora_a"),
+            candle_core::Var::from_tensor(&Tensor::zeros((rank, d_in), DType::F32, dev).unwrap())
+                .unwrap(),
+        );
+        data.insert(
+            format!("l{layer}.{var_key}.lora_b"),
+            candle_core::Var::from_tensor(&Tensor::zeros((d_out, rank), DType::F32, dev).unwrap())
+                .unwrap(),
+        );
+    }
+
+    /// extract_adapters must understand the LayeredTrainingLoop checkpoint
+    /// layout, emit merger-recognisable bare-proj layer names, derive rank from
+    /// the tensors, and skip the persistent `tok_embed` / `lm_head` vars.
+    #[test]
+    fn extract_adapters_reads_layered_checkpoint_layout() {
+        let varmap = VarMap::new();
+        // All 7 projections for layer 0, with a heterogeneous rank to prove rank
+        // is read from the tensor (not config). GQA-style: k/v narrower.
+        for var_key in ["attn_q", "attn_o", "ffn_gate", "ffn_up", "ffn_down"] {
+            insert_layered_pair(&varmap, 0, var_key, 8, 64, 64);
+        }
+        insert_layered_pair(&varmap, 0, "attn_k", 4, 64, 16);
+        insert_layered_pair(&varmap, 0, "attn_v", 4, 64, 16);
+
+        // Persistent non-adapter params that must be ignored.
+        {
+            let dev = &Device::Cpu;
+            let mut data = varmap.data().lock().unwrap();
+            data.insert(
+                "tok_embed".to_string(),
+                candle_core::Var::from_tensor(&Tensor::zeros((100, 64), DType::F32, dev).unwrap())
+                    .unwrap(),
+            );
+            data.insert(
+                "lm_head".to_string(),
+                candle_core::Var::from_tensor(&Tensor::zeros((64, 100), DType::F32, dev).unwrap())
+                    .unwrap(),
+            );
+        }
+
+        let exporter = LoraExporter::new(LoraConfig::default());
+        let adapters = exporter.extract_adapters(&varmap).unwrap();
+
+        assert_eq!(adapters.len(), 7, "expected one adapter per projection");
+
+        let names: Vec<&str> = adapters.iter().map(|a| a.layer_name.as_str()).collect();
+        for expected in [
+            "lora_layer_0_q_proj",
+            "lora_layer_0_k_proj",
+            "lora_layer_0_v_proj",
+            "lora_layer_0_o_proj",
+            "lora_layer_0_gate_proj",
+            "lora_layer_0_up_proj",
+            "lora_layer_0_down_proj",
+        ] {
+            assert!(names.contains(&expected), "missing adapter {expected}");
+        }
+
+        // Rank must reflect the tensors: k/v are rank 4, the rest rank 8.
+        for a in &adapters {
+            let expected_rank =
+                if a.layer_name.contains("_k_proj") || a.layer_name.contains("_v_proj") {
+                    4
+                } else {
+                    8
+                };
+            assert_eq!(a.rank, expected_rank, "rank for {}", a.layer_name);
+            a.validate_shapes().unwrap();
+        }
     }
 
     // ── Task 1.5: compute_delta with known values ─────────────────────────────

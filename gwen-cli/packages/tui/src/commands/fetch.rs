@@ -20,6 +20,11 @@ pub struct FetchArgs {
     #[arg(short = 'm', long = "model", action = clap::ArgAction::Append, num_args = 1..=3, value_name = "MODEL_ID")]
     pub models: Vec<String>,
 
+    /// Model id as a positional alternative to `-m`, e.g.
+    /// `gwen fetch tinyllama/TinyLlama-1.1B -q q4_k_m`.
+    #[arg(value_name = "MODEL")]
+    pub model_arg: Option<String>,
+
     /// Quantization variant to download (e.g. q4_k_m, q5_k_m, q8_0). Required in --non-interactive mode.
     #[arg(short = 'q', long = "quantize", value_name = "QUANT")]
     pub quantize: Option<String>,
@@ -111,7 +116,13 @@ pub async fn run_fetch(args: FetchArgs, mode: gwenland_core::engine::GwenMode) {
     }
 }
 
-async fn do_fetch(args: FetchArgs, mode: gwenland_core::engine::GwenMode) -> Result<(), FetchError> {
+async fn do_fetch(mut args: FetchArgs, mode: gwenland_core::engine::GwenMode) -> Result<(), FetchError> {
+    // Fold a positional model id into the -m list so both spellings work:
+    //   gwen fetch tinyllama/TinyLlama-1.1B   ≡   gwen fetch -m tinyllama/TinyLlama-1.1B
+    if let Some(m) = args.model_arg.take() {
+        args.models.push(m);
+    }
+
     let tmp_dir = gwenland_core::storage::paths::GwenPaths::tmp_dir();
 
     if args.cache_clear {

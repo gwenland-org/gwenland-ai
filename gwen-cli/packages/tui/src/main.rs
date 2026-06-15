@@ -16,7 +16,11 @@ pub struct GlobalArgs {
 
     /// Agent/script mode — no TUI, no spinners, no interactive prompts.
     /// Auto-enabled when stdout is not a TTY.
-    #[arg(long, short = 'n', global = true)]
+    ///
+    /// NOTE: no short flag. A global `-n` would collide with subcommand-local
+    /// `-n` options (`train --name`, `hub list -n`, `hub-dataset list -n`),
+    /// which makes clap's startup validation panic for every command.
+    #[arg(long, global = true)]
     pub non_interactive: bool,
 
     /// Pre-flight validation only — no side effects (implemented per-command).
@@ -24,7 +28,10 @@ pub struct GlobalArgs {
     pub dry_run: bool,
 
     /// Auto-confirm all [Y/n] prompts.
-    #[arg(long, short = 'y', global = true)]
+    ///
+    /// NOTE: no short flag — a global `-y` would collide with the subcommand
+    /// `-y` confirmations in `hub` / `hub-dataset` (same clap panic as `-n`).
+    #[arg(long, global = true)]
     pub yes: bool,
 }
 
@@ -40,7 +47,7 @@ pub struct GlobalArgs {
                     --json              Structured JSON output\n  \
                     --non-interactive   Agent/script mode (no TUI, no prompts)\n  \
                     --dry-run           Pre-flight validation only\n  \
-                    --yes, -y           Auto-confirm all prompts"
+                    --yes               Auto-confirm all prompts"
 )]
 pub struct Cli {
     #[command(flatten)]

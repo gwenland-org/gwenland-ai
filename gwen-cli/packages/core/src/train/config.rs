@@ -2,7 +2,7 @@
 // @EDITABLE: Add hyperparams here; update to_python_args() accordingly.
 // @DANGER: apply_overrides() must be called after from_yaml() before validate(). Order matters.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -25,6 +25,24 @@ impl Default for LoraConfig {
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
         }
     }
+}
+
+// ── Resume mode (GWEN-222) ────────────────────────────────────────────────────
+
+/// How the native training loop should resume from a prior checkpoint.
+///
+/// Restores LoRA adapter weights only — AdamW optimizer state is not persisted,
+/// so a momentum warm-up period occurs after resuming.
+#[derive(Debug, Clone, Default)]
+pub enum ResumeMode {
+    /// Start fresh from step 0; no checkpoint is loaded. Default.
+    #[default]
+    None,
+    /// Auto-discover the lexicographically greatest `checkpoint_*.safetensors`
+    /// in the configured output directory.
+    Auto,
+    /// Resume from an explicit checkpoint path.
+    Explicit(PathBuf),
 }
 
 // ── TrainResult ──────────────────────────────────────────────────────────────
@@ -62,6 +80,15 @@ pub struct NewTrainConfig {
     pub max_steps: Option<usize>,
     pub output_path: PathBuf,
     pub custom_script: Option<PathBuf>,
+    /// EXPERIMENTAL (GWEN-219 `--gdtqp`): allocate per-projection LoRA rank from
+    /// a GAAP S(ρ) entropy-sensitivity surrogate instead of a uniform rank.
+    /// Theory is UNPROVEN — never fold gdtqp runs into stable benchmark numbers.
+    /// Only the `LayeredTrainingLoop` (local-GGUF path) honours this flag.
+    pub gdtqp: bool,
+    /// GWEN-222: checkpoint resume mode. Restores LoRA adapter weights only;
+    /// AdamW optimizer state is not persisted, so a momentum warm-up occurs.
+    /// Only the `LayeredTrainingLoop` (local-GGUF path) honours this flag.
+    pub resume_checkpoint: ResumeMode,
 }
 
 impl Default for NewTrainConfig {
@@ -79,6 +106,8 @@ impl Default for NewTrainConfig {
             max_steps: None,
             output_path: PathBuf::new(),
             custom_script: None,
+            gdtqp: false,
+            resume_checkpoint: ResumeMode::None,
         }
     }
 }
@@ -100,10 +129,16 @@ pub struct Cli {
 impl From<Cli> for NewTrainConfig {
     fn from(cli: Cli) -> Self {
         let mut cfg = NewTrainConfig::default();
-        if let Some(m) = cli.model      { cfg.model_id     = m; }
-        if let Some(d) = cli.dataset    { cfg.dataset_path = d; }
-        if let Some(o) = cli.output     { cfg.output_path  = o; }
-        cfg.dry_run       = cli.dry_run;
+        if let Some(m) = cli.model {
+            cfg.model_id = m;
+        }
+        if let Some(d) = cli.dataset {
+            cfg.dataset_path = d;
+        }
+        if let Some(o) = cli.output {
+            cfg.output_path = o;
+        }
+        cfg.dry_run = cli.dry_run;
         cfg.custom_script = cli.custom_script;
         cfg
     }
@@ -111,20 +146,48 @@ impl From<Cli> for NewTrainConfig {
 
 // ── default fns (required by serde) ─────────────────────────────────────────
 
-fn default_epochs() -> u32 { 3 }
-fn default_batch() -> u32 { 1 }
-fn default_grad_accum() -> u32 { 16 }
-fn default_lr() -> f64 { 1e-4 }
-fn default_seq_len() -> u32 { 1024 }
-fn default_lora_r() -> u32 { 8 }
-fn default_lora_alpha() -> u32 { 16 }
-fn default_lora_dropout() -> f64 { 0.05 }
-fn default_lora_target() -> String { "q_proj,v_proj".to_string() }
-fn default_true() -> bool { true }
-fn default_optimizer() -> String { "adamw_8bit".to_string() }
-fn default_scheduler() -> String { "cosine".to_string() }
-fn default_weight_decay() -> f64 { 0.01 }
-fn default_max_grad_norm() -> f64 { 1.0 }
+fn default_epochs() -> u32 {
+    3
+}
+fn default_batch() -> u32 {
+    1
+}
+fn default_grad_accum() -> u32 {
+    16
+}
+fn default_lr() -> f64 {
+    1e-4
+}
+fn default_seq_len() -> u32 {
+    1024
+}
+fn default_lora_r() -> u32 {
+    8
+}
+fn default_lora_alpha() -> u32 {
+    16
+}
+fn default_lora_dropout() -> f64 {
+    0.05
+}
+fn default_lora_target() -> String {
+    "q_proj,v_proj".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_optimizer() -> String {
+    "adamw_8bit".to_string()
+}
+fn default_scheduler() -> String {
+    "cosine".to_string()
+}
+fn default_weight_decay() -> f64 {
+    0.01
+}
+fn default_max_grad_norm() -> f64 {
+    1.0
+}
 
 // ── struct ───────────────────────────────────────────────────────────────────
 
@@ -177,10 +240,18 @@ impl TrainConfig {
 
     /// Apply CLI flag overrides. Called after from_yaml(), before validate().
     pub fn apply_overrides(&mut self, args: &crate::train::runner::TrainOverrides) {
-        if let Some(m) = &args.model { self.model = m.clone(); }
-        if let Some(d) = &args.dataset { self.dataset = d.clone(); }
-        if let Some(o) = &args.output { self.output = o.clone(); }
-        if let Some(n) = &args.name { self.name = Some(n.clone()); }
+        if let Some(m) = &args.model {
+            self.model = m.clone();
+        }
+        if let Some(d) = &args.dataset {
+            self.dataset = d.clone();
+        }
+        if let Some(o) = &args.output {
+            self.output = o.clone();
+        }
+        if let Some(n) = &args.name {
+            self.name = Some(n.clone());
+        }
     }
 
     /// Check that the required string fields are not empty.
@@ -200,25 +271,44 @@ impl TrainConfig {
     /// Convert config into ordered CLI args for base_train.py.
     pub fn to_python_args(&self) -> Vec<String> {
         let mut args = vec![
-            "--model-name".into(), self.model.clone(),
-            "--dataset".into(), self.dataset.display().to_string(),
-            "--output-dir".into(), self.output.display().to_string(),
-            "--epochs".into(), self.epochs.to_string(),
-            "--batch-size".into(), self.batch_size.to_string(),
-            "--grad-accum".into(), self.grad_accum.to_string(),
-            "--learning-rate".into(), self.learning_rate.to_string(),
-            "--max-seq-len".into(), self.max_seq_len.to_string(),
-            "--lora-r".into(), self.lora_r.to_string(),
-            "--lora-alpha".into(), self.lora_alpha.to_string(),
-            "--lora-dropout".into(), self.lora_dropout.to_string(),
-            "--lora-target".into(), self.lora_target.clone(),
-            "--optimizer".into(), self.optimizer.clone(),
-            "--scheduler".into(), self.scheduler.clone(),
-            "--weight-decay".into(), self.weight_decay.to_string(),
+            "--model-name".into(),
+            self.model.clone(),
+            "--dataset".into(),
+            self.dataset.display().to_string(),
+            "--output-dir".into(),
+            self.output.display().to_string(),
+            "--epochs".into(),
+            self.epochs.to_string(),
+            "--batch-size".into(),
+            self.batch_size.to_string(),
+            "--grad-accum".into(),
+            self.grad_accum.to_string(),
+            "--learning-rate".into(),
+            self.learning_rate.to_string(),
+            "--max-seq-len".into(),
+            self.max_seq_len.to_string(),
+            "--lora-r".into(),
+            self.lora_r.to_string(),
+            "--lora-alpha".into(),
+            self.lora_alpha.to_string(),
+            "--lora-dropout".into(),
+            self.lora_dropout.to_string(),
+            "--lora-target".into(),
+            self.lora_target.clone(),
+            "--optimizer".into(),
+            self.optimizer.clone(),
+            "--scheduler".into(),
+            self.scheduler.clone(),
+            "--weight-decay".into(),
+            self.weight_decay.to_string(),
         ];
         // argparse flags (store_true): only pass when true
-        if self.qlora { args.push("--qlora".into()); }
-        if self.fp16  { args.push("--fp16".into()); }
+        if self.qlora {
+            args.push("--qlora".into());
+        }
+        if self.fp16 {
+            args.push("--fp16".into());
+        }
         args
     }
 }

@@ -13,7 +13,7 @@
 // Downloading multi-GB files silently would surprise users. `gwen run`
 // prints a clear "not found" message and points to `gwen fetch`.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use candle_core::Device;
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
@@ -31,20 +31,35 @@ pub struct LoadedModel {
 /// Resolve a model name or path to a local GGUF file.
 ///
 /// Resolution order:
-///   1. Exact path — if `model` starts with `./`, `../`, or `/` (or Windows `C:\`)
-///   2. `~/.config/gwen/models/<model>.gguf`
-///   3. `~/.config/gwen/models/<model>-q4_0.gguf`
-///   4. Error with actionable hint
+///   1. A filesystem path — anything that *looks* like a path (explicit `./`,
+///      `../`, `/`, `~`, a drive letter, an embedded separator, or a `.gguf`
+///      suffix). Bare filenames, relative paths, and Windows paths all count.
+///   2. `<models_dir>/<model>.gguf`
+///   3. `<models_dir>/<model>-q4_0.gguf`
+///   4. Error with an actionable hint (HuggingFace ids are routed to `gwen fetch`).
 pub fn resolve_model_path(model: &str) -> Result<PathBuf> {
-    // 1. Explicit path
-    if model.starts_with("./")
-        || model.starts_with("../")
-        || model.starts_with('/')
-        || (model.len() > 2 && model.chars().nth(1) == Some(':'))
-    {
-        let p = PathBuf::from(model);
+    // 1. Anything path-shaped: explicit prefixes, an embedded separator, a
+    //    Windows drive (`C:`), `~`, or a `.gguf` suffix. This accepts bare
+    //    filenames ("model.gguf"), relative paths ("models/x.gguf"), and
+    //    absolute Windows/Unix paths — the previous version only matched
+    //    `./`, `../`, `/`, and `C:`, so `model.gguf` or `sub/model.gguf` fell
+    //    through to the cache lookup and failed confusingly.
+    if looks_like_path(model) {
+        let p = expand_tilde(model);
         if p.exists() {
             return Ok(p);
+        }
+        // A HuggingFace repo id (e.g. `Qwen/Qwen3-1.7B`) also contains a `/`, so
+        // it lands here. Point the user at `gwen fetch` rather than a bare
+        // "does not exist" — you can't serve/run a model that isn't downloaded.
+        if is_hf_repo_id(model) {
+            bail!(
+                "'{}' looks like a HuggingFace repo id, not a local file.\n  \
+                 Download it first:\n    gwen fetch -m {}\n  \
+                 then `gwen run`/`gwen serve` it by the resulting file name or path.",
+                model,
+                model
+            );
         }
         bail!("Model path '{}' does not exist.", model);
     }
@@ -64,12 +79,53 @@ pub fn resolve_model_path(model: &str) -> Result<PathBuf> {
     }
 
     bail!(
-        "Model '{}' not found.\n  Checked:\n    {}\n    {}\n  Run `gwen fetch {}` to download it.",
+        "Model '{}' not found.\n  Checked:\n    {}\n    {}\n  Run `gwen fetch -m {}` to download it.",
         model,
         exact.display(),
         q4.display(),
         model
     )
+}
+
+/// Heuristic: does this string denote a filesystem path rather than a bare
+/// cache name? True for explicit prefixes, embedded separators, a Windows drive
+/// letter, a leading `~`, or a `.gguf` suffix.
+fn looks_like_path(model: &str) -> bool {
+    model.starts_with("./")
+        || model.starts_with("../")
+        || model.starts_with(".\\")
+        || model.starts_with("..\\")
+        || model.starts_with('/')
+        || model.starts_with('~')
+        || model.contains('/')
+        || model.contains('\\')
+        || (model.len() > 2 && model.as_bytes()[1] == b':') // C:\ or C:/
+        || model.to_ascii_lowercase().ends_with(".gguf")
+}
+
+/// A HuggingFace repo id is `org/name` (or `org/name/file`) with no `.gguf`
+/// suffix — distinguishable from a relative path by the absence of a `.gguf`
+/// extension and of OS-specific separators we'd expect in a real local path.
+fn is_hf_repo_id(model: &str) -> bool {
+    model.contains('/')
+        && !model.contains('\\')
+        && !model.to_ascii_lowercase().ends_with(".gguf")
+        && !model.starts_with('.')
+        && !model.starts_with('/')
+        && !model.starts_with('~')
+}
+
+/// Expand a leading `~/` (or `~\`) to the user's home directory.
+fn expand_tilde(model: &str) -> PathBuf {
+    if let Some(rest) = model
+        .strip_prefix("~/")
+        .or_else(|| model.strip_prefix("~\\"))
+    {
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(model)
 }
 
 /// `~/.config/gwen/models/` — where `gwen fetch` stores GGUF files.
@@ -131,8 +187,8 @@ pub fn load(model_name: &str, model_id_for_tokenizer: &str) -> Result<LoadedMode
 
 /// Fetch tokenizer.json from the HF Hub cache (downloads once, then cached).
 fn load_tokenizer(model_id: &str) -> Result<Tokenizer> {
-    use hf_hub::api::sync::ApiBuilder;
     use crate::platform::hub_model::resolve_token;
+    use hf_hub::api::sync::ApiBuilder;
 
     let token = resolve_token();
     let api = ApiBuilder::from_env()
@@ -146,8 +202,7 @@ fn load_tokenizer(model_id: &str) -> Result<Tokenizer> {
         .get("tokenizer.json")
         .with_context(|| format!("failed to fetch tokenizer.json for '{}'", model_id))?;
 
-    Tokenizer::from_file(&tok_path)
-        .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))
+    Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))
 }
 
 /// Estimate GGUF VRAM requirement from file size.
@@ -156,4 +211,62 @@ pub fn estimate_vram_gb(path: &Path) -> f64 {
     std::fs::metadata(path)
         .map(|m| m.len() as f64 / 1_073_741_824.0 * 1.1)
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looks_like_path_classification() {
+        // Path-shaped inputs.
+        assert!(looks_like_path("./m.gguf"));
+        assert!(looks_like_path("../m.gguf"));
+        assert!(looks_like_path("/abs/m.gguf"));
+        assert!(looks_like_path("models/m.gguf"));
+        assert!(looks_like_path("C:/x/m.gguf"));
+        assert!(looks_like_path("C:\\x\\m.gguf"));
+        assert!(looks_like_path("~/m.gguf"));
+        assert!(looks_like_path("m.gguf")); // bare filename with .gguf
+        assert!(looks_like_path("Qwen/Qwen3-1.7B")); // has a separator
+        // Bare cache names are NOT paths.
+        assert!(!looks_like_path("qwen3-8b"));
+        assert!(!looks_like_path("qwen3:8b")); // ':' not at index 1
+    }
+
+    #[test]
+    fn hf_repo_id_detection() {
+        assert!(is_hf_repo_id("Qwen/Qwen3-1.7B"));
+        assert!(is_hf_repo_id("tinyllama/TinyLlama-1.1B"));
+        assert!(!is_hf_repo_id("models/x.gguf")); // local .gguf
+        assert!(!is_hf_repo_id("./sub/x")); // leading '.'
+        assert!(!is_hf_repo_id("qwen3-8b")); // no separator
+        assert!(!is_hf_repo_id("C:\\x\\y")); // backslash path
+    }
+
+    #[test]
+    fn resolve_hf_repo_id_routes_to_fetch_hint() {
+        let err = resolve_model_path("Qwen/Qwen3-1.7B")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("HuggingFace"), "got: {err}");
+        assert!(err.contains("gwen fetch"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_bare_missing_gguf_reports_path_not_found() {
+        let err = resolve_model_path("definitely-not-here.gguf")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_existing_gguf_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("model.gguf");
+        std::fs::write(&p, b"x").unwrap();
+        let resolved = resolve_model_path(p.to_str().unwrap()).unwrap();
+        assert_eq!(resolved, p);
+    }
 }

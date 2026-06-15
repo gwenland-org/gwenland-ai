@@ -7,6 +7,7 @@
 ///
 /// Spec reference: https://github.com/ggerganov/ggml/blob/master/docs/gguf.md
 /// (GGUF v3, which is backward-compatible with v1 and v2 for the subset we use)
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -107,6 +108,52 @@ pub struct GgufFile {
     pub data_base: u64,
 }
 
+/// Scalar GGUF metadata retained by the header-only parser.
+///
+/// Large array values such as tokenizer vocabularies are deliberately skipped;
+/// transformer architecture configuration only needs scalar values.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetadataValue {
+    U64(u64),
+    I64(i64),
+    F64(f64),
+    Bool(bool),
+    String(String),
+}
+
+impl MetadataValue {
+    pub fn as_usize(&self) -> Option<usize> {
+        match self {
+            Self::U64(value) => usize::try_from(*value).ok(),
+            Self::I64(value) if *value >= 0 => usize::try_from(*value as u64).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn as_f32(&self) -> Option<f32> {
+        match self {
+            Self::F64(value) => Some(*value as f32),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::String(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// GGUF header and tensor descriptors without tensor payloads.
+#[derive(Debug)]
+pub struct GgufHeader {
+    pub version: u32,
+    pub metadata: HashMap<String, MetadataValue>,
+    pub tensors: Vec<TensorInfo>,
+    pub data_base: u64,
+}
+
 // ── Parser entry point ────────────────────────────────────────────────────────
 
 /// Parse a GGUF file from `path` and return a `GgufFile` ready for dequant.
@@ -120,9 +167,43 @@ pub fn parse(path: &Path) -> Result<GgufFile, String> {
     parse_inner(&mut reader, path)
 }
 
+/// Parse only the GGUF header, scalar KV metadata, and tensor descriptors.
+///
+/// Tensor payloads remain on disk for mmap-based consumers.
+pub fn parse_header(path: &Path) -> Result<GgufHeader, String> {
+    let file = File::open(path)
+        .map_err(|e| format!("cannot open '{}': {}", path.display(), e))?;
+    let mut reader = BufReader::new(file);
+    parse_header_inner(&mut reader, path)
+}
+
 // ── Internal parser ───────────────────────────────────────────────────────────
 
 fn parse_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufFile, String> {
+    let header = parse_header_inner(r, path)?;
+
+    let mut tensors_out: Vec<TensorInfo> = Vec::with_capacity(header.tensors.len());
+    for mut info in header.tensors {
+        let abs_offset = header.data_base + info.data_offset;
+        r.seek(SeekFrom::Start(abs_offset))
+            .map_err(|e| format!("seek error for tensor '{}': {}", info.name, e))?;
+
+        let mut raw_data = vec![0u8; info.data_size];
+        r.read_exact(&mut raw_data)
+            .map_err(|e| format!("read error for tensor '{}': {}", info.name, e))?;
+
+        info.raw_data = raw_data;
+        tensors_out.push(info);
+    }
+
+    Ok(GgufFile {
+        version: header.version,
+        tensors: tensors_out,
+        data_base: header.data_base,
+    })
+}
+
+fn parse_header_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufHeader, String> {
     // ── Magic + version ───────────────────────────────────────────────────────
     let magic = read_u32_le(r)?;
     if magic != GGUF_MAGIC {
@@ -143,11 +224,14 @@ fn parse_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufFile, Strin
     let tensor_count = read_u64_le(r)? as usize;
     let kv_count = read_u64_le(r)? as usize;
 
-    // ── Skip KV metadata ──────────────────────────────────────────────────────
-    // We don't use any KV metadata for dequantisation. We still must skip over
-    // it correctly to reach the tensor info section.
+    // ── Scalar KV metadata ────────────────────────────────────────────────────
+    let mut metadata = HashMap::with_capacity(kv_count);
     for _ in 0..kv_count {
-        skip_kv_entry(r)?;
+        let key = read_gguf_string(r)?;
+        let value_type = read_u32_le(r)?;
+        if let Some(value) = read_metadata_value(r, value_type)? {
+            metadata.insert(key, value);
+        }
     }
 
     // ── Tensor info section ───────────────────────────────────────────────────
@@ -173,24 +257,12 @@ fn parse_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufFile, Strin
     let data_base = r.stream_position()
         .map_err(|e| format!("seek error reading data base offset: {}", e))?;
 
-    // ── Load raw tensor data ───────────────────────────────────────────────────
-    // Seek to each tensor in order and read its raw bytes. Sequential reads
-    // are much faster than random seeks on spinning disks and NVMe alike.
-    let mut tensors_out: Vec<TensorInfo> = Vec::with_capacity(tensor_infos.len());
-    for mut info in tensor_infos {
-        let abs_offset = data_base + info.data_offset;
-        r.seek(SeekFrom::Start(abs_offset))
-            .map_err(|e| format!("seek error for tensor '{}': {}", info.name, e))?;
-
-        let mut raw_data = vec![0u8; info.data_size];
-        r.read_exact(&mut raw_data)
-            .map_err(|e| format!("read error for tensor '{}': {}", info.name, e))?;
-
-        info.raw_data = raw_data;
-        tensors_out.push(info);
-    }
-
-    Ok(GgufFile { version, tensors: tensors_out, data_base })
+    Ok(GgufHeader {
+        version,
+        metadata,
+        tensors: tensor_infos,
+        data_base,
+    })
 }
 
 // ── Tensor info reader ────────────────────────────────────────────────────────
@@ -228,17 +300,35 @@ fn read_tensor_info<R: Read>(r: &mut R) -> Result<TensorInfo, String> {
 
 // ── KV entry skipping ─────────────────────────────────────────────────────────
 
-/// Skip one KV metadata entry without interpreting its value.
-///
-/// KV entries have a variable-length value depending on their type tag.
-/// We must parse enough to know how many bytes to skip, but we discard the
-/// content entirely — only tensor data matters for dequantisation.
-fn skip_kv_entry<R: Read>(r: &mut R) -> Result<(), String> {
-    // Key is a GGUF string (u64 length prefix + bytes, no null terminator).
-    let _key = read_gguf_string(r)?;
-    let value_type = read_u32_le(r)?;
-    skip_kv_value(r, value_type)?;
-    Ok(())
+fn read_metadata_value<R: Read>(
+    r: &mut R,
+    value_type: u32,
+) -> Result<Option<MetadataValue>, String> {
+    let value = match value_type {
+        0 => MetadataValue::U64(read_u8(r)? as u64),
+        1 => MetadataValue::I64(read_i8(r)? as i64),
+        2 => MetadataValue::U64(read_u16_le(r)? as u64),
+        3 => MetadataValue::I64(read_i16_le(r)? as i64),
+        4 => MetadataValue::U64(read_u32_le(r)? as u64),
+        5 => MetadataValue::I64(read_i32_le(r)? as i64),
+        6 => MetadataValue::F64(read_f32_le(r)? as f64),
+        7 => MetadataValue::Bool(read_u8(r)? != 0),
+        8 => MetadataValue::String(read_gguf_string(r)?),
+        9 => {
+            skip_kv_value(r, value_type)?;
+            return Ok(None);
+        }
+        10 => MetadataValue::U64(read_u64_le(r)?),
+        11 => MetadataValue::I64(read_i64_le(r)?),
+        12 => MetadataValue::F64(read_f64_le(r)?),
+        other => {
+            return Err(format!(
+                "unknown KV value type {} in GGUF metadata",
+                other
+            ));
+        }
+    };
+    Ok(Some(value))
 }
 
 fn skip_kv_value<R: Read>(r: &mut R, vtype: u32) -> Result<(), String> {

@@ -10,42 +10,21 @@ use gwenland_core::train::{LayerLoader, LayeredTrainingLoop};
 use gwenland_core::train::layer_loader::LIVE_LAYER_COUNT;
 
 // write_minimal_gguf_pub is exposed via feature = "test-utils" in layer_loader.rs.
-use gwenland_core::train::layer_loader::write_minimal_gguf_pub as write_minimal_gguf;
+use gwenland_core::train::layer_loader::write_transformer_gguf_pub;
 
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{VarBuilder, VarMap};
+use candle_core::{Device, Tensor};
+use candle_nn::VarMap;
 use gwenland_core::train::config::{LoraConfig, NewTrainConfig};
 use tempfile::TempDir;
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 
-/// Write a two-layer GGUF where every tensor is 4 × f32 (16 bytes).
-///
-/// shape (4,1): d_out=4 covers token IDs [0..3], d_in=1 matches make_batch(2).
 fn two_layer_gguf() -> tempfile::NamedTempFile {
-    let w: Vec<u8> = [0.1f32, 0.2, 0.3, 0.4]
-        .iter().flat_map(|v| v.to_le_bytes()).collect();
-    write_minimal_gguf(&[
-        ("model.layers.0.self_attn.q_proj.weight", &w),
-        ("model.layers.1.self_attn.q_proj.weight", &w),
-    ])
+    write_transformer_gguf_pub(2)
 }
 
 fn make_varmap() -> VarMap {
-    const R: usize = 2;
-    const D_IN: usize = 1;
-    const D_OUT: usize = 4;
-    let vm = VarMap::new();
-    let vb = VarBuilder::from_varmap(&vm, DType::F32, &Device::Cpu);
-    let _ = vb.get_with_hints(
-        (R, D_IN), "lora_a",
-        candle_nn::init::Init::Randn { mean: 0.0, stdev: 0.01 },
-    ).unwrap();
-    let _ = vb.get_with_hints(
-        (D_OUT, R), "lora_b",
-        candle_nn::init::Init::Const(0.0),
-    ).unwrap();
-    vm
+    VarMap::new()
 }
 
 fn make_config(output: std::path::PathBuf) -> NewTrainConfig {
@@ -76,7 +55,7 @@ fn integration_layered_training_loop_loss_is_finite() {
     let cfg = make_config(td.path().to_path_buf());
 
     let mut ltl = LayeredTrainingLoop::new(
-        cfg, f.path(), make_batch(2), make_varmap(), None,
+        cfg, f.path(), make_batch(2), make_varmap(), None, 0,
     ).expect("LayeredTrainingLoop::new failed");
 
     let result = ltl.run().expect("LayeredTrainingLoop::run failed");
@@ -96,22 +75,14 @@ fn integration_layered_training_loop_loss_is_finite() {
 // while the layer is held and 0 immediately after drop.  If any path ever
 // materialises two layers simultaneously the assertion fires.
 //
-// This is gated on `#[cfg(unix)]` because `MADV_DONTNEED` (the mechanism that
-// reclaims pages on drop) is a Unix-only kernel call.  On Windows the counter
-// still tracks objects correctly but physical-page reclaim timing is up to the
-// kernel working-set manager, so asserting RSS-level behaviour there is fragile.
-#[cfg(unix)]
+// The object-lifetime counter is platform-independent. Unix additionally
+// issues MADV_DONTNEED on drop; Windows leaves physical-page reclamation to
+// the kernel, which is outside this test's scope.
 #[test]
 fn invariant_never_more_than_one_layer_in_ram() {
     use std::sync::atomic::Ordering;
 
-    let w: Vec<u8> = [0.1f32, 0.2, 0.3, 0.4]
-        .iter().flat_map(|v| v.to_le_bytes()).collect();
-    let f = write_minimal_gguf(&[
-        ("model.layers.0.self_attn.q_proj.weight", &w),
-        ("model.layers.1.self_attn.q_proj.weight", &w),
-        ("model.layers.2.self_attn.q_proj.weight", &w),
-    ]);
+    let f = write_transformer_gguf_pub(3);
 
     let loader = LayerLoader::open(f.path()).expect("open");
     assert_eq!(loader.num_layers(), 3);
