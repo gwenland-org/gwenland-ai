@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use gwenland_core::train::config::{LoraConfig, NewTrainConfig, TrainConfig};
+use gwenland_core::error::GwenError;
+use gwenland_core::train::config::{LoraConfig, NewTrainConfig, ResumeMode, TrainConfig};
 use gwenland_core::train::dry_run::{self, DryRunResult};
 use gwenland_core::train::lora_cli;
 use gwenland_core::train::native_runner;
@@ -91,6 +92,23 @@ pub struct TrainArgs {
     #[arg(long, value_name = "PATH", global = false,
           help = "Base GGUF model path for --auto-merge (required when --auto-merge is set)")]
     pub base_model: Option<PathBuf>,
+
+    // ── experimental ──────────────────────────────────────────────────────────
+
+    #[arg(long, global = false,
+          help = "EXPERIMENTAL: allocate per-projection LoRA rank from a GAAP S(ρ) \
+                  entropy-sensitivity surrogate (UNPROVEN theory; only the local-GGUF \
+                  --config training path honours it; never report as a stable benchmark)")]
+    pub gdtqp: bool,
+
+    // ── resume (GWEN-222) ─────────────────────────────────────────────────────
+
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "AUTO",
+          global = false,
+          help = "Resume from the last checkpoint (auto-discover) or an explicit checkpoint \
+                  path. Restores LoRA adapter weights only — AdamW optimizer state is NOT \
+                  restored; a momentum warm-up period will occur after resuming.")]
+    pub resume: Option<String>,
 }
 
 // ── Subcommands ───────────────────────────────────────────────────────────────
@@ -123,6 +141,12 @@ pub struct ExportAdapterArgs {
     #[arg(long,
           help = "Validate checkpoint and count adapters without writing output")]
     pub dry_run: bool,
+
+    #[arg(long, value_name = "PATH",
+          help = "Base GGUF file for pre-export shape validation (optional). When provided, \
+                  lora_a/lora_b dimensions are checked against the base model tensors before \
+                  any output is written.")]
+    pub base_gguf: Option<PathBuf>,
 }
 
 // ── merge-adapter args ────────────────────────────────────────────────────────
@@ -191,6 +215,22 @@ async fn run_train_inner(
         return run_legacy_path(&args, &mode).await;
     }
 
+    // ── path 1b: local-GGUF model via flags (no config) ──────────────────────
+    // `gwen train -m ./model.gguf -d data.jsonl [--gdtqp] [--dry-run]` trains
+    // against a local GGUF through the streaming layered loop — the same code
+    // path the `--config` flow uses (run_train_with_opts → run_native_local) —
+    // so a config YAML is no longer required just to point at a local file.
+    if let Some(model) = args.model.as_deref() {
+        if is_local_gguf_path(model) {
+            let config = build_train_config_from_args(&args)?;
+            return run_train_with_opts(
+                &config, dry_run, args.verbose, mode.json, None, args.gdtqp,
+                resume_mode_from_args(&args),
+            )
+            .await;
+        }
+    }
+
     // ── path 2: dry-run estimation (no config; needs --model/--dataset) ──────
     if dry_run {
         let config = build_train_config_from_args(&args)?;
@@ -204,6 +244,33 @@ async fn run_train_inner(
     run_native_path(args, mode).await
 }
 
+/// True when `model` denotes a local GGUF file rather than a HuggingFace id —
+/// a `.gguf` suffix, an explicit path prefix, or an existing file on disk.
+fn is_local_gguf_path(model: &str) -> bool {
+    model.to_ascii_lowercase().ends_with(".gguf")
+        || model.starts_with("./")
+        || model.starts_with("../")
+        || model.starts_with('/')
+        || model.starts_with('~')
+        || model.starts_with(".\\")
+        || model.starts_with("..\\")
+        || (model.len() > 2 && model.as_bytes()[1] == b':')
+        || std::path::Path::new(model).is_file()
+}
+
+/// Map the `--resume` flag to a `ResumeMode` (GWEN-222).
+///
+/// clap uses `default_missing_value = "AUTO"`, so bare `--resume` yields
+/// `Some("AUTO")` → `Auto`; `--resume <path>` yields `Some(path)` → `Explicit`;
+/// the flag absent yields `None` → `ResumeMode::None`.
+fn resume_mode_from_args(args: &TrainArgs) -> ResumeMode {
+    match &args.resume {
+        None => ResumeMode::None,
+        Some(s) if s == "AUTO" => ResumeMode::Auto,
+        Some(p) => ResumeMode::Explicit(PathBuf::from(p)),
+    }
+}
+
 // ── Task 8.1: export-adapter handler ─────────────────────────────────────────
 
 /// Handle `gwen train export-adapter`.
@@ -212,6 +279,21 @@ async fn run_train_inner(
 /// delegated to `gwenland_core::train::lora_cli::export_adapter` so that the
 /// tui crate never needs to import candle or ML types directly.
 fn run_export_adapter(args: ExportAdapterArgs) -> Result<()> {
+    // GWEN-222: validate --base-gguf early (before loading the checkpoint) so the
+    // user sees a bad path immediately; warn loudly when validation is skipped.
+    match &args.base_gguf {
+        Some(base) if !base.exists() => {
+            anyhow::bail!("--base-gguf path does not exist: {}", base.display());
+        }
+        Some(_) => {}
+        None => {
+            eprintln!(
+                "[export-adapter] warning: --base-gguf not provided; shape validation skipped — \
+                 exported adapter has not been verified against a base model"
+            );
+        }
+    }
+
     if args.dry_run {
         eprintln!("[export-adapter] dry-run: validating checkpoint...");
     } else {
@@ -222,7 +304,12 @@ fn run_export_adapter(args: ExportAdapterArgs) -> Result<()> {
         );
     }
 
-    match lora_cli::export_adapter(&args.checkpoint, &args.output, args.dry_run) {
+    match lora_cli::export_adapter(
+        &args.checkpoint,
+        &args.output,
+        args.dry_run,
+        args.base_gguf.as_deref(),
+    ) {
         Ok(count) if args.dry_run => {
             eprintln!("[export-adapter] validation passed: {count} adapter pair(s) found");
             Ok(())
@@ -233,6 +320,17 @@ fn run_export_adapter(args: ExportAdapterArgs) -> Result<()> {
                 args.output.display()
             );
             Ok(())
+        }
+        Err(GwenError::ShapeMismatch {
+            adapter_key,
+            adapter,
+            base,
+        }) => {
+            eprintln!(
+                "[export-adapter] shape mismatch: adapter '{adapter_key}' has dims {adapter:?}, \
+                 expected {base:?} from base GGUF"
+            );
+            std::process::exit(1);
         }
         Err(e) => {
             eprintln!("[export-adapter] error: {e}");
@@ -337,6 +435,8 @@ async fn run_legacy_path(
             args.verbose,
             mode.json,
             args.custom_script.as_deref(),
+            args.gdtqp,
+            resume_mode_from_args(args),
         )
         .await?;
     }
@@ -442,7 +542,9 @@ async fn run_native_path(
         };
 
         eprintln!("[auto-merge] step 1/2: exporting adapter...");
-        if let Err(e) = lora_cli::export_adapter(&checkpoint_path, &adapter_path, false) {
+        // Shape validation is not needed here — the adapter is merged into the
+        // same base model immediately, so pass None.
+        if let Err(e) = lora_cli::export_adapter(&checkpoint_path, &adapter_path, false, None) {
             eprintln!("[auto-merge] export failed: {e}");
             std::process::exit(1);
         }
@@ -521,10 +623,10 @@ fn print_dry_run_table(result: &DryRunResult, config: &TrainConfig) {
 
 fn build_train_config_from_args(args: &TrainArgs) -> Result<TrainConfig> {
     let model = args.model.clone().context(
-        "--dry-run requires --model/-m <HF_MODEL_ID>",
+        "training requires --model/-m <HF_MODEL_ID | ./model.gguf>",
     )?;
     let dataset = args.dataset.clone().context(
-        "--dry-run requires --dataset/-d <PATH>",
+        "training requires --dataset/-d <PATH>",
     )?;
     let output = args
         .output
@@ -609,5 +711,65 @@ fn fmt_duration(d: Duration) -> String {
         format!("{}m {:02}s", secs / 60, secs % 60)
     } else {
         format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal all-default `TrainArgs` for mapping tests.
+    fn bare_train_args() -> TrainArgs {
+        TrainArgs {
+            subcommand: None,
+            config: None,
+            model: None,
+            dataset: None,
+            epochs: None,
+            lr: None,
+            output: None,
+            dry_run: false,
+            verbose: false,
+            custom_script: None,
+            name: None,
+            auto_merge: false,
+            base_model: None,
+            gdtqp: false,
+            resume: None,
+        }
+    }
+
+    /// GWEN-222: a non-existent --base-gguf path must fail fast (before the
+    /// checkpoint is loaded), returning an Err rather than reaching the
+    /// export/exit path.
+    #[test]
+    fn test_export_adapter_base_gguf_missing_path() {
+        let args = ExportAdapterArgs {
+            checkpoint: PathBuf::from("unused_checkpoint.safetensors"),
+            output: PathBuf::from("unused_output.safetensors"),
+            dry_run: false,
+            base_gguf: Some(PathBuf::from("/nonexistent/base-model.gguf")),
+        };
+        let result = run_export_adapter(args);
+        assert!(
+            result.is_err(),
+            "missing --base-gguf path must Err before loading the checkpoint"
+        );
+    }
+
+    /// `resume_mode_from_args` maps the clap `Option<String>` to `ResumeMode`.
+    #[test]
+    fn test_resume_mode_mapping() {
+        let none = bare_train_args();
+        assert!(matches!(resume_mode_from_args(&none), ResumeMode::None));
+
+        let auto = TrainArgs { resume: Some("AUTO".to_string()), ..bare_train_args() };
+        assert!(matches!(resume_mode_from_args(&auto), ResumeMode::Auto));
+
+        let explicit = TrainArgs {
+            resume: Some("ckpt.safetensors".to_string()),
+            ..bare_train_args()
+        };
+        assert!(matches!(resume_mode_from_args(&explicit), ResumeMode::Explicit(_)));
     }
 }

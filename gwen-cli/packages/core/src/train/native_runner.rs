@@ -16,6 +16,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::{VarBuilder, VarMap};
 
 use crate::platform::hub_model::resolve_token;
+use crate::train::checkpoint_resumer;
 use crate::train::config::{NewTrainConfig, TrainResult};
 use crate::train::dataset::{batch, load_jsonl, tokenize, DEFAULT_MAX_LEN};
 use crate::train::lora::LoraLayer;
@@ -86,11 +87,27 @@ pub fn run_native_local(
     // adapters itself, so we pass an empty VarMap here.
     let varmap = VarMap::new();
 
-    // ── 4. LayeredTrainingLoop ────────────────────────────────────────────────
+    // ── 4. Checkpoint resume discovery (GWEN-222) ─────────────────────────────
+    // Resolve BEFORE constructing the loop to obtain the restored step counter,
+    // but load the weights AFTER construction: `VarMap::load` only populates Vars
+    // that already exist, and the adapter Vars are created inside `new()`.
+    let (ckpt_path, initial_step) = checkpoint_resumer::resolve_checkpoint(
+        &config.resume_checkpoint,
+        &config.output_path,
+    )
+    .context("checkpoint resume discovery failed")?;
+
+    // ── 5. LayeredTrainingLoop ────────────────────────────────────────────────
     eprintln!("[train] opening GGUF: {}", gguf_path.display());
     let mut training_loop = LayeredTrainingLoop::new(
-        config.clone(), gguf_path, batches, varmap, tx,
+        config.clone(), gguf_path, batches, varmap, tx, initial_step,
     ).context("failed to initialise LayeredTrainingLoop")?;
+
+    if let Some(ref path) = ckpt_path {
+        training_loop
+            .load_checkpoint(path)
+            .context("failed to load checkpoint into VarMap")?;
+    }
 
     eprintln!("[train] starting layered training ({} epochs)…", config.epochs);
     training_loop.run().context("layered training loop failed")

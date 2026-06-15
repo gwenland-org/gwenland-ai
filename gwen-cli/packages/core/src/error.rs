@@ -56,8 +56,12 @@ pub enum GwenError {
     MissingLoraPair { layer_idx: usize },
 
     /// The adapter delta shape does not match the base weight shape.
-    #[error("shape mismatch: adapter {adapter:?} vs base {base:?}")]
-    ShapeMismatch { adapter: Vec<usize>, base: Vec<usize> },
+    #[error("shape mismatch for adapter '{adapter_key}': adapter {adapter:?} vs base {base:?}")]
+    ShapeMismatch {
+        adapter_key: String,
+        adapter: Vec<usize>,
+        base: Vec<usize>,
+    },
 
     /// The GGUF tensor uses a quantization format the merger does not support.
     #[error("unsupported quantization format: {format}")]

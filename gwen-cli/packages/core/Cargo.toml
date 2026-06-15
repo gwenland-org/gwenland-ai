@@ -103,6 +103,11 @@ name = "gwen216_integration"
 path = "tests/gwen216_integration.rs"
 required-features = ["test-utils"]
 
+[[test]]
+name = "gwen222_e2e"
+path = "tests/gwen222_e2e.rs"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "core_bench"
 harness = false

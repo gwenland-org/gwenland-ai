@@ -3,24 +3,24 @@
 // @DANGER: script temp file must remain in scope for the entire subprocess lifetime.
 //          Assigning it to `_script` (underscore) is intentional: keep alive, not unused.
 
-use anyhow::{bail, Context, Result};
-use std::process::Stdio;
+use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use crate::dataset::validate::{run_validation, ValidateOptions};
+use crate::dataset::validate::{ValidateOptions, run_validation};
 use crate::storage::registry::{ModelEntry, ModelRegistry};
-use crate::train::config::TrainConfig;
+use crate::train::config::{ResumeMode, TrainConfig};
 use crate::train::script::write_train_script;
-use crate::train::vram::{estimate_vram, estimate_train_time, vram_suggestions};
+use crate::train::vram::{estimate_train_time, estimate_vram, vram_suggestions};
 
 /// Subset of CLI args that can override YAML fields.
 /// Defined here so config.rs can reference it without a TUI dependency.
 pub struct TrainOverrides {
-    pub model:   Option<String>,
+    pub model: Option<String>,
     pub dataset: Option<PathBuf>,
-    pub output:  Option<PathBuf>,
-    pub name:    Option<String>,
+    pub output: Option<PathBuf>,
+    pub name: Option<String>,
 }
 
 // ── public entry point ───────────────────────────────────────────────────────
@@ -36,7 +36,11 @@ pub async fn preflight_and_spawn(
 ) -> Result<(tokio::process::Child, tempfile::NamedTempFile)> {
     config.validate()?;
 
-    let val_opts = ValidateOptions { strict: false, fix: false, inplace: false };
+    let val_opts = ValidateOptions {
+        strict: false,
+        fix: false,
+        inplace: false,
+    };
     let val = run_validation(&config.dataset, &val_opts)
         .map_err(|e| anyhow::anyhow!("dataset validation failed: {}", e))?;
     if val.error_count > 0 {
@@ -73,7 +77,8 @@ pub async fn run_train(
     verbose: bool,
     custom_script: Option<&Path>,
 ) -> Result<()> {
-    run_train_with_opts(config, dry_run, verbose, false, custom_script).await
+    run_train_with_opts(config, dry_run, verbose, false, custom_script, false, ResumeMode::None)
+        .await
 }
 
 pub async fn run_train_with_opts(
@@ -82,12 +87,18 @@ pub async fn run_train_with_opts(
     verbose: bool,
     json_output: bool,
     custom_script: Option<&Path>,
+    gdtqp: bool,
+    resume: ResumeMode,
 ) -> Result<()> {
     // 1. Validate config fields
     config.validate()?;
 
     // 2. Dataset validation — reuse JIN-169 implementation
-    let val_opts = ValidateOptions { strict: false, fix: false, inplace: false };
+    let val_opts = ValidateOptions {
+        strict: false,
+        fix: false,
+        inplace: false,
+    };
     let val = run_validation(&config.dataset, &val_opts)
         .map_err(|e| anyhow::anyhow!("dataset validation failed: {}", e))?;
     if val.error_count > 0 {
@@ -119,7 +130,8 @@ pub async fn run_train_with_opts(
     //    memory + loss. For remote/HF models, fall back to the estimation table.
     if dry_run && is_local_model_path(&config.model) {
         let gguf_path = resolve_local_model_path(&config.model);
-        let native_cfg = train_config_to_native(config, true);
+        // Dry-run is a 1-step memory/loss probe; never resume into it.
+        let native_cfg = train_config_to_native(config, true, gdtqp, ResumeMode::None);
         crate::train::native_runner::run_native_local(&native_cfg, &gguf_path, None, None)?;
         return Ok(());
     }
@@ -131,19 +143,14 @@ pub async fn run_train_with_opts(
     // 6. Dispatch: native Rust path for local GGUF, Python script path otherwise
     if is_local_model_path(&config.model) {
         let gguf_path = resolve_local_model_path(&config.model);
-        let native_cfg = train_config_to_native(config, false);
+        let native_cfg = train_config_to_native(config, false, gdtqp, resume);
         let (tx, _rx) = std::sync::mpsc::channel::<String>();
         std::thread::spawn(move || {
             while let Ok(msg) = _rx.recv() {
                 println!("{}", msg);
             }
         });
-        crate::train::native_runner::run_native_local(
-            &native_cfg,
-            &gguf_path,
-            None,
-            Some(tx),
-        )?;
+        crate::train::native_runner::run_native_local(&native_cfg, &gguf_path, None, Some(tx))?;
     } else {
         let _script = write_train_script(custom_script)?;
         spawn_training(config, _script.path(), verbose).await?;
@@ -209,7 +216,7 @@ fn print_dry_run_report(
     val: &crate::dataset::validate::ValidationResult,
 ) -> Result<()> {
     let divider = "━".repeat(50);
-    let line    = "─".repeat(44);
+    let line = "─".repeat(44);
 
     // Check output dir free space
     let free_gb = if config.output.exists() || std::fs::create_dir_all(&config.output).is_ok() {
@@ -227,16 +234,34 @@ fn print_dry_run_report(
     println!("  {:<16} {:<24} ✓", config_label, "(loaded)");
 
     let dataset_str = config.dataset.display().to_string();
-    let dataset_short = if dataset_str.len() > 22 { &dataset_str[dataset_str.len()-22..] } else { &dataset_str };
-    println!("  {:<16} {:<24} ✓  ({} valid samples)", "Dataset", dataset_short, val.valid);
+    let dataset_short = if dataset_str.len() > 22 {
+        &dataset_str[dataset_str.len() - 22..]
+    } else {
+        &dataset_str
+    };
+    println!(
+        "  {:<16} {:<24} ✓  ({} valid samples)",
+        "Dataset", dataset_short, val.valid
+    );
 
-    let model_short = if config.model.len() > 24 { &config.model[..24] } else { &config.model };
+    let model_short = if config.model.len() > 24 {
+        &config.model[..24]
+    } else {
+        &config.model
+    };
     println!("  {:<16} {:<24} ✓", "Base model", model_short);
 
     let output_str = config.output.display().to_string();
-    let output_short = if output_str.len() > 22 { &output_str[output_str.len()-22..] } else { &output_str };
+    let output_short = if output_str.len() > 22 {
+        &output_str[output_str.len() - 22..]
+    } else {
+        &output_str
+    };
     if let Some(gb) = free_gb {
-        println!("  {:<16} {:<24} ✓  ({:.0} GB free)", "Output dir", output_short, gb);
+        println!(
+            "  {:<16} {:<24} ✓  ({:.0} GB free)",
+            "Output dir", output_short, gb
+        );
     } else {
         println!("  {:<16} {:<24} ✓", "Output dir", output_short);
     }
@@ -248,15 +273,34 @@ fn print_dry_run_report(
 
     println!("  VRAM Breakdown");
     println!("  {}", line);
-    println!("  {:<20} {:<26} {:.1} GB", "Base model", est.model_label, est.base_gb);
+    println!(
+        "  {:<20} {:<26} {:.1} GB",
+        "Base model", est.model_label, est.base_gb
+    );
     let lora_desc = format!("r={}, target: {}", config.lora_r, config.lora_target);
-    println!("  {:<20} {:<26} {:.1} GB", "LoRA adapters", lora_desc, est.lora_gb);
+    println!(
+        "  {:<20} {:<26} {:.1} GB",
+        "LoRA adapters", lora_desc, est.lora_gb
+    );
     let act_desc = format!("batch={}, seq={}", config.batch_size, config.max_seq_len);
-    println!("  {:<20} {:<26} {:.1} GB", "Activations", act_desc, est.activation_gb);
+    println!(
+        "  {:<20} {:<26} {:.1} GB",
+        "Activations", act_desc, est.activation_gb
+    );
 
-    let opt_label = if config.optimizer.contains("8bit") { "AdamW 8-bit states" } else { "AdamW states" };
-    println!("  {:<20} {:<26} {:.1} GB", "Optimizer", opt_label, est.optimizer_gb);
-    println!("  {:<20} {:<26} {:.1} GB", "Safety buffer", "+20% overhead", est.safety_gb);
+    let opt_label = if config.optimizer.contains("8bit") {
+        "AdamW 8-bit states"
+    } else {
+        "AdamW states"
+    };
+    println!(
+        "  {:<20} {:<26} {:.1} GB",
+        "Optimizer", opt_label, est.optimizer_gb
+    );
+    println!(
+        "  {:<20} {:<26} {:.1} GB",
+        "Safety buffer", "+20% overhead", est.safety_gb
+    );
     println!("  {}", line);
     println!("  {:<46} {:.1} GB", "Total estimated", est.total_gb);
 
@@ -291,7 +335,10 @@ fn print_dry_run_report(
     println!("  {}", line);
     println!("  {:<20} {}", "Epochs", config.epochs);
     println!("  {:<20} {}", "Steps", total_steps);
-    println!("  {:<20} ~{}  (based on T4 baseline)", "Est. time", time_str);
+    println!(
+        "  {:<20} ~{}  (based on T4 baseline)",
+        "Est. time", time_str
+    );
     println!("{}", divider);
 
     // ── Result ────────────────────────────────────────────────────────────────
@@ -322,7 +369,9 @@ fn print_dry_run_report(
 /// Returns true when `model` looks like a local file path rather than a HF model ID.
 /// Triggers on: leading `.` (relative), `/` (absolute), `~` (home), or `.gguf` suffix.
 fn is_local_model_path(model: &str) -> bool {
-    model.starts_with('.') || model.starts_with('/') || model.starts_with('~')
+    model.starts_with('.')
+        || model.starts_with('/')
+        || model.starts_with('~')
         || model.ends_with(".gguf")
 }
 
@@ -355,7 +404,8 @@ async fn check_model_on_hub(model_id: &str) -> Result<()> {
         bail!(
             "model '{}' not found in local registry or HF Hub. \
              Check the model ID or run `gwen fetch -m {}`.",
-            model_id, model_id
+            model_id,
+            model_id
         );
     }
     if !resp.status().is_success() && resp.status() != reqwest::StatusCode::UNAUTHORIZED {
@@ -407,7 +457,11 @@ pub fn spawn_child(
         .arg(script)
         .args(config.to_python_args())
         .stdout(Stdio::piped())
-        .stderr(if verbose { Stdio::inherit() } else { Stdio::null() })
+        .stderr(if verbose {
+            Stdio::inherit()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .context("failed to spawn python3 — is Python 3 installed and on PATH?")
 }
@@ -422,7 +476,11 @@ async fn spawn_training(config: &TrainConfig, script: &Path, verbose: bool) -> R
 
     let mut lines = BufReader::new(stdout).lines();
 
-    while let Some(line) = lines.next_line().await.context("error reading subprocess stdout")? {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("error reading subprocess stdout")?
+    {
         match serde_json::from_str::<serde_json::Value>(&line) {
             Ok(val) => handle_json_line(&val)?,
             Err(_) => {
@@ -433,7 +491,10 @@ async fn spawn_training(config: &TrainConfig, script: &Path, verbose: bool) -> R
         }
     }
 
-    let status = child.wait().await.context("failed to wait for training subprocess")?;
+    let status = child
+        .wait()
+        .await
+        .context("failed to wait for training subprocess")?;
     if !status.success() {
         bail!(
             "training subprocess exited with code {}",
@@ -456,10 +517,7 @@ fn handle_json_line(val: &serde_json::Value) -> Result<()> {
 
     match val.get("event").and_then(|e| e.as_str()) {
         Some("done") => {
-            let out = val
-                .get("output")
-                .and_then(|o| o.as_str())
-                .unwrap_or("");
+            let out = val.get("output").and_then(|o| o.as_str()).unwrap_or("");
             println!("  + Training complete -> {}", out);
         }
         Some("interrupted") => {
@@ -495,7 +553,11 @@ fn register_trained_model(config: &TrainConfig) -> Result<()> {
         id: id.clone(),
         source: config.model.clone(),
         format: "lora".into(),
-        quant: if config.qlora { "qlora".into() } else { "full".into() },
+        quant: if config.qlora {
+            "qlora".into()
+        } else {
+            "full".into()
+        },
         size_bytes: 0,
         downloaded_at: chrono::Utc::now().to_rfc3339(),
         sha256: String::new(),
@@ -504,7 +566,10 @@ fn register_trained_model(config: &TrainConfig) -> Result<()> {
 
     registry.upsert(entry);
     registry.save().with_context(|| {
-        format!("training succeeded but could not update model registry for '{}'", id)
+        format!(
+            "training succeeded but could not update model registry for '{}'",
+            id
+        )
     })?;
     Ok(())
 }
@@ -513,27 +578,35 @@ fn register_trained_model(config: &TrainConfig) -> Result<()> {
 ///
 /// When `dry_run` is set, `max_steps` is capped to 1 so the native runner runs
 /// a single forward/backward/step and reports memory + loss, then exits.
-fn train_config_to_native(cfg: &TrainConfig, dry_run: bool) -> crate::train::config::NewTrainConfig {
+fn train_config_to_native(
+    cfg: &TrainConfig,
+    dry_run: bool,
+    gdtqp: bool,
+    resume: ResumeMode,
+) -> crate::train::config::NewTrainConfig {
     crate::train::config::NewTrainConfig {
-        model_id:     cfg.model.clone(),
+        model_id: cfg.model.clone(),
         dataset_path: cfg.dataset.clone(),
-        epochs:       cfg.epochs as usize,
-        batch_size:   cfg.batch_size as usize,
-        grad_accum:   cfg.grad_accum as usize,
-        lr:           cfg.learning_rate,
+        epochs: cfg.epochs as usize,
+        batch_size: cfg.batch_size as usize,
+        grad_accum: cfg.grad_accum as usize,
+        lr: cfg.learning_rate,
         max_grad_norm: cfg.max_grad_norm,
         lora: crate::train::config::LoraConfig {
-            r:              cfg.lora_r as usize,
-            alpha:          cfg.lora_alpha as f32,
-            dropout:        cfg.lora_dropout,
-            target_modules: cfg.lora_target
+            r: cfg.lora_r as usize,
+            alpha: cfg.lora_alpha as f32,
+            dropout: cfg.lora_dropout,
+            target_modules: cfg
+                .lora_target
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .collect(),
         },
         dry_run,
-        max_steps:     if dry_run { Some(1) } else { None },
-        output_path:   cfg.output.clone(),
+        max_steps: if dry_run { Some(1) } else { None },
+        output_path: cfg.output.clone(),
         custom_script: None,
+        gdtqp,
+        resume_checkpoint: resume,
     }
 }

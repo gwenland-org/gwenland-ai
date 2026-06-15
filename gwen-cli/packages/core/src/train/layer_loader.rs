@@ -5,14 +5,15 @@
 /// lives inside a memory-mapped GGUF file.  `LayerIndex` groups slices by
 /// layer number so the training loop can load exactly one layer at a time.
 ///
-/// `LayerLoader` opens a GGUF file with `LoadMode::Lazy` so the OS never
-/// pulls the entire model into RSS.  `load_layer(n)` materialises exactly one
-/// layer's worth of tensors; `LoadedLayer::unload()` (or drop) releases them.
+/// `LayerLoader` parses only the GGUF header, then opens the file with
+/// `LoadMode::Lazy` so tensor payloads remain mmap-backed. `load_layer(n)`
+/// materialises exactly one layer's raw slices; `LoadedLayer::unload()` (or
+/// drop) releases them.
 use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
-use crate::convert::gguf_parser::{self, GgufDtype, GgufFile};
+use crate::convert::gguf_parser::{self, GgufDtype, GgufFile, GgufHeader, TensorInfo};
 use crate::engine::loader::{LoadMode, MmapLoader};
 
 // ── Test-only concurrency counter ─────────────────────────────────────────────
@@ -66,8 +67,11 @@ impl LayerIndex {
     ///   - `blk.{N}.*`           — llama.cpp-style (Qwen, Llama, Mistral, etc.)
     /// All other tensors (embeddings, norms, lm_head, …) are silently skipped.
     pub fn scan(file: &GgufFile) -> Self {
-        let mut slices: Vec<LayerSlice> = file
-            .tensors
+        Self::scan_tensors(&file.tensors, file.data_base)
+    }
+
+    fn scan_tensors(tensors: &[TensorInfo], data_base: u64) -> Self {
+        let mut slices: Vec<LayerSlice> = tensors
             .iter()
             .filter_map(|t| {
                 // Try both prefixes; extract the decimal layer index from the first segment.
@@ -79,7 +83,7 @@ impl LayerIndex {
                     layer_idx:   idx,
                     tensor_name: t.name.clone(),
                     // Absolute offset in the mmap so load_layer can slice directly.
-                    byte_offset: file.data_base + t.data_offset,
+                    byte_offset: data_base + t.data_offset,
                     byte_len:    t.data_size,
                     dtype:       t.dtype,
                     shape:       t.shape.clone(),
@@ -111,6 +115,32 @@ impl LayerIndex {
         let end   = self.slices.partition_point(|s| s.layer_idx <= n);
         &self.slices[start..end]
     }
+}
+
+/// Architecture values required by the training transformer forward.
+#[derive(Debug, Clone)]
+pub struct TransformerConfig {
+    pub architecture: String,
+    pub n_layers: usize,
+    pub hidden_size: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub intermediate_size: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+}
+
+/// Descriptor for any GGUF tensor, including non-layer tensors.
+#[derive(Debug, Clone)]
+pub struct TensorSlice {
+    pub tensor_name: String,
+    pub byte_offset: u64,
+    pub byte_len: usize,
+    pub dtype: GgufDtype,
+    /// GGUF dimension order. Reverse this when constructing a row-major Candle
+    /// tensor.
+    pub shape: Vec<u64>,
 }
 
 // ── LoadedLayer ───────────────────────────────────────────────────────────────
@@ -165,19 +195,118 @@ impl<'mmap> Drop for LoadedLayer<'mmap> {
 ///   - misc/generic:  any tensor whose name contains `embed`
 ///
 /// We try the well-known names first, then fall back to a substring match so
-/// new architectures work without code changes. Returns the row-major shape
-/// (`[vocab, hidden]`) or `None` if no embedding tensor is present.
-fn find_embedding_shape(file: &GgufFile) -> Option<Vec<u64>> {
+/// new architectures work without code changes. Returns the GGUF dimension
+/// order (`[hidden, vocab]`) or `None` if no embedding tensor is present.
+fn find_embedding_shape(tensors: &[TensorInfo]) -> Option<Vec<u64>> {
     const KNOWN: [&str; 2] = ["token_embd.weight", "model.embed_tokens.weight"];
     for name in KNOWN {
-        if let Some(t) = file.tensors.iter().find(|t| t.name == name) {
+        if let Some(t) = tensors.iter().find(|t| t.name == name) {
             return Some(t.shape.clone());
         }
     }
-    file.tensors
+    tensors
         .iter()
         .find(|t| t.name.to_lowercase().contains("embed"))
         .map(|t| t.shape.clone())
+}
+
+fn projection_dims(tensors: &[TensorInfo], needles: &[&str]) -> Option<(usize, usize)> {
+    let tensor = tensors
+        .iter()
+        .find(|tensor| needles.iter().any(|needle| tensor.name.contains(needle)))?;
+    match tensor.shape.as_slice() {
+        // GGUF stores the input dimension first and output dimension second.
+        [d_in, d_out] => Some((*d_out as usize, *d_in as usize)),
+        _ => None,
+    }
+}
+
+fn build_transformer_config(
+    header: &GgufHeader,
+    index: &LayerIndex,
+    embed_shape: Option<&[u64]>,
+) -> Result<TransformerConfig> {
+    let architecture = header
+        .metadata
+        .get("general.architecture")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let prefixed = |suffix: &str| format!("{}.{}", architecture, suffix);
+    let get_usize = |suffix: &str| {
+        header
+            .metadata
+            .get(&prefixed(suffix))
+            .and_then(|value| value.as_usize())
+    };
+    let get_f32 = |suffix: &str| {
+        header
+            .metadata
+            .get(&prefixed(suffix))
+            .and_then(|value| value.as_f32())
+    };
+
+    let inferred_hidden = embed_shape
+        .and_then(|shape| match shape {
+            [a, b] => Some((*a as usize).min(*b as usize)),
+            [only] => Some(*only as usize),
+            _ => None,
+        })
+        .or_else(|| {
+            projection_dims(&header.tensors, &["attn_q.weight", "q_proj.weight"])
+                .map(|(_, d_in)| d_in)
+        });
+    let hidden_size = get_usize("embedding_length")
+        .or(inferred_hidden)
+        .unwrap_or(1);
+    let n_layers = get_usize("block_count").unwrap_or(index.num_layers);
+    let n_heads = get_usize("attention.head_count").unwrap_or(1);
+    let n_kv_heads = get_usize("attention.head_count_kv").unwrap_or(n_heads);
+    let intermediate_size = get_usize("feed_forward_length")
+        .or_else(|| {
+            projection_dims(&header.tensors, &["ffn_gate.weight", "gate_proj.weight"])
+                .map(|(d_out, _)| d_out)
+        })
+        .unwrap_or(hidden_size.saturating_mul(4));
+    let vocab_size = get_usize("vocab_size")
+        .or_else(|| {
+            embed_shape.and_then(|shape| match shape {
+                [a, b] => Some((*a as usize).max(*b as usize)),
+                _ => None,
+            })
+        })
+        .unwrap_or(hidden_size.max(2));
+    let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
+    let rope_theta = get_f32("rope.freq_base").unwrap_or(10_000.0);
+
+    if n_layers != index.num_layers {
+        return Err(anyhow!(
+            "GGUF metadata reports {n_layers} layers but tensor index contains {}",
+            index.num_layers
+        ));
+    }
+    if hidden_size == 0
+        || n_heads == 0
+        || n_kv_heads == 0
+        || hidden_size % n_heads != 0
+        || n_heads % n_kv_heads != 0
+    {
+        return Err(anyhow!(
+            "invalid transformer dimensions: hidden={hidden_size}, heads={n_heads}, kv_heads={n_kv_heads}"
+        ));
+    }
+
+    Ok(TransformerConfig {
+        architecture,
+        n_layers,
+        hidden_size,
+        n_heads,
+        n_kv_heads,
+        intermediate_size,
+        vocab_size,
+        rms_norm_eps,
+        rope_theta,
+    })
 }
 
 // ── LayerLoader ───────────────────────────────────────────────────────────────
@@ -191,6 +320,8 @@ fn find_embedding_shape(file: &GgufFile) -> Option<Vec<u64>> {
 pub struct LayerLoader {
     mmap:  MmapLoader,
     index: LayerIndex,
+    tensors: Vec<TensorSlice>,
+    transformer_config: TransformerConfig,
     /// Shape of the token-embedding tensor, if present. Read generically from
     /// the GGUF at open time so callers can derive vocab/hidden dims at runtime
     /// without hardcoding per-architecture values. `[vocab, hidden]` row-major.
@@ -205,17 +336,59 @@ impl LayerLoader {
     pub fn open(path: &Path) -> Result<Self> {
         let mmap = MmapLoader::open_with_mode(path, LoadMode::Lazy)
             .map_err(|e| anyhow!("{}", e))?;
-        let gguf = gguf_parser::parse(path)
+        let header = gguf_parser::parse_header(path)
             .map_err(|e| anyhow!("{}", e))?;
-        let index = LayerIndex::scan(&gguf);
-        let embed_shape = find_embedding_shape(&gguf);
-        Ok(LayerLoader { mmap, index, embed_shape })
+        let index = LayerIndex::scan_tensors(&header.tensors, header.data_base);
+        let embed_shape = find_embedding_shape(&header.tensors);
+        let transformer_config =
+            build_transformer_config(&header, &index, embed_shape.as_deref())?;
+        let tensors = header
+            .tensors
+            .iter()
+            .map(|tensor| TensorSlice {
+                tensor_name: tensor.name.clone(),
+                byte_offset: header.data_base + tensor.data_offset,
+                byte_len: tensor.data_size,
+                dtype: tensor.dtype,
+                shape: tensor.shape.clone(),
+            })
+            .collect();
+        Ok(LayerLoader {
+            mmap,
+            index,
+            tensors,
+            transformer_config,
+            embed_shape,
+        })
     }
 
     /// Shape of the token-embedding tensor (`[vocab, hidden]`), if the GGUF has
     /// one under a recognised name. Used to derive vocab/hidden at runtime.
     pub fn embedding_shape(&self) -> Option<&[u64]> {
         self.embed_shape.as_deref()
+    }
+
+    pub fn transformer_config(&self) -> &TransformerConfig {
+        &self.transformer_config
+    }
+
+    /// Find the first tensor matching one of the supplied exact names.
+    pub(crate) fn find_tensor(&self, names: &[&str]) -> Option<&TensorSlice> {
+        names
+            .iter()
+            .find_map(|name| self.tensors.iter().find(|tensor| tensor.tensor_name == *name))
+    }
+
+    /// Borrow a tensor's quantized bytes directly from the mmap.
+    pub(crate) fn tensor_bytes<'a>(&'a self, tensor: &TensorSlice) -> Result<&'a [u8]> {
+        let start = tensor.byte_offset as usize;
+        let end = start
+            .checked_add(tensor.byte_len)
+            .ok_or_else(|| anyhow!("tensor '{}' byte range overflow", tensor.tensor_name))?;
+        self.mmap
+            .as_bytes()
+            .get(start..end)
+            .ok_or_else(|| anyhow!("tensor '{}' byte range is outside mmap", tensor.tensor_name))
     }
 
     /// Number of transformer layers found in the GGUF index.
@@ -339,6 +512,175 @@ pub fn write_minimal_gguf_pub(tensors: &[(&str, &[u8])]) -> tempfile::NamedTempF
     for (_, data) in tensors.iter() { f.write_all(data).unwrap(); }
     f.flush().unwrap();
     f
+}
+
+/// Write a tiny, complete F32 transformer GGUF for unit and integration tests.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn write_transformer_gguf_pub(n_layers: usize) -> tempfile::NamedTempFile {
+    use std::io::Write;
+
+    const HIDDEN: usize = 4;
+    const INTERMEDIATE: usize = 8;
+    const VOCAB: usize = 16;
+    const KV_DIM: usize = 2;
+
+    fn values(count: usize, seed: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|i| {
+                let value = ((i + seed) % 19) as f32 * 0.005 - 0.04;
+                value.to_le_bytes()
+            })
+            .collect()
+    }
+
+    fn ones(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|_| 1.0f32.to_le_bytes())
+            .collect()
+    }
+
+    fn write_key(file: &mut tempfile::NamedTempFile, key: &str) {
+        file.write_all(&(key.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(key.as_bytes()).unwrap();
+    }
+
+    let mut tensors: Vec<(String, Vec<u64>, Vec<u8>)> = vec![
+        (
+            "token_embd.weight".into(),
+            vec![HIDDEN as u64, VOCAB as u64],
+            values(HIDDEN * VOCAB, 1),
+        ),
+        (
+            "output_norm.weight".into(),
+            vec![HIDDEN as u64],
+            ones(HIDDEN),
+        ),
+        (
+            "output.weight".into(),
+            vec![HIDDEN as u64, VOCAB as u64],
+            values(HIDDEN * VOCAB, 7),
+        ),
+    ];
+
+    for layer in 0..n_layers {
+        let prefix = format!("blk.{layer}");
+        tensors.extend([
+            (
+                format!("{prefix}.attn_norm.weight"),
+                vec![HIDDEN as u64],
+                ones(HIDDEN),
+            ),
+            (
+                format!("{prefix}.attn_q.weight"),
+                vec![HIDDEN as u64, HIDDEN as u64],
+                values(HIDDEN * HIDDEN, layer + 2),
+            ),
+            (
+                format!("{prefix}.attn_k.weight"),
+                vec![HIDDEN as u64, KV_DIM as u64],
+                values(HIDDEN * KV_DIM, layer + 3),
+            ),
+            (
+                format!("{prefix}.attn_v.weight"),
+                vec![HIDDEN as u64, KV_DIM as u64],
+                values(HIDDEN * KV_DIM, layer + 4),
+            ),
+            (
+                format!("{prefix}.attn_output.weight"),
+                vec![HIDDEN as u64, HIDDEN as u64],
+                values(HIDDEN * HIDDEN, layer + 5),
+            ),
+            (
+                format!("{prefix}.attn_q_norm.weight"),
+                vec![2],
+                ones(2),
+            ),
+            (
+                format!("{prefix}.attn_k_norm.weight"),
+                vec![2],
+                ones(2),
+            ),
+            (
+                format!("{prefix}.ffn_norm.weight"),
+                vec![HIDDEN as u64],
+                ones(HIDDEN),
+            ),
+            (
+                format!("{prefix}.ffn_gate.weight"),
+                vec![HIDDEN as u64, INTERMEDIATE as u64],
+                values(HIDDEN * INTERMEDIATE, layer + 6),
+            ),
+            (
+                format!("{prefix}.ffn_up.weight"),
+                vec![HIDDEN as u64, INTERMEDIATE as u64],
+                values(HIDDEN * INTERMEDIATE, layer + 7),
+            ),
+            (
+                format!("{prefix}.ffn_down.weight"),
+                vec![INTERMEDIATE as u64, HIDDEN as u64],
+                values(HIDDEN * INTERMEDIATE, layer + 8),
+            ),
+        ]);
+    }
+
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(b"GGUF").unwrap();
+    file.write_all(&3u32.to_le_bytes()).unwrap();
+    file.write_all(&(tensors.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(&9u64.to_le_bytes()).unwrap();
+
+    write_key(&mut file, "general.architecture");
+    file.write_all(&8u32.to_le_bytes()).unwrap();
+    file.write_all(&4u64.to_le_bytes()).unwrap();
+    file.write_all(b"test").unwrap();
+
+    for (key, value) in [
+        ("test.block_count", n_layers as u32),
+        ("test.embedding_length", HIDDEN as u32),
+        ("test.attention.head_count", 2),
+        ("test.attention.head_count_kv", 1),
+        ("test.feed_forward_length", INTERMEDIATE as u32),
+        ("test.vocab_size", VOCAB as u32),
+    ] {
+        write_key(&mut file, key);
+        file.write_all(&4u32.to_le_bytes()).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
+    }
+
+    for (key, value) in [
+        ("test.attention.layer_norm_rms_epsilon", 1e-5f32),
+        ("test.rope.freq_base", 10_000.0f32),
+    ] {
+        write_key(&mut file, key);
+        file.write_all(&6u32.to_le_bytes()).unwrap();
+        file.write_all(&value.to_le_bytes()).unwrap();
+    }
+
+    let mut offset = 0u64;
+    for (name, shape, data) in &tensors {
+        file.write_all(&(name.len() as u64).to_le_bytes())
+            .unwrap();
+        file.write_all(name.as_bytes()).unwrap();
+        file.write_all(&(shape.len() as u32).to_le_bytes())
+            .unwrap();
+        for dim in shape {
+            file.write_all(&dim.to_le_bytes()).unwrap();
+        }
+        file.write_all(&0u32.to_le_bytes()).unwrap();
+        file.write_all(&offset.to_le_bytes()).unwrap();
+        offset += data.len() as u64;
+    }
+
+    let position = file.as_file().metadata().unwrap().len();
+    let padding = (32 - position % 32) % 32;
+    file.write_all(&vec![0; padding as usize]).unwrap();
+    for (_, _, data) in &tensors {
+        file.write_all(data).unwrap();
+    }
+    file.flush().unwrap();
+    file
 }
 
 #[cfg(test)]

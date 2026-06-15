@@ -120,7 +120,10 @@ pub fn run_run_cmd(args: RunArgs) {
                 }
             }
             Err(e) => {
-                eprintln!("error: {}", e);
+                // `{:#}` prints the full anyhow cause chain on one line, so the
+                // actionable reason (e.g. the resolve_model_path hint) is shown
+                // rather than just the top-level "failed to load model".
+                eprintln!("error: {:#}", e);
                 std::process::exit(1);
             }
         }
@@ -174,7 +177,7 @@ fn run_interactive_loop(base_cfg: InferenceConfig) {
                 }
             }
             Err(e) => {
-                eprintln!("error: {}", e);
+                eprintln!("error: {:#}", e);
                 break;
             }
         }

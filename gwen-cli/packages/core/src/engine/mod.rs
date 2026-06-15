@@ -7,6 +7,7 @@ pub mod memory_guard;
 pub mod runtime;
 pub mod stream;
 pub mod tokenizer;
+pub mod transformer_ops;
 pub mod windowing;
 
 pub use gguf_loader::load_gguf;
