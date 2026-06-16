@@ -63,7 +63,7 @@ pub struct ChatPane {
     // behind the model's output rate
     rx: Option<mpsc::Receiver<StreamEvent>>,
     history: ConversationHistory,
-    // @INFO — loaded from ~/.gwen/config.json; controls whether file content
+    // @INFO — loaded from ~/.gwenland/config/config.json; controls whether file content
     // is compressed before being sent to mistral.rs (JIN-164)
     pub window_config: WindowConfig,
     system_error_index: usize,
@@ -72,7 +72,7 @@ pub struct ChatPane {
 impl ChatPane {
     /// Create the pane, populate `messages` from history, and load windowing config.
     ///
-    /// Pass a `WindowConfig` from `App` (which reads `~/.gwen/config.json`) so that
+    /// Pass a `WindowConfig` from `App` (which reads `~/.gwenland/config/config.json`) so that
     /// CLI flag overrides (`--no-compression`, `--token-budget`) can flow down here.
     pub fn new(window_config: WindowConfig) -> Self {
         let history = ConversationHistory::new();

@@ -1,12 +1,9 @@
-// @INFO: Single source of truth for ~/.config/gwen/config.toml.
-//        On first access, auto-migrates the legacy config.json if present.
-// @DANGER: Never store hf_token here — use OS keyring (platform::hub_model).
-// @EDITABLE: Add new fields to the appropriate section struct; serde defaults handle missing keys.
+// @INFO: Core GwenLand configuration persisted at ~/.gwenland/config/config.json.
+// @DANGER: Never store hf_token here; use OS keyring (platform::hub_model).
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-
-// ── section structs ───────────────────────────────────────────────────────────
+use serde_json::{Map, Value};
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 #[serde(default)]
@@ -42,13 +39,10 @@ impl Default for AiConfig {
     }
 }
 
-/// [auth] section intentionally holds no token — keyring only.
-/// Reserved for future non-secret auth preferences.
+/// [auth] intentionally holds no token; keyring only.
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
 pub struct AuthConfig {}
-
-// ── root config ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Serialize, Clone, Default)]
 #[serde(default)]
@@ -61,64 +55,80 @@ pub struct GwenConfig {
 }
 
 impl GwenConfig {
-    fn toml_path() -> std::path::PathBuf {
+    fn json_path() -> std::path::PathBuf {
         crate::storage::paths::GwenPaths::config_file()
     }
 
-    fn json_path() -> std::path::PathBuf {
-        crate::storage::paths::GwenPaths::config_dir().join("config.json")
-    }
-
-    /// Load from disk.
-    /// If config.toml is missing but config.json exists, migrates automatically.
-    /// Returns default on missing/corrupt (never errors out).
+    /// Load from disk. Missing or malformed config returns defaults.
     pub fn load() -> Self {
-        let toml_path = Self::toml_path();
-
-        // Auto-migrate legacy config.json → config.toml
-        if !toml_path.exists() {
-            let json_path = Self::json_path();
-            if json_path.exists() {
-                if let Ok(migrated) = Self::migrate_from_json(&json_path) {
-                    if migrated.save().is_ok() {
-                        let _ = std::fs::remove_file(&json_path);
-                        eprintln!("✦ Config migrated to TOML format.");
-                        return migrated;
-                    }
-                }
-            }
+        let path = Self::json_path();
+        if !path.exists() {
             return Self::default();
         }
 
-        std::fs::read_to_string(&toml_path)
+        std::fs::read_to_string(&path)
             .ok()
-            .and_then(|s| toml::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
     }
 
-    /// Persist to disk, creating parent dirs as needed.
+    /// Persist to disk, merging core sections into the shared JSON config file.
     pub fn save(&self) -> Result<()> {
-        let path = Self::toml_path();
+        let path = Self::json_path();
         std::fs::create_dir_all(crate::storage::paths::GwenPaths::config_dir())
             .context("cannot create gwen config dir")?;
-        let toml_str = toml::to_string_pretty(self).context("cannot serialise GwenConfig")?;
-        std::fs::write(&path, toml_str).context("cannot write config.toml")?;
+
+        let mut root = read_json_object(&path);
+        let core = serde_json::to_value(self).context("cannot serialise GwenConfig")?;
+        if let Value::Object(core_map) = core {
+            for (key, value) in core_map {
+                root.insert(key, value);
+            }
+        }
+
+        root.insert(
+            "configDir".to_string(),
+            Value::String(
+                crate::storage::paths::GwenPaths::config_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
+        root.insert(
+            "modelsDir".to_string(),
+            Value::String(
+                crate::storage::paths::GwenPaths::models_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
+        root.insert(
+            "sessionsDir".to_string(),
+            Value::String(
+                crate::storage::paths::GwenPaths::session_dir()
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        );
+
+        let json = serde_json::to_string_pretty(&Value::Object(root))
+            .context("cannot serialise config JSON")?;
+        std::fs::write(&path, json).context("cannot write config.json")?;
         Ok(())
     }
 
     /// Read a config value by dotted key (e.g. "general.last_used_model").
-    /// Returns the value as a String (numbers and bools are coerced).
     pub fn get(&self, key: &str) -> Result<String> {
         match key {
             "general.last_used_model" => Ok(self.general.last_used_model.clone()),
-            "general.default_port"    => Ok(self.general.default_port.to_string()),
-            "ai.compression"          => Ok(self.ai.compression.to_string()),
-            "ai.token_budget"         => Ok(self.ai.token_budget.to_string()),
-            "ai.strategy"             => Ok(self.ai.strategy.clone()),
-            "inference.backend"       => Ok(self.inference.backend.clone()),
-            "inference.model"         => Ok(self.inference.model.clone()),
+            "general.default_port" => Ok(self.general.default_port.to_string()),
+            "ai.compression" => Ok(self.ai.compression.to_string()),
+            "ai.token_budget" => Ok(self.ai.token_budget.to_string()),
+            "ai.strategy" => Ok(self.ai.strategy.clone()),
+            "inference.backend" => Ok(self.inference.backend.clone()),
+            "inference.model" => Ok(self.inference.model.clone()),
             "inference.params.temperature" => Ok(self.inference.params.temperature.to_string()),
-            "inference.params.top_p"  => Ok(self.inference.params.top_p.to_string()),
+            "inference.params.top_p" => Ok(self.inference.params.top_p.to_string()),
             "inference.params.max_tokens" => Ok(self.inference.params.max_tokens.to_string()),
             _ => anyhow::bail!("unknown config key: {}", key),
         }
@@ -133,7 +143,7 @@ impl GwenConfig {
             "general.default_port" => {
                 self.general.default_port = value
                     .parse::<u16>()
-                    .context("default_port must be a u16 (0–65535)")?;
+                    .context("default_port must be a u16 (0-65535)")?;
             }
             "ai.compression" => {
                 self.ai.compression = value
@@ -173,39 +183,27 @@ impl GwenConfig {
         }
         Ok(())
     }
-
-    // ── migration ─────────────────────────────────────────────────────────────
-
-    fn migrate_from_json(json_path: &std::path::Path) -> Result<Self> {
-        #[derive(serde::Deserialize, Default)]
-        struct LegacyJson {
-            #[serde(default)]
-            last_used_model: String,
-            #[serde(default)]
-            default_port: Option<u16>,
-        }
-
-        let raw = std::fs::read_to_string(json_path)
-            .context("cannot read legacy config.json")?;
-        let legacy: LegacyJson = serde_json::from_str(&raw).unwrap_or_default();
-
-        let mut cfg = Self::default();
-        if !legacy.last_used_model.is_empty() {
-            cfg.general.last_used_model = legacy.last_used_model;
-        }
-        if let Some(port) = legacy.default_port {
-            cfg.general.default_port = port;
-        }
-        Ok(cfg)
-    }
 }
 
-// ── convenience helpers (used by serve, chat, hub_model) ─────────────────────
+fn read_json_object(path: &std::path::Path) -> Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
 
 /// Read just the last_used_model field. Returns None if empty.
 pub fn read_last_used_model() -> Option<String> {
     let m = GwenConfig::load().general.last_used_model;
-    if m.is_empty() { None } else { Some(m) }
+    if m.is_empty() {
+        None
+    } else {
+        Some(m)
+    }
 }
 
 /// Update only last_used_model, preserving other fields.
@@ -215,12 +213,12 @@ pub fn save_last_used_model(model_id: &str) -> Result<()> {
     cfg.save()
 }
 
-/// Convenience wrapper for get — loads config fresh each call.
+/// Convenience wrapper for get; loads config fresh each call.
 pub fn get(key: &str) -> Result<String> {
     GwenConfig::load().get(key)
 }
 
-/// Convenience wrapper for set — loads, mutates, saves atomically.
+/// Convenience wrapper for set; loads, mutates, saves atomically.
 pub fn set(key: &str, value: &str) -> Result<()> {
     let mut cfg = GwenConfig::load();
     cfg.set(key, value)?;
@@ -228,8 +226,65 @@ pub fn set(key: &str, value: &str) -> Result<()> {
 }
 
 /// Load just the inference configuration section.
-///
-/// Convenience function for modules that only need inference config.
 pub fn load_inference_config() -> crate::engine::inference::config::InferenceConfig {
     GwenConfig::load().inference
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_round_trips_through_gwenland_config_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::storage::paths::test_support::set_gwen_home(temp.path());
+
+        let mut cfg = GwenConfig::default();
+        cfg.general.last_used_model = "qwen3:8b".to_string();
+        cfg.ai.compression = false;
+        cfg.save().unwrap();
+
+        let path = crate::storage::paths::GwenPaths::config_file();
+        assert_eq!(path, temp.path().join("config").join("config.json"));
+        assert!(path.exists());
+        assert!(!path.to_string_lossy().contains(".config/gwen"));
+
+        let loaded = GwenConfig::load();
+        assert_eq!(loaded.general.last_used_model, "qwen3:8b");
+        assert!(!loaded.ai.compression);
+    }
+
+    #[test]
+    fn save_preserves_non_core_json_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::storage::paths::test_support::set_gwen_home(temp.path());
+
+        let path = crate::storage::paths::GwenPaths::config_file();
+        std::fs::write(&path, r#"{"theme":"gwen-noir"}"#).unwrap();
+
+        let mut cfg = GwenConfig::default();
+        cfg.general.default_port = 4242;
+        cfg.save().unwrap();
+
+        let raw = std::fs::read_to_string(path).unwrap();
+        let value: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(value["theme"], "gwen-noir");
+        assert_eq!(value["general"]["default_port"], 4242);
+        assert!(value["configDir"].as_str().unwrap().ends_with("config"));
+        assert!(value["modelsDir"].as_str().unwrap().ends_with("models"));
+    }
+
+    #[test]
+    fn old_xdg_config_is_not_migrated_or_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::storage::paths::test_support::set_gwen_home(temp.path());
+        let old_root = temp.path().join(".config").join("gwen");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_config = old_root.join("config.json");
+        std::fs::write(&old_config, r#"{"general":{"last_used_model":"old"}}"#).unwrap();
+
+        let loaded = GwenConfig::load();
+        assert!(loaded.general.last_used_model.is_empty());
+        assert!(old_config.exists());
+    }
 }

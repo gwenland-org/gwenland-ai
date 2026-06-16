@@ -22,7 +22,7 @@
 //! 1. Rename the running EXE to `<name>.exe.old` (allowed because Windows only
 //!    locks the inode, not the directory entry, as of Vista+).
 //! 2. Write the new EXE to the original path.
-//! 3. Record the `.old` path in `~/.config/gwen/update.old` so the next
+//! 3. Record the `.old` path in `~/.gwenland/update.old` so the next
 //!    invocation can clean it up.
 //!
 //! # Asset naming convention
@@ -130,21 +130,18 @@ fn current_exe_path() -> Result<PathBuf> {
 /// without needing a separate command.  Failure is non-fatal: the `.old` file
 /// is inert and takes no disk space beyond one binary-sized copy.
 fn cleanup_windows_old_binary() {
-    let marker = dirs::config_dir()
-        .map(|d| d.join("gwen").join("update.old"));
+    let marker_path = gwenland_core::storage::paths::GwenPaths::root_dir().join("update.old");
 
-    if let Some(marker_path) = marker {
-        if let Ok(old_path_str) = std::fs::read_to_string(&marker_path) {
-            let old_path = PathBuf::from(old_path_str.trim());
-            if old_path.exists() {
-                // Best-effort removal; ignore errors (file might still be locked
-                // if the user opened two terminals).
-                let _ = std::fs::remove_file(&old_path);
-            }
+    if let Ok(old_path_str) = std::fs::read_to_string(&marker_path) {
+        let old_path = PathBuf::from(old_path_str.trim());
+        if old_path.exists() {
+            // Best-effort removal; ignore errors (file might still be locked
+            // if the user opened two terminals).
+            let _ = std::fs::remove_file(&old_path);
         }
-        // Remove the marker regardless of whether deletion succeeded.
-        let _ = std::fs::remove_file(&marker_path);
     }
+    // Remove the marker regardless of whether deletion succeeded.
+    let _ = std::fs::remove_file(&marker_path);
 }
 
 // ── download with progress ────────────────────────────────────────────────────
@@ -350,7 +347,7 @@ fn replace_binary_unix(current: &std::path::Path, new_bytes: &[u8]) -> Result<()
 /// Windows holds a share lock on the executing EXE's inode but does NOT
 /// lock the directory entry, so we can rename the running EXE to a `.old`
 /// path.  After the rename, we write the new bytes to the original path.
-/// The `.old` path is recorded in `~/.config/gwen/update.old` so the next
+/// The `.old` path is recorded in `~/.gwenland/update.old` so the next
 /// run of `gwen update` can delete it.
 #[cfg(windows)]
 fn replace_binary_windows(current: &std::path::Path, new_bytes: &[u8]) -> Result<()> {
@@ -383,9 +380,7 @@ fn replace_binary_windows(current: &std::path::Path, new_bytes: &[u8]) -> Result
     // Step 3: record the `.old` path so the next run can clean it up.
     // We use a marker file rather than a registry key so the cleanup path
     // works the same way on all Windows editions.
-    let marker_dir = dirs::config_dir()
-        .map(|d| d.join("gwen"))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let marker_dir = gwenland_core::storage::paths::GwenPaths::root_dir();
     let _ = std::fs::create_dir_all(&marker_dir);
     let marker = marker_dir.join("update.old");
     let _ = std::fs::write(&marker, old_path.to_string_lossy().as_bytes());

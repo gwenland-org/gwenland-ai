@@ -1,10 +1,8 @@
-// @INFO: Model Registry — persisted to ~/.config/gwen/models.toml.
-//        On first load, auto-migrates legacy models.json if present.
-// @EDITABLE: Add new fields to ModelEntry as needed.
+// @INFO: Model registry persisted under ~/.gwenland/models/.
 
-use std::path::PathBuf;
-use serde::{Serialize, Deserialize};
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
@@ -30,19 +28,9 @@ pub struct ModelRegistry {
 }
 
 impl ModelRegistry {
-    /// Load from disk. If models.toml missing but models.json exists, migrates.
-    /// Empty registry on file missing; attempts rebuild from disk on corrupt.
+    /// Load from ~/.gwenland/models/models.json. Missing means empty registry.
     pub fn load() -> Result<Self> {
-        let registry_path = super::paths::GwenPaths::models_file();
-        let json_path = super::paths::GwenPaths::config_dir().join("models.json");
-
-        // Auto-migrate legacy models.json → models.toml
-        if !registry_path.exists() && json_path.exists() {
-            if let Ok(migrated) = Self::migrate_from_json(&json_path, &registry_path) {
-                eprintln!("✦ Model registry migrated to TOML format.");
-                return Ok(migrated);
-            }
-        }
+        let registry_path = super::paths::GwenPaths::models_dir().join("models.json");
 
         if !registry_path.exists() {
             return Ok(Self {
@@ -52,29 +40,31 @@ impl ModelRegistry {
         }
 
         match std::fs::read_to_string(&registry_path) {
-            Ok(content) => {
-                match toml::from_str::<RegistryFile>(&content) {
-                    Ok(parsed) => Ok(Self {
-                        models: parsed.models,
-                        registry_path,
-                    }),
-                    Err(_) => Self::rebuild_from_disk(),
-                }
-            }
+            Ok(content) => match serde_json::from_str::<RegistryFile>(&content) {
+                Ok(parsed) => Ok(Self {
+                    models: parsed.models,
+                    registry_path,
+                }),
+                Err(_) => Self::rebuild_from_disk(),
+            },
             Err(_) => Self::rebuild_from_disk(),
         }
     }
 
     /// Persist to disk atomically (write to .tmp, then rename).
     pub fn save(&self) -> Result<()> {
+        if let Some(parent) = self.registry_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
         let file_data = RegistryFile {
             version: 1,
             models: self.models.clone(),
         };
-        let toml_str = toml::to_string_pretty(&file_data)?;
+        let json = serde_json::to_string_pretty(&file_data)?;
 
-        let tmp_path = self.registry_path.with_extension("toml.tmp");
-        std::fs::write(&tmp_path, toml_str)?;
+        let tmp_path = self.registry_path.with_extension("json.tmp");
+        std::fs::write(&tmp_path, json)?;
         std::fs::rename(&tmp_path, &self.registry_path)?;
         Ok(())
     }
@@ -97,7 +87,9 @@ impl ModelRegistry {
 
     /// Find by id or by source (e.g. "mistralai/Mistral-7B-v0.1").
     pub fn find(&self, query: &str) -> Option<&ModelEntry> {
-        self.models.iter().find(|m| m.id == query || m.source == query)
+        self.models
+            .iter()
+            .find(|m| m.id == query || m.source == query)
     }
 
     /// List all entries.
@@ -107,7 +99,7 @@ impl ModelRegistry {
 
     /// Rebuild registry by scanning models/ directory for metadata.json files.
     pub fn rebuild_from_disk() -> Result<Self> {
-        let registry_path = super::paths::GwenPaths::models_file();
+        let registry_path = super::paths::GwenPaths::models_dir().join("models.json");
         let models_dir = super::paths::GwenPaths::models_dir();
 
         let mut models = Vec::new();
@@ -121,21 +113,43 @@ impl ModelRegistry {
                             let metadata_path = path.join("metadata.json");
                             if metadata_path.exists() {
                                 if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-                                    if let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) {
-                                        let id = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                    if let Ok(metadata) =
+                                        serde_json::from_str::<serde_json::Value>(&content)
+                                    {
+                                        let id = path
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                            .to_string();
 
                                         if id.starts_with('.') {
                                             continue;
                                         }
 
-                                        let source = metadata["source"].as_str().unwrap_or("").to_string();
-                                        let format = metadata["format"].as_str().unwrap_or("gguf").to_string();
-                                        let quant = metadata["quant"].as_str().unwrap_or("").to_string();
-                                        let size_bytes = metadata["size_bytes"].as_u64()
+                                        let source = metadata["source"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let format = metadata["format"]
+                                            .as_str()
+                                            .unwrap_or("gguf")
+                                            .to_string();
+                                        let quant = metadata["quant"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let size_bytes = metadata["size_bytes"]
+                                            .as_u64()
                                             .or_else(|| metadata["size"].as_u64())
                                             .unwrap_or(0);
-                                        let downloaded_at = metadata["downloaded_at"].as_str().unwrap_or("").to_string();
-                                        let sha256 = metadata["sha256"].as_str().unwrap_or("").to_string();
+                                        let downloaded_at = metadata["downloaded_at"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let sha256 = metadata["sha256"]
+                                            .as_str()
+                                            .unwrap_or("")
+                                            .to_string();
                                         let model_gguf_path = path.join("model.gguf");
 
                                         models.push(ModelEntry {
@@ -157,49 +171,64 @@ impl ModelRegistry {
             }
         }
 
-        eprintln!("models.toml was corrupt — rebuilt from disk");
+        eprintln!("models.json was corrupt; rebuilt from disk");
 
         Ok(Self {
             models,
             registry_path,
         })
     }
+}
 
-    // ── migration ─────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    fn migrate_from_json(json_path: &std::path::Path, toml_path: &std::path::Path) -> Result<Self> {
-        let content = std::fs::read_to_string(json_path)?;
-
-        // Legacy models.json was either a bare Vec<Value> (fetch.rs wrote it)
-        // or the structured RegistryFile. Try structured first.
-        let models: Vec<ModelEntry> = if let Ok(rf) = serde_json::from_str::<RegistryFile>(&content) {
-            rf.models
-        } else if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(&content) {
-            // Bare array written by old fetch.rs — best-effort parse.
-            entries.into_iter().filter_map(|v| {
-                Some(ModelEntry {
-                    id: v["model"].as_str()?.to_string(),
-                    source: v["model"].as_str().unwrap_or("").to_string(),
-                    format: "gguf".to_string(),
-                    quant: String::new(),
-                    size_bytes: 0,
-                    downloaded_at: String::new(),
-                    sha256: String::new(),
-                    path: PathBuf::from(v["path"].as_str().unwrap_or("")),
-                })
-            }).collect()
-        } else {
-            Vec::new()
-        };
-
-        if let Some(parent) = toml_path.parent() {
-            std::fs::create_dir_all(parent)?;
+    fn sample_entry(path: PathBuf) -> ModelEntry {
+        ModelEntry {
+            id: "qwen3".to_string(),
+            source: "Qwen/Qwen3".to_string(),
+            format: "gguf".to_string(),
+            quant: "q4_k_m".to_string(),
+            size_bytes: 123,
+            downloaded_at: "2026-06-16T14:32:07+07:00".to_string(),
+            sha256: "abc".to_string(),
+            path,
         }
+    }
 
-        let registry = Self { models, registry_path: toml_path.to_path_buf() };
-        registry.save()?;
-        // Remove legacy file after successful write
-        let _ = std::fs::remove_file(json_path);
-        Ok(registry)
+    #[test]
+    fn registry_round_trips_through_gwenland_models_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::storage::paths::test_support::set_gwen_home(temp.path());
+
+        let model_path = crate::storage::paths::GwenPaths::models_dir().join("qwen3.gguf");
+        let mut registry = ModelRegistry::load().unwrap();
+        registry.upsert(sample_entry(model_path.clone()));
+        registry.save().unwrap();
+
+        let registry_path = temp.path().join("models").join("models.json");
+        assert_eq!(registry.registry_path, registry_path);
+        assert!(registry_path.exists());
+        assert!(!registry_path.to_string_lossy().contains(".config/gwen"));
+
+        let loaded = ModelRegistry::load().unwrap();
+        let entry = loaded.find("qwen3").unwrap();
+        assert_eq!(entry.path, model_path);
+        assert_eq!(entry.source, "Qwen/Qwen3");
+    }
+
+    #[test]
+    fn old_xdg_registry_is_not_migrated_or_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::storage::paths::test_support::set_gwen_home(temp.path());
+        let old_root = temp.path().join(".config").join("gwen");
+        std::fs::create_dir_all(&old_root).unwrap();
+        let old_registry = old_root.join("models.json");
+        std::fs::write(&old_registry, r#"{"version":1,"models":[]}"#).unwrap();
+
+        let registry = ModelRegistry::load().unwrap();
+        assert!(registry.list().is_empty());
+        assert!(old_registry.exists());
     }
 }

@@ -63,7 +63,7 @@ pub struct FileContext {
 ///
 /// `files` — optional file context to inject before the conversation history.
 ///   Each file is compressed via relevance windowing when `config.enabled == true`.
-/// `config` — windowing configuration loaded from `~/.gwen/config.json`.
+/// `config` — windowing configuration loaded from `~/.gwenland/config/config.json`.
 ///
 /// Sends `StreamEvent::Token` for each delta, `StreamEvent::Done` on `[DONE]`,
 /// or `StreamEvent::Error` if the runtime is unreachable or returns an error.

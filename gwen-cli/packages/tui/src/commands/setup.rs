@@ -3,22 +3,22 @@
 
 use gwenland_core::doctor::{run_all_checks, CheckStatus};
 use gwenland_core::storage::config::GwenConfig;
-use gwenland_core::storage::paths::config_toml_path;
+use gwenland_core::storage::paths::config_json_path;
 
 pub async fn run_setup(mode: gwenland_core::engine::GwenMode) {
-    // Step 1: scaffold config.toml if missing (GwenConfig::load() handles migration of old config.json)
-    let toml_path = config_toml_path();
+    // Step 1: scaffold config.json if missing.
+    let json_path = config_json_path();
 
-    if !toml_path.exists() {
+    if !json_path.exists() {
         let cfg = GwenConfig::default();
         match cfg.save() {
             Ok(_) => {
                 if !mode.non_interactive {
-                    println!("✓ created ~/.config/gwen/config.toml");
+                    println!("created ~/.gwenland/config/config.json");
                 }
             }
             Err(e) => {
-                eprintln!("error: could not write config.toml: {}", e);
+                eprintln!("error: could not write config.json: {}", e);
                 std::process::exit(1);
             }
         }

@@ -21,7 +21,7 @@ impl Default for WindowConfig {
 }
 
 impl WindowConfig {
-    /// Load from config.toml [ai] section, silently falling back to defaults on any error.
+    /// Load from config.json [ai] section, silently falling back to defaults on any error.
     pub fn load() -> Self {
         let cfg = crate::storage::config::GwenConfig::load();
         Self {

@@ -21,7 +21,7 @@ struct HistoryEntry {
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-/// Append-only conversation history stored at `~/.gwen/history.jsonl`.
+/// Append-only conversation history stored at `~/.gwenland/history.jsonl`.
 ///
 /// Each call to `append()` opens the file, writes one JSON line, and closes it.
 /// `load()` reads line-by-line and skips malformed entries without panicking.
@@ -31,7 +31,7 @@ pub struct ConversationHistory {
 }
 
 impl ConversationHistory {
-    /// Resolve the default `~/.gwen/history.jsonl` path.
+    /// Resolve the default `~/.gwenland/history.jsonl` path.
     pub fn new() -> Self {
         Self {
             path: crate::storage::paths::GwenPaths::history_file(),
@@ -75,7 +75,7 @@ impl ConversationHistory {
     /// Append one message to the history file.
     ///
     /// Opens the file in append mode — does NOT load the file into memory.
-    /// Creates `~/.gwen/` if it does not exist.
+    /// Creates `~/.gwenland/` if it does not exist.
     /// @DANGER — do NOT open with `create_new` or `write(true)` without `append(true)`;
     /// either flag would truncate the history file on the second message.
     pub fn append(&self, msg: &ChatMessage) -> anyhow::Result<()> {

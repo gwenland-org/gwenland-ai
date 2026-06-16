@@ -139,6 +139,16 @@ pub enum QuantizeMode {
 }
 
 fn main() {
+    // GWEN-224 Wave 3: install crash reporting as early as possible so any
+    // panic/signal from here on — including clap parse panics — is captured.
+    // Surface defaults to Cli; refined below once we know the subcommand.
+    gwenland_core::diagnostics::crash_report::init_context(
+        env!("GWEN_VERSION"),
+        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
+    );
+    gwenland_core::diagnostics::crash_report::install_panic_hook();
+    gwenland_core::diagnostics::crash_report::install_signal_handler();
+
     // `gwenland help` is not a Clap subcommand; mirror `--help` explicitly.
     if matches!(std::env::args().nth(1).as_deref(), Some("help")) {
         use clap::CommandFactory;
@@ -150,6 +160,15 @@ fn main() {
     }
 
     let cli = Cli::parse();
+
+    use gwenland_core::diagnostics::crash_report::{set_surface, Surface};
+    match &cli.command {
+        Commands::Start { r#type: StartType::Tui } => set_surface(Surface::Tui),
+        Commands::Start { r#type: StartType::Gui } => set_surface(Surface::Gui),
+        Commands::Chat(_) => set_surface(Surface::Tui),
+        Commands::Serve(_) => set_surface(Surface::Serve),
+        _ => set_surface(Surface::Cli),
+    }
 
     // Runtime detection runs sync, before the tokio runtime starts.
     if matches!(cli.command, Commands::Start { .. }) {

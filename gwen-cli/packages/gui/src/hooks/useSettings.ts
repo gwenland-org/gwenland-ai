@@ -1,4 +1,4 @@
-// useSettings.ts — reads and persists ~/.config/gwen/config.json via the
+// useSettings.ts — reads and persists ~/.gwenland/config/config.json via the
 // Tauri fs plugin.
 //
 // WHY fs plugin and not localStorage:
@@ -11,9 +11,8 @@
 //   Writing the whole file each keystroke is wasteful and races on disk. We
 //   coalesce rapid edits into one write 500ms after the last change.
 //
-// WHY the path is `.config/gwen/...` with BaseDirectory.Home:
-//   The config lives at ~/.config/gwen/ (dotted). Tauri's Home base dir is
-//   the user's home, so the relative path keeps the dot.
+// WHY the path is `.gwenland/...` with BaseDirectory.Home:
+//   The config lives under the user's home-dotfile GwenLand root.
 //
 // Falls back to DEFAULT_CONFIG if the file is missing or malformed so the
 // screen is always usable, even on a fresh install before the core has
@@ -23,7 +22,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { readTextFile, writeTextFile, BaseDirectory } from '@tauri-apps/plugin-fs'
 import { GwenConfig, DEFAULT_CONFIG } from '../types/config'
 
-const CONFIG_PATH = '.config/gwen/config.json'
+const CONFIG_PATH = '.gwenland/config/config.json'
 const SAVE_DEBOUNCE_MS = 500
 const SAVED_FLASH_MS = 1500
 

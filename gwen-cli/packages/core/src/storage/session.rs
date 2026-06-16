@@ -54,7 +54,7 @@ struct LogEntry {
 
 // ─── SessionLogger ────────────────────────────────────────────────────────────
 
-/// Human-readable session log written to `~/.gwen/session/session_<ts>.txt`.
+/// Human-readable session log written to `~/.gwenland/sessions/session_<ts>.txt`.
 ///
 /// Lifecycle:
 ///   1. `new()` — allocate; creates the session directory.
@@ -72,7 +72,7 @@ pub struct SessionLogger {
 }
 
 impl SessionLogger {
-    /// Allocate a new logger and prepare `~/.gwen/session/` for writing.
+    /// Allocate a new logger and prepare `~/.gwenland/sessions/` for writing.
     /// Does NOT write to disk yet — the file is created only in `finalize()`.
     pub fn new() -> anyhow::Result<Self> {
         let now = Local::now();
@@ -261,7 +261,7 @@ pub fn capture_simplified_trace() -> Vec<String> {
 
 // ─── Startup recovery check ───────────────────────────────────────────────────
 
-/// Check `~/.gwen/session/` for the most recent session and return it if it crashed.
+/// Check `~/.gwenland/sessions/` for the most recent session and return it if it crashed.
 ///
 /// Called once at startup, before the TUI renders. Returns `None` if:
 /// - The session directory does not exist yet (first run).

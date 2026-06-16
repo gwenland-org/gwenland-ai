@@ -3,33 +3,22 @@
 //! # Why this module exists
 //!
 //! GwenLand exposes user-facing settings (theme, default_model, etc.) through
-//! a JSON file at `~/.config/gwen/config.json`.  This module owns:
+//! a JSON file at `~/.gwenland/config/config.json`.  This module owns:
 //!   - loading that file (creating it with defaults when missing)
 //!   - typed get/set via a flat key namespace (e.g. `"theme"`)
 //!   - pretty-printed JSON I/O so the file stays human-editable
 //!   - ANSI colour output that matches GwenLand's brand orange
 //!
-//! # Why JSON and not TOML
+//! # Why merge-on-save
 //!
-//! The internal engine config (`config.toml`) uses TOML.  The user-facing
-//! config here is JSON because the spec locks the wire format, and the target
-//! audience (CLI power users) are already familiar with JSON.  The two files
-//! live at different paths and serve different purposes; they do not conflict.
-//!
-//! # Why `dirs::config_dir()` and not `GwenPaths::config_dir()`
-//!
-//! `GwenPaths` resolves via `directories::ProjectDirs` which uses a vendor
-//! qualifier ("JinXSuper") on macOS/Windows.  `dirs::config_dir()` returns
-//! the bare XDG / OS config directory (e.g. `~/.config` on Linux) which is
-//! the conventional location for `~/.config/gwen/config.json`.  We want
-//! `~/.config/gwen/config.json`, not
-//! `~/Library/Application Support/dev.JinXSuper.gwen/config.json`.
-
-use std::path::PathBuf;
+//! The Rust core also stores nested engine sections in this JSON file.  This
+//! command owns only the flat user-facing keys, so writes merge those keys into
+//! the existing object instead of replacing unrelated sections.
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 // ── colour constant ───────────────────────────────────────────────────────────
 
@@ -40,7 +29,7 @@ const RESET: &str = "\x1b[0m";
 
 // ── config struct ─────────────────────────────────────────────────────────────
 
-/// The user-facing configuration persisted at `~/.config/gwen/config.json`.
+/// The user-facing configuration persisted at `~/.gwenland/config/config.json`.
 ///
 /// Every field is `Option` or has a default so that missing keys in an
 /// existing file are filled in rather than causing a parse error — important
@@ -93,13 +82,9 @@ impl Default for UserConfig {
 
 // ── path resolution ───────────────────────────────────────────────────────────
 
-/// Resolve `~/.config/gwen/config.json` cross-platform via `dirs`.
-///
-/// Returns `None` only if the OS refuses to provide a config directory
-/// (extremely rare; would typically mean a sandboxed/container environment
-/// with no home directory).
-fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("gwen").join("config.json"))
+/// Resolve the shared GwenLand JSON config path.
+fn config_path() -> std::path::PathBuf {
+    gwenland_core::storage::paths::GwenPaths::config_file()
 }
 
 // ── I/O helpers ───────────────────────────────────────────────────────────────
@@ -112,7 +97,7 @@ fn config_path() -> Option<PathBuf> {
 /// If the file exists but is malformed JSON, returns an error rather than
 /// silently overwriting user edits.
 fn load_or_create() -> Result<UserConfig> {
-    let path = config_path().context("cannot determine config directory on this platform")?;
+    let path = config_path();
 
     if !path.exists() {
         let cfg = UserConfig::default();
@@ -132,7 +117,7 @@ fn load_or_create() -> Result<UserConfig> {
 /// Why pretty-print: the file is designed to be hand-edited by users.
 /// Compact JSON would make diffs illegible and discourage manual edits.
 fn save(cfg: &UserConfig) -> Result<()> {
-    let path = config_path().context("cannot determine config directory on this platform")?;
+    let path = config_path();
 
     // Create parent directory if it doesn't exist yet (fresh install).
     if let Some(parent) = path.parent() {
@@ -140,11 +125,30 @@ fn save(cfg: &UserConfig) -> Result<()> {
             .with_context(|| format!("cannot create config directory at {}", parent.display()))?;
     }
 
-    // `to_string_pretty` uses 2-space indent by default in serde_json.
-    let json = serde_json::to_string_pretty(cfg).context("cannot serialise UserConfig")?;
+    let mut root = read_json_object(&path);
+    let user = serde_json::to_value(cfg).context("cannot serialise UserConfig")?;
+    if let Value::Object(user_map) = user {
+        for (key, value) in user_map {
+            root.insert(key, value);
+        }
+    }
+
+    let json = serde_json::to_string_pretty(&Value::Object(root))
+        .context("cannot serialise config JSON")?;
     std::fs::write(&path, json)
         .with_context(|| format!("cannot write config file at {}", path.display()))?;
     Ok(())
+}
+
+fn read_json_object(path: &std::path::Path) -> Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|value| match value {
+            Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 // ── key helpers ───────────────────────────────────────────────────────────────
@@ -231,7 +235,7 @@ fn set_key(cfg: &mut UserConfig, key: &str, value: &str) -> Result<()> {
 #[command(
     about = "Manage GwenLand user configuration",
     long_about = "Read and write GwenLand user settings stored at\n\
-                  ~/.config/gwen/config.json.\n\n\
+                  ~/.gwenland/config/config.json.\n\n\
                   Subcommands:\n  \
                     gwen config get <key>        Print value of a config key\n  \
                     gwen config set <key> <val>  Update a config key\n  \
@@ -313,9 +317,7 @@ fn run_config_inner(args: ConfigArgs) -> Result<()> {
 /// We hand-roll this rather than calling `serde_json::to_string_pretty`
 /// directly on the struct so we can apply per-key ANSI colouring.
 fn print_list(cfg: &UserConfig) {
-    let path = config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<unknown>".to_string());
+    let path = config_path().display().to_string();
 
     println!("{}GwenLand config{} — {}", ORANGE, RESET, path);
     println!();

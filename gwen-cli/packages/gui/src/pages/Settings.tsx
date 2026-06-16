@@ -2,7 +2,7 @@
 //
 // Layout: a fixed 160px SettingsNav on the left, a scrollable content pane on
 // the right. The visible tab is local state; every config edit flows through
-// useSettings.update, which debounces a write to ~/.config/gwen/config.json
+// useSettings.update, which debounces a write to ~/.gwenland/config/config.json
 // and flashes the "Saved" toast on success.
 //
 // WHY tabs live here (not in the URL): consistent with the app's router-free
@@ -161,7 +161,7 @@ export default function Settings({ toast }: SettingsProps) {
           <SettingsSection title="Paths" icon={Folder}>
             <SettingRow
               label="Config directory"
-              description="~/.config/gwen/"
+              description="~/.gwenland/config/"
             >
               <PathSetting path={config.configDir} mode="open" onError={msg => toast?.(msg, 'error')} />
             </SettingRow>

@@ -54,6 +54,7 @@ pub async fn run_all_checks(
     );
 
     let mut results = vec![cuda, vram, disk, native_inference, models];
+    results.extend(check_gwenland_root());
     results.extend(check_gguf_training_readiness(model_paths));
     results
 }
@@ -236,7 +237,7 @@ async fn check_native_inference() -> CheckResult {
 
 // ── Models directory ──────────────────────────────────────────────────────────
 
-/// Check how many GGUF models are present in ~/.config/gwen/models/.
+/// Check how many GGUF models are present in ~/.gwenland/models/.
 async fn check_models_dir() -> CheckResult {
     use crate::engine::inference::loader::gwen_models_dir;
 
@@ -283,6 +284,65 @@ async fn check_models_dir() -> CheckResult {
         fix_applied: false,
         fix_succeeded: false,
         suggestion: None,
+    }
+}
+
+// ── GwenLand storage root (GWEN-224 Wave 4) ───────────────────────────────────
+
+/// Report existence + writability of the four `~/.gwenland/` subdirectories.
+/// Each subdirectory gets its own check entry so a partial setup (e.g.
+/// crash-logs/ exists but is read-only) is visible at a glance rather than
+/// collapsed into one pass/fail bit.
+fn check_gwenland_root() -> Vec<CheckResult> {
+    let entries: [(&str, PathBuf); 4] = [
+        ("gwenland-root", GwenPaths::root_dir()),
+        ("gwenland-config", GwenPaths::config_dir()),
+        ("gwenland-models", GwenPaths::models_dir()),
+        ("gwenland-crash-logs", GwenPaths::crash_logs_dir()),
+    ];
+
+    entries
+        .into_iter()
+        .map(|(name, dir)| check_dir_writable(name, &dir))
+        .collect()
+}
+
+fn check_dir_writable(name: &str, dir: &PathBuf) -> CheckResult {
+    if !dir.is_dir() {
+        return CheckResult {
+            name: name.into(),
+            status: CheckStatus::Fail,
+            value: format!("missing: {}", dir.display()),
+            fix_available: false,
+            fix_applied: false,
+            fix_succeeded: false,
+            suggestion: Some("directory should auto-create on next `gwen` invocation".into()),
+        };
+    }
+
+    let probe = dir.join(".gwen-doctor-write-probe");
+    match std::fs::write(&probe, b"ok") {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&probe);
+            CheckResult {
+                name: name.into(),
+                status: CheckStatus::Pass,
+                value: dir.display().to_string(),
+                fix_available: false,
+                fix_applied: false,
+                fix_succeeded: false,
+                suggestion: None,
+            }
+        }
+        Err(e) => CheckResult {
+            name: name.into(),
+            status: CheckStatus::Fail,
+            value: format!("not writable: {} ({e})", dir.display()),
+            fix_available: false,
+            fix_applied: false,
+            fix_succeeded: false,
+            suggestion: Some("check filesystem permissions".into()),
+        },
     }
 }
 
@@ -411,5 +471,58 @@ fn probe_gguf_training_readiness(path: PathBuf) -> CheckResult {
             fix_succeeded: false,
             suggestion: Some(suggestion),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::paths::test_support::set_gwen_home;
+
+    #[test]
+    fn reports_pass_when_all_dirs_present_and_writable() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = set_gwen_home(temp.path());
+
+        // GwenPaths::*_dir() auto-creates on call.
+        let results = check_gwenland_root();
+        assert_eq!(results.len(), 4);
+        for r in &results {
+            assert_eq!(r.status, CheckStatus::Pass, "{} should pass: {}", r.name, r.value);
+        }
+    }
+
+    #[test]
+    fn reports_fail_when_a_dir_does_not_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let never_created = temp.path().join("does-not-exist");
+
+        let result = check_dir_writable("gwenland-crash-logs", &never_created);
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(result.value.contains("missing"));
+    }
+
+    // Unix permission bits reliably block writes inside a directory; Windows'
+    // read-only attribute on a *directory* is cosmetic (Explorer-only) and
+    // does not stop file creation, so there's no portable way to simulate
+    // "exists but unwritable" without ACL plumbing. Gate this one to Unix.
+    #[cfg(unix)]
+    #[test]
+    fn reports_fail_when_a_dir_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = set_gwen_home(temp.path());
+
+        let unwritable = temp.path().join("readonly-crash-logs");
+        std::fs::create_dir_all(&unwritable).unwrap();
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = check_dir_writable("gwenland-crash-logs", &unwritable);
+
+        // Restore so the tempdir can be cleaned up.
+        std::fs::set_permissions(&unwritable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(result.status, CheckStatus::Fail);
     }
 }

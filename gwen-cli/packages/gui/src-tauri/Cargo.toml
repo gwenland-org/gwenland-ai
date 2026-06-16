@@ -18,6 +18,9 @@ tauri-plugin-shell  = "2"
 tauri-plugin-dialog = "2"
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Only used for crash reporting (GWEN-224 Wave 3) so the GUI writes the same
+# ~/.gwenland/crash-logs/ report format as the CLI/TUI on panic.
+gwenland-core = { path = "../../core" }
 
 [profile.release]
 opt-level     = "z"

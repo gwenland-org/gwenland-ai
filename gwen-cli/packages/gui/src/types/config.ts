@@ -1,4 +1,4 @@
-// config.ts — shape of ~/.config/gwen/config.json, the GUI-editable settings.
+// config.ts — shape of ~/.gwenland/config/config.json, the GUI-editable settings.
 //
 // WHY a dedicated types module (not inline in the hook):
 //   The schema is referenced by useSettings, the Settings page, and the

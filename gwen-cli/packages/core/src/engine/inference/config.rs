@@ -50,15 +50,10 @@ pub struct InferenceConfig {
 
 impl Default for InferenceConfig {
     fn default() -> Self {
-        let model_path = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("gwen")
-            .join("models");
-
         Self {
             backend: "candle".to_string(),
             model: String::new(),
-            model_path,
+            model_path: crate::storage::paths::GwenPaths::models_dir(),
             params: InferParams::default(),
             tokenizer_id: None,
         }

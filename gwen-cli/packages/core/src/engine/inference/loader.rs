@@ -128,12 +128,9 @@ fn expand_tilde(model: &str) -> PathBuf {
     PathBuf::from(model)
 }
 
-/// `~/.config/gwen/models/` — where `gwen fetch` stores GGUF files.
+/// `~/.gwenland/models/` - where `gwen fetch` stores GGUF files.
 pub fn gwen_models_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("gwen")
-        .join("models")
+    crate::storage::paths::GwenPaths::models_dir()
 }
 
 /// Select the best available candle `Device` and return a human-readable label.

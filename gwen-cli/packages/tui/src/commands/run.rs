@@ -26,8 +26,8 @@ use gwenland_core::engine::memory_guard::MemoryGuard;
                   No Ollama. No Python. No external process.\n\n\
                   Model resolution order:\n  \
                     1. Exact path (./model.gguf, /abs/path.gguf)\n  \
-                    2. ~/.config/gwen/models/<name>.gguf\n  \
-                    3. ~/.config/gwen/models/<name>-q4_0.gguf\n  \
+                    2. ~/.gwenland/models/<name>.gguf\n  \
+                    3. ~/.gwenland/models/<name>-q4_0.gguf\n  \
                     4. Error — run `gwen fetch <name>` first\n\n\
                   Examples:\n  \
                     gwen run qwen3:8b --prompt \"hello\"\n  \

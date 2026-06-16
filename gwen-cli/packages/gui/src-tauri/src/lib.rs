@@ -2,7 +2,7 @@
 pub fn run() {
     tauri::Builder::default()
         // Plugins used by the Settings screen:
-        //   fs     — read/write ~/.config/gwen/config.json and clear session files
+        //   fs     — read/write ~/.gwenland/config/config.json and clear session files
         //   shell  — open the config/models/sessions folders in the OS file
         //            explorer and run `gwen update --check`
         //   dialog — folder picker (reserved for future "browse" path rows)

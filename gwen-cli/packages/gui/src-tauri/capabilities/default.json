@@ -12,19 +12,19 @@
 
     {
       "identifier": "fs:allow-read-text-file",
-      "allow": [{ "path": "$HOME/.config/gwen/*" }]
+      "allow": [{ "path": "$HOME/.gwenland/config/*" }]
     },
     {
       "identifier": "fs:allow-write-text-file",
-      "allow": [{ "path": "$HOME/.config/gwen/*" }]
+      "allow": [{ "path": "$HOME/.gwenland/config/*" }]
     },
     {
       "identifier": "fs:allow-read-dir",
-      "allow": [{ "path": "$HOME/.config/gwen/**" }]
+      "allow": [{ "path": "$HOME/.gwenland/**" }]
     },
     {
       "identifier": "fs:allow-remove",
-      "allow": [{ "path": "$HOME/.config/gwen/sessions/*" }]
+      "allow": [{ "path": "$HOME/.gwenland/sessions/*" }]
     },
 
     "dialog:allow-open",
@@ -33,7 +33,7 @@
       "identifier": "shell:allow-open",
       "allow": [
         { "url": "https://github.com/**" },
-        { "url": "$HOME/.config/gwen/**" }
+        { "url": "$HOME/.gwenland/**" }
       ]
     },
     {

@@ -69,7 +69,7 @@ impl fmt::Display for FetchError {
         write!(f, "error: ")?;
         match self {
             FetchError::ModelNotFoundHub(m) => {
-                write!(f, "model not found on HuggingFace Hub.\n\n  The repository '{}' does not exist or is private.\n\n  hint:\n    Check your spelling or provide an access token in ~/.config/gwen/config.toml", m)
+                write!(f, "model not found on HuggingFace Hub.\n\n  The repository '{}' does not exist or is private.\n\n  hint:\n    Check your spelling or log in with `gwen hub model login`.", m)
             }
             FetchError::QuantNotAvailable(m, q) => {
                 write!(f, "quantization not available.\n\n  The model '{}' does not have a '{}' GGUF file.\n\n  hint:\n    Run `gwen fetch -m {}` without -q to see available options.", m, q, m)
@@ -87,7 +87,7 @@ impl fmt::Display for FetchError {
                 write!(f, "insufficient disk space.\n\n  Downloading requires {} MB, but only {} MB is available on {}.\n\n  hint:\n    Free up space or use the --to flag to specify a different drive: gwen fetch -m jinxsuperdev/gwen1.0-code-mini --to D:\\models", req, avail, path)
             }
             FetchError::InvalidToken => {
-                write!(f, "invalid HuggingFace token.\n\n  The token provided in config.toml is rejected by the API.\n\n  hint:\n    Update your token in ~/.config/gwen/config.toml")
+                write!(f, "invalid HuggingFace token.\n\n  The token stored in the OS keyring or HF_TOKEN is rejected by the API.\n\n  hint:\n    Run `gwen hub model login` again.")
             }
             FetchError::NetworkUnreachable(err) => {
                 write!(f, "network unreachable.\n\n  {}\n\n  hint:\n    Ensure you are connected to the internet.", err)
@@ -385,7 +385,7 @@ async fn do_fetch(mut args: FetchArgs, mode: gwenland_core::engine::GwenMode) ->
         }
     }
 
-    // Persist downloaded models to models.toml registry
+    // Persist downloaded models to the JSON registry.
     if let Ok(mut reg) = gwenland_core::storage::registry::ModelRegistry::load() {
         for (model, item) in plans {
             reg.upsert(gwenland_core::storage::registry::ModelEntry {
@@ -423,7 +423,7 @@ fn load_hf_token() -> Option<String> {
 }
 
 fn save_hf_token(token: &str) {
-    // Tokens are stored in OS keyring only — never in config.toml
+    // Tokens are stored in OS keyring only; never in config.json.
     if let Ok(entry) = keyring::Entry::new("gwenland", "hf_token") {
         let _ = entry.set_password(token);
     }

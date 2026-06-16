@@ -1,97 +1,218 @@
-// @INFO: Single source of truth for ALL GwenLand filesystem paths.
+// @INFO: Single source of truth for all GwenLand filesystem paths.
 //        Use GwenPaths::* everywhere. Never hardcode ~/.config, AppData, etc.
-// @DANGER: DO NOT call dirs::* or directories::* from anywhere else in the codebase.
-//          All path resolution must go through this module.
 
-use directories::ProjectDirs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-// ── core resolver ─────────────────────────────────────────────────────────────
+const GWENLAND_DIR: &str = ".gwenland";
+const GWEN_HOME_ENV: &str = "GWEN_HOME";
 
-fn project_dirs() -> ProjectDirs {
-    // qualifier="dev", organization="JinXSuper", application="gwen"
-    // Linux   → ~/.config/gwen/  +  ~/.cache/gwen/
-    // macOS   → ~/Library/Application Support/gwen/  +  ~/Library/Caches/gwen/
-    // Windows → AppData\Roaming\gwen\  +  AppData\Local\gwen\cache\
-    ProjectDirs::from("dev", "JinXSuper", "gwen")
-        .expect("cannot determine platform config directories")
+fn ensure_dir(path: &Path) {
+    let _ = std::fs::create_dir_all(path);
 }
 
-// ── GwenPaths ─────────────────────────────────────────────────────────────────
+fn home_root() -> PathBuf {
+    if let Ok(v) = std::env::var(GWEN_HOME_ENV) {
+        return PathBuf::from(v);
+    }
+
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(GWENLAND_DIR)
+}
 
 pub struct GwenPaths;
 
 impl GwenPaths {
-    /// Platform-correct config directory (e.g. ~/.config/gwen on Linux).
-    pub fn config_dir() -> PathBuf {
-        // Honour GWEN_HOME override for CI and portable installs.
-        if let Ok(v) = std::env::var("GWEN_HOME") {
-            return PathBuf::from(v);
-        }
-        project_dirs().config_dir().to_path_buf()
+    /// Root GwenLand storage directory: ~/.gwenland/.
+    pub fn root_dir() -> PathBuf {
+        let path = home_root();
+        ensure_dir(&path);
+        path
     }
 
-    /// Path to the primary config file.
+    /// User and engine configuration directory: ~/.gwenland/config/.
+    pub fn config_dir() -> PathBuf {
+        let path = Self::root_dir().join("config");
+        ensure_dir(&path);
+        path
+    }
+
+    /// Path to the primary JSON config file.
     pub fn config_file() -> PathBuf {
-        Self::config_dir().join("config.toml")
+        Self::config_dir().join("config.json")
+    }
+
+    /// Directory where downloaded models and the model registry are stored.
+    pub fn models_dir() -> PathBuf {
+        let path = Self::root_dir().join("models");
+        ensure_dir(&path);
+        path
     }
 
     /// Path to the model registry file.
     pub fn models_file() -> PathBuf {
-        Self::config_dir().join("models.toml")
+        Self::models_dir().join("models.json")
     }
 
-    /// Directory where downloaded models are stored.
-    pub fn models_dir() -> PathBuf {
-        Self::config_dir().join("models")
+    /// Directory for human-readable crash reports.
+    pub fn crash_logs_dir() -> PathBuf {
+        let path = Self::root_dir().join("crash-logs");
+        ensure_dir(&path);
+        path
     }
 
-    /// Platform-correct cache directory.
+    /// Directory for internal cache artifacts.
     pub fn cache_dir() -> PathBuf {
-        if let Ok(v) = std::env::var("GWEN_HOME") {
-            return PathBuf::from(v).join("cache");
-        }
-        project_dirs().cache_dir().to_path_buf()
+        let path = Self::root_dir().join("cache");
+        ensure_dir(&path);
+        path
     }
 
-    /// Directory for eval result JSON files (machine output — stays JSON).
+    /// Directory for eval result JSON files.
     pub fn eval_results_dir() -> PathBuf {
-        Self::config_dir().join("eval_results")
+        let path = Self::root_dir().join("eval_results");
+        ensure_dir(&path);
+        path
     }
 
     /// Temporary directory used during self-updates and partial downloads.
     pub fn tmp_dir() -> PathBuf {
-        Self::cache_dir().join("tmp")
+        let path = Self::cache_dir().join("tmp");
+        ensure_dir(&path);
+        path
     }
 
     /// Chat history file.
     pub fn history_file() -> PathBuf {
-        Self::config_dir().join("history.jsonl")
+        Self::root_dir().join("history.jsonl")
     }
 
     /// Session log directory.
     pub fn session_dir() -> PathBuf {
-        Self::cache_dir().join("sessions")
+        let path = Self::root_dir().join("sessions");
+        ensure_dir(&path);
+        path
     }
 }
 
-// ── backwards-compat shim ─────────────────────────────────────────────────────
-// Called by diagnostics/doctor.rs and any module not yet migrated.
-// Will be removed once all callers are updated.
+#[inline]
+pub fn root_dir() -> PathBuf {
+    GwenPaths::root_dir()
+}
+
+#[inline]
+pub fn config_dir() -> PathBuf {
+    GwenPaths::config_dir()
+}
+
+#[inline]
+pub fn models_dir() -> PathBuf {
+    GwenPaths::models_dir()
+}
+
+#[inline]
+pub fn crash_logs_dir() -> PathBuf {
+    GwenPaths::crash_logs_dir()
+}
 
 #[inline]
 pub fn gwen_config_dir() -> PathBuf {
     GwenPaths::config_dir()
 }
 
-/// Absolute path to the primary config file (TOML format).
 #[inline]
-pub fn config_toml_path() -> PathBuf {
+pub fn config_json_path() -> PathBuf {
     GwenPaths::config_file()
 }
 
-/// Absolute path to the model registry file (TOML format).
 #[inline]
-pub fn models_toml_path() -> PathBuf {
+pub fn models_json_path() -> PathBuf {
     GwenPaths::models_file()
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(crate) struct GwenHomeGuard {
+        old: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for GwenHomeGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                unsafe {
+                    std::env::set_var(super::GWEN_HOME_ENV, old);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(super::GWEN_HOME_ENV);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn set_gwen_home(path: &Path) -> GwenHomeGuard {
+        let lock = ENV_LOCK.lock().expect("GWEN_HOME test lock poisoned");
+        let old = std::env::var_os(super::GWEN_HOME_ENV);
+        unsafe {
+            std::env::set_var(super::GWEN_HOME_ENV, path);
+        }
+        GwenHomeGuard { old, _lock: lock }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn path_dirs_resolve_under_gwenland_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = test_support::set_gwen_home(temp.path());
+
+        let root = GwenPaths::root_dir();
+        assert_eq!(root, temp.path());
+        assert_eq!(GwenPaths::config_dir(), root.join("config"));
+        assert_eq!(GwenPaths::models_dir(), root.join("models"));
+        assert_eq!(GwenPaths::crash_logs_dir(), root.join("crash-logs"));
+
+        assert!(!GwenPaths::config_dir().to_string_lossy().contains(".config/gwen"));
+        assert!(!GwenPaths::models_dir().to_string_lossy().contains(".config/gwen"));
+        assert!(!GwenPaths::crash_logs_dir().to_string_lossy().contains(".config/gwen"));
+    }
+
+    #[test]
+    fn path_dirs_are_created_on_first_call() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = test_support::set_gwen_home(temp.path());
+
+        let config = GwenPaths::config_dir();
+        let models = GwenPaths::models_dir();
+        let crash_logs = GwenPaths::crash_logs_dir();
+
+        assert!(config.is_dir());
+        assert!(models.is_dir());
+        assert!(crash_logs.is_dir());
+    }
+
+    #[test]
+    fn file_paths_use_new_layout() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = test_support::set_gwen_home(temp.path());
+
+        assert_eq!(
+            GwenPaths::config_file(),
+            temp.path().join("config").join("config.json")
+        );
+        assert_eq!(
+            GwenPaths::models_file(),
+            temp.path().join("models").join("models.json")
+        );
+    }
 }
