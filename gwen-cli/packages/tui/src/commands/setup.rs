@@ -25,7 +25,7 @@ pub async fn run_setup(mode: gwenland_core::engine::GwenMode) {
     }
 
     // Step 2: run all checks with force=true, safe=false
-    let results = run_all_checks(false, true).await;
+    let results = run_all_checks(false, true, vec![]).await;
 
     // Step 3: collect unresolved Fail items (Warning and auto-fixed are excluded)
     let unresolved: Vec<_> = results
