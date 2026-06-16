@@ -5,24 +5,27 @@
 /// layers in reverse, loading and recomputing one full attention-plus-MLP layer
 /// at a time. This produces exact adapter gradients without keeping every
 /// layer's base tensors or autograd graph resident at once.
+use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use anyhow::{Context, Result, anyhow};
-use candle_core::{Device, Tensor, Var, backprop::GradStore};
+use anyhow::{anyhow, Context, Result};
+use candle_core::{backprop::GradStore, Device, Tensor, Var};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use candle_nn::{VarBuilder, VarMap};
 
 use crate::convert::dequant::{self, DequantMode};
 use crate::convert::gguf_parser::GgufDtype;
 use crate::engine::transformer_ops::rms_norm;
+use crate::train::adamw_state::{varmap_key_for, MomentStore};
 use crate::train::config::{NewTrainConfig, TrainResult};
 use crate::train::layer_loader::LayerLoader;
 use crate::train::transformer_layer::{
-    AttentionConfig, AttentionLoras, AttentionWeights, MlpLoras, MlpWeights, ProjectionLora,
-    TransformerLayerConfig, TransformerLayerLoras, TransformerLayerWeights,
-    transformer_layer_forward,
+    transformer_layer_forward, AttentionConfig, AttentionLoras, AttentionWeights, MlpLoras,
+    MlpWeights, ProjectionLora, TransformerLayerConfig, TransformerLayerLoras,
+    TransformerLayerWeights,
 };
 
 // ── LayeredTrainingLoop ───────────────────────────────────────────────────────
@@ -34,12 +37,6 @@ use crate::train::transformer_layer::{
 /// them. LoRA adapters persist in the VarMap and receive gradients from every
 /// layer in the end-to-end language-model objective.
 ///
-/// Upper bound on the fixed vocab dimension, keeping the resident
-/// embedding + output head bounded regardless of the model's true vocab.
-/// This is a *runtime cap* applied to whatever vocab the GGUF reports — not a
-/// per-model constant — so the loop stays model-agnostic and memory-safe.
-const VOCAB_CAP: usize = 8192;
-
 /// Classifies a tensor name suffix into a known transformer projection.
 /// Used to route per-projection LoRA adapters in the VarMap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -111,13 +108,14 @@ pub struct LayeredTrainingLoop {
     varmap: VarMap,
     adamw: AdamW,
     tx: Option<Sender<String>>,
-    /// Effective (capped) vocab size for the fixed embedding and output head.
+    /// Full vocabulary size used by embedding lookup and cross-entropy.
     vocab: usize,
     /// Model hidden size, read from the GGUF embedding tensor at runtime.
     hidden: usize,
-    /// Capped, frozen model tensors used by the real language-model objective.
+    /// Frozen token embeddings loaded once for lookup and tied output projection.
     model_embedding: Tensor,
     output_norm: Tensor,
+    /// Transposed view of `model_embedding`; it owns no separate weight buffer.
     lm_head: Tensor,
     layer_config: TransformerLayerConfig,
     /// Per-projection adapter descriptors `(kind, d_in, d_out, rank)`, one entry
@@ -131,6 +129,57 @@ pub struct LayeredTrainingLoop {
     /// `optimizer_steps` counter is seeded from this so the checkpoint interval
     /// (`% 500`) and filenames stay on the global step axis across resumes.
     global_step: usize,
+    /// GWEN-223: manually maintained AdamW moment state keyed by VarMap key.
+    moment_store: MomentStore,
+    /// GWEN-223: AdamW global step counter persisted with moment_store.
+    step_t: usize,
+    /// Process RSS sampled before the GGUF loader and full embedding are built.
+    /// Dry-run reporting uses this baseline so construction memory is visible.
+    rss_baseline_mb: f64,
+}
+
+/// Snapshot rendered after a bounded training run.
+///
+/// Keeping formatting separate from execution makes the operator-facing output
+/// deterministic and testable without redirecting process-wide stderr.
+#[derive(Debug, Clone, Copy)]
+struct DryRunReport {
+    vocab: usize,
+    hidden: usize,
+    layers: usize,
+    trainable_params: usize,
+    rss_start_mb: f64,
+    rss_peak_mb: f64,
+    loss: f32,
+    elapsed_secs: f64,
+}
+
+impl fmt::Display for DryRunReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            formatter,
+            "[dry-run] vocab(full)={} hidden={} layers={}",
+            self.vocab, self.hidden, self.layers
+        )?;
+        writeln!(
+            formatter,
+            "[dry-run] trainable params={}",
+            self.trainable_params
+        )?;
+        writeln!(
+            formatter,
+            "[dry-run] RSS start={:.1} MB  peak={:.1} MB  delta={:.1} MB",
+            self.rss_start_mb,
+            self.rss_peak_mb,
+            self.rss_peak_mb - self.rss_start_mb
+        )?;
+        writeln!(
+            formatter,
+            "[dry-run] step 1 loss={:.4}  elapsed={:.2}s",
+            self.loss, self.elapsed_secs
+        )?;
+        write!(formatter, "[dry-run] no OOM - 1 step completed cleanly")
+    }
 }
 
 impl LayeredTrainingLoop {
@@ -138,12 +187,11 @@ impl LayeredTrainingLoop {
     ///
     /// Reads all architecture dimensions from the GGUF header at runtime:
     ///   - `num_layers` from the layer index,
-    ///   - `(vocab, hidden)` from the embedding tensor shape (capped to
-    ///     `VOCAB_CAP` for the fixed embedding/head).
+    ///   - `(vocab, hidden)` from the embedding tensor shape.
     ///
-    /// Loads the capped embedding, output norm, and output head as frozen model
-    /// tensors. Every per-layer LoRA adapter is created up front in `varmap` so
-    /// AdamW tracks the complete trainable parameter set for the whole run.
+    /// Loads the full embedding and output norm, then derives the output head as
+    /// a transposed view of the embedding. Every per-layer LoRA adapter is
+    /// created up front so AdamW sees the complete trainable parameter set.
     ///
     /// Returns `Err` if the GGUF has zero layers.
     pub fn new(
@@ -154,6 +202,7 @@ impl LayeredTrainingLoop {
         tx: Option<Sender<String>>,
         initial_step: usize,
     ) -> Result<Self> {
+        let rss_baseline_mb = sample_rss_mb();
         let layer_loader = LayerLoader::open(gguf_path)?;
 
         if layer_loader.num_layers() == 0 {
@@ -164,17 +213,26 @@ impl LayeredTrainingLoop {
         }
 
         let model_config = layer_loader.transformer_config().clone();
+        if !model_config.tie_word_embeddings {
+            return Err(anyhow!(
+                "GGUF '{}' does not establish weight tying: expected \
+                 <architecture>.tie_word_embeddings=true or no separate output.weight/lm_head.weight \
+                 tensor. Full-vocabulary training without weight tying is unsupported; open a \
+                 sampled-softmax follow-up.",
+                gguf_path.display()
+            ));
+        }
         let hidden = model_config.hidden_size;
-        let vocab = model_config.vocab_size.min(VOCAB_CAP).max(2);
+        let vocab = model_config.vocab_size.max(2);
         let device = Device::Cpu;
-        let model_embedding = load_capped_matrix(
+        let model_embedding = load_matrix_rows(
             &layer_loader,
             &["token_embd.weight", "model.embed_tokens.weight"],
             vocab,
             hidden,
             &device,
         )
-        .context("load capped model embedding")?;
+        .context("load full model embedding")?;
         let output_norm = load_vector(
             &layer_loader,
             &["output_norm.weight", "model.norm.weight"],
@@ -182,21 +240,11 @@ impl LayeredTrainingLoop {
             &device,
         )
         .context("load output norm")?;
-        let lm_head = if layer_loader
-            .find_tensor(&["output.weight", "lm_head.weight"])
-            .is_some()
-        {
-            load_capped_matrix(
-                &layer_loader,
-                &["output.weight", "lm_head.weight"],
-                vocab,
-                hidden,
-                &device,
-            )
-            .context("load capped output head")?
-        } else {
-            model_embedding.clone()
-        };
+        // Weight tying is mandatory above, so any separate output.weight or
+        // lm_head.weight tensor in the GGUF is intentionally ignored.
+        let lm_head = model_embedding
+            .t()
+            .context("transpose model_embedding for tied lm_head")?;
         let layer_config = TransformerLayerConfig {
             attention: AttentionConfig {
                 hidden_size: hidden,
@@ -325,6 +373,9 @@ impl LayeredTrainingLoop {
             layer_config,
             proj_keys_per_layer: proj_keys_ranked,
             global_step: initial_step,
+            moment_store: HashMap::new(),
+            step_t: initial_step,
+            rss_baseline_mb,
         })
     }
 
@@ -335,6 +386,91 @@ impl LayeredTrainingLoop {
     /// AdamW optimiser state is not affected.
     pub fn load_checkpoint(&mut self, path: &Path) -> Result<()> {
         crate::train::checkpoint_resumer::load_checkpoint_into_varmap(&mut self.varmap, path)
+    }
+
+    pub fn load_adamw_state(&mut self, weight_ckpt_path: &Path) {
+        match crate::train::adamw_state::load_adamw_state(weight_ckpt_path) {
+            Ok(Some((store, step_t))) => {
+                let varmap_data = self.varmap.data().lock().unwrap();
+                let mut filtered = MomentStore::new();
+
+                for (key, (m1, m2)) in store {
+                    let Some(var) = varmap_data.get(&key) else {
+                        eprintln!(
+                            "[resume] WARNING: AdamW state key {key} is not present in current VarMap; dropping moment pair"
+                        );
+                        continue;
+                    };
+
+                    let expected_shape = var.as_tensor().dims();
+                    if m1.dims() != expected_shape || m2.dims() != expected_shape {
+                        eprintln!(
+                            "[resume] WARNING: AdamW state shape mismatch for {key}: m1={:?} m2={:?} expected={:?}; dropping moment pair",
+                            m1.dims(),
+                            m2.dims(),
+                            expected_shape
+                        );
+                        continue;
+                    }
+
+                    filtered.insert(key, (m1, m2));
+                }
+                drop(varmap_data);
+
+                let restored = filtered.len();
+                self.moment_store = filtered;
+                self.step_t = step_t;
+                eprintln!(
+                    "[resume] AdamW state restored: {restored} moment pairs, step_t={step_t}"
+                );
+            }
+            Ok(None) => {
+                self.moment_store.clear();
+                eprintln!(
+                    "[resume] AdamW state not found for checkpoint {}; resuming with fresh optimizer (GWEN-222 behavior)",
+                    weight_ckpt_path.display()
+                );
+            }
+            Err(error) => {
+                self.moment_store.clear();
+                eprintln!(
+                    "[resume] WARNING: failed to load AdamW state: {error}. Resuming with fresh optimizer."
+                );
+            }
+        }
+    }
+
+    fn save_checkpoint_and_adamw_state(&self, step: usize) {
+        let filename = format!("checkpoint_{:06}.safetensors", step);
+        let path = self.config.output_path.join(&filename);
+        if let Err(error) = std::fs::create_dir_all(&self.config.output_path)
+            .with_context(|| {
+                format!(
+                    "cannot create output dir '{}'",
+                    self.config.output_path.display()
+                )
+            })
+            .and_then(|_| {
+                self.varmap
+                    .save(&path)
+                    .with_context(|| format!("failed to write checkpoint '{}'", path.display()))
+            })
+        {
+            eprintln!("[checkpoint] WARNING: failed to save weights: {error}");
+            return;
+        }
+        eprintln!("[checkpoint] saved -> {}", path.display());
+
+        if let Err(error) = crate::train::adamw_state::save_adamw_state(
+            &self.moment_store,
+            self.step_t,
+            &self.config.output_path,
+            step,
+        ) {
+            eprintln!(
+                "[resume] WARNING: failed to save AdamW state for checkpoint {step}: {error}"
+            );
+        }
     }
 
     /// Run the full layered training loop and return a summary.
@@ -357,8 +493,8 @@ impl LayeredTrainingLoop {
             self.config.grad_accum.max(1)
         };
 
-        let rss_start = sample_rss_mb();
-        let mut peak_rss = rss_start;
+        let rss_start = self.rss_baseline_mb;
+        let mut peak_rss = sample_rss_mb().max(rss_start);
 
         let mut global_batch: usize = 0;
         // `optimizer_steps` rides the GLOBAL step axis (seeded from the resumed
@@ -400,6 +536,9 @@ impl LayeredTrainingLoop {
                     scale_gradstore(&mut grads, &trainable_vars, 1.0 / accum_count as f64)?;
                     clip_gradstore_norm(&mut grads, &self.varmap, self.config.max_grad_norm)?;
                     self.adamw.step(&grads).context("optimizer step failed")?;
+                    let varmap_data = self.varmap.data().lock().unwrap().clone();
+                    self.update_moments(&grads, &trainable_vars, &varmap_data)
+                        .context("update AdamW moment store")?;
 
                     optimizer_steps += 1;
                     steps_this_run += 1;
@@ -408,7 +547,7 @@ impl LayeredTrainingLoop {
                     accum_count = 0;
 
                     if optimizer_steps % 500 == 0 {
-                        save_checkpoint(&self.varmap, &self.config, optimizer_steps)?;
+                        self.save_checkpoint_and_adamw_state(optimizer_steps);
                     }
                 }
 
@@ -433,25 +572,17 @@ impl LayeredTrainingLoop {
             }
         }
 
-        // Dry-run report: emit memory + loss summary to stderr.
         if max_steps.is_some() {
             eprintln!(
-                "[dry-run] vocab(capped)={} hidden={} layers={}",
-                self.vocab, self.hidden, num_layers
+                "{}",
+                self.build_dry_run_report(
+                    num_layers,
+                    rss_start,
+                    peak_rss,
+                    last_avg_loss,
+                    start.elapsed().as_secs_f64(),
+                )
             );
-            eprintln!("[dry-run] trainable params={}", count_params(&self.varmap));
-            eprintln!(
-                "[dry-run] RSS start={:.1} MB  peak={:.1} MB  delta={:.1} MB",
-                rss_start,
-                peak_rss,
-                peak_rss - rss_start
-            );
-            eprintln!(
-                "[dry-run] step 1 loss={:.4}  elapsed={:.2}s",
-                last_avg_loss,
-                start.elapsed().as_secs_f64()
-            );
-            eprintln!("[dry-run] ✓ no OOM — 1 step completed cleanly");
         }
 
         let done_json = format!(
@@ -470,6 +601,92 @@ impl LayeredTrainingLoop {
             total_steps: steps_this_run,
             elapsed: start.elapsed(),
         })
+    }
+
+    fn build_dry_run_report(
+        &self,
+        layers: usize,
+        rss_start_mb: f64,
+        rss_peak_mb: f64,
+        loss: f32,
+        elapsed_secs: f64,
+    ) -> DryRunReport {
+        DryRunReport {
+            vocab: self.vocab,
+            hidden: self.hidden,
+            layers,
+            trainable_params: count_params(&self.varmap),
+            rss_start_mb,
+            rss_peak_mb,
+            loss,
+            elapsed_secs,
+        }
+    }
+
+    fn update_moments(
+        &mut self,
+        grads: &GradStore,
+        vars: &[Var],
+        varmap_data: &HashMap<String, Var>,
+    ) -> Result<()> {
+        const BETA1: f64 = 0.9;
+        const BETA2: f64 = 0.999;
+
+        for var in vars {
+            let Some(key) = varmap_key_for(var, varmap_data) else {
+                eprintln!(
+                    "[resume] WARNING: unable to resolve VarMap key for trainable tensor; skipping AdamW moment update"
+                );
+                continue;
+            };
+            let Some(grad) = grads.get(var.as_tensor()) else {
+                continue;
+            };
+
+            if !self.moment_store.contains_key(&key) {
+                self.moment_store
+                    .insert(key.clone(), (grad.zeros_like()?, grad.zeros_like()?));
+            }
+
+            let Some((m1_prev, m2_prev)) = self.moment_store.get_mut(&key) else {
+                continue;
+            };
+            if m1_prev.shape() != grad.shape() || m2_prev.shape() != grad.shape() {
+                eprintln!(
+                    "[resume] WARNING: AdamW moment shape mismatch for {key}: m1={:?} m2={:?} grad={:?}; skipping update",
+                    m1_prev.dims(),
+                    m2_prev.dims(),
+                    grad.dims()
+                );
+                continue;
+            }
+
+            let next_m1 = m1_prev
+                .affine(BETA1, 0.0)
+                .context("scale AdamW first moment")?
+                .add(
+                    &grad
+                        .affine(1.0 - BETA1, 0.0)
+                        .context("scale AdamW gradient for first moment")?,
+                )
+                .context("update AdamW first moment")?;
+            let grad_sq = grad.sqr().context("square AdamW gradient")?;
+            let next_m2 = m2_prev
+                .affine(BETA2, 0.0)
+                .context("scale AdamW second moment")?
+                .add(
+                    &grad_sq
+                        .affine(1.0 - BETA2, 0.0)
+                        .context("scale AdamW gradient square")?,
+                )
+                .context("update AdamW second moment")?;
+
+            *m1_prev = next_m1;
+            *m2_prev = next_m2;
+        }
+
+        self.step_t += 1;
+        Ok(())
     }
 
     /// Re-bind the persistent per-projection LoRA adapters for layer `n`.
@@ -582,10 +799,7 @@ impl LayeredTrainingLoop {
         let ids = sample
             .to_vec1::<u32>()
             .context("failed to read token IDs")?;
-        let ids: Vec<u32> = ids
-            .into_iter()
-            .map(|id| id % self.vocab as u32)
-            .collect();
+        let ids: Vec<u32> = ids.into_iter().map(|id| id % self.vocab as u32).collect();
         let (input_tokens, target) = match ids.as_slice() {
             [] => (vec![0], 0),
             [only] => (vec![*only], *only),
@@ -608,10 +822,10 @@ impl LayeredTrainingLoop {
         let last_hidden = normalized
             .narrow(1, seq_len - 1, 1)?
             .reshape((1, self.hidden))?;
-        let logits = last_hidden.matmul(&self.lm_head.t()?)?;
+        let logits = self.logits_from_last_hidden(&last_hidden)?;
         let target_ids = Tensor::from_vec(vec![target], (1,), device)?;
-        let loss = candle_nn::loss::cross_entropy(&logits, &target_ids)
-            .context("cross_entropy failed")?;
+        let loss =
+            candle_nn::loss::cross_entropy(&logits, &target_ids).context("cross_entropy failed")?;
         let loss_value = scalar_f32(&loss)?;
         let mut sample_grads = loss.backward().context("final objective backward")?;
         let mut upstream = sample_grads
@@ -622,8 +836,7 @@ impl LayeredTrainingLoop {
 
         let trainable_vars = self.varmap.all_vars();
         for layer_n in (0..self.layer_loader.num_layers()).rev() {
-            let input_var =
-                Var::from_tensor(&boundaries[layer_n]).context("layer boundary Var")?;
+            let input_var = Var::from_tensor(&boundaries[layer_n]).context("layer boundary Var")?;
             let weights = self.load_layer_weights(layer_n, device)?;
             let adapters = self.projection_adapters(layer_n, device)?;
             let loras = layer_loras(&adapters);
@@ -650,6 +863,12 @@ impl LayeredTrainingLoop {
         }
 
         Ok((loss_value, sample_grads))
+    }
+
+    fn logits_from_last_hidden(&self, last_hidden: &Tensor) -> Result<Tensor> {
+        last_hidden
+            .matmul(&self.lm_head)
+            .context("tied lm_head projection")
     }
 
     fn forward_boundaries(&self, input_ids: &Tensor, device: &Device) -> Result<Vec<Tensor>> {
@@ -689,12 +908,8 @@ impl LayeredTrainingLoop {
             .layer_loader
             .load_layer(layer_n)
             .with_context(|| format!("load layer {layer_n}"))?;
-        let weights = OwnedLayerWeights::from_loaded(
-            &self.layer_loader,
-            layer_n,
-            &loaded.slices,
-            device,
-        );
+        let weights =
+            OwnedLayerWeights::from_loaded(&self.layer_loader, layer_n, &loaded.slices, device);
         loaded.unload();
         weights
     }
@@ -862,7 +1077,7 @@ impl LayerLoader {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
-fn load_capped_matrix(
+fn load_matrix_rows(
     loader: &LayerLoader,
     names: &[&str],
     rows: usize,
@@ -897,18 +1112,14 @@ fn load_capped_matrix(
     let row_bytes = tensor.byte_len / stored_rows;
     let selected_len = row_bytes
         .checked_mul(rows)
-        .ok_or_else(|| anyhow!("capped tensor byte length overflow"))?;
+        .ok_or_else(|| anyhow!("tensor byte length overflow"))?;
     let bytes = loader
         .tensor_bytes(tensor)?
         .get(..selected_len)
-        .ok_or_else(|| anyhow!("capped tensor slice is outside '{}'", tensor.tensor_name))?;
-    let data = dequant_slice(
-        bytes,
-        tensor.dtype,
-        &[input_dim as u64, rows as u64],
-    )?;
+        .ok_or_else(|| anyhow!("tensor row slice is outside '{}'", tensor.tensor_name))?;
+    let data = dequant_slice(bytes, tensor.dtype, &[input_dim as u64, rows as u64])?;
     Tensor::from_vec(data, (rows, input_dim), device)
-        .with_context(|| format!("construct capped tensor '{}'", tensor.tensor_name))
+        .with_context(|| format!("construct tensor rows for '{}'", tensor.tensor_name))
 }
 
 fn load_vector(
@@ -986,22 +1197,6 @@ pub(crate) fn shape_to_2d(shape: &[u64]) -> Result<(usize, usize)> {
     }
 }
 
-fn save_checkpoint(varmap: &VarMap, config: &NewTrainConfig, step: usize) -> Result<()> {
-    let filename = format!("checkpoint_{:06}.safetensors", step);
-    let path = config.output_path.join(&filename);
-    std::fs::create_dir_all(&config.output_path).with_context(|| {
-        format!(
-            "cannot create output dir '{}'",
-            config.output_path.display()
-        )
-    })?;
-    varmap
-        .save(&path)
-        .with_context(|| format!("failed to write checkpoint '{}'", path.display()))?;
-    eprintln!("[checkpoint] saved → {}", path.display());
-    Ok(())
-}
-
 fn scalar_f32(t: &Tensor) -> Result<f32> {
     t.to_scalar::<f32>().context("expected scalar loss tensor")
 }
@@ -1025,7 +1220,8 @@ fn scale_gradstore(grads: &mut GradStore, vars: &[Var], scale: f64) -> Result<()
         if let Some(grad) = grads.get(var.as_tensor()) {
             grads.insert(
                 var.as_tensor(),
-                grad.affine(scale, 0.0).context("scale accumulated gradient")?,
+                grad.affine(scale, 0.0)
+                    .context("scale accumulated gradient")?,
             );
         }
     }
@@ -1305,6 +1501,55 @@ mod tests {
         VarMap::new()
     }
 
+    fn var_by_key(ltl: &LayeredTrainingLoop, key: &str) -> Var {
+        ltl.varmap
+            .data()
+            .lock()
+            .unwrap()
+            .get(key)
+            .unwrap_or_else(|| panic!("missing VarMap key {key}"))
+            .clone()
+    }
+
+    fn varmap_data_snapshot(ltl: &LayeredTrainingLoop) -> HashMap<String, Var> {
+        ltl.varmap.data().lock().unwrap().clone()
+    }
+
+    fn synthetic_grads_for_var(var: &Var, values: Vec<f32>) -> GradStore {
+        let grad = Tensor::from_vec(
+            values,
+            var.as_tensor().shape().clone(),
+            var.as_tensor().device(),
+        )
+        .expect("gradient tensor");
+        let loss = var
+            .as_tensor()
+            .mul(&grad)
+            .expect("synthetic loss multiply")
+            .sum_all()
+            .expect("synthetic loss sum");
+        loss.backward().expect("synthetic backward")
+    }
+
+    fn assert_all_close(actual: &[f32], expected: &[f32], tolerance: f32) {
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (left, right)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (left - right).abs() <= tolerance,
+                "mismatch at {idx}: actual={left}, expected={right}"
+            );
+        }
+    }
+
+    fn max_abs_diff(actual: &[f32], expected: &[f32]) -> f32 {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max)
+    }
+
     fn write_one_layer_gguf() -> tempfile::NamedTempFile {
         write_transformer_gguf(1)
     }
@@ -1318,6 +1563,25 @@ mod tests {
     }
 
     fn write_transformer_gguf(n_layers: usize) -> tempfile::NamedTempFile {
+        write_transformer_gguf_with_tie_word_embeddings(n_layers, true)
+    }
+
+    fn write_transformer_gguf_with_tie_word_embeddings(
+        n_layers: usize,
+        tie_word_embeddings: bool,
+    ) -> tempfile::NamedTempFile {
+        write_transformer_gguf_fixture(n_layers, Some(tie_word_embeddings), true)
+    }
+
+    fn write_structurally_tied_transformer_gguf(n_layers: usize) -> tempfile::NamedTempFile {
+        write_transformer_gguf_fixture(n_layers, None, false)
+    }
+
+    fn write_transformer_gguf_fixture(
+        n_layers: usize,
+        tie_word_embeddings: Option<bool>,
+        include_output_head: bool,
+    ) -> tempfile::NamedTempFile {
         const HIDDEN: usize = 4;
         const INTERMEDIATE: usize = 8;
         const VOCAB: usize = 16;
@@ -1335,8 +1599,7 @@ mod tests {
             (0..count).flat_map(|_| 1.0f32.to_le_bytes()).collect()
         }
         fn write_key(file: &mut tempfile::NamedTempFile, key: &str) {
-            file.write_all(&(key.len() as u64).to_le_bytes())
-                .unwrap();
+            file.write_all(&(key.len() as u64).to_le_bytes()).unwrap();
             file.write_all(key.as_bytes()).unwrap();
         }
 
@@ -1351,12 +1614,14 @@ mod tests {
                 vec![HIDDEN as u64],
                 ones(HIDDEN),
             ),
-            (
+        ];
+        if include_output_head {
+            tensors.push((
                 "output.weight".into(),
                 vec![HIDDEN as u64, VOCAB as u64],
                 values(HIDDEN * VOCAB, 7),
-            ),
-        ];
+            ));
+        }
         for layer in 0..n_layers {
             let prefix = format!("blk.{layer}");
             tensors.extend([
@@ -1385,16 +1650,8 @@ mod tests {
                     vec![HIDDEN as u64, HIDDEN as u64],
                     values(HIDDEN * HIDDEN, layer + 5),
                 ),
-                (
-                    format!("{prefix}.attn_q_norm.weight"),
-                    vec![2],
-                    ones(2),
-                ),
-                (
-                    format!("{prefix}.attn_k_norm.weight"),
-                    vec![2],
-                    ones(2),
-                ),
+                (format!("{prefix}.attn_q_norm.weight"), vec![2], ones(2)),
+                (format!("{prefix}.attn_k_norm.weight"), vec![2], ones(2)),
                 (
                     format!("{prefix}.ffn_norm.weight"),
                     vec![HIDDEN as u64],
@@ -1423,7 +1680,8 @@ mod tests {
         file.write_all(&3u32.to_le_bytes()).unwrap();
         file.write_all(&(tensors.len() as u64).to_le_bytes())
             .unwrap();
-        file.write_all(&9u64.to_le_bytes()).unwrap();
+        let kv_count = 9 + tie_word_embeddings.is_some() as u64;
+        file.write_all(&kv_count.to_le_bytes()).unwrap();
         write_key(&mut file, "general.architecture");
         file.write_all(&8u32.to_le_bytes()).unwrap();
         file.write_all(&4u64.to_le_bytes()).unwrap();
@@ -1448,14 +1706,17 @@ mod tests {
             file.write_all(&6u32.to_le_bytes()).unwrap();
             file.write_all(&value.to_le_bytes()).unwrap();
         }
+        if let Some(tie_word_embeddings) = tie_word_embeddings {
+            write_key(&mut file, "test.tie_word_embeddings");
+            file.write_all(&7u32.to_le_bytes()).unwrap();
+            file.write_all(&[u8::from(tie_word_embeddings)]).unwrap();
+        }
 
         let mut offset = 0u64;
         for (name, shape, data) in &tensors {
-            file.write_all(&(name.len() as u64).to_le_bytes())
-                .unwrap();
+            file.write_all(&(name.len() as u64).to_le_bytes()).unwrap();
             file.write_all(name.as_bytes()).unwrap();
-            file.write_all(&(shape.len() as u32).to_le_bytes())
-                .unwrap();
+            file.write_all(&(shape.len() as u32).to_le_bytes()).unwrap();
             for dim in shape {
                 file.write_all(&dim.to_le_bytes()).unwrap();
             }
@@ -1507,6 +1768,439 @@ mod tests {
         assert_eq!(model.vocab_size, 16);
         assert_eq!(model.rms_norm_eps, 1e-5);
         assert_eq!(model.rope_theta, 10_000.0);
+        assert!(model.tie_word_embeddings);
+    }
+
+    #[test]
+    fn new_rejects_untied_gguf_with_sampled_softmax_diagnostic() {
+        let file = write_transformer_gguf_with_tie_word_embeddings(1, false);
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+
+        let error =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .err()
+                .expect("untied GGUF must be rejected");
+        let message = error.to_string();
+
+        assert!(message.contains("tie_word_embeddings=true"));
+        assert!(message.contains("output.weight/lm_head.weight"));
+        assert!(message.contains("sampled-softmax"));
+    }
+
+    #[test]
+    fn new_accepts_structurally_tied_gguf_without_metadata() {
+        let file = write_structurally_tied_transformer_gguf(1);
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("construct structurally tied training loop");
+
+        assert!(ltl.layer_loader.transformer_config().tie_word_embeddings);
+        assert!(ltl
+            .layer_loader
+            .find_tensor(&["output.weight", "lm_head.weight"])
+            .is_none());
+        assert_eq!(ltl.lm_head.dims(), &[ltl.hidden, ltl.vocab]);
+    }
+
+    #[test]
+    fn tied_gguf_uses_full_vocab_for_embedding_and_token_modulo() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("construct tied training loop");
+
+        assert_eq!(ltl.vocab, 16);
+        assert_eq!(ltl.model_embedding.dims(), &[16, 4]);
+
+        let base = Tensor::from_vec(vec![1u32, 2], (2,), &Device::Cpu).unwrap();
+        let wrapped = Tensor::from_vec(vec![17u32, 18], (2,), &Device::Cpu).unwrap();
+        let (base_loss, _) = ltl
+            .forward_backward_sample(&base, &Device::Cpu)
+            .expect("base token sample");
+        let (wrapped_loss, _) = ltl
+            .forward_backward_sample(&wrapped, &Device::Cpu)
+            .expect("full-vocab modulo sample");
+
+        assert!(
+            (base_loss - wrapped_loss).abs() < 1e-6,
+            "token IDs separated by self.vocab must map identically"
+        );
+    }
+
+    #[test]
+    fn tied_lm_head_is_embedding_transpose_and_ignores_output_weight() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("construct tied training loop");
+
+        assert_eq!(ltl.model_embedding.dims(), &[16, 4]);
+        assert_eq!(ltl.lm_head.dims(), &[4, 16]);
+
+        let (embedding_storage, _) = ltl.model_embedding.storage_and_layout();
+        let (head_storage, _) = ltl.lm_head.storage_and_layout();
+        assert!(
+            std::ptr::eq(&*embedding_storage, &*head_storage),
+            "tied lm_head must reuse the embedding storage"
+        );
+        drop(head_storage);
+        drop(embedding_storage);
+
+        let embedding = ltl.model_embedding.to_vec2::<f32>().unwrap();
+        let head = ltl.lm_head.to_vec2::<f32>().unwrap();
+        for (row, values) in head.iter().enumerate() {
+            for (column, value) in values.iter().enumerate() {
+                assert_eq!(*value, embedding[column][row]);
+            }
+        }
+
+        let separate_output = load_matrix_rows(
+            &ltl.layer_loader,
+            &["output.weight"],
+            ltl.vocab,
+            ltl.hidden,
+            &Device::Cpu,
+        )
+        .expect("load fixture output.weight");
+        assert_ne!(
+            ltl.model_embedding
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            separate_output
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            "fixture must keep output.weight distinct from the embedding"
+        );
+    }
+
+    #[test]
+    fn tied_embedding_and_head_never_register_lora_parameters() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("construct tied training loop");
+        let data = ltl.varmap.data().lock().unwrap();
+
+        assert!(data
+            .keys()
+            .all(|key| !key.starts_with("tok_embed") && !key.starts_with("lm_head")));
+    }
+
+    #[test]
+    fn tied_lm_head_produces_full_vocab_logits() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("construct tied training loop");
+        let last_hidden =
+            Tensor::zeros((1, ltl.hidden), candle_core::DType::F32, &Device::Cpu).unwrap();
+        let logits = ltl
+            .logits_from_last_hidden(&last_hidden)
+            .expect("project tied logits");
+
+        assert_eq!(logits.dims(), &[1, 16]);
+        assert_eq!(logits.dims()[1], ltl.vocab);
+    }
+
+    #[test]
+    fn dry_run_report_uses_full_vocab_and_includes_required_fields() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let mut config = default_config(output.path().to_path_buf());
+        config.max_steps = Some(1);
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(3), make_varmap(), None, 0)
+                .expect("construct dry-run training loop");
+
+        let result = ltl.run().expect("complete one dry-run step");
+        let report = ltl
+            .build_dry_run_report(1, 100.0, 125.0, result.final_loss, 0.25)
+            .to_string();
+
+        assert!(report.contains("vocab(full)=16"));
+        assert!(!report.contains("vocab(capped)="));
+        for required in ["hidden=", "layers=", "trainable params=", "RSS", "loss="] {
+            assert!(
+                report.contains(required),
+                "dry-run report is missing '{required}':\n{report}"
+            );
+        }
+    }
+
+    #[test]
+    fn loss_remains_finite_and_non_negative_during_first_fifty_optimizer_steps() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(3), make_varmap(), None, 0)
+                .expect("construct training loop");
+        let sample = ltl.batches[0][0].clone();
+
+        for step in 1..=50 {
+            let (loss, mut gradients) = ltl
+                .forward_backward_sample(&sample, &Device::Cpu)
+                .expect("compute training gradients");
+            assert!(
+                loss.is_finite() && loss >= 0.0,
+                "invalid cross-entropy at step {step}: {loss}"
+            );
+
+            clip_gradstore_norm(&mut gradients, &ltl.varmap, ltl.config.max_grad_norm)
+                .expect("clip training gradients");
+            ltl.adamw.step(&gradients).expect("apply optimizer step");
+        }
+    }
+
+    #[test]
+    fn test_update_moments_initial_zero() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new");
+        let key = "l0.attn_q.lora_a";
+        let var = var_by_key(&ltl, key);
+        let grads = synthetic_grads_for_var(&var, vec![0.0; var.as_tensor().elem_count()]);
+        let varmap_data = varmap_data_snapshot(&ltl);
+
+        ltl.update_moments(&grads, std::slice::from_ref(&var), &varmap_data)
+            .expect("update moments");
+
+        let (m1, m2) = ltl.moment_store.get(key).expect("moment pair");
+        assert!(m1
+            .to_vec2::<f32>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|v| *v == 0.0));
+        assert!(m2
+            .to_vec2::<f32>()
+            .unwrap()
+            .iter()
+            .flatten()
+            .all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn test_update_moments_formula() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new");
+        let key = "l0.attn_q.lora_a";
+        let var = var_by_key(&ltl, key);
+        let grad_values: Vec<f32> = (1..=var.as_tensor().elem_count())
+            .map(|value| value as f32)
+            .collect();
+        let grads = synthetic_grads_for_var(&var, grad_values.clone());
+        let varmap_data = varmap_data_snapshot(&ltl);
+
+        ltl.update_moments(&grads, std::slice::from_ref(&var), &varmap_data)
+            .expect("update moments");
+
+        let (m1, m2) = ltl.moment_store.get(key).expect("moment pair");
+        let m1_values = m1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let m2_values = m2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let expected_m1: Vec<f32> = grad_values.iter().map(|g| 0.1 * g).collect();
+        let expected_m2: Vec<f32> = grad_values.iter().map(|g| 0.001 * g * g).collect();
+
+        assert_all_close(&m1_values, &expected_m1, 1e-6);
+        assert_all_close(&m2_values, &expected_m2, 1e-6);
+    }
+
+    #[test]
+    fn test_update_moments_step_t_increments() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 7)
+                .expect("new");
+        let key = "l0.attn_q.lora_a";
+        let var = var_by_key(&ltl, key);
+        let grads = synthetic_grads_for_var(&var, vec![1.0; var.as_tensor().elem_count()]);
+        let varmap_data = varmap_data_snapshot(&ltl);
+
+        for _ in 0..3 {
+            ltl.update_moments(&grads, std::slice::from_ref(&var), &varmap_data)
+                .expect("update moments");
+        }
+
+        assert_eq!(ltl.step_t, 10);
+    }
+
+    #[test]
+    fn test_moment_shape_unchanged() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new");
+        let key = "l0.attn_q.lora_a";
+        let var = var_by_key(&ltl, key);
+        let grads = synthetic_grads_for_var(&var, vec![1.0; var.as_tensor().elem_count()]);
+        let varmap_data = varmap_data_snapshot(&ltl);
+
+        ltl.update_moments(&grads, std::slice::from_ref(&var), &varmap_data)
+            .expect("update moments");
+
+        let (m1, m2) = ltl.moment_store.get(key).expect("moment pair");
+        assert_eq!(m1.dims(), var.as_tensor().dims());
+        assert_eq!(m2.dims(), var.as_tensor().dims());
+    }
+
+    #[test]
+    fn test_moment_store_entry_count_multi_projection() {
+        let file = write_multi_proj_gguf(2);
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(3), make_varmap(), None, 0)
+                .expect("new");
+
+        let result = ltl.run().expect("run");
+
+        assert_eq!(result.total_steps, 1);
+        assert_eq!(ltl.moment_store.len(), 2 * 7 * 2);
+        assert_eq!(ltl.step_t, 1);
+    }
+
+    #[test]
+    fn test_moment_values_match_adamw_internal() {
+        const STEPS: usize = 3;
+        const TOLERANCE: f32 = 1e-5;
+        const BETA1: f32 = 0.9;
+        const BETA2: f32 = 0.999;
+
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let mut config = default_config(output.path().to_path_buf());
+        // Make clipping a no-op so the captured pre-clip gradient is also the
+        // exact optimizer-input gradient Candle AdamW receives.
+        config.max_grad_norm = 1.0e12;
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(3), make_varmap(), None, 0)
+                .expect("new");
+
+        let batch = ltl.batches[0].clone();
+        let trainable_vars = ltl.varmap.all_vars();
+        let mut reference: HashMap<String, (Vec<f32>, Vec<f32>)> = HashMap::new();
+
+        for _ in 0..STEPS {
+            let (_, mut grads) = ltl
+                .forward_backward_batch(&batch, &Device::Cpu)
+                .expect("training gradients");
+            let varmap_data_before_step = varmap_data_snapshot(&ltl);
+
+            for var in &trainable_vars {
+                let Some(key) = varmap_key_for(var, &varmap_data_before_step) else {
+                    continue;
+                };
+                let Some(grad) = grads.get(var.as_tensor()) else {
+                    continue;
+                };
+                let grad_values = grad.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                let (m1_ref, m2_ref) = reference.entry(key).or_insert_with(|| {
+                    (vec![0.0; grad_values.len()], vec![0.0; grad_values.len()])
+                });
+
+                for (idx, grad_value) in grad_values.iter().copied().enumerate() {
+                    m1_ref[idx] = BETA1 * m1_ref[idx] + (1.0 - BETA1) * grad_value;
+                    m2_ref[idx] = BETA2 * m2_ref[idx] + (1.0 - BETA2) * grad_value * grad_value;
+                }
+            }
+
+            clip_gradstore_norm(&mut grads, &ltl.varmap, ltl.config.max_grad_norm)
+                .expect("clip optimizer gradients");
+            ltl.adamw.step(&grads).expect("optimizer step");
+            let varmap_data_after_step = varmap_data_snapshot(&ltl);
+            ltl.update_moments(&grads, &trainable_vars, &varmap_data_after_step)
+                .expect("update moment store");
+        }
+
+        assert_eq!(ltl.step_t, STEPS);
+        assert_eq!(ltl.moment_store.len(), reference.len());
+        for (key, (expected_m1, expected_m2)) in reference {
+            let (actual_m1, actual_m2) = ltl
+                .moment_store
+                .get(&key)
+                .unwrap_or_else(|| panic!("missing moment pair for {key}"));
+            let actual_m1 = actual_m1.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let actual_m2 = actual_m2.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+            let m1_error = max_abs_diff(&actual_m1, &expected_m1);
+            let m2_error = max_abs_diff(&actual_m2, &expected_m2);
+
+            assert!(
+                m1_error < TOLERANCE,
+                "m1 mismatch for {key}: max error {m1_error}"
+            );
+            assert!(
+                m2_error < TOLERANCE,
+                "m2 mismatch for {key}: max error {m2_error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_load_adamw_state_shape_mismatch_dropped() {
+        let file = write_one_layer_gguf();
+        let output = TempDir::new().unwrap();
+        let config = default_config(output.path().to_path_buf());
+        let mut ltl =
+            LayeredTrainingLoop::new(config, file.path(), make_batch(2), make_varmap(), None, 7)
+                .expect("new");
+
+        let valid_key = "l0.attn_q.lora_a".to_string();
+        let valid_shape = var_by_key(&ltl, &valid_key).as_tensor().shape().clone();
+        let mut store = MomentStore::new();
+        store.insert(
+            valid_key.clone(),
+            (
+                Tensor::zeros(valid_shape.clone(), candle_core::DType::F32, &Device::Cpu).unwrap(),
+                Tensor::zeros(valid_shape, candle_core::DType::F32, &Device::Cpu).unwrap(),
+            ),
+        );
+        store.insert(
+            "l0.attn_q.lora_b".to_string(),
+            (
+                Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap(),
+                Tensor::zeros((1, 1), candle_core::DType::F32, &Device::Cpu).unwrap(),
+            ),
+        );
+
+        crate::train::adamw_state::save_adamw_state(&store, 500, output.path(), 500)
+            .expect("save AdamW state");
+        let weight_path = output.path().join("checkpoint_000500.safetensors");
+
+        ltl.load_adamw_state(&weight_path);
+
+        assert_eq!(ltl.step_t, 500);
+        assert!(ltl.moment_store.contains_key(&valid_key));
+        assert!(
+            !ltl.moment_store.contains_key("l0.attn_q.lora_b"),
+            "mismatched moment pair must be dropped"
+        );
+        assert_eq!(ltl.moment_store.len(), 1);
     }
 
     /// Property 12 (GWEN-222): `shape_to_2d` reverses GGUF `[d_in, d_out]`
@@ -1531,13 +2225,11 @@ mod tests {
         let cfg = default_config(td.path().to_path_buf());
         let result = LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0);
         assert!(result.is_err());
-        assert!(
-            result
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("no model.layers")
-        );
+        assert!(result
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("no model.layers"));
     }
 
     #[test]
@@ -1546,8 +2238,9 @@ mod tests {
         let td = TempDir::new().unwrap();
         let cfg = default_config(td.path().to_path_buf());
         // 2 tokens → input shape (1,1) which matches d_in=1 from the 1-element GGUF tensor.
-        let mut ltl = LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
-            .expect("new");
+        let mut ltl =
+            LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new");
 
         let result = ltl.run().expect("run");
         assert!(
@@ -1584,19 +2277,20 @@ mod tests {
         let f = write_two_layer_gguf();
         let td = TempDir::new().unwrap();
         let cfg = default_config(td.path().to_path_buf());
-        // `tests` is a submodule, so the private `varmap` field + free
-        // `save_checkpoint` fn are both in scope.
         let ltl =
             LayeredTrainingLoop::new(cfg.clone(), f.path(), make_batch(2), make_varmap(), None, 0)
                 .expect("new");
 
-        save_checkpoint(&ltl.varmap, &cfg, 500).expect("save_checkpoint");
+        ltl.save_checkpoint_and_adamw_state(500);
         let path = cfg.output_path.join("checkpoint_000500.safetensors");
         assert!(path.exists(), "checkpoint file should exist");
 
         let tensors =
             candle_core::safetensors::load(&path, &Device::Cpu).expect("load safetensors");
-        assert!(!tensors.is_empty(), "checkpoint must contain adapter tensors");
+        assert!(
+            !tensors.is_empty(),
+            "checkpoint must contain adapter tensors"
+        );
         for key in tensors.keys() {
             assert!(
                 key.contains("lora_"),
@@ -1701,8 +2395,9 @@ mod tests {
         let f = write_multi_proj_gguf(2); // 2 layers
         let td = TempDir::new().unwrap();
         let cfg = default_config(td.path().to_path_buf()); // 1 epoch
-        let mut ltl = LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
-            .expect("new");
+        let mut ltl =
+            LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new");
 
         let result = ltl.run().expect("run");
         assert!(result.final_loss.is_finite(), "loss must be finite");
@@ -1754,7 +2449,7 @@ mod tests {
             .unwrap()
             .reshape((1, ltl.hidden))
             .unwrap()
-            .matmul(&ltl.lm_head.t().unwrap())
+            .matmul(&ltl.lm_head)
             .unwrap();
         let target = Tensor::from_vec(vec![3u32], (1,), &Device::Cpu).unwrap();
         let full_loss = candle_nn::loss::cross_entropy(&logits, &target).unwrap();
@@ -1801,8 +2496,16 @@ mod tests {
         assert_eq!(boundaries.len(), 3);
         assert_eq!(boundaries[0].dims(), &[1, 2, 4]);
         assert_ne!(
-            boundaries[0].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-            boundaries[2].flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            boundaries[0]
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap(),
+            boundaries[2]
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap()
         );
     }
 
@@ -1912,8 +2615,9 @@ mod tests {
         let td = TempDir::new().unwrap();
         let mut cfg = default_config(td.path().to_path_buf());
         cfg.gdtqp = true;
-        let mut ltl = LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
-            .expect("new with --gdtqp");
+        let mut ltl =
+            LayeredTrainingLoop::new(cfg, f.path(), make_batch(2), make_varmap(), None, 0)
+                .expect("new with --gdtqp");
 
         assert_eq!(ltl.proj_keys_per_layer.len(), 7);
         // Every allocated rank is a sane positive value.
@@ -1958,7 +2662,8 @@ mod tests {
         cfg.epochs = epochs;
         cfg.grad_accum = grad_accum;
 
-        let mut ltl = match LayeredTrainingLoop::new(cfg, f.path(), batches, make_varmap(), None, 0) {
+        let mut ltl = match LayeredTrainingLoop::new(cfg, f.path(), batches, make_varmap(), None, 0)
+        {
             Ok(l) => l,
             Err(_) => return true, // construction errors are not the property under test
         };

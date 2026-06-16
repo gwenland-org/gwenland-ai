@@ -5,8 +5,10 @@
 //
 // @EDITABLE: Wire new check_* functions into run_all_checks().
 
-use crate::storage::paths::gwen_config_dir;
+use crate::convert::gguf_parser::{self, MetadataValue};
+use crate::storage::paths::{GwenPaths, gwen_config_dir};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::process::Command;
 
 // ── check result types ────────────────────────────────────────────────────────
@@ -34,8 +36,15 @@ pub struct CheckResult {
 // ── entry point ────────────────────────────────────────────────────────────────
 
 /// Run all diagnostic checks concurrently.
-pub async fn run_all_checks(safe: bool, force: bool) -> Vec<CheckResult> {
-    let force_apply = !safe && force;
+///
+/// `model_paths` — explicit GGUF files to inspect for training readiness.
+/// Pass an empty vec to scan `GwenPaths::models_dir()` automatically.
+pub async fn run_all_checks(
+    safe: bool,
+    force: bool,
+    model_paths: Vec<PathBuf>,
+) -> Vec<CheckResult> {
+    let _force_apply = !safe && force;
     let (cuda, vram, disk, native_inference, models) = tokio::join!(
         check_cuda(),
         check_vram(),
@@ -44,7 +53,9 @@ pub async fn run_all_checks(safe: bool, force: bool) -> Vec<CheckResult> {
         check_models_dir(),
     );
 
-    vec![cuda, vram, disk, native_inference, models]
+    let mut results = vec![cuda, vram, disk, native_inference, models];
+    results.extend(check_gguf_training_readiness(model_paths));
+    results
 }
 
 // ── CUDA ──────────────────────────────────────────────────────────────────────
@@ -73,7 +84,7 @@ async fn check_cuda() -> CheckResult {
                 fix_applied: false,
                 fix_succeeded: false,
                 suggestion: Some("Check NVIDIA drivers".into()),
-            }
+            };
         }
     };
 
@@ -247,9 +258,7 @@ async fn check_models_dir() -> CheckResult {
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter(|e| {
-                    e.path().extension().and_then(|x| x.to_str()) == Some("gguf")
-                })
+                .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("gguf"))
                 .count()
         })
         .unwrap_or(0);
@@ -274,5 +283,133 @@ async fn check_models_dir() -> CheckResult {
         fix_applied: false,
         fix_succeeded: false,
         suggestion: None,
+    }
+}
+
+// ── GGUF training readiness ───────────────────────────────────────────────────
+
+/// Probe every GGUF in `model_paths` (or all GGUFs in `GwenPaths::models_dir()`
+/// when the list is empty) and report whether each model supports the
+/// weight-tied training path.
+///
+/// For each file the check reports:
+///   - which resolution path was taken (explicit metadata KV vs structural)
+///   - the raw evidence (KV value / tensor presence)
+///   - whether training will succeed without sampled-softmax
+fn check_gguf_training_readiness(model_paths: Vec<PathBuf>) -> Vec<CheckResult> {
+    let paths = if model_paths.is_empty() {
+        collect_gguf_paths_from_models_dir()
+    } else {
+        model_paths
+    };
+
+    if paths.is_empty() {
+        return vec![];
+    }
+
+    paths
+        .into_iter()
+        .map(probe_gguf_training_readiness)
+        .collect()
+}
+
+fn collect_gguf_paths_from_models_dir() -> Vec<PathBuf> {
+    let dir = GwenPaths::models_dir();
+    if !dir.exists() {
+        return vec![];
+    }
+    std::fs::read_dir(&dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn probe_gguf_training_readiness(path: PathBuf) -> CheckResult {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let check_name = format!("gguf-train:{}", stem);
+
+    let header = match gguf_parser::parse_header(&path) {
+        Ok(h) => h,
+        Err(e) => {
+            return CheckResult {
+                name: check_name,
+                status: CheckStatus::Warning,
+                value: format!("parse error: {}", e),
+                fix_available: false,
+                fix_applied: false,
+                fix_succeeded: false,
+                suggestion: Some("file may be corrupt or not a valid GGUF".into()),
+            };
+        }
+    };
+
+    let arch = header
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let tie_key = format!("{arch}.tie_word_embeddings");
+    let tie_kv = header.metadata.get(&tie_key);
+
+    const OUTPUT_HEAD_NAMES: [&str; 3] =
+        ["output.weight", "lm_head.weight", "model.lm_head.weight"];
+    let has_output_head = header
+        .tensors
+        .iter()
+        .any(|t| OUTPUT_HEAD_NAMES.contains(&t.name.as_str()));
+
+    let (tied, resolution) = match tie_kv {
+        Some(MetadataValue::Bool(true)) => (true, "metadata=true".to_string()),
+        Some(MetadataValue::Bool(false)) => (false, "metadata=false".to_string()),
+        Some(_) => (
+            false,
+            format!("metadata key present but wrong type ({})", tie_key),
+        ),
+        None if !has_output_head => (true, "structural (no separate output head)".to_string()),
+        None => (
+            false,
+            "structural (output.weight / lm_head.weight present; metadata key absent)".to_string(),
+        ),
+    };
+
+    if tied {
+        CheckResult {
+            name: check_name,
+            status: CheckStatus::Pass,
+            value: format!("tied — {}", resolution),
+            fix_available: false,
+            fix_applied: false,
+            fix_succeeded: false,
+            suggestion: None,
+        }
+    } else {
+        let suggestion = if resolution.contains("metadata=false") {
+            "model is genuinely untied; use sampled-softmax (option b) or switch to a tied model (e.g. Qwen3-0.6B)".into()
+        } else {
+            "output.weight exists but tie_word_embeddings KV is absent — possible metadata gap in GGUF conversion; try re-converting or check config.json on HuggingFace".into()
+        };
+        CheckResult {
+            name: check_name,
+            status: CheckStatus::Fail,
+            value: format!("untied — {}", resolution),
+            fix_available: false,
+            fix_applied: false,
+            fix_succeeded: false,
+            suggestion: Some(suggestion),
+        }
     }
 }

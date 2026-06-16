@@ -34,6 +34,12 @@ pub struct DoctorArgs {
     /// Write a full JSON report to FILE in addition to stdout output (e.g. -o report.json)
     #[arg(short = 'o', long, value_name = "FILE")]
     pub output: Option<PathBuf>,
+
+    /// Specific GGUF file(s) to probe for training readiness instead of scanning the models dir.
+    /// Accepts one or more paths (repeat the flag or separate with spaces).
+    /// When omitted, all GGUFs in the default models directory are scanned automatically.
+    #[arg(long = "model", value_name = "GGUF", num_args = 1..)]
+    pub model: Vec<PathBuf>,
 }
 
 // @INFO: The main runner for the doctor command in TUI.
@@ -41,7 +47,7 @@ pub struct DoctorArgs {
 // Includes graceful degradation for non-TTY terminals via `atty` and optionally writes a JSON report.
 // @EDITABLE: Yes, update this function if you want to change the visual formatting or add new display metrics.
 pub async fn run_doctor(args: DoctorArgs) {
-    let results = run_all_checks(args.safe, args.force).await;
+    let results = run_all_checks(args.safe, args.force, args.model).await;
     
     let use_color = atty::is(atty::Stream::Stdout);
     

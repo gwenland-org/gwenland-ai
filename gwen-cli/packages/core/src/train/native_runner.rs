@@ -107,6 +107,7 @@ pub fn run_native_local(
         training_loop
             .load_checkpoint(path)
             .context("failed to load checkpoint into VarMap")?;
+        training_loop.load_adamw_state(path);
     }
 
     eprintln!("[train] starting layered training ({} epochs)…", config.epochs);
