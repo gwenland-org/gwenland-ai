@@ -30,7 +30,7 @@ const POLL_MS: u64 = 16; // ~60 fps
 
 const INFERENCE_SERVER_DOWN: &str = "inference server is not running";
 const INFERENCE_SERVER_DOWN_HINT: &str =
-    "start one with `gwen serve --model <path/to/model.gguf>`";
+    "start one with `gwen serve <path/to/model.gguf>`";
 
 fn sse_error_is_connect(err: &reqwest_eventsource::Error) -> bool {
     matches!(

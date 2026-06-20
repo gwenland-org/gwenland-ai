@@ -1,0 +1,192 @@
+# GwenLand GitLab CI/CD
+#
+# Repo layout: the Cargo workspace lives in `gwen-cli/`, the Tauri frontend in
+# `gwen-cli/packages/gui/`. Jobs cd into the right place rather than assuming the
+# repo root is the crate root.
+#
+# Pipeline:
+#   check  →  fmt / clippy / cargo check (core + tui)  +  gui typecheck
+#   test   →  core lib tests + tui tests
+#   build  →  release CLI binary (gwenland) + GUI frontend (dist/)
+#            + optional manual desktop bundle (Linux; Windows template below)
+
+stages:
+  - check
+  - test
+  - build
+
+variables:
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  CARGO_TERM_COLOR: "always"
+  RUST_BACKTRACE: "1"
+  WORKSPACE: "gwen-cli"
+
+# ── Shared Rust setup ─────────────────────────────────────────────────────────
+# edition = 2024 needs Rust >= 1.85; pin a recent stable for reproducibility.
+.rust:
+  image: rust:1.86-bookworm
+  cache:
+    key:
+      files:
+        - gwen-cli/Cargo.lock
+    paths:
+      - .cargo/
+      - gwen-cli/target/
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq cmake pkg-config libssl-dev
+    - rustc --version && cargo --version
+
+# ── Shared Node/pnpm setup (GUI frontend) ─────────────────────────────────────
+# tauri.conf.json drives the frontend with pnpm (beforeBuildCommand: pnpm build).
+.node:
+  image: node:20-bookworm
+  cache:
+    key:
+      files:
+        - gwen-cli/packages/gui/pnpm-lock.yaml
+    paths:
+      - gwen-cli/packages/gui/node_modules/
+  before_script:
+    - corepack enable
+    - cd gwen-cli/packages/gui
+    # No pnpm-lock.yaml is committed yet. After you commit one, switch this to
+    # `pnpm install --frozen-lockfile` for reproducible CI installs.
+    - pnpm install
+
+# ── check ─────────────────────────────────────────────────────────────────────
+check:
+  extends: .rust
+  stage: check
+  script:
+    # gwenland-gui is intentionally excluded: tauri::generate_context! needs the
+    # built frontend (../dist) and bundle icons present at compile time, which
+    # the gui:* / bundle:* jobs handle. core + tui are pure Rust, no WebKit.
+    - cd $WORKSPACE && cargo check -p gwenland-core -p gwenland-tui --locked
+
+fmt:
+  extends: .rust
+  stage: check
+  needs: []
+  allow_failure: true
+  script:
+    - rustup component add rustfmt
+    - cd $WORKSPACE && cargo fmt --all -- --check
+
+clippy:
+  extends: .rust
+  stage: check
+  needs: []
+  allow_failure: true
+  script:
+    - rustup component add clippy
+    - cd $WORKSPACE && cargo clippy -p gwenland-core -p gwenland-tui --all-targets -- -D warnings
+
+gui:typecheck:
+  extends: .node
+  stage: check
+  needs: []
+  allow_failure: true
+  script:
+    - pnpm typecheck
+
+# ── test ──────────────────────────────────────────────────────────────────────
+test:core:
+  extends: .rust
+  stage: test
+  script:
+    # --test-threads=1: several tests touch process-global state
+    # (std::panic::set_hook, the GWEN_HOME test env) and race otherwise.
+    # NOTE: a few engine::inference::selector tests need the candle-ggqr backend
+    # at runtime; if they fail on a given runner, add `--skip selector` here.
+    - cd $WORKSPACE && cargo test -p gwenland-core --lib -- --test-threads=1
+
+test:tui:
+  extends: .rust
+  stage: test
+  script:
+    - cd $WORKSPACE && cargo test -p gwenland-tui
+
+# ── build ─────────────────────────────────────────────────────────────────────
+# Release profile uses fat LTO + opt-level "z" (the <50MB target), so this is
+# slow — restrict it to the default branch and tags.
+build:cli:
+  extends: .rust
+  stage: build
+  script:
+    - cd $WORKSPACE && cargo build --release -p gwenland-tui
+  artifacts:
+    name: "gwenland-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - gwen-cli/target/release/gwenland
+    expire_in: 1 week
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+gui:build:
+  extends: .node
+  stage: build
+  script:
+    - pnpm build
+  artifacts:
+    name: "gwenland-gui-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - gwen-cli/packages/gui/dist/
+    expire_in: 1 week
+
+# ── Optional: full Tauri desktop bundle (Linux) ───────────────────────────────
+# Heavy — pulls the WebKitGTK stack plus a Rust toolchain. Manual so it doesn't
+# run on every push. Produces installers under gwen-cli/target/release/bundle/.
+# The bundle ships the `gwen` CLI as a sidecar: tauri.conf.json beforeBuildCommand
+# runs `pnpm sidecar`, which builds gwenland-tui and copies it to
+# src-tauri/binaries/gwen-<triple>. No extra CI steps needed — Rust is already
+# in this image.
+bundle:linux:
+  stage: build
+  image: rust:1.86-bookworm
+  when: manual
+  allow_failure: true
+  cache:
+    key:
+      files:
+        - gwen-cli/Cargo.lock
+    paths:
+      - .cargo/
+      - gwen-cli/target/
+  before_script:
+    - apt-get update -qq
+    - >-
+      apt-get install -y -qq
+      libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev
+      librsvg2-dev libssl-dev build-essential curl wget file cmake pkg-config
+    - curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+    - apt-get install -y -qq nodejs
+    - corepack enable
+  script:
+    - cd gwen-cli/packages/gui
+    - pnpm install
+    - pnpm tauri build
+  artifacts:
+    paths:
+      - gwen-cli/target/release/bundle/
+    expire_in: 1 week
+
+# ── Windows desktop bundle (template) ─────────────────────────────────────────
+# The Windows .exe embeds icons/icon.ico as its executable icon. This needs a
+# Windows runner (a runner registered with the "windows" tag). Uncomment and
+# point `tags:` at your runner to enable it.
+#
+# bundle:windows:
+#   stage: build
+#   tags: [windows]
+#   when: manual
+#   before_script:
+#     - corepack enable
+#   script:
+#     - cd gwen-cli/packages/gui
+#     - pnpm install
+#     - pnpm tauri build
+#   artifacts:
+#     paths:
+#       - gwen-cli/target/release/bundle/
+#     expire_in: 1 week

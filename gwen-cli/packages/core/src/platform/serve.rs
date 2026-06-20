@@ -54,6 +54,12 @@ pub fn save_last_used_model(model_id: &str) -> Result<()> {
     crate::storage::config::save_last_used_model(model_id)
 }
 
+/// Read the last served model id from config. Used when `gwen serve` is invoked
+/// without a model (e.g. the GUI auto-start spawns a bare `gwen serve`).
+pub fn read_last_used_model() -> Option<String> {
+    crate::storage::config::read_last_used_model()
+}
+
 // ── model resolution ──────────────────────────────────────────────────────────
 
 /// Resolve a model name to its GGUF path using the same logic as the runner.

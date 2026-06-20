@@ -28,7 +28,7 @@ export default function AboutCard({ onError }: AboutCardProps = {}) {
     setChecking(true)
     setUpdateMsg(null)
     try {
-      const out = await Command.create('gwen', ['update', '--check']).execute()
+      const out = await Command.sidecar('binaries/gwen', ['update', '--check']).execute()
       const text = (out.stdout || out.stderr || '').trim()
       setUpdateMsg(text || 'No update information returned.')
     } catch {

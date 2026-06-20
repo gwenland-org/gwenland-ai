@@ -39,11 +39,13 @@
     {
       "identifier": "shell:allow-execute",
       "allow": [
-        {
-          "name": "gwen",
-          "cmd": "gwen",
-          "args": ["update", "--check"]
-        }
+        { "name": "binaries/gwen", "sidecar": true, "args": ["update", "--check"] }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        { "name": "binaries/gwen", "sidecar": true, "args": ["serve"] }
       ]
     }
   ]

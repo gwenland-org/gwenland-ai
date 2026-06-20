@@ -26,7 +26,7 @@ const DEFAULT_SYSTEM_PROMPT: &str =
 
 pub const INFERENCE_SERVER_DOWN: &str = "inference server is not running";
 pub const INFERENCE_SERVER_DOWN_HINT: &str =
-    "start one with `gwen serve --model <path/to/model.gguf>`";
+    "start one with `gwen serve <path/to/model.gguf>`";
 
 /// User-facing message for TUI history when the inference server is unreachable.
 pub fn inference_server_down_message() -> String {

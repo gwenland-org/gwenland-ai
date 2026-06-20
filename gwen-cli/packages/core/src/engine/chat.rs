@@ -162,8 +162,8 @@ pub async fn probe_server(port: u16) -> bool {
 
 pub fn server_unreachable_message(port: u16) -> String {
     let hint = match read_last_used_model() {
-        Some(m) => format!("gwen serve --model {}", m),
-        None => "gwen serve --model <model-id>".to_string(),
+        Some(m) => format!("gwen serve {}", m),
+        None => "gwen serve <model-id>".to_string(),
     };
     format!(
         "  ⚠ No server running on port {}. Start with:\n    {}",

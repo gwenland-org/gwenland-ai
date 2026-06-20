@@ -42,7 +42,7 @@ export default function App() {
   // proxy unexpectedly would disrupt any in-flight chat stream.
   useEffect(() => {
     if (config.autoStartProxy) {
-      Command.create('gwen', ['serve']).spawn().catch(() => {
+      Command.sidecar('binaries/gwen', ['serve']).spawn().catch(() => {
         // EADDRINUSE means the proxy is already running — not an error.
         // Any other spawn failure is also non-fatal; the user will see the
         // "proxy offline" banner in Chat if the proxy isn't reachable.

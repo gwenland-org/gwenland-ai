@@ -13,7 +13,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use gwenland_core::platform::serve::{
-    dry_run_serve, find_model_in_cache, save_last_used_model,
+    dry_run_serve, find_model_in_cache, read_last_used_model, save_last_used_model,
     EXIT_CONNECTION_FAILED, EXIT_ERROR, EXIT_MODEL_NOT_FOUND, EXIT_OK, ServeStatus,
 };
 use gwenland_core::engine::inference::sampler::SamplerConfig;
@@ -40,13 +40,21 @@ use tokio::sync::oneshot;
                   No external process required — pure Rust.\n\n\
                   Examples:\n  \
                     gwen serve qwen3-8b-q4_0\n  \
+                    gwen serve -m qwen3-8b-q4_0          (--model also works)\n  \
                     gwen serve qwen3-8b-q4_0 --port 8080\n  \
                     gwen serve qwen3-8b-q4_0 --dry-run"
 )]
 pub struct ServeArgs {
-    /// Model name or path (e.g. qwen3-8b-q4_0, ./models/custom.gguf)
-    #[arg(required = true, value_name = "MODEL")]
-    pub model: String,
+    /// Model name or path (e.g. qwen3-8b-q4_0, ./models/custom.gguf).
+    /// Optional — if omitted, the last served model is reused.
+    #[arg(value_name = "MODEL")]
+    pub model: Option<String>,
+
+    /// Model name or path passed as a flag. Mirrors `gwen fetch`/`gwen train`
+    /// (which use `-m/--model`) so the form people expect also works on serve.
+    /// Takes precedence over the positional MODEL.
+    #[arg(short = 'm', long = "model", value_name = "MODEL", conflicts_with = "model")]
+    pub model_flag: Option<String>,
 
     /// Port to bind the SSE proxy on (default: 1136)
     #[arg(long, short = 'p', default_value = "1136", value_name = "PORT")]
@@ -78,9 +86,31 @@ async fn run_serve_inner(
     args: ServeArgs,
     mode: gwenland_core::engine::GwenMode,
 ) -> anyhow::Result<i32> {
+    // Resolve the model: `-m/--model` flag > positional MODEL > last served model.
+    // `serve` historically accepted only a positional MODEL, but its own hints
+    // (and `gwen fetch`/`gwen train`) use `--model`, so accept both — and fall
+    // back to the last served model when none is given (e.g. the GUI auto-start
+    // spawns a bare `gwen serve`).
+    let model = match args.model_flag.or(args.model) {
+        Some(m) => m,
+        None => match read_last_used_model() {
+            Some(m) => {
+                if !args.json {
+                    eprintln!("No model given — reusing last served model: {m}");
+                }
+                m
+            }
+            None => {
+                eprintln!("error: no model specified.");
+                eprintln!("hint:  gwen serve <path/to/model.gguf>   (or: gwen serve -m <model>)");
+                return Ok(EXIT_MODEL_NOT_FOUND);
+            }
+        },
+    };
+
     // --dry-run: read-only pre-flight only.
     if mode.dry_run {
-        let report = dry_run_serve(&args.model, args.port);
+        let report = dry_run_serve(&model, args.port);
         if mode.json {
             gwenland_core::dry_run::print_json(&report);
         } else {
@@ -90,13 +120,13 @@ async fn run_serve_inner(
     }
 
     // Verify the model exists before starting the proxy.
-    if find_model_in_cache(&args.model).is_none() {
+    if find_model_in_cache(&model).is_none() {
         if args.json {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&ServeStatus {
                     status: "model_not_found".into(),
-                    model: args.model.clone(),
+                    model: model.clone(),
                     port: args.port,
                     pid: None,
                 })
@@ -105,13 +135,13 @@ async fn run_serve_inner(
         } else {
             eprintln!(
                 "error: model '{}' not found. Run `gwen fetch {}`.",
-                args.model, args.model
+                model, model
             );
         }
         return Ok(EXIT_MODEL_NOT_FOUND);
     }
 
-    let _ = save_last_used_model(&args.model);
+    let _ = save_last_used_model(&model);
 
     // Create the shutdown channel — dropping the sender stops the proxy.
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
@@ -120,7 +150,7 @@ async fn run_serve_inner(
         // JSON mode: print status and park until Ctrl+C.
         let status = ServeStatus {
             status: "running".into(),
-            model: args.model.clone(),
+            model: model.clone(),
             port: args.port,
             pid: Some(std::process::id()),
         };
@@ -139,7 +169,7 @@ async fn run_serve_inner(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "status": "stopped",
-                "model": args.model,
+                "model": model.clone(),
             }))
             .unwrap_or_default()
         );
@@ -156,7 +186,7 @@ async fn run_serve_inner(
         }
     });
 
-    let code = run_serve_tui(&args.model, args.port, request_count).await;
+    let code = run_serve_tui(&model, args.port, request_count).await;
     // Drop shutdown_tx — this signals the proxy to stop gracefully.
     drop(shutdown_tx);
 

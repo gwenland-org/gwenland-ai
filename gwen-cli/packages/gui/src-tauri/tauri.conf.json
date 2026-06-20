@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "pnpm build && pnpm sidecar"
   },
   "app": {
     "windows": [
@@ -34,8 +34,11 @@
     "targets": "all",
     "icon": [
       "icons/32x32.png",
-      "icons/icon.ico",
-      "icons/icon.png"
+      "icons/icons.png",
+      "icons/icon.ico"
+    ],
+    "externalBin": [
+      "binaries/gwen"
     ]
   }
 }
