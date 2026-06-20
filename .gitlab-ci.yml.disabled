@@ -1,3 +1,14 @@
+# ⚠️ DISABLED — this file is intentionally named `.gitlab-ci.yml.disabled` so
+# GitLab does NOT run it. GitLab's shared runners require credit-card verification,
+# which we don't have yet.
+#
+# To re-enable later, pick ONE:
+#   • Verify a card on GitLab, then: `git mv .gitlab-ci.yml.disabled .gitlab-ci.yml`
+#   • Or register a free SELF-HOSTED GitLab Runner on your own machine (no card),
+#     then rename it back. Tag the jobs for your runner if needed.
+#   • Or run the same checks locally — see CONTRIBUTING.md ("Tests & checks").
+#
+# ─────────────────────────────────────────────────────────────────────────────
 # GwenLand GitLab CI/CD
 #
 # Repo layout: the Cargo workspace lives in `gwen-cli/`, the Tauri frontend in
