@@ -1,218 +1,130 @@
 # GwenLand
 
-> **"Speed is Everything, but Precise is more than Everything."**
+GwenLand is a local-first AI toolkit. One Rust binary, under 50 MB, that takes you through the whole loop: fetch a model, fine-tune it, serve it, and chat with it. Inference runs on your machine and nothing leaves it.
 
-AI all-in-one toolkit. Local-first. &lt;50MB. Privacy-first. Zero Python.
+It's still pre-release, so expect flags and file formats to move around. The native `gwen train` backend especially is experimental: the layer-streaming LoRA objective converges, but it's still an approximation (mean-pool forward, capped vocab, one projection per layer), so the adapters it makes aren't ready for inference yet. Fine for experimenting, not for real training runs. The `changelog/` folder tracks what's landed.
 
-A single Rust CLI for the full LLM lifecycle — **fetch → train → serve → chat** — with dataset tooling, a safety scanner, and HuggingFace Hub integration built in. Every model runs on your machine. No data leaves it.
+GwenLand is built for modest hardware. The machine we target is an 11th-gen i3 with 8 GB of RAM and no GPU, running Linux, backed by an mmap-based loader that streams one model layer into memory at a time so it doesn't blow the RAM budget. A GPU is optional, not required.
 
-> ⚠️ **Unstable / pre-release.** GwenLand is under active development; APIs, file formats, and CLI flags may change without notice. The native `gwen train` backend in particular is **experimental** — the layer-streaming LoRA objective converges but is still an approximation (mean-pool forward, capped vocab, one projection per layer), so trained adapters are **not yet drop-in for inference**. Don't rely on it for production training. See the [changelog](changelog/) for what's landed and what's coming.
+## Installing
 
----
-
-## Why Rust
-
-| Others | GwenLand |
-|---|---|
-| Python for accessibility | Rust for precision |
-| Abstractions on abstractions | Lean, direct, no runtime overhead |
-| &lt;50MB? Impossible in Python | &lt;50MB. Stripped. Precise. |
-
-GwenLand is designed to be useful on commodity hardware. The reference target is an
-**i3 (11th gen), 8 GB RAM, no GPU**, served by an mmap-based, OOM-safe layered model
-loader that streams one layer into RAM at a time. GPUs are optional, not required.
-
----
-
-## Install
-
-GwenLand builds from source with a stable Rust toolchain (edition 2024).
+You'll need a recent Rust toolchain (edition 2024, so Rust 1.85 or newer). From the `gwen-cli/` workspace root:
 
 ```bash
-# clone, then from the gwen-cli/ workspace root:
 cargo build --release -p gwenland-tui
-
-# the stripped binary lands at:
-#   target/release/gwenland
 ```
 
-The binary is named `gwenland`; throughout this README it is invoked as **`gwen`**
-(its CLI name). Symlink or alias it for convenience:
+The stripped binary lands at `target/release/gwenland`. It's named `gwenland`, but its command name is `gwen`, which is how this README refers to it. Alias it so the examples work as written:
 
 ```bash
 alias gwen="$PWD/target/release/gwenland"
 ```
 
-Or run it through Cargo while developing:
+Or just run it through cargo while you're hacking on it:
 
 ```bash
 cargo run -p gwenland-tui -- doctor
 ```
 
-### GPU acceleration (optional)
+### Using a GPU
 
-The default build is CPU-only and compiles everywhere without a CUDA toolkit or macOS
-SDK. To opt into GPU at runtime, set an environment variable — Candle picks it up
-dynamically:
+The default build is CPU-only and compiles anywhere without a CUDA toolkit or the macOS SDK. To use a GPU you don't rebuild anything — set an environment variable and Candle picks it up at runtime:
 
 ```bash
-CANDLE_CUDA=1  gwen serve qwen3-8b-q4_0     # NVIDIA
-CANDLE_METAL=1 gwen serve qwen3-8b-q4_0     # Apple Silicon
+CANDLE_CUDA=1  gwen serve qwen3-8b-q4_0    # NVIDIA
+CANDLE_METAL=1 gwen serve qwen3-8b-q4_0    # Apple Silicon
 ```
 
----
+## A quick run-through
 
-## Quickstart
-
-The full local pipeline, end to end:
+The whole pipeline, start to finish:
 
 ```bash
-# 0. Sanity-check your environment
-gwen doctor
-
-# 1. Pull a quantised model from HuggingFace
+gwen doctor                                   # check your environment first
 gwen fetch -m tinyllama/TinyLlama-1.1B -q q4_k_m
-
-# 2. Fine-tune a LoRA adapter on a JSONL dataset  (experimental)
-gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --epochs 3
-
-# 3. Serve the model locally over SSE
-gwen serve tinyllama-1.1b-q4_k_m            # POST /gwenland/chat on :1136
-
-# 4. Chat with it in the terminal
-gwen chat
+gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --epochs 3   # experimental
+gwen serve tinyllama-1.1b-q4_k_m              # serves SSE on port 1136
+gwen chat                                     # chat with it in the terminal
 ```
-
----
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `gwen fetch` | Download models from HuggingFace with quantisation selection (resumable, checksum-verified) |
-| `gwen train` | Fine-tune via LoRA — native Rust/Candle backend |
-| `gwen serve` | Spawn a local inference server (SSE, candle-transformers, no subprocess) |
-| `gwen chat` | Streaming TUI chat with conversation history |
-| `gwen run` | One-shot native inference on a local GGUF model |
-| `gwen eval` | Evaluate a model on a validation dataset |
-| `gwen benchmark` | Cold-start, inference, layer-load, and memory benchmarks |
-| `gwen hub` | HuggingFace Hub — list, pull, push, info, prune |
-| `gwen dataset` | Validate, convert, and split JSONL training datasets |
-| `gwen scan` | Safety scanner — PII, toxicity, prompt injection |
-| `gwen convert` | GGUF → SafeTensors dequantisation |
-| `gwen config` | Manage user configuration |
-| `gwen doctor` | Environment health check (storage layout, runtime, deps) |
-| `gwen update` | Self-update to the latest release |
+- `gwen fetch` — download a model from HuggingFace. Resumes interrupted downloads and checks the SHA-256.
+- `gwen train` — fine-tune a LoRA adapter on the native Candle backend.
+- `gwen serve` — start the local inference server (SSE, served by candle-transformers, no subprocess).
+- `gwen chat` — a streaming terminal chat with history.
+- `gwen run` — one-shot inference on a local GGUF file.
+- `gwen eval` — score a model on a validation set.
+- `gwen benchmark` — cold start, inference, layer load, and memory numbers.
+- `gwen hub` — list, pull, push, info, and prune on HuggingFace.
+- `gwen dataset` — validate, convert, and split JSONL datasets.
+- `gwen scan` — flag PII, toxicity, and prompt injection in models and datasets.
+- `gwen convert` — GGUF to SafeTensors.
+- `gwen config` — read and write your settings.
+- `gwen doctor` — check the storage layout, runtime, and dependencies.
+- `gwen update` — update to the latest release.
 
-### Global flags
+Every command also takes a few global flags: `--json` for machine-readable output (NDJSON with `--non-interactive`), `--non-interactive` for scripts and agents (no TUI or prompts, and it turns on automatically when stdout isn't a terminal), `--dry-run` to validate without doing anything, and `--yes` to auto-confirm prompts.
 
-Every subcommand accepts these:
-
-| Flag | Effect |
-|---|---|
-| `--json` | Structured JSON output (NDJSON when combined with `--non-interactive`) |
-| `--non-interactive` | Agent/script mode — no TUI, spinners, or prompts (auto-enabled when stdout is not a TTY) |
-| `--dry-run` | Pre-flight validation only — no side effects |
-| `--yes` | Auto-confirm all `[Y/n]` prompts |
-
-### Examples
+A few examples:
 
 ```bash
-# Fetch — multiple models, direct URL, or recover a corrupt download
 gwen fetch -m mistralai/Mistral-7B-v0.1 -q q5_k_m
 gwen fetch --from https://example.com/model.gguf --to /data/models
-gwen fetch -m tinyllama/TinyLlama-1.1B --cache-clear
 
-# Train — estimate cost first, then the one-shot train→export→merge pipeline
-gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --dry-run
+gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --dry-run     # estimate cost first
 gwen train --auto-merge --base-model ./qwen3.gguf --dataset ./data.jsonl
-gwen train export-adapter ...      # export a LoRA adapter from a checkpoint
-gwen train merge-adapter   ...      # merge adapter SafeTensors into a GGUF base
 
-# Serve — pick a port, or just validate the request
 gwen serve qwen3-8b-q4_0 --port 8080
 gwen serve qwen3-8b-q4_0 --dry-run
 
-# Datasets & safety
 gwen dataset validate ./data.jsonl
 gwen scan ./model.gguf
 ```
 
----
+## Where your files go
 
-## Storage layout
+Everything lives under one folder in your home directory, `~/.gwenland/`. Set `GWEN_HOME` if you want it somewhere else. The folders are created as needed:
 
-All state lives under a single home dotfile root, **`~/.gwenland/`** (override with the
-`GWEN_HOME` environment variable). Every accessor self-heals — directories are created on
-demand.
+- `config/` — your `config.json`
+- `models/` — downloaded models and the `models.json` registry
+- `crash-logs/` — readable crash reports
+- `cache/` — internal cache and a `tmp/` for partial downloads and updates
+- `eval_results/` — output from `gwen eval`
 
-```
-~/.gwenland/
-  config/         — config.json (user + engine settings)
-  models/         — downloaded models + models.json registry
-  crash-logs/     — human-readable crash-<timestamp>.txt reports
-  cache/          — internal cache + tmp/ for partial downloads & self-updates
-  eval_results/   — gwen eval output JSON
-```
+This replaced the old `~/.config/gwen/` layout, and there's no automatic migration. If you used a pre-1.0 build, just re-run `gwen fetch <model>` to repopulate; your old data is left alone.
 
-> **Note:** this is a breaking change from the old `~/.config/gwen/` layout with **no
-> auto-migration**. Pre-1.0 users upgrading just re-run `gwen fetch <model>` to repopulate
-> models; old data at `~/.config/gwen/` is left untouched.
-
-On any panic or OS-level fault (segfault, illegal instruction, abort) — from the CLI, TUI,
-or GUI — GwenLand writes a readable crash report to `~/.gwenland/crash-logs/`. Set
-`RUST_BACKTRACE=1` for a full trace. `gwen doctor` verifies this directory structure is
-present and writable.
-
----
+If `gwen` ever crashes — a panic, or a lower-level fault like a segfault — it writes a readable report to `~/.gwenland/crash-logs/`. Set `RUST_BACKTRACE=1` for a full trace, and run `gwen doctor` to confirm the storage folders exist and are writable.
 
 ## Project structure
 
-```
-gwen-cli/                — Rust workspace (resolver 2, edition 2024)
-  packages/core/         — gwenland-core: inference, training, benchmark, storage,
-                           diagnostics — all the real logic (lib crate)
-  packages/tui/          — gwenland-tui: the `gwenland` CLI + ratatui TUI binary
-  packages/gui/src-tauri — Tauri 2 desktop shell (shares core's crash reporting)
-  changelog/             — full per-session change history
-  benchmark/             — dequant/quant math experiments (sibling of gwen-cli/)
-```
+The repo is a Cargo workspace (resolver 2, edition 2024):
 
-The release profile is tuned for size: `opt-level = "z"`, fat LTO, single codegen unit,
-`panic = "abort"`, symbols stripped — that's how the binary stays under 50 MB.
+- `packages/core` — `gwenland-core`, where the real work happens: inference, training, benchmarks, storage, diagnostics. It's a library crate.
+- `packages/tui` — `gwenland-tui`, the `gwenland` CLI and its ratatui TUI. This is the binary.
+- `packages/gui/src-tauri` — a Tauri 2 desktop shell that reuses core's crash reporting.
+- `changelog/` — per-session notes.
 
----
+The release profile is tuned for size: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`, symbols stripped. That's how the binary stays under 50 MB.
 
-## Development
+## Working on it
 
 ```bash
-# Build / check the whole workspace
 cargo check --workspace
 
-# Run the core test suite (single-threaded: some tests touch process-global state
-# like std::panic::set_hook and the GWEN_HOME test env)
+# Core tests run single-threaded on purpose: a few of them touch process-global
+# state (the panic hook, the GWEN_HOME test env) and would race otherwise.
 cargo test -p gwenland-core --lib -- --test-threads=1
 
-# Benchmarks
 cargo bench -p gwenland-core
 ```
 
-Each change session is recorded under [changelog/](changelog/) (`Gwen-Changes-<date>.md`),
-and new optimisation candidates for the CPU training path are triaged in
-[`NewExperiment.md`](../NewExperiment.md) before they graduate into a tracked `GWEN-XXX`
-issue and a `.kiro/specs/` spec.
-
----
+Each change gets a note under `changelog/`, and new ideas for the CPU training path get triaged in [NewExperiment.md](../NewExperiment.md) before they turn into a tracked issue and a spec. See [CONTRIBUTING.md](../CONTRIBUTING.md) for the rest.
 
 ## Privacy
 
-Inference and training run entirely on your machine. The only network calls are explicit
-model/dataset downloads and pushes you initiate via `gwen fetch` / `gwen hub`. See
-[PRIVACY.md](PRIVACY.md) for details.
-
----
+Training and inference run on your machine. The only network calls are the model and dataset downloads and pushes you ask for with `gwen fetch` and `gwen hub`. [PRIVACY.md](PRIVACY.md) has the details.
 
 ## License
 
-MIT with Commons Clause. See [LICENSE.txt](LICENSE.txt) for details.
-Free for personal and research use. Commercial use requires a separate agreement.
+MIT with the Commons Clause — see [LICENSE.txt](LICENSE.txt). Free for personal and research use; commercial use needs a separate agreement.

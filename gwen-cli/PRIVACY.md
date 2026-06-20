@@ -1,46 +1,21 @@
-# GwenLand Privacy
+# Privacy
 
-GwenLand is designed to be **fully local**. No data is sent to any remote server by default.
+GwenLand runs locally. Nothing you do with it is sent to a remote server unless you explicitly ask for it — and the only thing that reaches out is downloading or pushing models and datasets through `gwen fetch` and `gwen hub`. Your conversations, your files, and your config never leave the machine.
 
-## What stays on your machine
+## What's stored, and where
 
-| Data | Location | Transmitted? |
-|---|---|---|
-| Conversation history | `~/.gwen/history/` | Never |
-| Session error logs | `~/.gwen/session/` | Never |
-| File contents (context injection) | Read at inference time | Only to local mistral.rs |
-| Config | `~/.gwen/config.json` | Never |
+Everything lives under `~/.gwenland/`:
 
-## File context (JIN-164 — Relevance Windowing)
+- **Conversation history** is written as JSONL, one file per session. It's loaded locally when you start up and goes nowhere else.
+- **Session files** hold things like error messages and warnings from a run, a snapshot of the TUI state (active pane, scroll position, input buffer), and — if the process crashed — the crash report.
+- **Config** is a single `config/config.json`.
 
-When you include files in a chat query, GwenLand reads their content locally.
+None of these are transmitted anywhere. Delete any of them whenever you want; GwenLand recreates what it needs on the next run, and `gwen doctor` will tell you where the folders are and whether they're writable.
 
-- With `compression.enabled = true`: only **relevant line windows** (not the full file)
-  are sent to the local mistral.rs process.
-- With `compression.enabled = false` (default): the full file is sent to the local
-  mistral.rs process.
-- In both cases, file content is **never transmitted beyond your local machine**.
+## Files you bring into a chat
 
-## Session logs (`~/.gwen/session/`)
+When you reference a file in a query, GwenLand reads it locally and hands the content to the in-process inference engine running on your machine. Depending on your settings it may send only the relevant slices of a file rather than the whole thing, but either way the content stays local — it's never sent off the machine.
 
-`session_<timestamp>.txt` files contain:
-- Error messages and warnings logged during the session
-- A TUI state snapshot (active pane, scroll position, input buffer)
-- Crash information if the process panicked (formatted stack trace)
+## Crashes
 
-These files are never sent anywhere. You can delete them at any time:
-
-```
-gwenland session clear
-```
-
-List all session files with their status:
-
-```
-gwenland session list
-```
-
-## History (`~/.gwen/history/`)
-
-Conversation history is stored as JSONL, one file per session.
-It is loaded locally on startup and never leaves your machine.
+If GwenLand crashes, it writes a readable report to `~/.gwenland/crash-logs/`. The report includes the version, which part of the app was running, the command line, some OS details, and the error itself. It stays on disk for you to read or share if you're filing a bug — it isn't uploaded.

@@ -1,384 +1,144 @@
-# GwenLand Euler Dequantisation — Formula Specification
+# Euler Dequantisation
 
-> *"Speed is Everything. But Precise is more than Everything."*
+This is the reference for GwenLand's Euler dequantisation — a cosine-projection method for turning GGUF quantised weights into a bounded floating-point range that the inference engine is comfortable with. If you just want SafeTensors for another framework, you want standard dequantisation instead; this one is specifically for feeding GwenLand.
 
-This document is the canonical reference for the **GwenLand Euler Dequantisation** formula —
-a custom cosine-projection method for converting GGUF quantised weights into a bounded
-floating-point space aligned with the GwenLand inference engine.
+## The problem it solves
 
----
+A GGUF model stores every tensor as compact integers (Q4_0 or Q8_0). The usual way to get floats back is linear:
 
-## The Problem
+$$W[i] = X_{quant}[i] \times scale$$
 
-When a GGUF model is loaded, every tensor is stored as compact integers (Q4_0 or Q8_0).
-Standard linear dequantisation recovers those integers with:
+That's correct, but it gives you weights across whatever range the original model used. On large models `|scale|` can be many orders of magnitude bigger than 1.0, which pushes reconstructed weights well outside the range GwenLand's kernel is built for, and the accumulator overflows. Standard mode is the right answer for general SafeTensors export; Euler mode is the right answer when the destination is GwenLand inference.
 
+## The formula
 
-$$W[i] = X_quant[i] × scale$$
+It's three steps.
 
+**Step 1 — map each integer to an angle.** Take the quantised integer and turn it into a radian angle:
 
-This works. But it produces weights in an *arbitrary* real range — as wide as the original
-model's dynamic range. For large models, `|scale|` can be orders of magnitude larger than 1.0,
-pushing reconstructed weights far outside the numeric range GwenLand's inference kernel
-is designed to operate in.
+$$\theta_i = (X_{quant}[i] \times \pi) / Max\_Bound$$
 
-**Feeding out-of-range weights into GwenLand causes accumulator overflow.**
-Standard mode is correct for general-purpose SafeTensors output.
-Euler mode is correct for GwenLand inference.
+`Max_Bound` is the largest absolute quantised integer *in the current block*, not the theoretical maximum for the dtype (127 for Q8_0, 7 for Q4_0). Using the per-block max normalises `θ` into `[-π, +π]` based on what's actually in each block, which keeps the relative magnitude differences between blocks.
 
----
+**Step 2 — reconstruct a smooth value with cosine.** Take the real part of Euler's formula:
 
-## The Formula
+$$\text{Real}(e^{i\theta}) = \cos(\theta)$$
 
-### Step 1 — Phase Vector Mapping (Euler Quantization Reverse)
+Cosine maps `θ ∈ [-π, +π]` to a smooth wave bounded in `[-1, +1]`. Discrete integers become continuous, differentiable values with no hard clipping or saturation.
 
-Map the raw GGUF quantised integer `X_quant[i]` to a radian angle `θ_i`:
+**Step 3 — scale into GwenLand's range.** Multiply by the GGUF block delta and divide by the golden ratio:
 
+$$W_{safetensor}[i] = \cos(\theta_i) \times \delta_b / \varphi$$
 
-$$θ_i = (X_quant[i] × π) / Max_Bound$$
+That lands values in `[-0.309, 0.309]`, which is where the kernel does its best work. Here `δ_b` is the f16 scale stored at the head of each GGUF block, and `φ = 1.6180339...` is `(1 + √5) / 2`. Since `1/φ ≈ 0.618`, that's the outer bound, and `0.5/φ ≈ 0.309` is the sweet spot.
 
+So the whole thing is:
 
-Where `Max_Bound` is the **absolute maximum quantised integer in the current block** —
-not the theoretical dtype maximum (127 for Q8_0, 7 for Q4_0).
+$$\theta_i = (X_{quant}[i] \times \pi) / Max\_Bound$$
+$$W_{safetensor}[i] = \cos(\theta_i) \times \delta_b / \varphi$$
 
-This normalises `θ_i` into `[-π, +π]` based on the actual distribution of values
-in each block, preserving relative inter-block magnitude differences.
+## The variables
 
----
+- `X_quant[i]` — the stored quantised integer (i8 for Q8_0, 4-bit signed for Q4_0).
+- `Max_Bound` — `max(|X_quant[k]|)` over the block. Per block, not per dtype.
+- `θ_i` — the angle in `[-π, +π]` that the integer maps to.
+- `δ_b` — the block delta/scale from the GGUF header (f16); the original linear reconstruction scale for that block.
+- `φ` — the golden ratio, `1.6180339`. Scales the output into GwenLand's bound.
+- `W_safetensor[i]` — the final f32 weight written out.
 
-### Step 2 — Continuous Wave Reconstruction via Euler
+## Why these choices
 
-Apply the real part of Euler's formula to recover a smooth, continuous weight value:
+**Why cosine, not sigmoid or tanh.** Sigmoid outputs `(0, 1)`, so it's always positive and throws away the sign. Tanh saturates quickly, so extreme integers map to ±1 no matter the block context. Cosine is an odd-symmetry function with the full `[-1, 1]` range and a natural period at π. The deciding property is `cos(0) = 1`. A quantised zero is the most common value in sparse weight matrices (pruned attention heads, zero-initialised LoRA), and a stored zero means "no deviation from the block centre," not "null weight" — so mapping it to the block's maximum amplitude is exactly right. Tanh and sigmoid send zero to the middle of their range and lose the block's scale.
 
-$$Real(e^{i·θ}) = cos(θ)$$
+**Why the per-block max, not the dtype max.** The theoretical max is 127 for Q8_0 and 7 for Q4_0. If you normalised against those, a block whose largest value is 3 would use the same angular range as a block whose largest value is 127, and you'd flatten the differences between blocks. The per-block max means busy blocks use the full `[-π, +π]` and quiet blocks get compressed proportionally, so the relative magnitudes survive into the output. It's the same idea as per-block quantisation itself: respect the local distribution.
 
-Which gives:
+**Why the golden ratio.** `φ` is the value where `1/φ = φ - 1 ≈ 0.618`. Dividing the cosine output by `φ` scales `[-1, 1]` down to `[-0.618, 0.618]`, and the inner band `[-0.309, 0.309] = [-0.5/φ, 0.5/φ]` is where the fixed-point accumulator hits its best precision — far enough from zero to avoid underflowing into noise, far enough from the edge to avoid saturating. `φ` also has no awkward rounding at common precisions, so it stays stable across f16, f32, and bf16.
 
-$$cos(θ_i)$$
+**Why use δ_b as the amplitude.** `δ_b` is already the best per-block magnitude estimate around — the quantiser chose it to minimise that block's reconstruction error. Reusing it as the amplitude means high-magnitude blocks produce higher-amplitude output and near-zero blocks produce near-zero output, so the relative scale ordering of tensors is preserved, just bounded.
 
-The cosine function maps `θ ∈ [-π, +π]` to a smooth wave bounded within `[-1, +1]`.
-This is where the "continuous wave restoration" happens — discrete integers become smooth,
-differentiable values without hard clipping or saturation artifacts.
+## Edge case: a fully pruned block
 
----
+If every quantised value in a block is zero, `Max_Bound = 0` and the angle is undefined. In that case the output is just `0.0` for every element. A block of all zeros carries no information and reconstructs to zero in both modes anyway — which is the normal case for pruned heads and zero-initialised matrices.
 
-### Step 3 — GwenLand Precision Parameter Restoration
+## The numbers at a glance
 
-Scale by the GGUF block delta `δ_b` and divide by the Golden Ratio `φ` to land values
-directly in the GwenLand sweet spot `[-0.309, 0.309]`:
+- `φ = 1.6180339` (golden ratio)
+- `1/φ ≈ 0.618` — outer output bound
+- `0.5/φ ≈ 0.309` — sweet-spot boundary
+- Output range: `[-0.618, 0.618]`
+- Sweet spot: `[-0.309, 0.309]`
+- `cos(0) = 1.0` — a zero integer maps to the block's max amplitude
+- `cos(±π) = -1.0` — the max integer maps to the inverted max amplitude
 
-$$W_{safetensor}[i] = (cos(θ_i) × δ_b) / φ$$
+## Where it's implemented
 
-Where:
-- `δ_b` — the f16 scale stored at the head of each GGUF block
-- `φ = 1.6180339...` — the Golden Ratio `(1 + √5) / 2`
-- `1/φ ≈ 0.618` — the outer bound of the output range
-- `0.5/φ ≈ 0.309` — the sweet spot boundary
+The block routine is `euler_dequant_block(ivalues: &[i32], delta_b: f32) -> Vec<f32>` in `packages/core/src/convert/dequant.rs`, dispatched per block by `dequant_q8_0_euler` and `dequant_q4_0_euler`. Turn it on with `gwen convert gguf <MODEL.gguf> --euler`.
 
----
+## When to use which mode
 
-## Complete Formula
-
-$$θ_i            = (X_{quant}[i] × π) / Max_Bound$$
-
-$$W_{safetensor}[i] = cos(θ_i) × δ_b / φ$$
+Use standard when you're exporting SafeTensors for another framework, inspecting raw weight distributions, or fine-tuning from a dequanted checkpoint — it's lossless within quantisation error. Use Euler when you're loading into GwenLand inference or deploying to an embedded target, where the bounded, accumulator-safe range matters.
 
 ---
 
-## Variable Reference
+# The 10D Engine
 
-| Symbol | Name | Source | Meaning |
-|---|---|---|---|
-| $$X_{quant}[i]$$ | Quantised integer | GGUF raw data | The stored integer value (i8 for Q8_0, 4-bit signed for Q4_0) |
-| $$Max_Bound$$ | Per-block maximum | Computed per block | `max(|X_quant[k]|)` over all elements in the block |
-| $$θ_i$$ | Phase angle | Computed | Maps the integer to a radian in `[-π, +π]` |
-| $$δ_b$$ | Block delta / scale | GGUF block header (f16) | The original linear reconstruction scale for this block |
-| $$φ$$ | Golden Ratio | Constant `1.6180339` | `(1 + √5) / 2` — scales the output into the GwenLand bound |
-| $$W_{safetensor}[i]$$ | Restored weight | Output | The final f32 weight value written to SafeTensors |
+A small, local-first neural engine written in Rust. Instead of doing floating-point tensor multiplication, it works in a binarised space and uses constant-time memory indexing, which keeps a single lookup down to a couple hundred nanoseconds. It's exploratory — a place to try out the math below — not the production inference path.
 
----
+## Measured numbers
 
-## Why These Choices
+From the benchmark run:
 
-### Why cosine — not sigmoid, not tanh?
+- Initialisation: about 27.7 µs (the golden init below)
+- Parallel inference, 12 chars over 10 layers: about 942 µs (multi-threaded with `rayon`)
+- Single-layer core fetch: about 270 ns (O(1) strided indexing)
+- Binary: 8.3 MB stripped
+- Model on disk: about 41 KB (SafeTensors, 10,240 weights)
 
-| Function | Problem |
-|---|---|
-| $$sigmoid(x)$$ | Output is `(0, 1)` — always positive, destroys sign information |
-| $$tanh(x)$$ | Saturates fast; extreme integers map to ±1 regardless of block context |
-| $$cos(θ)$$ | Odd-function symmetry, full `[-1,1]` range, natural periodicity at π |
+## The three formulas
 
-Cosine has one decisive property for this use case: **`cos(0) = 1`**.
+Three formulas run the whole engine, and all three are anchored on `φ`.
 
-A quantised value of zero is the most common value in sparse weight matrices
-(pruned attention heads, zero-initialised LoRA adapters). With cosine projection,
-zero maps to the maximum reconstruction amplitude of the block — which is exactly
-correct, because a stored zero means "no deviation from block centre," not "null weight."
+### 1. Golden initialisation
 
-With tanh or sigmoid, zero maps to the midpoint of the output range, discarding the
-block's scale information.
+Weights start inside the stable band `[-0.309, 0.309]`, computed from the golden ratio with no random number generator at all — just arithmetic, so it's deterministic and reproducible:
 
-### Why per-block `Max_Bound` instead of the dtype theoretical maximum?
+$$Factor_i = \sqrt{i} \times \varphi$$
+$$W_i = \sin(Factor_i) \times \cos(Factor_i) / \varphi$$
 
-The theoretical maximum for Q8_0 is 127. The theoretical maximum for Q4_0 is 7.
-Using these would normalise every block identically — a block with a max value of 3
-would use the same $$θ$$ range as a block with a max value of 127.
+Here `i` is the flat array index of the weight in memory. It works because `sin(x)·cos(x) = sin(2x)/2`, so the output is bounded by `[-0.5, 0.5]`, and dividing by `φ` tightens it to `[-0.309, 0.309]` — the same sweet spot the Euler formula above targets. The `√i` factor makes the angle grow slowly so the weights spread smoothly instead of repeating a tight cycle. The reason for not using `randn` or Xavier init is that those call the OS RNG, which adds non-determinism and startup latency; this is closed-form, so the same binary produces the same weights every time on every platform.
 
-Using the **per-block maximum** means:
-- Blocks with large activations use the full $$[-π, +π]$$ angular range
-- Blocks with small activations are compressed proportionally
-- The relative magnitude relationships between blocks are preserved in the output
+### 2. O(1) strided indexing
 
-This is the same philosophy as per-block quantisation itself: honour the local
-distribution, not a global assumption.
+Coordinates in the 10D space collapse to a single flat memory address through a precomputed stride vector — no allocation, no looping over dimensions at runtime:
 
-### Why the Golden Ratio?
+$$FlatIndex = \sum_{k=0}^{9} Coordinate_k \times Strides_k$$
 
-`φ = 1.618...` is the unique value where `1/φ = φ - 1 ≈ 0.618`.
+The strides are `Strides_k = 2^(9-k)`, which is `[512, 256, 128, 64, 32, 16, 8, 4, 2, 1]`. That's just the row-major layout for a 10-dimensional binary tensor (2^10 = 1024 cells). Because they're powers of two, the CPU can do the index math with bit-shifts instead of multiplies, and the whole thing is one multiply-accumulate pass. Ten binary dimensions give 1024 addressable cells — enough for the token encoding space, and small enough to sit in L1 cache.
 
-Dividing by `φ` scales the cosine output from `[-1, 1]` to `[-0.618, 0.618]`.
-The inner sweet spot `[-0.309, 0.309]` = `[-0.5/φ, 0.5/φ]` is the range where
-GwenLand's fixed-point accumulator achieves maximum dot-product precision —
-neither underflowing into noise nor overflowing into saturation.
+### 3. Sequential layer propagation
 
-`φ` also has no special floating-point rounding behaviour at common precisions,
-making it a numerically stable divisor across f16, f32, and bf16 accumulation paths.
+On the forward pass the signal moves through 10 layers, with a residual link at each one so it doesn't collapse to zero or run away:
 
-### Why δ_b (the GGUF block scale) as the amplitude?
+$$x_{l+1} = \text{Clip}(x_l + (x_l \times W_l), -1.0, +1.0)$$
 
-`δ_b` is already the best available per-block magnitude estimate — it was chosen
-by the original quantisation process to minimise reconstruction error for that block.
-Rather than discarding this information and treating all blocks equally, Euler mode
-reuses it as the amplitude modulator.
+The residual term `x_l` is an identity shortcut: even if `W_l ≈ 0`, `x_{l+1} ≈ x_l`, so a near-zero weight can't make the signal decay across 10 layers the way pure multiplication would. The clip is a hard clamp rather than tanh or sigmoid because those need `exp()`, which is expensive and adds smooth saturation; a clamp is a single comparison. The `±1.0` bound works because, with weights in `[-0.309, 0.309]`, the residual can at most reach about `1.3x`, and the clamp absorbs that overshoot without touching the central `[-0.618, 0.618]` band.
 
-This means:
-- Blocks quantised from high-magnitude weights produce higher-amplitude Euler outputs
-- Blocks quantised from near-zero weights produce near-zero Euler outputs
-- The relative scale ordering of tensors is preserved, just bounded
+## How it ties back to Euler dequant
 
----
+Both halves share `φ` as their anchor. GRN weights live in `[-0.309, 0.309]`, Euler-dequanted weights land in `[-0.618, 0.618]`, and the propagation clip sits at `±1.0`. Each outer bound is exactly twice the inner one — a geometric progression rooted in `1/φ`. That nesting is deliberate.
 
-## Edge Case: Fully Pruned Block (`Max_Bound = 0`)
+## Stack
 
-If every quantised value in a block is zero, `Max_Bound = 0` and the angle formula
-is undefined (division by zero).
+Pure Rust (safe, with targeted `unsafe` for raw memory mapping), `rayon` for parallelism, HuggingFace `safetensors` for zero-copy storage, cross-compiled for AMD64, ARM64, and Apple Silicon.
 
-**Decision:** output `0.0` for every element in the block.
-
-A block of all-zero quantised values carries no information. Its reconstruction is
-identically zero in both standard and Euler modes. This is the common case for
-pruned attention heads and zero-initialised weight matrices.
-
-```
-If Max_Bound == 0:  W_safetensor[i] = 0.0  for all i in block
-```
-
----
-
-## Numeric Bounds Summary
-
-| Expression | Value | Meaning |
-|---|---|---|
-| $$φ$$ | $$1.6180339$$ | Golden Ratio |
-| $$1/φ$$ | $$≈ 0.618$$ | Outer output bound |
-| $$0.5/φ$$ | $$≈ 0.309$$ | Sweet spot boundary |
-| Output range | $$[-0.618, 0.618]$$ | Maximum possible reconstructed weight |
-| Sweet spot | $$[-0.309, 0.309]$$ | Optimal precision region for GwenLand kernel |
-| $$cos(0)$$ | $$1.0$$ | Zero quantised value → maximum block amplitude |
-| $$cos(±π)$$ | $$-1.0$$ | Maximum quantised value → inverted maximum amplitude |
-
----
-
-## Implementation Reference
-
-The formula is implemented in:
-
-```
-gwen-cli/packages/core/src/convert/dequant.rs
-  └── fn euler_dequant_block(ivalues: &[i32], delta_b: f32) -> Vec<f32>
-```
-
-Invoked for each quantisation block by:
-- `fn dequant_q8_0_euler` — Q8_0 block dispatch
-- `fn dequant_q4_0_euler` — Q4_0 block dispatch
-
-Activated via: `gwen convert gguf <MODEL.gguf> --euler`
-
----
-
-## Standard vs Euler — When to Use Which
-
-| Scenario | Use |
-|---|---|
-| General SafeTensors export for other frameworks | `Standard` (lossless within quantisation error) |
-| Loading into GwenLand inference engine | `Euler` (bounded, accumulator-safe) |
-| Inspecting raw weight distributions | `Standard` |
-| Fine-tuning from a dequanted checkpoint | `Standard` |
-| Deploying on GwenLand embedded targets | `Euler` |
-
----
-
-*Prototype formula by the GwenLand author. Implementation: GwenLand Cycle 3.*
-
----
-
-
-# GwenLand 10D Engine
-
-> *"While others use Python, we use Rust. Not because it's easy — because it's precise."*
-
-An ultra-efficient, local-first Multi-Layer Neural Engine written natively in Rust.
-GwenLand achieves sub-microsecond inference by bypassing heavy matrix operations and
-high-level runtimes entirely — leveraging constant-time binary layout indexing instead.
-
----
-
-## Performance Highlights (Empirical Benchmarks)
-
-| Metric | Result | Method |
-|---|---|---|
-| Initialization time | `~27.7 µs` | Golden Initialization (GRN) |
-| Parallel inference (12 chars, 10 layers) | `~942.0 µs` | Multi-threaded `rayon` |
-| Single-layer core fetch | `~270 ns` | O(1) strided coordinate mapping |
-| Binary footprint | `8.3 MB` | Stripped release binary |
-| Model storage | `~41 KB` | SafeTensors, 10,240 weights |
-
----
-
-## Mathematical Architecture
-
-GwenLand replaces traditional floating-point tensor multiplication with a binarized
-space framework. Three formulas govern the entire engine.
-
----
-
-### Formula 1 — Golden Initialization (GRN)
-
-Weights are initialized inside the stable geometric sweet spot `[-0.309, 0.309]` using
-the Golden Ratio `φ`. This prevents vanishing and exploding gradients without any
-external random number generator — pure arithmetic, deterministic, reproducible.
-
-```
-Factor_i = sqrt(i) × φ
-
-W_i = sin(Factor_i) × cos(Factor_i) / φ
-```
-
-Where:
-- `φ = 1.6180339887` — the Golden Ratio `(1 + √5) / 2`
-- `i` — the flat array index of the weight in memory (continuous, zero-based)
-
-**Why this works:** `sin(x) × cos(x) = sin(2x) / 2`, so the output is bounded by
-`[-0.5, 0.5]`. Dividing by `φ ≈ 1.618` tightens it further to `[-0.309, 0.309]` —
-exactly the GwenLand sweet spot established in the Euler Dequantisation formula above.
-The `sqrt(i)` factor ensures the angular argument grows slowly, distributing weights
-smoothly across the initialization space rather than repeating a tight periodic cycle.
-
-**Why not `torch.randn` or `torch.xavier`:** Those call the OS RNG, introducing
-non-determinism and startup latency. GRN is a closed-form computation — no RNG,
-no syscall, no variance across platforms. Same binary, same weights, every time.
-
----
-
-### Formula 2 — O(1) Strided Coordinate Mapping
-
-Multi-dimensional coordinates in 10D space are collapsed to a single flat hardware
-memory address via a precomputed stride vector. No dynamic allocation, no loop over
-dimensions at runtime.
-
-```
-FlatIndex = Σ (k=0 to 9)  Coordinate_k × Strides_k
-```
-
-Where `Strides_k = 2^(9-k)`, generating the binary sequence:
-
-```
-Strides = [512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
-```
-
-This is a bitwise dot product. The CPU computes it in a single multiply-accumulate
-pass — `O(1)` in practice because the stride vector has fixed length 10.
-
-**Why powers of 2:** The stride sequence is the standard row-major layout for a
-`[2, 2, 2, 2, 2, 2, 2, 2, 2, 2]` tensor (10 binary dimensions, 2^10 = 1024 cells).
-Powers of 2 allow the CPU to replace multiplications with bit-shifts, shaving cycles
-on every single coordinate lookup. At `~270 ns` per fetch, this is measurable.
-
-**Why 10D:** 10 binary dimensions gives 1024 addressable cells — enough expressivity
-for the token encoding space while fitting entirely in L1 cache on any modern CPU.
-
----
-
-### Formula 3 — Sequential Layer Propagation (ResNet-Style)
-
-During forward pass (`predict`), the input signal node propagates through 10 hidden
-tensor layers. A hard residual link at each layer prevents the signal from collapsing
-to zero (vanishing) or exploding beyond the representable range.
-
-```
-x_(l+1) = Clip( x_l + (x_l × W_l),  -1.0, +1.0 )
-```
-
-Where:
-- `x_l` — the signal value entering layer `l`
-- `W_l` — the weight at the coordinate address for layer `l`
-- `Clip(v, -1, +1)` — hard clamp, implemented as `v.clamp(-1.0, 1.0)` in Rust
-
-**Why residual addition (`x + x×W`) instead of pure multiplication (`x×W`):**
-Pure multiplication with weights near zero causes the signal to decay exponentially
-across 10 layers. The residual term `x_l` is an identity shortcut — even if `W_l ≈ 0`,
-`x_(l+1) ≈ x_l`. The signal survives.
-
-**Why hard clip instead of tanh/sigmoid:** Tanh and sigmoid require `exp()`, which is
-expensive and introduces smooth saturation. The hard clip is a single comparison
-instruction — no transcendental math, no approximation error, constant time.
-
-**Why ±1.0 as the clip bound:** Combined with the GRN initialization bound of
-`[-0.309, 0.309]`, the residual term `x + x×W` can at most reach `x(1 + 0.309) ≈ 1.3x`.
-The ±1.0 clip absorbs this overshoot cleanly without losing precision in the central
-`[-0.618, 0.618]` band that the Euler dequant formula is also designed around.
-
----
-
-## Connection to the Euler Dequantisation Formula
-
-The 10D Engine and the Euler Dequantisation formula share the same numeric anchor: `φ`.
-
-| Formula | Role of φ |
-|---|---|
-| Euler Dequant | Divisor — scales cosine output to `[-0.618, 0.618]` |
-| Golden Initialization | Divisor — scales `sin×cos` to `[-0.309, 0.309]` |
-| Layer Propagation | Implicit — GRN weights stay within the Euler sweet spot |
-
-This is intentional. Weights initialized by GRN live in `[-0.309, 0.309]`. Weights
-loaded via Euler dequant land in `[-0.618, 0.618]`. The layer propagation clip is at
-`±1.0`. The three bounds form a nested structure where each outer bound is exactly `2×`
-the inner one — a geometric progression rooted in `1/φ`.
-
----
-
-## Hardware and Software Stack
-
-| Layer | Technology |
-|---|---|
-| Language | Pure Rust (safe + targeted unsafe for raw memory mapping) |
-| Parallelism | `rayon` work-stealing parallel iterator |
-| Storage | HuggingFace `safetensors` (zero-copy binary format) |
-| Target architectures | AMD64, ARM64, Apple Silicon (cross-compiled by default) |
-
----
-
-## How to Run
+## Running it
 
 ```sh
-# Compile and run with maximum optimisation
 cargo run --release
-
-# Inspect the auto-generated weights file
 ls -la | grep safetensors
 ```
 
-Expected output (from the screenshot benchmark):
+A run looks roughly like this:
 
 ```
 === GWENLAND AI MULTI-THREADED TOKENGINE ===
@@ -392,7 +152,3 @@ Hasil Akhir Generasi Teks AI: "eh!!de!dd!rd"
 
 Engine berhasil di-backup ke 'gwen_multilayer_10d.safetensors'.
 ```
-
----
-
-*GwenLand 10D Engine — exploratory high-performance AI tooling. GwenLand Cycle 3.*
