@@ -174,9 +174,11 @@ pub struct LoadedLayer<'mmap> {
 impl<'mmap> LoadedLayer<'mmap> {
     /// Explicitly release this layer's pages (equivalent to drop).
     ///
-    /// On Unix this issues `MADV_DONTNEED` so the kernel can reclaim the
-    /// physical pages before the next layer is loaded.  On Windows it is a
-    /// no-op — the OS manages the working set automatically.
+    /// On Linux this issues `MADV_DONTNEED` so the kernel can reclaim the
+    /// physical pages before the next layer is loaded. On other platforms it is
+    /// a no-op — `Advice::DontNeed` is not a portable `memmap2` variant (it is
+    /// gated off on macOS in some versions) and only Linux's `MADV_DONTNEED`
+    /// reliably frees the pages; elsewhere the OS manages the working set.
     pub fn unload(self) {
         drop(self);
     }
@@ -184,7 +186,11 @@ impl<'mmap> LoadedLayer<'mmap> {
 
 impl<'mmap> Drop for LoadedLayer<'mmap> {
     fn drop(&mut self) {
-        #[cfg(unix)]
+        // Linux-only: `MADV_DONTNEED` is guaranteed on Linux across memmap2
+        // versions and actually reclaims pages there. macOS/BSD either gate the
+        // variant out or treat it as a weak hint, so we skip it (see GWEN-216 —
+        // the one-layer RAM invariant is enforced on the Linux target).
+        #[cfg(target_os = "linux")]
         {
             let _ = self.mmap_data.advise_range(
                 memmap2::Advice::DontNeed,
