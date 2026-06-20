@@ -15,8 +15,13 @@
 
 use anyhow::{Context, Result, bail};
 use candle_core::Device;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokenizers::Tokenizer;
+
+use crate::engine::inference::model_dispatch::{detect_from_gguf, ModelKind};
 
 /// Everything the inference runner needs, resolved before generation starts.
 pub struct LoadedModel {
@@ -25,7 +30,10 @@ pub struct LoadedModel {
     pub device_label: String,
     /// Path to the GGUF file that was loaded.
     pub gguf_path: PathBuf,
-    pub tokenizer: Tokenizer,
+    /// Tokenizer, shared from the per-model cache (cheap to clone).
+    pub tokenizer: Arc<Tokenizer>,
+    /// Architecture, detected once and cached.
+    pub kind: ModelKind,
 }
 
 /// Resolve a model name or path to a local GGUF file.
@@ -151,18 +159,41 @@ pub fn select_device() -> (Device, String) {
     (Device::Cpu, "CPU (fallback)".to_string())
 }
 
-/// Load a GGUF model and its tokenizer.
+// ── per-model asset cache ───────────────────────────────────────────────────
+//
+// The SSE proxy calls `load` on *every* chat request. We cache the immutable,
+// safe-to-share assets — the tokenizer and the detected architecture — keyed by
+// GGUF path, so they are resolved once instead of per message (and the tokenizer
+// is no longer re-fetched over the network every time; see `resolve_tokenizer`).
+//
+// NOTE: we deliberately do NOT cache the built `ModelWeights`. candle 0.9.2's
+// `quantized_llama::ModelWeights` exposes no KV-cache reset, and the proxy
+// replays the full conversation history on every request — reusing a model
+// would bleed attention state between turns and corrupt output. The weights are
+// rebuilt per request (the OS page cache keeps the re-read fast, and no extra
+// resident copy is held).
+type CachedAssets = (Arc<Tokenizer>, ModelKind);
+
+lazy_static::lazy_static! {
+    static ref ASSET_CACHE: Mutex<HashMap<PathBuf, CachedAssets>> = Mutex::new(HashMap::new());
+}
+
+/// Resolve a GGUF model's tokenizer + architecture (cached per model path).
 ///
-/// Prints device / file info to stderr so the user sees progress before
-/// generation starts (streaming means stdout is reserved for tokens).
+/// Prints device / file info to stderr on first load so the user sees progress
+/// before generation starts (streaming means stdout is reserved for tokens).
 pub fn load(model_name: &str, model_id_for_tokenizer: &str) -> Result<LoadedModel> {
     let gguf_path = resolve_model_path(model_name)?;
     let (device, device_label) = select_device();
 
+    // Fast path: reuse the tokenizer + arch resolved on a previous request.
+    if let Some((tokenizer, kind)) = ASSET_CACHE.lock().unwrap().get(&gguf_path).cloned() {
+        return Ok(LoadedModel { device, device_label, gguf_path, tokenizer, kind });
+    }
+
     let file_size_gb = std::fs::metadata(&gguf_path)
         .map(|m| m.len() as f64 / 1_073_741_824.0)
         .unwrap_or(0.0);
-
     eprintln!("  ❖ Device: {}", device_label);
     eprintln!(
         "  ❖ Loading: {} ({:.1} GB)",
@@ -170,36 +201,117 @@ pub fn load(model_name: &str, model_id_for_tokenizer: &str) -> Result<LoadedMode
         file_size_gb
     );
 
-    // Load tokenizer from HF Hub (sync API — safe to call from any thread).
-    let tokenizer = load_tokenizer(model_id_for_tokenizer)
-        .with_context(|| format!("failed to load tokenizer for '{}'", model_id_for_tokenizer))?;
+    let tokenizer = Arc::new(
+        resolve_tokenizer(&gguf_path, model_id_for_tokenizer)
+            .with_context(|| format!("failed to load tokenizer for '{}'", gguf_path.display()))?,
+    );
+    let kind = detect_from_gguf(&gguf_path)
+        .with_context(|| format!("failed to detect architecture for '{}'", gguf_path.display()))?;
 
-    Ok(LoadedModel {
-        device,
-        device_label,
-        gguf_path,
-        tokenizer,
-    })
+    ASSET_CACHE
+        .lock()
+        .unwrap()
+        .insert(gguf_path.clone(), (tokenizer.clone(), kind.clone()));
+
+    Ok(LoadedModel { device, device_label, gguf_path, tokenizer, kind })
 }
 
-/// Fetch tokenizer.json from the HF Hub cache (downloads once, then cached).
-fn load_tokenizer(model_id: &str) -> Result<Tokenizer> {
+/// Resolve the tokenizer **locally first**, never blocking `serve` on a doomed
+/// network call.
+///
+/// Order:
+///   1. `<stem>_tokenizer.json` or `tokenizer.json` beside the GGUF (fully offline).
+///   2. HuggingFace Hub — using a *real* `org/name` repo id (the hint if it is
+///      already one, else the model's recorded `source` repo from the registry),
+///      and **time-bounded** so a slow/offline Hub can never hang `serve`.
+///
+/// The old code fetched `tokenizer.json` from HF Hub keyed on the *model name*
+/// — often a local path or Ollama blob hash, which is not a repo id. That
+/// produced a doomed, minutes-long network stall (the "ghost bug") before the
+/// model ever loaded.
+fn resolve_tokenizer(gguf_path: &Path, hint_id: &str) -> Result<Tokenizer> {
+    // 1. Local sidecar beside the GGUF.
+    if let Some(dir) = gguf_path.parent() {
+        let stem = gguf_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        for cand in [dir.join(format!("{stem}_tokenizer.json")), dir.join("tokenizer.json")] {
+            if cand.exists() {
+                return Tokenizer::from_file(&cand)
+                    .map_err(|e| anyhow::anyhow!("tokenizer load error ({}): {}", cand.display(), e));
+            }
+        }
+    }
+
+    // 2. HuggingFace Hub — only with a genuine repo id, time-bounded.
+    if let Some(repo_id) = resolve_tokenizer_repo_id(gguf_path, hint_id) {
+        return fetch_tokenizer_from_hf(&repo_id, Duration::from_secs(20));
+    }
+
+    bail!(
+        "No tokenizer found for '{}'.\n  \
+         Place a `tokenizer.json` next to the model file, or (re)fetch it with \
+         `gwen fetch -m <org/name>` so GwenLand knows its HuggingFace repo.",
+        gguf_path.display()
+    )
+}
+
+/// Pick a HuggingFace repo id to source the tokenizer from: the hint if it is
+/// already an `org/name`, otherwise the model's recorded `source` repo in the
+/// local registry (looked up by name or by path). Returns `None` for local-only
+/// models (e.g. an Ollama blob) that have no associated HF repo.
+fn resolve_tokenizer_repo_id(gguf_path: &Path, hint_id: &str) -> Option<String> {
+    if is_hf_repo_id(hint_id) {
+        return Some(hint_id.to_string());
+    }
+    let registry = crate::storage::registry::ModelRegistry::load().ok()?;
+    let entry = registry
+        .find(hint_id)
+        .or_else(|| registry.list().iter().find(|m| m.path == gguf_path))?;
+    is_hf_repo_id(&entry.source).then(|| entry.source.clone())
+}
+
+/// Fetch `tokenizer.json` from HF Hub on a worker thread with a hard timeout, so
+/// a slow or unreachable Hub can never stall `serve` indefinitely.
+fn fetch_tokenizer_from_hf(model_id: &str, timeout: Duration) -> Result<Tokenizer> {
+    use std::sync::mpsc;
+
+    let id = model_id.to_string();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(fetch_tokenizer_json(&id));
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(path)) => Tokenizer::from_file(&path)
+            .map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e)),
+        Ok(Err(e)) => Err(e),
+        Err(_) => bail!(
+            "HuggingFace tokenizer fetch for '{}' timed out after {}s — \
+             place a tokenizer.json next to the model instead.",
+            model_id,
+            timeout.as_secs()
+        ),
+    }
+}
+
+/// Blocking HF Hub fetch of `tokenizer.json` (cached on disk by hf-hub after the
+/// first successful download). Runs on a worker thread; see `fetch_tokenizer_from_hf`.
+fn fetch_tokenizer_json(model_id: &str) -> Result<PathBuf> {
     use crate::platform::hub_model::resolve_token;
     use hf_hub::api::sync::ApiBuilder;
 
     let token = resolve_token();
     let api = ApiBuilder::from_env()
         .with_token(token)
-        .with_progress(true)
         .build()
         .context("failed to build HF Hub sync client")?;
 
-    let tok_path = api
-        .model(model_id.to_string())
+    api.model(model_id.to_string())
         .get("tokenizer.json")
-        .with_context(|| format!("failed to fetch tokenizer.json for '{}'", model_id))?;
-
-    Tokenizer::from_file(&tok_path).map_err(|e| anyhow::anyhow!("tokenizer load error: {}", e))
+        .with_context(|| format!("failed to fetch tokenizer.json for '{}'", model_id))
 }
 
 /// Estimate GGUF VRAM requirement from file size.

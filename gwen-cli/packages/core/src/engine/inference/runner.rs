@@ -23,7 +23,7 @@ use sysinfo::System;
 
 use crate::engine::inference::{
     loader::{self, LoadedModel},
-    model_dispatch::{detect_from_gguf, ModelKind},
+    model_dispatch::ModelKind,
     sampler::SamplerConfig,
 };
 use crate::engine::memory_guard::MemoryGuard;
@@ -87,8 +87,8 @@ pub fn run_inference(
     let loaded = loader::load(&cfg.model, &cfg.model_id_for_tokenizer)
         .context("failed to load model")?;
 
-    let kind = detect_from_gguf(&loaded.gguf_path)
-        .context("failed to detect model architecture")?;
+    // Architecture was detected (and cached) during load.
+    let kind = loaded.kind.clone();
 
     if cfg.show_banner {
         eprintln!("  ❖ Architecture: {}", kind.as_str());
