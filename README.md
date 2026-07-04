@@ -1,33 +1,50 @@
 # GwenLand
 
-An AI toolkit that runs entirely on your own machine. It's written in Rust, ships as one binary under 50 MB, and doesn't send your data anywhere.
+GwenLand is a local-first AI toolkit written in Rust. It ships as a single, lightweight binary (under 50 MB) that provides an end-to-end workflow for running and experimenting with local models.
 
-A single command-line tool covers the whole loop: pull a model, fine-tune it, serve it locally, and chat with it. Dataset tools and HuggingFace Hub access come built in.
+A single command-line tool covers the whole loop: pull a model, fine-tune it, serve it locally, and chat with it. Inference and data processing run entirely on your own machine—your data never leaves it.
 
-This is still pre-release, so flags, file formats, and APIs can change without warning. The native `gwen train` backend is the rough edge — it converges, but adapters it produces aren't ready to drop straight into inference, so don't lean on it for real training yet.
+## Key Features
 
-## Why Rust instead of Python
+- **Fetch**: Download models from HuggingFace and manage local registry.
+- **Train (Experimental)**: Fine-tune models using LoRA directly on a native Rust/Candle backend.
+- **Serve**: Spin up a local inference server.
+- **Chat**: Interact with models in your terminal.
+- **Tools**: Built-in dataset validation, GGUF conversion, evaluation, and security scanning (PII, toxicity).
 
-Most local-AI tooling is Python on top of more Python. That's great in a notebook, but it drags along a heavy runtime and a big install. GwenLand goes the other way: native code, no interpreter, no garbage-collector pauses, and a stripped binary small enough to carry around. You trade a little convenience for speed and a tiny footprint.
+## Status & Expectations (No Overpromising)
 
-## What it does
+GwenLand is in **pre-release**.
+- Flags, file formats, and APIs are subject to change without warning.
+- The native `gwen train` backend is highly experimental. While the layer-streaming LoRA objective converges, it is currently an approximation and the generated adapters are not yet ready to drop straight into inference. It is suitable for experimenting and hacking, but **not** for real-world training runs yet.
 
-- `gwen fetch` — download a model from HuggingFace and pick the quantization
-- `gwen train` — fine-tune with LoRA on the native Rust/Candle backend
-- `gwen serve` — start a local inference server
-- `gwen chat` — talk to a local model in your terminal
-- `gwen benchmark` — measure cold start, inference, layer load, and memory
-- `gwen hub` — list, pull, push, and prune HuggingFace models
-- `gwen dataset` — validate, convert, and split JSONL datasets
-- `gwen scan` — check models and datasets for PII, toxicity, and prompt injection
-- `gwen convert` — turn a GGUF file into SafeTensors
-- `gwen eval` — score a model against a validation set
-- `gwen config` and `gwen doctor` — manage settings and sanity-check your setup
+GwenLand targets modest hardware (e.g., 8GB RAM machines without GPUs) using an mmap-based layer loader, but it also natively supports CUDA and Metal if you have the hardware.
 
-## Where the code lives
+## Quick Start
 
-Everything is under `gwen-cli/`. Its [README](gwen-cli/README.md) has the build steps and the full command reference, and `gwen-cli/changelog/` keeps the per-session notes.
+You will need a recent Rust toolchain (edition 2024, Rust 1.85+).
+
+```bash
+# Build the binary
+cargo build --release -p gwenland-tui
+
+# Alias it for convenience
+alias gwen="$PWD/target/release/gwenland"
+
+# Check your environment
+gwen doctor
+
+# Start the workflow
+gwen fetch -m tinyllama/TinyLlama-1.1B -q q4_k_m
+gwen serve tinyllama-1.1b-q4_k_m
+gwen chat
+```
+
+## Documentation
+
+Everything is built as a Cargo workspace. Head over to [`gwen-cli/`](gwen-cli/) and read its [README](gwen-cli/README.md) for full documentation, build steps, and command references.
+The session-by-session changelog is kept in [`gwen-cli/changelog/`](gwen-cli/changelog/).
 
 ## License
 
-MIT with the Commons Clause, in [LICENSE](LICENSE). Free for personal and research use; commercial use needs a separate agreement.
+MIT with the Commons Clause (see [LICENSE.txt](LICENSE.txt)). Free for personal and research use; commercial use requires a separate agreement.
