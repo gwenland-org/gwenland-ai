@@ -1,0 +1,27 @@
+{
+  "activeEditorGroupId": "group-root",
+  "bottomPanelHeight": 134,
+  "bottomPanelOpen": false,
+  "editorGroupOrientation": "horizontal",
+  "editorGroups": [
+    {
+      "activeTabPath": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gitlab-ci.yml.disabled",
+      "id": "group-root",
+      "isLocked": false,
+      "isMaximized": false,
+      "size": 1,
+      "tabs": [
+        {
+          "isDirty": false,
+          "isPreview": false,
+          "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gitlab-ci.yml.disabled",
+          "type": "editor"
+        }
+      ]
+    }
+  ],
+  "sidebarOpen": true,
+  "sidebarWidth": 560,
+  "terminalOpen": false,
+  "theme": "gwen"
+}

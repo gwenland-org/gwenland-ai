@@ -1,0 +1,44 @@
+{
+  "activeTabPath": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gitlab-ci.yml.disabled",
+  "conversationState": {
+    "activeConversationId": "conv-fa79c899-1082-439c-b1ff-5c7d518d9331",
+    "activeModel": "deepseek-v3.1",
+    "activeProvider": "deep_seek",
+    "isOpen": true,
+    "reasoningLevel": "on",
+    "unsentInput": ""
+  },
+  "openTabs": [
+    {
+      "isDirty": false,
+      "isPreview": false,
+      "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gitlab-ci.yml.disabled",
+      "type": "editor"
+    },
+    {
+      "isDirty": false,
+      "isPreview": false,
+      "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gwenland\\conversations\\conv-182b4020-d567-4a72-be2b-db7e5865cf13.jsonl",
+      "type": "editor"
+    },
+    {
+      "isDirty": false,
+      "isPreview": false,
+      "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gwenland\\agent\\memory\\gwenland\\mermaid-project-structure-generator\\memory-agent-diff-logic.md",
+      "type": "editor"
+    },
+    {
+      "isDirty": false,
+      "isPreview": false,
+      "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gwenland\\agent\\memory\\gwenland\\mermaid-project-structure-generator\\newton-multivariate-method.md",
+      "type": "editor"
+    },
+    {
+      "isDirty": false,
+      "isPreview": false,
+      "path": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand\\.gwenland\\agent\\memory\\gwenland\\new-conversation\\project-structure-documentation.md",
+      "type": "editor"
+    }
+  ],
+  "workspaceRoot": "C:\\Users\\reyha\\Documents\\JinXSuper-Projects\\GwenLand"
+}
