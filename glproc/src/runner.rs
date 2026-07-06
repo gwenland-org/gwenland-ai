@@ -13,11 +13,12 @@ use glcore::GlError;
 use crate::attention::attention_one_into;
 use crate::kernels;
 use crate::kernels::bridge::bridge_matvec_quant;
+use crate::kernels::qdot::{self, QuantizedActivation};
 use crate::kv_cache::KvCache;
 use crate::model::{GlprocModel, RopeStyle, WeightMatrix};
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
-use crate::threading::{par_matvec, par_matvec_quant, ThreadPool};
+use crate::threading::{par_matvec, par_matvec_qdot, par_matvec_quant, ThreadPool};
 
 /// KV cache sequence capacity cap. Qwen-class models advertise 32k context;
 /// pre-allocating that costs GBs, so the cache is sized to
@@ -26,16 +27,24 @@ const MAX_KV_CONTEXT: usize = 4096;
 
 /// Decode threads. 4 matches the i3-1115G4 (4 logical cores); capped by the
 /// machine's actual core count so small VMs don't oversubscribe.
+/// `GLPROC_THREADS` overrides — for benchmarking and as the X5 thermal
+/// knob (reduce thread count if the CPU runs hot).
 const N_THREADS: usize = 4;
+
+/// Thread count after the optional `GLPROC_THREADS` override.
+fn n_threads() -> usize {
+    std::env::var("GLPROC_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(N_THREADS)
+        .min(num_cpus::get())
+        .max(1)
+}
 
 /// Below this many multiply-accumulates a matvec runs on the calling thread —
 /// waking workers costs more than the work itself.
 const PAR_MIN_WORK: usize = 1 << 16;
-
-/// SiLU activation: `x * sigmoid(x)`.
-fn silu(x: f32) -> f32 {
-    x / (1.0 + (-x).exp())
-}
 
 /// Apply rotary position embeddings in place to one head's vector.
 fn rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32, style: RopeStyle) {
@@ -55,13 +64,23 @@ fn rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32, style: RopeS
     }
 }
 
+/// True when `w` is consumed through the integer-dot path, i.e. the caller
+/// must quantize the activation into the workspace first.
+fn needs_q8(w: &WeightMatrix) -> bool {
+    matches!(w, WeightMatrix::Quant(fmt, _) if qdot::supports(*fmt))
+}
+
 /// Matvec over either weight representation, threaded when the work is big
-/// enough to amortize waking the pool.
+/// enough to amortize waking the pool. Quantized formats with an integer
+/// kernel use `act` — the caller must have quantized the current `x` into
+/// it (once per distinct vector, even when several matrices consume it);
+/// the rest go through the f32 bridge.
 fn matvec_w(
     pool: &ThreadPool,
     strategy: SimdStrategy,
     w: &WeightMatrix,
     x: &[f32],
+    act: &QuantizedActivation,
     y: &mut [f32],
     out_dim: usize,
     in_dim: usize,
@@ -76,7 +95,18 @@ fn matvec_w(
             }
         }
         WeightMatrix::Quant(fmt, blocks) => {
-            if parallel {
+            if qdot::supports(*fmt) {
+                debug_assert_eq!(act.len, in_dim, "caller must quantize x into act first");
+                if parallel {
+                    par_matvec_qdot(pool, *fmt, blocks, act, y, out_dim, in_dim, strategy);
+                } else {
+                    let row_bytes = in_dim / fmt.block_numel() * fmt.block_bytes();
+                    for (o, out) in y.iter_mut().enumerate() {
+                        let row = &blocks[o * row_bytes..(o + 1) * row_bytes];
+                        *out = qdot::row_dot_q8(*fmt, row, act, strategy);
+                    }
+                }
+            } else if parallel {
                 par_matvec_quant(pool, *fmt, blocks, x, y, out_dim, in_dim, strategy);
             } else {
                 bridge_matvec_quant(*fmt, blocks, x, y, out_dim, in_dim, strategy);
@@ -112,6 +142,44 @@ struct Workspace {
     scores: Vec<f32>,
     /// Output logits, `[vocab_size]`.
     logits: Vec<f32>,
+    /// Q8-quantized activation for the integer-domain matvec path, sized
+    /// for the widest input this model feeds a quantized matrix.
+    act: QuantizedActivation,
+}
+
+/// Per-phase wall-time accumulators for the decode loop, enabled by setting
+/// `GLPROC_PROFILE=1`. A measurement tool for finding the fat — when
+/// disabled (`None`) the decode loop takes zero timestamps.
+#[derive(Default)]
+struct Prof {
+    /// Attention-norm + Q/K/V matvecs + biases + head norms + RoPE + cache.
+    qkv: std::time::Duration,
+    /// Per-head single-query attention against the KV cache.
+    attn: std::time::Duration,
+    /// Output projection + FFN norm + gate/up/SiLU/down + residuals.
+    ffn: std::time::Duration,
+    /// Final norm + LM-head matvec over the full vocabulary.
+    lm_head: std::time::Duration,
+    /// Token sampling (measured in `generate`).
+    sampler: std::time::Duration,
+    tokens: u32,
+}
+
+impl Prof {
+    fn report(&self) {
+        let toks = self.tokens.max(1);
+        let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / toks as f64;
+        eprintln!(
+            "[profile] per token over {} tokens: qkv {:.2}ms | attn {:.2}ms | \
+             ffn {:.2}ms | lm_head {:.2}ms | sampler {:.2}ms",
+            self.tokens,
+            ms(self.qkv),
+            ms(self.attn),
+            ms(self.ffn),
+            ms(self.lm_head),
+            ms(self.sampler),
+        );
+    }
 }
 
 /// Drives token-by-token inference over a loaded model.
@@ -121,6 +189,8 @@ pub struct Runner<'m> {
     pool: ThreadPool,
     strategy: SimdStrategy,
     ws: Workspace,
+    /// `Some` only when `GLPROC_PROFILE` is set in the environment.
+    prof: Option<Box<Prof>>,
 }
 
 impl<'m> Runner<'m> {
@@ -134,7 +204,7 @@ impl<'m> Runner<'m> {
         Runner {
             model,
             cache: KvCache::new(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity),
-            pool: ThreadPool::new(N_THREADS.min(num_cpus::get()).max(1)),
+            pool: ThreadPool::new(n_threads()),
             strategy: SimdStrategy::detect(),
             ws: Workspace {
                 x: vec![0.0; c.dim],
@@ -149,7 +219,14 @@ impl<'m> Runner<'m> {
                 up: vec![0.0; c.hidden_dim],
                 scores: vec![0.0; kv_capacity],
                 logits: vec![0.0; c.vocab_size],
+                act: QuantizedActivation::with_capacity(
+                    c.dim.max(c.hidden_dim).max(q_dim),
+                ),
             },
+            prof: std::env::var("GLPROC_PROFILE")
+                .ok()
+                .filter(|v| !v.is_empty() && v != "0")
+                .map(|_| Box::new(Prof::default())),
         }
     }
 
@@ -157,6 +234,14 @@ impl<'m> Runner<'m> {
     /// logits in the workspace (borrow them via [`Runner::logits`]).
     /// Advances the KV cursor — call with strictly increasing `pos`.
     pub fn forward_into(&mut self, token: u32, pos: usize) -> Result<(), GlError> {
+        self.step(token, pos, true)
+    }
+
+    /// Forward pass with an optional LM head. Prefill only needs the KV
+    /// cache side effects — the head is the single biggest matvec (full
+    /// vocabulary), so skipping it for all but the last prompt token saves
+    /// its full cost per prefill position.
+    fn step(&mut self, token: u32, pos: usize, want_logits: bool) -> Result<(), GlError> {
         let c = &self.model.config;
         let dim = c.dim;
         let head_dim = c.head_dim;
@@ -181,13 +266,27 @@ impl<'m> Runner<'m> {
         let ws = &mut self.ws;
         ws.x.copy_from_slice(&self.model.token_embd[start..start + dim]);
 
+        // One timestamp per phase boundary, only when profiling.
+        let mut t = self.prof.as_ref().map(|_| std::time::Instant::now());
+        let mut lap = |p: &mut Option<Box<Prof>>, pick: fn(&mut Prof) -> &mut std::time::Duration| {
+            if let Some(p) = p.as_deref_mut() {
+                let now = std::time::Instant::now();
+                *pick(p) += now - t.unwrap();
+                t = Some(now);
+            }
+        };
+
         for (l, layer) in self.model.layers.iter().enumerate() {
             // --- attention block ---
             kernels::rms_norm_into(&ws.x, &layer.attn_norm, c.rms_eps, &mut ws.xn);
 
-            matvec_w(&self.pool, self.strategy, &layer.wq, &ws.xn, &mut ws.q, q_dim, dim);
-            matvec_w(&self.pool, self.strategy, &layer.wk, &ws.xn, &mut ws.k, kv_dim, dim);
-            matvec_w(&self.pool, self.strategy, &layer.wv, &ws.xn, &mut ws.v, kv_dim, dim);
+            // One quantization feeds all three projections.
+            if needs_q8(&layer.wq) || needs_q8(&layer.wk) || needs_q8(&layer.wv) {
+                ws.act.quantize(&ws.xn);
+            }
+            matvec_w(&self.pool, self.strategy, &layer.wq, &ws.xn, &ws.act, &mut ws.q, q_dim, dim);
+            matvec_w(&self.pool, self.strategy, &layer.wk, &ws.xn, &ws.act, &mut ws.k, kv_dim, dim);
+            matvec_w(&self.pool, self.strategy, &layer.wv, &ws.xn, &ws.act, &mut ws.v, kv_dim, dim);
 
             if let Some(b) = &layer.bq {
                 for (qi, bi) in ws.q.iter_mut().zip(b) {
@@ -241,6 +340,7 @@ impl<'m> Runner<'m> {
                 self.cache.write_k(l, h, &ws.k[h * head_dim..(h + 1) * head_dim]);
                 self.cache.write_v(l, h, &ws.v[h * head_dim..(h + 1) * head_dim]);
             }
+            lap(&mut self.prof, |p| &mut p.qkv);
 
             let cached_len = self.cache.current_pos() + 1;
             for h in 0..c.n_heads {
@@ -254,12 +354,17 @@ impl<'m> Runner<'m> {
                     &mut ws.attn_out[h * head_dim..(h + 1) * head_dim],
                 );
             }
+            lap(&mut self.prof, |p| &mut p.attn);
 
+            if needs_q8(&layer.wo) {
+                ws.act.quantize(&ws.attn_out);
+            }
             matvec_w(
                 &self.pool,
                 self.strategy,
                 &layer.wo,
                 &ws.attn_out,
+                &ws.act,
                 &mut ws.proj,
                 dim,
                 q_dim,
@@ -270,11 +375,16 @@ impl<'m> Runner<'m> {
 
             // --- SwiGLU feed-forward block ---
             kernels::rms_norm_into(&ws.x, &layer.ffn_norm, c.rms_eps, &mut ws.xn);
+            // One quantization feeds both gate and up.
+            if needs_q8(&layer.w_gate) || needs_q8(&layer.w_up) {
+                ws.act.quantize(&ws.xn);
+            }
             matvec_w(
                 &self.pool,
                 self.strategy,
                 &layer.w_gate,
                 &ws.xn,
+                &ws.act,
                 &mut ws.gate,
                 c.hidden_dim,
                 dim,
@@ -284,18 +394,21 @@ impl<'m> Runner<'m> {
                 self.strategy,
                 &layer.w_up,
                 &ws.xn,
+                &ws.act,
                 &mut ws.up,
                 c.hidden_dim,
                 dim,
             );
-            for (g, u) in ws.gate.iter_mut().zip(&ws.up) {
-                *g = silu(*g) * u;
+            kernels::silu_mul(&mut ws.gate, &ws.up);
+            if needs_q8(&layer.w_down) {
+                ws.act.quantize(&ws.gate);
             }
             matvec_w(
                 &self.pool,
                 self.strategy,
                 &layer.w_down,
                 &ws.gate,
+                &ws.act,
                 &mut ws.proj,
                 dim,
                 c.hidden_dim,
@@ -303,21 +416,32 @@ impl<'m> Runner<'m> {
             for (xi, di) in ws.x.iter_mut().zip(&ws.proj) {
                 *xi += di;
             }
+            lap(&mut self.prof, |p| &mut p.ffn);
         }
 
         // All layers committed this token's K/V — advance the cursor once.
         self.cache.advance();
 
-        kernels::rms_norm_into(&ws.x, &self.model.output_norm, c.rms_eps, &mut ws.xn);
-        matvec_w(
-            &self.pool,
-            self.strategy,
-            &self.model.output,
-            &ws.xn,
-            &mut ws.logits,
-            c.vocab_size,
-            dim,
-        );
+        if want_logits {
+            kernels::rms_norm_into(&ws.x, &self.model.output_norm, c.rms_eps, &mut ws.xn);
+            if needs_q8(&self.model.output) {
+                ws.act.quantize(&ws.xn);
+            }
+            matvec_w(
+                &self.pool,
+                self.strategy,
+                &self.model.output,
+                &ws.xn,
+                &ws.act,
+                &mut ws.logits,
+                c.vocab_size,
+                dim,
+            );
+            lap(&mut self.prof, |p| &mut p.lm_head);
+        }
+        if let Some(p) = self.prof.as_deref_mut() {
+            p.tokens += 1;
+        }
         Ok(())
     }
 
@@ -353,7 +477,8 @@ impl<'m> Runner<'m> {
         self.cache.reset();
         let max_seq = self.model.config.max_seq.min(self.cache.max_context);
 
-        // Prefill: run every prompt token, keep only the last logits.
+        // Prefill: run every prompt token; only the last one needs logits,
+        // so earlier positions skip the (huge) LM-head matvec entirely.
         for (pos, &tok) in prompt.iter().enumerate() {
             if pos >= max_seq {
                 return Err(GlError::Engine(format!(
@@ -361,7 +486,7 @@ impl<'m> Runner<'m> {
                     prompt.len()
                 )));
             }
-            self.forward_into(tok, pos)?;
+            self.step(tok, pos, pos + 1 == prompt.len())?;
         }
 
         let mut generated = Vec::with_capacity(max_new_tokens);
@@ -370,7 +495,11 @@ impl<'m> Runner<'m> {
             if pos >= max_seq {
                 break;
             }
+            let t = self.prof.as_ref().map(|_| std::time::Instant::now());
             let next = sampler.sample(&self.ws.logits);
+            if let (Some(p), Some(t)) = (self.prof.as_deref_mut(), t) {
+                p.sampler += t.elapsed();
+            }
             if next == eos_id {
                 break;
             }
@@ -378,6 +507,9 @@ impl<'m> Runner<'m> {
             generated.push(next);
             self.forward_into(next, pos)?;
             pos += 1;
+        }
+        if let Some(p) = &self.prof {
+            p.report();
         }
         Ok(generated)
     }

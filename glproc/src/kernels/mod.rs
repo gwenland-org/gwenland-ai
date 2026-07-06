@@ -2,6 +2,7 @@ pub mod bridge;
 pub mod dequant;
 pub mod matmul;
 pub mod ops;
+pub mod qdot;
 
 use crate::simd_strategy::SimdStrategy;
 
@@ -85,6 +86,15 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         SimdStrategy::Avx512 => unsafe { ops::rms_norm::avx2::run(x, weight, eps) }, // Fallback to AVX2 if no AVX-512 specific
         SimdStrategy::Avx2 => unsafe { ops::rms_norm::avx2::run(x, weight, eps) },
         SimdStrategy::Scalar => ops::rms_norm::scalar::run(x, weight, eps),
+    }
+}
+
+/// Fused SwiGLU gating for the decode loop: `gate[i] = silu(gate[i]) * up[i]`.
+pub fn silu_mul(gate: &mut [f32], up: &[f32]) {
+    match SimdStrategy::detect() {
+        // AVX-512 falls back to AVX2 — no AVX-512-specific silu yet.
+        SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { ops::silu::avx2::run(gate, up) },
+        SimdStrategy::Scalar => ops::silu::scalar::run(gate, up),
     }
 }
 

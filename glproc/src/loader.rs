@@ -11,6 +11,121 @@ use crate::kernels;
 use crate::kernels::bridge::QuantFormat;
 use crate::model::{GlprocModel, LayerWeights, ModelConfig, RopeStyle, WeightMatrix};
 
+/// Page size used for the warm-touch stride. 4 KiB on every x86 target we
+/// ship on; touching one byte per page faults the whole page in.
+const PAGE_BYTES: usize = 4096;
+
+#[cfg(windows)]
+mod winmem {
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn VirtualLock(addr: *const c_void, size: usize) -> i32;
+        pub fn GetCurrentProcess() -> *mut c_void;
+        pub fn SetProcessWorkingSetSize(process: *mut c_void, min: usize, max: usize) -> i32;
+    }
+}
+
+/// The memory region backing one weight matrix, whichever representation
+/// it is stored in.
+fn weight_region(w: &WeightMatrix) -> (*const u8, usize) {
+    match w {
+        WeightMatrix::F32(v) => (v.as_ptr() as *const u8, std::mem::size_of_val(v.as_slice())),
+        WeightMatrix::Quant(_, b) => (b.as_ptr(), b.len()),
+    }
+}
+
+/// Warm the model's weights into RAM and pin them there. Call once, after
+/// load and before the first decode.
+///
+/// A cold or evicted page costs a fault mid-matvec — at this machine's disk
+/// speed that is milliseconds per page, which destroys decode latency. So:
+/// touch every page up front (fault them in while nothing is latency
+/// sensitive), then pin them (`VirtualLock` / `mlock`) so an 8 GB box under
+/// memory pressure cannot swap the weights back out between requests.
+///
+/// Deviation from the X5 sketch: glproc copies tensors out of the GGUF mmap
+/// into owned heap buffers at load, so the decode working set is those
+/// buffers, not the mmap — warm-and-lock targets each weight buffer.
+///
+/// Best effort: pinning can fail (working-set quota, `ulimit -l`); the
+/// prefetch touch still helps, so a failure only warns.
+pub fn warm_and_lock_model(model: &GlprocModel) {
+    let mut regions: Vec<(*const u8, usize)> = Vec::new();
+    let mut push_f32 = |regions: &mut Vec<_>, v: &[f32]| {
+        regions.push((v.as_ptr() as *const u8, std::mem::size_of_val(v)));
+    };
+    push_f32(&mut regions, &model.token_embd);
+    push_f32(&mut regions, &model.output_norm);
+    regions.push(weight_region(&model.output));
+    for l in &model.layers {
+        push_f32(&mut regions, &l.attn_norm);
+        push_f32(&mut regions, &l.ffn_norm);
+        for opt in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm] {
+            if let Some(v) = opt {
+                push_f32(&mut regions, v);
+            }
+        }
+        for w in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+            regions.push(weight_region(w));
+        }
+    }
+    regions.retain(|&(_, size)| size > 0);
+    let total: usize = regions.iter().map(|&(_, size)| size).sum();
+
+    // Step 1: touch one byte per page. Faults every page in now, so the
+    // decode loop never takes one — and it still helps if pinning fails.
+    for &(ptr, size) in &regions {
+        let mut i = 0;
+        while i < size {
+            // SAFETY: ptr..ptr+size is a live owned buffer of the model.
+            unsafe { std::ptr::read_volatile(ptr.add(i)) };
+            i += PAGE_BYTES;
+        }
+    }
+
+    // Step 2: pin the pages so they cannot be evicted.
+    let mut failed = 0usize;
+    #[cfg(windows)]
+    {
+        // VirtualLock is capped by the process working-set maximum (a few
+        // MB by default), so raise it to model size + slack first.
+        const SLACK: usize = 256 << 20;
+        // SAFETY: plain kernel32 calls on the current process handle.
+        unsafe {
+            winmem::SetProcessWorkingSetSize(
+                winmem::GetCurrentProcess(),
+                total + SLACK,
+                total + SLACK * 2,
+            );
+        }
+        for &(ptr, size) in &regions {
+            // SAFETY: region is a live owned buffer, valid for `size` bytes.
+            if unsafe { winmem::VirtualLock(ptr as *const _, size) } == 0 {
+                failed += 1;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        for &(ptr, size) in &regions {
+            // SAFETY: region is a live owned buffer, valid for `size` bytes.
+            if unsafe { libc::mlock(ptr as *const libc::c_void, size) } != 0 {
+                failed += 1;
+            }
+        }
+    }
+    if failed > 0 {
+        eprintln!(
+            "warning: pinning failed for {failed}/{} weight buffers ({} MB total) — \
+             pages are prefetched but may be swapped out under memory pressure \
+             (unix: try `ulimit -l unlimited`)",
+            regions.len(),
+            total >> 20,
+        );
+    }
+}
+
 /// Read `{arch}.{suffix}` from metadata as u64.
 fn meta_u64(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<u64> {
     gguf.get_meta(&format!("{arch}.{suffix}"))
@@ -67,6 +182,23 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<WeightMatrix, GlError> {
         _ => None,
     };
     match fmt {
+        // Q5_0 is repacked to Q8_0 at load: the conversion is bit-exact
+        // (see `repack_to_q8_0`) and Q8_0's inner loop is much cheaper than
+        // Q5_0's high-bit unpack, which measured compute-bound.
+        Some(QuantFormat::Q5_0) if info.dimensions[0] as usize % 32 == 0 => {
+            Ok(WeightMatrix::Quant(
+                QuantFormat::Q8_0,
+                kernels::dequant::q5_0::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
+            ))
+        }
+        // Q6_K likewise repacks to Q8_0 (requantized; error well under the
+        // format's own quantization noise — see `repack_to_q8_0`).
+        Some(QuantFormat::Q6K) if info.dimensions[0] as usize % 256 == 0 => {
+            Ok(WeightMatrix::Quant(
+                QuantFormat::Q8_0,
+                kernels::dequant::q6_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
+            ))
+        }
         // dimensions[0] is the contiguous axis = in_features; GGML packs
         // quantization blocks along it, so it is always a whole number of
         // blocks — guard anyway and fall back to f32 if not.

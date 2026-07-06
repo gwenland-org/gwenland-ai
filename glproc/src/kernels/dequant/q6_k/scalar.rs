@@ -71,3 +71,14 @@ pub fn run(data: &[u8]) -> Result<Vec<f32>, GlError> {
     }
     Ok(out)
 }
+
+/// Repack a whole Q6_K tensor as Q8_0 blocks. Load-time path only.
+///
+/// Not exact: Q6_K's per-16 signed sub-scales collapse into one scale per
+/// 32 weights, adding <=0.4% error on top of Q6_K's own ~1.5% -- well under
+/// the model's quantization noise. The trade: +29% weight bytes
+/// (0.82 -> 1.06 B/weight) for Q8_0's much cheaper inner loop, a net win on
+/// machines where the Q6_K unpack is compute-bound (see M1.5 notes).
+pub fn repack_to_q8_0(data: &[u8]) -> Result<Vec<u8>, GlError> {
+    Ok(crate::kernels::dequant::q8_0::scalar::quantize(&run(data)?))
+}

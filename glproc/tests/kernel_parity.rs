@@ -409,6 +409,81 @@ fn bridge_row_dot_all_formats_match_naive() {
     }
 }
 
+/// Integer-domain fused dot vs the f32 bridge, per format.
+///
+/// The activation is built from whole numbers with one ±127 per 32-group,
+/// so Q8 quantization is *exact* (scale = 1.0) and any disagreement is a
+/// kernel bug, not quantization noise.
+#[test]
+fn qdot_matches_f32_bridge_exactly_quantizable() {
+    use glproc::kernels::bridge::QuantFormat;
+    use glproc::kernels::dequant::{q5_0, q6_k, q8_0};
+    use glproc::kernels::qdot::{self, QuantizedActivation};
+
+    let mut rng = Lcg::new(2026);
+    let cases: [(QuantFormat, usize); 3] = [
+        (QuantFormat::Q5_0, 22),
+        (QuantFormat::Q6K, 210),
+        (QuantFormat::Q8_0, 34),
+    ];
+
+    for (fmt, bb) in cases {
+        let bn = fmt.block_numel();
+        let n_blocks = 512 / bn;
+        let mut row = vec![0u8; n_blocks * bb];
+        rng.fill(&mut row);
+        for block in row.chunks_mut(bb) {
+            match fmt {
+                QuantFormat::Q6K => block[208..210].copy_from_slice(&0x3C00u16.to_le_bytes()),
+                _ => block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()),
+            }
+        }
+
+        // Exactly quantizable activation: integers in [-127, 127], one 127
+        // per 32-group so the group scale is exactly 1.0.
+        let mut x: Vec<f32> = (0..512)
+            .map(|_| (rng.next_u32() % 255) as f32 - 127.0)
+            .collect();
+        for g in x.chunks_mut(32) {
+            g[0] = 127.0;
+        }
+
+        let mut act = QuantizedActivation::with_capacity(512);
+        act.quantize(&x);
+        // Quantization must be lossless for this input.
+        for (i, &v) in x.iter().enumerate() {
+            assert_eq!(act.q[i] as f32, v, "activation quantization not exact at {i}");
+        }
+
+        let dequant = match fmt {
+            QuantFormat::Q5_0 => q5_0::scalar::run(&row).unwrap(),
+            QuantFormat::Q6K => q6_k::scalar::run(&row).unwrap(),
+            QuantFormat::Q8_0 => q8_0::scalar::run(&row),
+            QuantFormat::Q4K => unreachable!(),
+        };
+        let want = glproc::kernels::matmul::scalar::dot_f32(&dequant, &x);
+        let tol = 1e-3 * want.abs().max(1.0); // f32 accumulation order only
+
+        let scalar = qdot::row_dot_q8(fmt, &row, &act, SimdStrategy::Scalar);
+        assert!(
+            (scalar - want).abs() <= tol,
+            "{fmt:?} scalar qdot: got {scalar}, want {want}"
+        );
+        if has_avx2() {
+            let got = qdot::row_dot_q8(fmt, &row, &act, SimdStrategy::Avx2);
+            assert!(
+                (got - want).abs() <= tol,
+                "{fmt:?} avx2 qdot: got {got}, want {want}"
+            );
+            // And scalar vs AVX2 agree tightly on the same integer inputs.
+            assert!(
+                (got - scalar).abs() <= 1e-3 * scalar.abs().max(1.0),
+                "{fmt:?} avx2 vs scalar qdot: {got} vs {scalar}"
+            );
+        }
+    }
+}
+
 #[test]
 fn fast_exp_avx2_matches_scalar() {
     if !has_avx2() {
@@ -425,5 +500,93 @@ fn fast_exp_avx2_matches_scalar() {
             "x={}, got={}, want={}, rel_err={}", x, avx2, scalar, rel_err
         );
         x += 0.1;
+    }
+}
+
+/// X5 test 9: after `warm_and_lock_model`, every weight buffer is resident
+/// and readable with its original contents. Pinning itself is best-effort
+/// (quota-dependent), so accessibility is the contract under test.
+#[test]
+fn warm_model_pages_loaded() {
+    use glproc::kernels::bridge::QuantFormat;
+    use glproc::loader::warm_and_lock_model;
+    use glproc::model::{GlprocModel, LayerWeights, ModelConfig, RopeStyle, WeightMatrix};
+
+    let dim = 64usize;
+    let vocab = 8usize;
+    let layer = LayerWeights {
+        attn_norm: vec![1.0; dim],
+        wq: WeightMatrix::F32(vec![0.5; dim * dim]),
+        wk: WeightMatrix::F32(vec![0.5; dim * dim]),
+        wv: WeightMatrix::F32(vec![0.5; dim * dim]),
+        wo: WeightMatrix::F32(vec![0.5; dim * dim]),
+        bq: None,
+        bk: None,
+        bv: None,
+        q_norm: None,
+        k_norm: None,
+        ffn_norm: vec![1.0; dim],
+        // One quantized matrix so the raw-bytes region path is exercised.
+        w_gate: WeightMatrix::Quant(QuantFormat::Q8_0, vec![7u8; dim / 32 * 34 * dim]),
+        w_up: WeightMatrix::F32(vec![0.5; dim * dim]),
+        w_down: WeightMatrix::F32(vec![0.5; dim * dim]),
+    };
+    let model = GlprocModel {
+        config: ModelConfig {
+            arch: "test".into(),
+            dim,
+            n_layers: 1,
+            n_heads: 4,
+            n_kv_heads: 4,
+            head_dim: dim / 4,
+            hidden_dim: dim,
+            vocab_size: vocab,
+            max_seq: 32,
+            rms_eps: 1e-5,
+            rope_freq_base: 10_000.0,
+            rope_style: RopeStyle::Neox,
+        },
+        token_embd: vec![0.25; vocab * dim],
+        layers: vec![layer],
+        output_norm: vec![1.0; dim],
+        output: WeightMatrix::F32(vec![0.5; vocab * dim]),
+    };
+
+    warm_and_lock_model(&model);
+
+    assert!(model.token_embd.iter().all(|&v| v == 0.25));
+    assert!(model.output_norm.iter().all(|&v| v == 1.0));
+    match &model.layers[0].w_gate {
+        WeightMatrix::Quant(QuantFormat::Q8_0, b) => assert!(b.iter().all(|&v| v == 7)),
+        _ => unreachable!("w_gate was constructed as Q8_0"),
+    }
+    match &model.layers[0].wq {
+        WeightMatrix::F32(w) => assert!(w.iter().all(|&v| v == 0.5)),
+        _ => unreachable!("wq was constructed as F32"),
+    }
+}
+
+/// Q5_0 -> Q8_0 repack is bit-exact: dequantizing the repacked Q8_0 blocks
+/// must reproduce the Q5_0 dequantization exactly (integer x8 / scale /8).
+#[test]
+fn q5_0_repack_to_q8_0_is_exact() {
+    use glproc::kernels::dequant::{q5_0, q8_0};
+
+    let mut rng = Lcg::new(77);
+    let n_blocks = 64;
+    let mut data = vec![0u8; n_blocks * 22];
+    rng.fill(&mut data);
+    // Force a normal, comfortably-sized f16 scale per block (exp > 3).
+    for block in data.chunks_mut(22) {
+        block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+    }
+
+    let want = q5_0::scalar::run(&data).unwrap();
+    let repacked = q5_0::scalar::repack_to_q8_0(&data).unwrap();
+    assert_eq!(repacked.len(), n_blocks * 34);
+    let got = q8_0::scalar::run(&repacked);
+
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert_eq!(g, w, "repack mismatch at weight {i}");
     }
 }

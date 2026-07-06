@@ -2681,6 +2681,7 @@ name = "glproc"
 version = "0.1.0"
 dependencies = [
  "glcore",
+ "libc",
  "num_cpus",
 ]
 

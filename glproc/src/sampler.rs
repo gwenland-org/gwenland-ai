@@ -54,6 +54,11 @@ impl XorShift64 {
 pub struct Sampler {
     config: SamplerConfig,
     rng: XorShift64,
+    /// `(id, scaled logit)` working set, reused across calls so sampling
+    /// allocates only on the first token, never in the decode loop after.
+    candidates: Vec<(usize, f32)>,
+    /// Softmax scratch matching `candidates`, reused the same way.
+    probs: Vec<f32>,
 }
 
 impl Sampler {
@@ -68,6 +73,8 @@ impl Sampler {
         Sampler {
             config,
             rng: XorShift64::new(seed),
+            candidates: Vec::new(),
+            probs: Vec::new(),
         }
     }
 
@@ -96,26 +103,28 @@ impl Sampler {
             return Self::greedy(logits);
         }
 
-        // (id, logit) working set, temperature applied.
+        // (id, logit) working set, temperature applied. `clear` + `extend`
+        // reuses the buffer's capacity — steady-state this allocates nothing.
         let inv_temp = 1.0 / self.config.temperature;
-        let mut candidates: Vec<(usize, f32)> = logits
-            .iter()
-            .enumerate()
-            .map(|(i, &v)| (i, v * inv_temp))
-            .collect();
+        let candidates = &mut self.candidates;
+        candidates.clear();
+        candidates.extend(logits.iter().enumerate().map(|(i, &v)| (i, v * inv_temp)));
 
-        // top-k: keep only the k highest logits.
+        // top-k: keep only the k highest logits. O(n) partition selection
+        // first, full sort only of the k survivors — sorting the whole
+        // 150k-entry vocab cost ~7ms/token, more than a whole FFN layer.
         let k = self.config.top_k;
         if k > 0 && k < candidates.len() {
-            candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+            candidates.select_nth_unstable_by(k - 1, |a, b| b.1.total_cmp(&a.1));
             candidates.truncate(k);
-        } else {
-            candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         }
+        candidates.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
 
         // softmax over the surviving logits.
-        let mut probs: Vec<f32> = candidates.iter().map(|&(_, v)| v).collect();
-        softmax(&mut probs);
+        let probs = &mut self.probs;
+        probs.clear();
+        probs.extend(candidates.iter().map(|&(_, v)| v));
+        softmax(probs);
 
         // top-p: cut the sorted tail once cumulative mass exceeds p.
         let p = self.config.top_p;

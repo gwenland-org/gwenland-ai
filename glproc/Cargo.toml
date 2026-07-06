@@ -9,4 +9,7 @@ license-file = "../LICENSE.txt"
 glcore = { path = "../glcore" }
 num_cpus = "1.16"
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]

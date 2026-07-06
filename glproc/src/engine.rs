@@ -131,7 +131,11 @@ impl GlEngine for GlprocEngine {
         }
 
         self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
-        self.model = Some(load_gguf(&gguf)?);
+        let model = load_gguf(&gguf)?;
+        // X5 step 1: fault every weight page in and pin it before the first
+        // token, so no decode ever stalls on a page fault or swap-in.
+        crate::loader::warm_and_lock_model(&model);
+        self.model = Some(model);
         Ok(())
     }
 

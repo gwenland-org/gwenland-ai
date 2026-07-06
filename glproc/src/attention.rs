@@ -13,7 +13,9 @@ pub fn softmax(x: &mut [f32]) {
     }
     let mut sum = 0.0f32;
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
+        // X5 §4.8: fast_exp (range-reduced polynomial, ~1e-4 rel err) in
+        // place of f32::exp — well under the weights' quantization noise.
+        *v = crate::kernels::fast_exp(*v - max);
         sum += *v;
     }
     if sum > 0.0 {

@@ -1,14 +1,17 @@
-//! Persistent worker pool with interleaved row assignment.
+//! Persistent worker pool with contiguous per-thread row chunks.
 //!
 //! Why a persistent pool? `thread::spawn` costs tens of microseconds; a
 //! decode step dispatches ~170 matvecs, so spawning per call would burn the
 //! whole latency budget. Workers are spawned once and parked on a condvar.
 //!
-//! Why interleaved rows (thread `t` takes rows `t, t+N, t+2N, ...`) instead
-//! of contiguous chunks? Row cost is uniform, so interleaving gives perfect
-//! static balance with zero scheduling state, and threads sweep the weight
-//! matrix together so their working sets share the same L3 region of the
-//! i3-1115G4's 6 MB cache instead of thrashing four distant ones.
+//! Why contiguous chunks (thread `t` takes rows `[t*chunk, (t+1)*chunk)`)
+//! instead of interleaved rows? Row cost is uniform so both balance
+//! perfectly, but the weights stream from DRAM every token (they cannot fit
+//! in cache), and single-channel DDR4 rewards a few clean sequential
+//! streams with far better page locality than N interleaved streams that
+//! each skip (N−1) rows between reads. Measured on the i3-1115G4: chunked
+//! beat interleaved by ~35% end-to-end (18.6 → 25.3 tok/s on
+//! Qwen2.5-0.5B), with the Q8_0 lm-head matvec reaching ~23 GB/s.
 //!
 //! Layer-level parallelism (thread 0 runs layers 0,4,8...) is impossible for
 //! autoregressive decode — layer L+1 consumes layer L's output — so the
@@ -18,11 +21,14 @@
 //! Fallback: if worker spawn fails, the pool degrades to 0 workers and every
 //! `run` executes single-threaded on the caller. No panic.
 
+use std::cell::UnsafeCell;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::kernels::bridge::{bridge_row_dot, QuantFormat};
 use crate::kernels::matmul;
+use crate::kernels::qdot::{row_dot_q8, QuantizedActivation};
 use crate::simd_strategy::SimdStrategy;
 
 /// Type-erased pointer to the job closure. Only valid while `ThreadPool::run`
@@ -34,23 +40,36 @@ struct JobPtr(*const (dyn Fn(usize) + Sync));
 // lifetime is enforced by `run` blocking until all workers are done with it.
 unsafe impl Send for JobPtr {}
 
-struct PoolState {
-    job: Option<JobPtr>,
-    /// Bumped once per dispatched job so workers can tell "new job" apart
-    /// from a spurious condvar wakeup.
-    generation: u64,
-    /// Workers still running the current job.
-    remaining: usize,
-    shutdown: bool,
-}
+/// Iterations a worker spins on the generation counter before parking on
+/// the condvar. A decode step dispatches ~170 jobs back-to-back with only
+/// microseconds between them; spinning bridges those gaps so the kernel
+/// scheduler (each wake ≈ 5–50 µs) stays out of the hot path. ~2^14 pause
+/// iterations ≈ 10–20 µs — long enough to catch the next matvec, short
+/// enough not to burn a core when generation stops.
+const SPIN_ITERS: u32 = 1 << 14;
 
 struct PoolShared {
-    state: Mutex<PoolState>,
-    /// Signals workers: new job available (or shutdown).
+    /// Bumped once per dispatched job (after `job` is written). Workers spin
+    /// on this — one atomic load per iteration, no lock.
+    generation: AtomicU64,
+    /// Workers still running the current job.
+    remaining: AtomicUsize,
+    shutdown: AtomicBool,
+    /// The current job. Written by `run` before the generation bump
+    /// (release) and read by workers after observing the bump (acquire),
+    /// so the plain cell access is ordered — see SAFETY notes at the uses.
+    job: UnsafeCell<Option<JobPtr>>,
+    /// Parking lot for workers whose spin budget ran out.
+    lock: Mutex<()>,
     work_cv: Condvar,
     /// Signals the caller: all workers finished the current job.
     done_cv: Condvar,
 }
+
+// SAFETY: `job` is the only non-Sync field; its cross-thread handoff is
+// ordered by the acquire/release pair on `generation` (write-before-bump,
+// read-after-observe) and `run` never overwrites it while workers run.
+unsafe impl Sync for PoolShared {}
 
 /// Fixed-size worker pool. The calling thread participates as thread 0, so
 /// `ThreadPool::new(4)` spawns 3 workers.
@@ -67,12 +86,11 @@ impl ThreadPool {
     pub fn new(n_threads: usize) -> Self {
         let n_threads = n_threads.max(1);
         let shared = Arc::new(PoolShared {
-            state: Mutex::new(PoolState {
-                job: None,
-                generation: 0,
-                remaining: 0,
-                shutdown: false,
-            }),
+            generation: AtomicU64::new(0),
+            remaining: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            job: UnsafeCell::new(None),
+            lock: Mutex::new(()),
             work_cv: Condvar::new(),
             done_cv: Condvar::new(),
         });
@@ -119,30 +137,50 @@ impl ThreadPool {
                 as *const _
         });
 
+        // SAFETY: no worker reads `job` until it observes the generation
+        // bump below, and the previous job's readers are all gone
+        // (`remaining` reached 0 before the last `run` returned).
+        unsafe { *self.shared.job.get() = Some(job) };
+        // Arm `remaining` before the bump: a spinning worker acts on the
+        // bump immediately and must find the counter already set.
+        self.shared
+            .remaining
+            .store(self.workers.len(), Ordering::Relaxed);
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        // Wake any parked workers. Taking the lock orders this notify
+        // against a worker sitting between its last generation check and
+        // the condvar wait — without it the wakeup could be lost.
         {
-            let mut st = self.shared.state.lock().unwrap();
-            st.job = Some(job);
-            st.generation = st.generation.wrapping_add(1);
-            st.remaining = self.workers.len();
+            let _g = self.shared.lock.lock().unwrap();
             self.shared.work_cv.notify_all();
         }
 
         // The caller is thread 0 — do its share instead of just waiting.
         f(0);
 
-        let mut st = self.shared.state.lock().unwrap();
-        while st.remaining > 0 {
-            st = self.shared.done_cv.wait(st).unwrap();
+        // Workers usually finish within the caller's own share; spin for
+        // the stragglers and only park when the budget runs out.
+        let mut spins = 0u32;
+        while self.shared.remaining.load(Ordering::Acquire) > 0 {
+            if spins < SPIN_ITERS {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                let mut g = self.shared.lock.lock().unwrap();
+                while self.shared.remaining.load(Ordering::Acquire) > 0 {
+                    g = self.shared.done_cv.wait(g).unwrap();
+                }
+                break;
+            }
         }
-        st.job = None;
     }
 }
 
 impl Drop for ThreadPool {
     fn drop(&mut self) {
+        self.shared.shutdown.store(true, Ordering::Release);
         {
-            let mut st = self.shared.state.lock().unwrap();
-            st.shutdown = true;
+            let _g = self.shared.lock.lock().unwrap();
             self.shared.work_cv.notify_all();
         }
         for handle in self.workers.drain(..) {
@@ -154,39 +192,60 @@ impl Drop for ThreadPool {
 fn worker_loop(shared: Arc<PoolShared>, tid: usize) {
     let mut seen_generation = 0u64;
     loop {
-        let job = {
-            let mut st = shared.state.lock().unwrap();
-            loop {
-                if st.shutdown {
-                    return;
-                }
-                if st.generation != seen_generation {
-                    if let Some(job) = st.job {
-                        seen_generation = st.generation;
-                        break job;
-                    }
-                }
-                st = shared.work_cv.wait(st).unwrap();
+        // Spin for the next generation bump; park once the budget runs out.
+        let mut spins = 0u32;
+        loop {
+            if shared.shutdown.load(Ordering::Acquire) {
+                return;
             }
-        };
+            let generation = shared.generation.load(Ordering::Acquire);
+            if generation != seen_generation {
+                seen_generation = generation;
+                break;
+            }
+            if spins < SPIN_ITERS {
+                std::hint::spin_loop();
+                spins += 1;
+            } else {
+                let mut g = shared.lock.lock().unwrap();
+                loop {
+                    if shared.shutdown.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let generation = shared.generation.load(Ordering::Acquire);
+                    if generation != seen_generation {
+                        seen_generation = generation;
+                        break;
+                    }
+                    g = shared.work_cv.wait(g).unwrap();
+                }
+                break;
+            }
+        }
+
+        // SAFETY: the Acquire load of `generation` above synchronizes with
+        // `run`'s Release bump, which happens after `job` was written — so
+        // the cell holds the current job and nobody writes it while we read.
+        let job = unsafe { (*shared.job.get()).expect("job set before generation bump") };
 
         // SAFETY: `ThreadPool::run` keeps the closure alive until we
         // decrement `remaining` below, and the closure is `Sync`.
         unsafe { (*job.0)(tid) };
 
-        let mut st = shared.state.lock().unwrap();
-        st.remaining -= 1;
-        if st.remaining == 0 {
+        // Release so the caller's Acquire load of `remaining == 0` also
+        // publishes this worker's output-row writes.
+        if shared.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            let _g = shared.lock.lock().unwrap();
             shared.done_cv.notify_all();
         }
     }
 }
 
-/// Output slice handed to multiple threads. Each thread writes a disjoint,
-/// interleaved subset of rows, so there is never a data race.
+/// Output slice handed to multiple threads. Each thread writes a disjoint
+/// row range, so there is never a data race.
 struct RowWriter(*mut f32);
 
-// SAFETY: threads write disjoint indices (row % n_threads == thread_id) and
+// SAFETY: threads write disjoint index ranges (contiguous chunks) and
 // nobody reads until the pool's barrier in `run` has passed.
 unsafe impl Send for RowWriter {}
 unsafe impl Sync for RowWriter {}
@@ -206,14 +265,18 @@ pub fn par_matvec(
     debug_assert_eq!(y.len(), out_dim);
     let n = pool.n_threads();
     let out = RowWriter(y.as_mut_ptr());
+    // Contiguous chunk per thread — sequential weight streams beat
+    // interleaved rows on single-channel DRAM (see par_matvec_qdot).
+    let chunk = out_dim.div_ceil(n);
 
     pool.run(&|tid| {
         let out = &out;
-        let mut o = tid;
-        while o < out_dim {
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
             let row = &w[o * in_dim..(o + 1) * in_dim];
             // SAFETY: `strategy` comes from SimdStrategy::detect(); rows are
-            // disjoint per thread (interleaved by n).
+            // disjoint per thread (contiguous chunks).
             let dot = match strategy {
                 SimdStrategy::Avx512 => unsafe { matmul::avx512::dot_f32(row, x) },
                 SimdStrategy::Avx2 => unsafe { matmul::avx2::dot_f32(row, x) },
@@ -221,7 +284,6 @@ pub fn par_matvec(
             };
             // SAFETY: o < out_dim == y.len(), and no other thread touches o.
             unsafe { *out.0.add(o) = dot };
-            o += n;
         }
     });
 }
@@ -245,16 +307,57 @@ pub fn par_matvec_quant(
     debug_assert_eq!(weights.len(), out_dim * row_bytes);
     let n = pool.n_threads();
     let out = RowWriter(y.as_mut_ptr());
+    // Contiguous chunk per thread — see par_matvec_qdot.
+    let chunk = out_dim.div_ceil(n);
 
     pool.run(&|tid| {
         let out = &out;
-        let mut o = tid;
-        while o < out_dim {
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
             let row = &weights[o * row_bytes..(o + 1) * row_bytes];
             let dot = bridge_row_dot(fmt, row, x, strategy);
             // SAFETY: o < out_dim == y.len(), and no other thread touches o.
             unsafe { *out.0.add(o) = dot };
-            o += n;
+        }
+    });
+}
+
+/// Threaded integer-domain matvec: quantized weights × Q8 activation, rows
+/// interleaved across the pool. The activation must already be quantized
+/// (once per matvec, by the caller) for `in_dim` elements.
+pub fn par_matvec_qdot(
+    pool: &ThreadPool,
+    fmt: QuantFormat,
+    weights: &[u8],
+    act: &QuantizedActivation,
+    y: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    strategy: SimdStrategy,
+) {
+    debug_assert_eq!(in_dim % fmt.block_numel(), 0);
+    debug_assert_eq!(act.len, in_dim);
+    debug_assert_eq!(y.len(), out_dim);
+    let row_bytes = in_dim / fmt.block_numel() * fmt.block_bytes();
+    debug_assert_eq!(weights.len(), out_dim * row_bytes);
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    // Contiguous chunk per thread, not interleaved rows: each thread then
+    // reads one clean sequential weight stream, which single-channel DDR4
+    // rewards with far better DRAM page locality than 4 interleaved streams
+    // that each skip (n-1) rows between reads.
+    let chunk = out_dim.div_ceil(n);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+            let dot = row_dot_q8(fmt, row, act, strategy);
+            // SAFETY: o < out_dim == y.len(), and no other thread touches o.
+            unsafe { *out.0.add(o) = dot };
         }
     });
 }
