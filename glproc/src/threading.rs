@@ -362,6 +362,51 @@ pub fn par_matvec_qdot(
     });
 }
 
+/// Fused SwiGLU matvec: `y[o] = silu(gate[o]·act) * (up[o]·act)`.
+///
+/// One pool dispatch instead of three passes (gate matvec, up matvec,
+/// activation sweep): both dots for a row live in registers until the
+/// activated product is stored once — the intermediate gate/up vectors
+/// never round-trip through RAM, and per row the two dot chains are
+/// independent, doubling instruction-level parallelism.
+///
+/// `gate` and `up` must share `fmt` and shape (`out_dim` rows of `in_dim`).
+pub fn par_matvec_swiglu(
+    pool: &ThreadPool,
+    fmt: QuantFormat,
+    gate: &[u8],
+    up: &[u8],
+    act: &QuantizedActivation,
+    y: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    strategy: SimdStrategy,
+) {
+    debug_assert_eq!(in_dim % fmt.block_numel(), 0);
+    debug_assert_eq!(act.len, in_dim);
+    debug_assert_eq!(y.len(), out_dim);
+    let row_bytes = in_dim / fmt.block_numel() * fmt.block_bytes();
+    debug_assert_eq!(gate.len(), out_dim * row_bytes);
+    debug_assert_eq!(up.len(), out_dim * row_bytes);
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    // Contiguous chunk per thread — see par_matvec_qdot.
+    let chunk = out_dim.div_ceil(n);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let g = row_dot_q8(fmt, &gate[o * row_bytes..(o + 1) * row_bytes], act, strategy);
+            let u = row_dot_q8(fmt, &up[o * row_bytes..(o + 1) * row_bytes], act, strategy);
+            let s = g / (1.0 + crate::kernels::fast_exp(-g)) * u;
+            // SAFETY: o < out_dim == y.len(), and no other thread touches o.
+            unsafe { *out.0.add(o) = s };
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

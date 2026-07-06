@@ -590,3 +590,73 @@ fn q5_0_repack_to_q8_0_is_exact() {
         assert_eq!(g, w, "repack mismatch at weight {i}");
     }
 }
+
+/// Fused SwiGLU matvec vs the reference three-pass computation.
+#[test]
+fn swiglu_fused_matches_reference() {
+    use glproc::kernels::bridge::QuantFormat;
+    use glproc::kernels::dequant::q8_0;
+    use glproc::kernels::qdot::QuantizedActivation;
+    use glproc::threading::{par_matvec_swiglu, ThreadPool};
+
+    let out_dim = 37; // deliberately not a multiple of the thread count
+    let in_dim = 64;
+    let mut rng = Lcg::new(4242);
+
+    // Random f32 weights packed to Q8_0 so dequantization is well-defined.
+    let mk = |rng: &mut Lcg| -> Vec<u8> {
+        let vals: Vec<f32> = (0..out_dim * in_dim)
+            .map(|_| (rng.next_u32() % 2000) as f32 / 1000.0 - 1.0)
+            .collect();
+        q8_0::scalar::quantize(&vals)
+    };
+    let gate = mk(&mut rng);
+    let up = mk(&mut rng);
+
+    let x: Vec<f32> = (0..in_dim)
+        .map(|_| (rng.next_u32() % 2000) as f32 / 1000.0 - 1.0)
+        .collect();
+    let mut act = QuantizedActivation::with_capacity(in_dim);
+    act.quantize(&x);
+
+    // Reference: dequantized rows, scalar dots against the *quantized*
+    // activation values (the fused path sees act, not x), exact silu.
+    let gate_f = q8_0::scalar::run(&gate);
+    let up_f = q8_0::scalar::run(&up);
+    let xq: Vec<f32> = (0..in_dim)
+        .map(|i| act.q[i] as f32 * act.scales[i / 32])
+        .collect();
+    let want: Vec<f32> = (0..out_dim)
+        .map(|o| {
+            let dot = |w: &[f32]| -> f32 {
+                w[o * in_dim..(o + 1) * in_dim]
+                    .iter()
+                    .zip(&xq)
+                    .map(|(a, b)| a * b)
+                    .sum()
+            };
+            let g = dot(&gate_f);
+            let u = dot(&up_f);
+            g / (1.0 + (-g).exp()) * u
+        })
+        .collect();
+
+    let pool = ThreadPool::new(3);
+    let mut got = vec![0f32; out_dim];
+    par_matvec_swiglu(
+        &pool,
+        QuantFormat::Q8_0,
+        &gate,
+        &up,
+        &act,
+        &mut got,
+        out_dim,
+        in_dim,
+        SimdStrategy::detect(),
+    );
+
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        let tol = 2e-3 * w.abs().max(1.0); // fast_exp ~1e-4 rel + int8 rounding
+        assert!((g - w).abs() <= tol, "row {i}: got {g}, want {w}");
+    }
+}

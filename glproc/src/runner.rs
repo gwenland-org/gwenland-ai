@@ -18,7 +18,9 @@ use crate::kv_cache::KvCache;
 use crate::model::{GlprocModel, RopeStyle, WeightMatrix};
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
-use crate::threading::{par_matvec, par_matvec_qdot, par_matvec_quant, ThreadPool};
+use crate::threading::{
+    par_matvec, par_matvec_qdot, par_matvec_quant, par_matvec_swiglu, ThreadPool,
+};
 
 /// KV cache sequence capacity cap. Qwen-class models advertise 32k context;
 /// pre-allocating that costs GBs, so the cache is sized to
@@ -379,27 +381,49 @@ impl<'m> Runner<'m> {
             if needs_q8(&layer.w_gate) || needs_q8(&layer.w_up) {
                 ws.act.quantize(&ws.xn);
             }
-            matvec_w(
-                &self.pool,
-                self.strategy,
-                &layer.w_gate,
-                &ws.xn,
-                &ws.act,
-                &mut ws.gate,
-                c.hidden_dim,
-                dim,
-            );
-            matvec_w(
-                &self.pool,
-                self.strategy,
-                &layer.w_up,
-                &ws.xn,
-                &ws.act,
-                &mut ws.up,
-                c.hidden_dim,
-                dim,
-            );
-            kernels::silu_mul(&mut ws.gate, &ws.up);
+            match (&layer.w_gate, &layer.w_up) {
+                // Fused SwiGLU: gate dot, up dot and the activation stay in
+                // registers per row — no intermediate vectors hit RAM and
+                // the pool is woken once instead of twice.
+                (WeightMatrix::Quant(gf, gb), WeightMatrix::Quant(uf, ub))
+                    if gf == uf && qdot::supports(*gf) =>
+                {
+                    par_matvec_swiglu(
+                        &self.pool,
+                        *gf,
+                        gb,
+                        ub,
+                        &ws.act,
+                        &mut ws.gate,
+                        c.hidden_dim,
+                        dim,
+                        self.strategy,
+                    );
+                }
+                _ => {
+                    matvec_w(
+                        &self.pool,
+                        self.strategy,
+                        &layer.w_gate,
+                        &ws.xn,
+                        &ws.act,
+                        &mut ws.gate,
+                        c.hidden_dim,
+                        dim,
+                    );
+                    matvec_w(
+                        &self.pool,
+                        self.strategy,
+                        &layer.w_up,
+                        &ws.xn,
+                        &ws.act,
+                        &mut ws.up,
+                        c.hidden_dim,
+                        dim,
+                    );
+                    kernels::silu_mul(&mut ws.gate, &ws.up);
+                }
+            }
             if needs_q8(&layer.w_down) {
                 ws.act.quantize(&ws.gate);
             }
