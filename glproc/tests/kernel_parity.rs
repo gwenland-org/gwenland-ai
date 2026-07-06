@@ -510,15 +510,17 @@ fn fast_exp_avx2_matches_scalar() {
 fn warm_model_pages_loaded() {
     use glproc::kernels::bridge::QuantFormat;
     use glproc::loader::warm_and_lock_model;
-    use glproc::model::{GlprocModel, LayerWeights, ModelConfig, RopeStyle, WeightMatrix};
+    use glproc::model::{GateUp, GlprocModel, LayerWeights, ModelConfig, RopeStyle, WeightMatrix};
 
     let dim = 64usize;
     let vocab = 8usize;
     let layer = LayerWeights {
         attn_norm: vec![1.0; dim],
-        wq: WeightMatrix::F32(vec![0.5; dim * dim]),
-        wk: WeightMatrix::F32(vec![0.5; dim * dim]),
-        wv: WeightMatrix::F32(vec![0.5; dim * dim]),
+        qkv: glproc::model::QkvWeights::Split(
+            WeightMatrix::F32(vec![0.5; dim * dim]),
+            WeightMatrix::F32(vec![0.5; dim * dim]),
+            WeightMatrix::F32(vec![0.5; dim * dim]),
+        ),
         wo: WeightMatrix::F32(vec![0.5; dim * dim]),
         bq: None,
         bk: None,
@@ -526,9 +528,12 @@ fn warm_model_pages_loaded() {
         q_norm: None,
         k_norm: None,
         ffn_norm: vec![1.0; dim],
-        // One quantized matrix so the raw-bytes region path is exercised.
-        w_gate: WeightMatrix::Quant(QuantFormat::Q8_0, vec![7u8; dim / 32 * 34 * dim]),
-        w_up: WeightMatrix::F32(vec![0.5; dim * dim]),
+        // One quantized matrix so the raw-bytes region path is exercised,
+        // split so the F32 arm is covered too.
+        gate_up: GateUp::Split(
+            WeightMatrix::Quant(QuantFormat::Q8_0, vec![7u8; dim / 32 * 34 * dim]),
+            WeightMatrix::F32(vec![0.5; dim * dim]),
+        ),
         w_down: WeightMatrix::F32(vec![0.5; dim * dim]),
     };
     let model = GlprocModel {
@@ -556,12 +561,16 @@ fn warm_model_pages_loaded() {
 
     assert!(model.token_embd.iter().all(|&v| v == 0.25));
     assert!(model.output_norm.iter().all(|&v| v == 1.0));
-    match &model.layers[0].w_gate {
-        WeightMatrix::Quant(QuantFormat::Q8_0, b) => assert!(b.iter().all(|&v| v == 7)),
-        _ => unreachable!("w_gate was constructed as Q8_0"),
+    match &model.layers[0].gate_up {
+        GateUp::Split(WeightMatrix::Quant(QuantFormat::Q8_0, b), _) => {
+            assert!(b.iter().all(|&v| v == 7))
+        }
+        _ => unreachable!("gate was constructed as Q8_0"),
     }
-    match &model.layers[0].wq {
-        WeightMatrix::F32(w) => assert!(w.iter().all(|&v| v == 0.5)),
+    match &model.layers[0].qkv {
+        glproc::model::QkvWeights::Split(WeightMatrix::F32(w), _, _) => {
+            assert!(w.iter().all(|&v| v == 0.5))
+        }
         _ => unreachable!("wq was constructed as F32"),
     }
 }
@@ -641,13 +650,20 @@ fn swiglu_fused_matches_reference() {
         })
         .collect();
 
+    // Interleave rows exactly like the loader's fuse_gate_up.
+    let row_bytes = in_dim / 32 * 34;
+    let mut packed = Vec::with_capacity(gate.len() + up.len());
+    for o in 0..out_dim {
+        packed.extend_from_slice(&gate[o * row_bytes..(o + 1) * row_bytes]);
+        packed.extend_from_slice(&up[o * row_bytes..(o + 1) * row_bytes]);
+    }
+
     let pool = ThreadPool::new(3);
     let mut got = vec![0f32; out_dim];
     par_matvec_swiglu(
         &pool,
         QuantFormat::Q8_0,
-        &gate,
-        &up,
+        &packed,
         &act,
         &mut got,
         out_dim,

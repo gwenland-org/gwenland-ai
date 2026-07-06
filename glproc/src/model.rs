@@ -67,6 +67,34 @@ impl WeightMatrix {
     }
 }
 
+/// The SwiGLU gate and up projections, `[hidden_dim, dim]` each.
+///
+/// When both share a bridge-supported quantized format the loader
+/// interleaves them row-wise — `[gate row 0][up row 0][gate row 1]…` — so
+/// the fused SwiGLU matvec streams ONE contiguous region per thread.
+/// Two separate matrices would give each thread two DRAM streams megabytes
+/// apart; single-channel DDR4 pays for that in page locality.
+pub enum GateUp {
+    /// Row-interleaved quantized pair; row `o` occupies
+    /// `[o * 2 * row_bytes, (o + 1) * 2 * row_bytes)` (gate half, up half).
+    FusedQuant(QuantFormat, Vec<u8>),
+    /// Separate matrices (f32 fallback or mismatched formats).
+    Split(WeightMatrix, WeightMatrix),
+}
+
+/// The Q, K and V projections. When all three share a bridge-supported
+/// quantized format the loader stacks them into one matrix —
+/// `[q rows][k rows][v rows]`, `[(q_dim + 2*kv_dim), dim]` — so a single
+/// pool dispatch computes the whole projection into one output buffer.
+/// The K/V matrices are tiny under GQA (128 rows here), so as separate
+/// matvecs their dispatch overhead is proportionally large.
+pub enum QkvWeights {
+    /// Stacked rows, quantized.
+    FusedQuant(QuantFormat, Vec<u8>),
+    /// Separate q, k, v matrices (f32 fallback or mismatched formats).
+    Split(WeightMatrix, WeightMatrix, WeightMatrix),
+}
+
 /// Weights of a single transformer block.
 ///
 /// Matrices use GGUF layout `[out_features, in_features]`, row-major.
@@ -74,12 +102,8 @@ impl WeightMatrix {
 pub struct LayerWeights {
     /// Pre-attention RMSNorm gain, `[dim]`.
     pub attn_norm: Vec<f32>,
-    /// Query projection, `[n_heads * head_dim, dim]`.
-    pub wq: WeightMatrix,
-    /// Key projection, `[n_kv_heads * head_dim, dim]`.
-    pub wk: WeightMatrix,
-    /// Value projection, `[n_kv_heads * head_dim, dim]`.
-    pub wv: WeightMatrix,
+    /// Q, K and V projections (stacked when quantized — see [`QkvWeights`]).
+    pub qkv: QkvWeights,
     /// Attention output projection, `[dim, n_heads * head_dim]`.
     pub wo: WeightMatrix,
     /// Optional query bias (qwen2-style models).
@@ -94,10 +118,9 @@ pub struct LayerWeights {
     pub k_norm: Option<Vec<f32>>,
     /// Pre-FFN RMSNorm gain, `[dim]`.
     pub ffn_norm: Vec<f32>,
-    /// SwiGLU gate projection, `[hidden_dim, dim]`.
-    pub w_gate: WeightMatrix,
-    /// SwiGLU up projection, `[hidden_dim, dim]`.
-    pub w_up: WeightMatrix,
+    /// SwiGLU gate + up projections, `[hidden_dim, dim]` each (interleaved
+    /// when quantized — see [`GateUp`]).
+    pub gate_up: GateUp,
     /// Down projection, `[dim, hidden_dim]`.
     pub w_down: WeightMatrix,
 }

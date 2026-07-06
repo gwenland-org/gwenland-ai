@@ -15,7 +15,7 @@ use crate::kernels;
 use crate::kernels::bridge::bridge_matvec_quant;
 use crate::kernels::qdot::{self, QuantizedActivation};
 use crate::kv_cache::KvCache;
-use crate::model::{GlprocModel, RopeStyle, WeightMatrix};
+use crate::model::{GateUp, GlprocModel, QkvWeights, RopeStyle, WeightMatrix};
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
 use crate::threading::{
@@ -124,12 +124,9 @@ struct Workspace {
     x: Vec<f32>,
     /// RMSNorm output, `[dim]`.
     xn: Vec<f32>,
-    /// Query vector, `[n_heads * head_dim]`.
-    q: Vec<f32>,
-    /// Key vector, `[n_kv_heads * head_dim]`.
-    k: Vec<f32>,
-    /// Value vector, `[n_kv_heads * head_dim]`.
-    v: Vec<f32>,
+    /// Q, K and V vectors in one buffer, `[q_dim + 2 * kv_dim]` — the
+    /// fused QKV matvec writes all three in a single dispatch.
+    qkv: Vec<f32>,
     /// Per-head RMSNorm scratch (qwen3 q/k norm), `[head_dim]`.
     head: Vec<f32>,
     /// Attention output, `[n_heads * head_dim]`.
@@ -211,9 +208,7 @@ impl<'m> Runner<'m> {
             ws: Workspace {
                 x: vec![0.0; c.dim],
                 xn: vec![0.0; c.dim],
-                q: vec![0.0; q_dim],
-                k: vec![0.0; kv_dim],
-                v: vec![0.0; kv_dim],
+                qkv: vec![0.0; q_dim + 2 * kv_dim],
                 head: vec![0.0; c.head_dim],
                 attn_out: vec![0.0; q_dim],
                 proj: vec![0.0; c.dim],
@@ -282,26 +277,49 @@ impl<'m> Runner<'m> {
             // --- attention block ---
             kernels::rms_norm_into(&ws.x, &layer.attn_norm, c.rms_eps, &mut ws.xn);
 
-            // One quantization feeds all three projections.
-            if needs_q8(&layer.wq) || needs_q8(&layer.wk) || needs_q8(&layer.wv) {
-                ws.act.quantize(&ws.xn);
+            match &layer.qkv {
+                // Fused QKV: all three projections in one dispatch over one
+                // contiguous weight stream, written into one buffer.
+                QkvWeights::FusedQuant(fmt, packed) => {
+                    ws.act.quantize(&ws.xn);
+                    par_matvec_qdot(
+                        &self.pool,
+                        *fmt,
+                        packed,
+                        &ws.act,
+                        &mut ws.qkv,
+                        q_dim + 2 * kv_dim,
+                        dim,
+                        self.strategy,
+                    );
+                }
+                QkvWeights::Split(wq, wk, wv) => {
+                    // One quantization feeds all three projections.
+                    if needs_q8(wq) || needs_q8(wk) || needs_q8(wv) {
+                        ws.act.quantize(&ws.xn);
+                    }
+                    let (q, rest) = ws.qkv.split_at_mut(q_dim);
+                    let (k, v) = rest.split_at_mut(kv_dim);
+                    matvec_w(&self.pool, self.strategy, wq, &ws.xn, &ws.act, q, q_dim, dim);
+                    matvec_w(&self.pool, self.strategy, wk, &ws.xn, &ws.act, k, kv_dim, dim);
+                    matvec_w(&self.pool, self.strategy, wv, &ws.xn, &ws.act, v, kv_dim, dim);
+                }
             }
-            matvec_w(&self.pool, self.strategy, &layer.wq, &ws.xn, &ws.act, &mut ws.q, q_dim, dim);
-            matvec_w(&self.pool, self.strategy, &layer.wk, &ws.xn, &ws.act, &mut ws.k, kv_dim, dim);
-            matvec_w(&self.pool, self.strategy, &layer.wv, &ws.xn, &ws.act, &mut ws.v, kv_dim, dim);
+            let (q, rest) = ws.qkv.split_at_mut(q_dim);
+            let (k, v) = rest.split_at_mut(kv_dim);
 
             if let Some(b) = &layer.bq {
-                for (qi, bi) in ws.q.iter_mut().zip(b) {
+                for (qi, bi) in q.iter_mut().zip(b) {
                     *qi += bi;
                 }
             }
             if let Some(b) = &layer.bk {
-                for (ki, bi) in ws.k.iter_mut().zip(b) {
+                for (ki, bi) in k.iter_mut().zip(b) {
                     *ki += bi;
                 }
             }
             if let Some(b) = &layer.bv {
-                for (vi, bi) in ws.v.iter_mut().zip(b) {
+                for (vi, bi) in v.iter_mut().zip(b) {
                     *vi += bi;
                 }
             }
@@ -309,22 +327,22 @@ impl<'m> Runner<'m> {
             // qwen3-style per-head RMSNorm on Q/K, applied before RoPE.
             if let Some(qn) = &layer.q_norm {
                 for h in 0..c.n_heads {
-                    let seg = &ws.q[h * head_dim..(h + 1) * head_dim];
+                    let seg = &q[h * head_dim..(h + 1) * head_dim];
                     kernels::rms_norm_into(seg, qn, c.rms_eps, &mut ws.head);
-                    ws.q[h * head_dim..(h + 1) * head_dim].copy_from_slice(&ws.head);
+                    q[h * head_dim..(h + 1) * head_dim].copy_from_slice(&ws.head);
                 }
             }
             if let Some(kn) = &layer.k_norm {
                 for h in 0..c.n_kv_heads {
-                    let seg = &ws.k[h * head_dim..(h + 1) * head_dim];
+                    let seg = &k[h * head_dim..(h + 1) * head_dim];
                     kernels::rms_norm_into(seg, kn, c.rms_eps, &mut ws.head);
-                    ws.k[h * head_dim..(h + 1) * head_dim].copy_from_slice(&ws.head);
+                    k[h * head_dim..(h + 1) * head_dim].copy_from_slice(&ws.head);
                 }
             }
 
             for h in 0..c.n_heads {
                 rope(
-                    &mut ws.q[h * head_dim..(h + 1) * head_dim],
+                    &mut q[h * head_dim..(h + 1) * head_dim],
                     pos,
                     head_dim,
                     c.rope_freq_base,
@@ -333,14 +351,14 @@ impl<'m> Runner<'m> {
             }
             for h in 0..c.n_kv_heads {
                 rope(
-                    &mut ws.k[h * head_dim..(h + 1) * head_dim],
+                    &mut k[h * head_dim..(h + 1) * head_dim],
                     pos,
                     head_dim,
                     c.rope_freq_base,
                     c.rope_style,
                 );
-                self.cache.write_k(l, h, &ws.k[h * head_dim..(h + 1) * head_dim]);
-                self.cache.write_v(l, h, &ws.v[h * head_dim..(h + 1) * head_dim]);
+                self.cache.write_k(l, h, &k[h * head_dim..(h + 1) * head_dim]);
+                self.cache.write_v(l, h, &v[h * head_dim..(h + 1) * head_dim]);
             }
             lap(&mut self.prof, |p| &mut p.qkv);
 
@@ -348,7 +366,7 @@ impl<'m> Runner<'m> {
             for h in 0..c.n_heads {
                 let kv_head = h / heads_per_kv.max(1);
                 attention_one_into(
-                    &ws.q[h * head_dim..(h + 1) * head_dim],
+                    &q[h * head_dim..(h + 1) * head_dim],
                     self.cache.read_k(l, kv_head),
                     self.cache.read_v(l, kv_head),
                     head_dim,
@@ -377,22 +395,15 @@ impl<'m> Runner<'m> {
 
             // --- SwiGLU feed-forward block ---
             kernels::rms_norm_into(&ws.x, &layer.ffn_norm, c.rms_eps, &mut ws.xn);
-            // One quantization feeds both gate and up.
-            if needs_q8(&layer.w_gate) || needs_q8(&layer.w_up) {
-                ws.act.quantize(&ws.xn);
-            }
-            match (&layer.w_gate, &layer.w_up) {
-                // Fused SwiGLU: gate dot, up dot and the activation stay in
-                // registers per row — no intermediate vectors hit RAM and
-                // the pool is woken once instead of twice.
-                (WeightMatrix::Quant(gf, gb), WeightMatrix::Quant(uf, ub))
-                    if gf == uf && qdot::supports(*gf) =>
-                {
+            match &layer.gate_up {
+                // Fused SwiGLU over row-interleaved weights: one contiguous
+                // stream per thread, one dispatch, no intermediate vectors.
+                GateUp::FusedQuant(fmt, packed) => {
+                    ws.act.quantize(&ws.xn);
                     par_matvec_swiglu(
                         &self.pool,
-                        *gf,
-                        gb,
-                        ub,
+                        *fmt,
+                        packed,
                         &ws.act,
                         &mut ws.gate,
                         c.hidden_dim,
@@ -400,11 +411,15 @@ impl<'m> Runner<'m> {
                         self.strategy,
                     );
                 }
-                _ => {
+                GateUp::Split(w_gate, w_up) => {
+                    // One quantization feeds both gate and up.
+                    if needs_q8(w_gate) || needs_q8(w_up) {
+                        ws.act.quantize(&ws.xn);
+                    }
                     matvec_w(
                         &self.pool,
                         self.strategy,
-                        &layer.w_gate,
+                        w_gate,
                         &ws.xn,
                         &ws.act,
                         &mut ws.gate,
@@ -414,7 +429,7 @@ impl<'m> Runner<'m> {
                     matvec_w(
                         &self.pool,
                         self.strategy,
-                        &layer.w_up,
+                        w_up,
                         &ws.xn,
                         &ws.act,
                         &mut ws.up,
@@ -576,9 +591,11 @@ mod tests {
         let layers = (0..2)
             .map(|i| LayerWeights {
                 attn_norm: vec![1.0; dim],
-                wq: w(n_heads * head_dim * dim, 11 + i),
-                wk: w(n_kv_heads * head_dim * dim, 22 + i),
-                wv: w(n_kv_heads * head_dim * dim, 33 + i),
+                qkv: crate::model::QkvWeights::Split(
+                    w(n_heads * head_dim * dim, 11 + i),
+                    w(n_kv_heads * head_dim * dim, 22 + i),
+                    w(n_kv_heads * head_dim * dim, 33 + i),
+                ),
                 wo: w(dim * n_heads * head_dim, 44 + i),
                 bq: None,
                 bk: None,
@@ -586,8 +603,10 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 ffn_norm: vec![1.0; dim],
-                w_gate: w(hidden * dim, 55 + i),
-                w_up: w(hidden * dim, 66 + i),
+                gate_up: crate::model::GateUp::Split(
+                    w(hidden * dim, 55 + i),
+                    w(hidden * dim, 66 + i),
+                ),
                 w_down: w(dim * hidden, 77 + i),
             })
             .collect();

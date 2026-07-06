@@ -9,7 +9,10 @@ use glcore::GlError;
 
 use crate::kernels;
 use crate::kernels::bridge::QuantFormat;
-use crate::model::{GlprocModel, LayerWeights, ModelConfig, RopeStyle, WeightMatrix};
+use crate::kernels::qdot;
+use crate::model::{
+    GateUp, GlprocModel, LayerWeights, ModelConfig, QkvWeights, RopeStyle, WeightMatrix,
+};
 
 /// Page size used for the warm-touch stride. 4 KiB on every x86 target we
 /// ship on; touching one byte per page faults the whole page in.
@@ -66,8 +69,23 @@ pub fn warm_and_lock_model(model: &GlprocModel) {
                 push_f32(&mut regions, v);
             }
         }
-        for w in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+        for w in [&l.wo, &l.w_down] {
             regions.push(weight_region(w));
+        }
+        match &l.qkv {
+            QkvWeights::FusedQuant(_, packed) => regions.push((packed.as_ptr(), packed.len())),
+            QkvWeights::Split(q, k, v) => {
+                for w in [q, k, v] {
+                    regions.push(weight_region(w));
+                }
+            }
+        }
+        match &l.gate_up {
+            GateUp::FusedQuant(_, packed) => regions.push((packed.as_ptr(), packed.len())),
+            GateUp::Split(g, u) => {
+                regions.push(weight_region(g));
+                regions.push(weight_region(u));
+            }
         }
     }
     regions.retain(|&(_, size)| size > 0);
@@ -209,6 +227,51 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<WeightMatrix, GlError> {
     }
 }
 
+/// Combine the gate and up projections: interleave rows into one buffer
+/// when both are quantized in the same integer-dot format, so the fused
+/// SwiGLU matvec streams a single contiguous region (see [`GateUp`]).
+fn fuse_gate_up(gate: WeightMatrix, up: WeightMatrix, hidden_dim: usize) -> GateUp {
+    match (gate, up) {
+        (WeightMatrix::Quant(gf, gb), WeightMatrix::Quant(uf, ub))
+            if gf == uf
+                && qdot::supports(gf)
+                && gb.len() == ub.len()
+                && hidden_dim > 0
+                && gb.len() % hidden_dim == 0 =>
+        {
+            let row_bytes = gb.len() / hidden_dim;
+            let mut packed = Vec::with_capacity(gb.len() + ub.len());
+            for o in 0..hidden_dim {
+                packed.extend_from_slice(&gb[o * row_bytes..(o + 1) * row_bytes]);
+                packed.extend_from_slice(&ub[o * row_bytes..(o + 1) * row_bytes]);
+            }
+            GateUp::FusedQuant(gf, packed)
+        }
+        (gate, up) => GateUp::Split(gate, up),
+    }
+}
+
+/// Combine the Q/K/V projections: stack rows into one matrix when all
+/// three are quantized in the same integer-dot format, so one dispatch
+/// covers the whole projection (see [`QkvWeights`]). Rows are already
+/// contiguous per matrix, so stacking is plain concatenation.
+fn fuse_qkv(q: WeightMatrix, k: WeightMatrix, v: WeightMatrix) -> QkvWeights {
+    match (q, k, v) {
+        (
+            WeightMatrix::Quant(qf, qb),
+            WeightMatrix::Quant(kf, kb),
+            WeightMatrix::Quant(vf, vb),
+        ) if qf == kf && qf == vf && qdot::supports(qf) => {
+            let mut packed = Vec::with_capacity(qb.len() + kb.len() + vb.len());
+            packed.extend_from_slice(&qb);
+            packed.extend_from_slice(&kb);
+            packed.extend_from_slice(&vb);
+            QkvWeights::FusedQuant(qf, packed)
+        }
+        (q, k, v) => QkvWeights::Split(q, k, v),
+    }
+}
+
 /// Parse config and dequantize every weight of a GGUF transformer.
 ///
 /// Supports llama-family architectures (llama, mistral, qwen2, tinyllama...)
@@ -258,9 +321,11 @@ pub fn load_gguf(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
     for i in 0..n_layers {
         layers.push(LayerWeights {
             attn_norm: tensor(gguf, &format!("blk.{i}.attn_norm.weight"))?,
-            wq: weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
-            wk: weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
-            wv: weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
+            qkv: fuse_qkv(
+                weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
+                weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
+                weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
+            ),
             wo: weight(gguf, &format!("blk.{i}.attn_output.weight"))?,
             bq: tensor_opt(gguf, &format!("blk.{i}.attn_q.bias"))?,
             bk: tensor_opt(gguf, &format!("blk.{i}.attn_k.bias"))?,
@@ -268,8 +333,11 @@ pub fn load_gguf(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
             q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
             k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
             ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
-            w_gate: weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-            w_up: weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+            gate_up: fuse_gate_up(
+                weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
+                weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+                hidden_dim,
+            ),
             w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
         });
     }
