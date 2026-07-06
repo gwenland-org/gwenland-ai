@@ -1,9 +1,14 @@
 [workspace]
 members = [
+    "glcore",
+    "glproc",
+    "glcuda",
+    "glvulkan",
+    "glmetal",
+    "glcli",
     "packages/core",
-    "packages/tui",
+    "packages/gltui",
     "packages/mcp",
-    "packages/gui/src-tauri",
 ]
 resolver = "2"
 
@@ -13,3 +18,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# The inference hot path must be optimized for speed, not size — "z" would
+# undo the M1.5 SIMD/threading work. Everything else stays size-optimized.
+[profile.release.package.glproc]
+opt-level = 3
+
+[profile.release.package.glcore]
+opt-level = 3

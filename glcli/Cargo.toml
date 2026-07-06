@@ -1,0 +1,15 @@
+[package]
+name = "glcli"
+version = "0.1.0"
+edition = "2021"
+description = "GwenLand AI CLI — run local inference with the GL engines"
+license-file = "../LICENSE.txt"
+
+[[bin]]
+name = "gwen"
+path = "src/main.rs"
+
+[dependencies]
+glcore = { path = "../glcore" }
+glproc = { path = "../glproc" }
+clap = { version = "4", features = ["derive"] }

@@ -1,0 +1,12 @@
+[package]
+name = "glproc"
+version = "0.1.0"
+edition = "2021"
+description = "GwenLand AI CPU inference engine (source of truth)"
+license-file = "../LICENSE.txt"
+
+[dependencies]
+glcore = { path = "../glcore" }
+num_cpus = "1.16"
+
+[dev-dependencies]

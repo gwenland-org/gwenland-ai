@@ -1,0 +1,9 @@
+[package]
+name = "glvulkan"
+version = "0.1.0"
+edition = "2021"
+description = "GwenLand AI Vulkan engine for AMD/Intel/NVIDIA (stub — implemented in M2+)"
+license-file = "../LICENSE.txt"
+
+[dependencies]
+glcore = { path = "../glcore" }
