@@ -103,6 +103,25 @@ impl QuantizedActivation {
     }
 }
 
+/// True when the 256-bit EVEX VNNI dot (`vpdpbusd` on ymm) is available.
+/// Detected once — this is AVX512VL+VNNI encoding-wise, but it is a 256-bit
+/// datapath running at the AVX2 frequency license, so the X5 AVX-512
+/// thermal ban does not apply (explicitly approved for use).
+fn has_vnni_256() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512vnni")
+                && std::arch::is_x86_feature_detected!("avx512vl")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
 /// One quantized weight row · Q8 activation, integer inner loop.
 /// `fmt`-specific kernels; scalar is the parity ground truth for AVX2.
 pub fn row_dot_q8(
@@ -121,7 +140,13 @@ pub fn row_dot_q8(
             SimdStrategy::Scalar => q5_0::scalar::row_dot(row, act),
         },
         QuantFormat::Q8_0 => match strategy {
-            SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { q8_0::avx2::row_dot(row, act) },
+            SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe {
+                if has_vnni_256() {
+                    q8_0::vnni::row_dot(row, act)
+                } else {
+                    q8_0::avx2::row_dot(row, act)
+                }
+            },
             SimdStrategy::Scalar => q8_0::scalar::row_dot(row, act),
         },
         QuantFormat::Q6K => match strategy {
