@@ -109,11 +109,10 @@ jobs:
             libxi-dev
 
       # =========================================================================
-      # 5. Build gwenland-tui in release mode
-      #    -p tui builds only the tui package (skips gui which is not in workspace).
+      # 5. Build gltui in release mode
       # =========================================================================
-      - name: Build gwenland-tui (release)
-        run: cargo build --release -p gwenland-tui
+      - name: Build gltui (release)
+        run: cargo build --release -p gltui
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true

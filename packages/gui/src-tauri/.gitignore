@@ -1,5 +1,0 @@
-/target
-/gen/schemas
-
-# Sidecar CLI binary — built & copied by scripts/prepare-sidecar.mjs at bundle time.
-/binaries

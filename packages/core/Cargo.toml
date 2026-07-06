@@ -74,7 +74,10 @@ signal-hook = "0.3"
 windows = { version = "0.58", features = ["Win32_System_Diagnostics_Debug", "Win32_System_Kernel", "Win32_Foundation"] }
 
 [features]
-default = []
+# candle-backend is on by default: candle itself is a mandatory dependency
+# ("always compiled since Cycle 6"), so the selector's candle path must be
+# active or default-feature test runs fail with BackendNotAvailable.
+default = ["candle-backend"]
 legacy = []
 nvidia = ["nvml-wrapper"]
 mistralrs-backend = ["dep:mistralrs"]

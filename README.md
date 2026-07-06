@@ -11,7 +11,7 @@ GwenLand is built for modest hardware. The machine we target is an 11th-gen i3 w
 You'll need a recent Rust toolchain (edition 2024, so Rust 1.85 or newer). From the workspace root:
 
 ```bash
-cargo build --release -p gwenland-tui
+cargo build --release -p gltui
 ```
 
 The stripped binary lands at `target/release/gwenland`. It's named `gwenland`, but its command name is `gwen`, which is how this README refers to it. Alias it so the examples work as written:
@@ -23,7 +23,7 @@ alias gwen="$PWD/target/release/gwenland"
 Or just run it through cargo while you're hacking on it:
 
 ```bash
-cargo run -p gwenland-tui -- doctor
+cargo run -p gltui -- doctor
 ```
 
 ### Using a GPU
@@ -101,8 +101,7 @@ If `gwen` ever crashes — a panic, or a lower-level fault like a segfault — i
 The repo is a Cargo workspace (resolver 2, edition 2024):
 
 - `packages/core` — `gwenland-core`, where the real work happens: inference, training, benchmarks, storage, diagnostics. It's a library crate.
-- `packages/tui` — `gwenland-tui`, the `gwenland` CLI and its ratatui TUI. This is the binary.
-- `packages/gui/src-tauri` — a Tauri 2 desktop shell that reuses core's crash reporting.
+- `packages/gltui` — `gltui`, the `gwenland` CLI and its ratatui TUI. This is the binary.
 - `changelog/` — per-session notes.
 
 The release profile is tuned for size: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`, symbols stripped. That's how the binary stays under 50 MB.

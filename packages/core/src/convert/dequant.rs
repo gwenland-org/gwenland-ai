@@ -793,7 +793,9 @@ fn dequant_q4_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 ///   [d:   f16 (2 bytes)]         — superblock scale factor
 ///
 /// Bit reconstruction (GGML dequantize_row_q6_K):
-///   For element i (0..255):
+///
+/// ```text
+/// For element i (0..255):
 ///     ql_byte = ql[i / 2]
 ///     qh_byte = qh[i / 4]
 ///
@@ -802,6 +804,7 @@ fn dequant_q4_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 ///
 ///     q6_raw = low4 | (high2 << 4)          — unsigned [0, 63]
 ///     q      = q6_raw as i8 - 32            — signed   [-32, 31]
+/// ```
 ///
 /// Sub-block structure: 16 sub-blocks × 16 elements each.
 /// Each sub-block has one signed i8 scale stored in `scales[j]`.

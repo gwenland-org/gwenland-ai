@@ -4,11 +4,11 @@ Thanks for wanting to help out. GwenLand is a local-first AI toolkit written in 
 
 ## Getting oriented
 
-The code is a Cargo workspace under `gwen-cli/` — that's the workspace root, not the repo root, so run cargo commands from there. Inside it, `packages/core` (`gwenland-core`) is where the real work lives: inference, training, benchmarks, storage, diagnostics. `packages/tui` (`gwenland-tui`) is the `gwenland` binary and its terminal UI; you invoke it as `gwen`. `packages/gui` is the Tauri 2 desktop app (React, Vite, Tailwind, pnpm). Per-session notes go in `gwen-cli/changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+The code is a Cargo workspace under `gwen-cli/` — that's the workspace root, not the repo root, so run cargo commands from there. Inside it, `packages/core` (`gwenland-core`) is where the real work lives: inference, training, benchmarks, storage, diagnostics. `packages/gltui` (`gltui`) is the `gwenland` binary and its terminal UI; you invoke it as `gwen`. Per-session notes go in `gwen-cli/changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
 
 ## What you'll need
 
-A recent Rust toolchain — edition 2024, so 1.85 or newer, via [rustup](https://rustup.rs). If you're touching the GUI you'll also want Node 20+ and pnpm (`corepack enable`), plus your platform's Tauri/WebView toolchain (WebView2 on Windows, WebKitGTK and the usual build deps on Linux).
+A recent Rust toolchain — edition 2024, so 1.85 or newer, via [rustup](https://rustup.rs).
 
 ## Building and running
 
@@ -16,18 +16,11 @@ For the CLI, which is the main thing:
 
 ```bash
 cd gwen-cli
-cargo build --release -p gwenland-tui     # produces target/release/gwenland
-cargo run -p gwenland-tui -- doctor        # quick smoke test
+cargo build --release -p gltui     # produces target/release/gwenland
+cargo run -p gltui -- doctor        # quick smoke test
 ```
 
-For the desktop app:
 
-```bash
-cd gwen-cli/packages/gui
-pnpm install
-pnpm tauri dev      # dev server on :1420
-pnpm tauri build    # installers under gwen-cli/target/release/bundle/
-```
 
 GPU support is off by default; turn it on at runtime with `CANDLE_CUDA=1` or `CANDLE_METAL=1`.
 
@@ -40,12 +33,9 @@ cd gwen-cli
 # (the panic hook, the GWEN_HOME test env) and race each other otherwise.
 cargo test -p gwenland-core --lib -- --test-threads=1
 
-cargo test -p gwenland-tui
+cargo test -p gltui
 cargo fmt --all
-cargo clippy -p gwenland-core -p gwenland-tui --all-targets -- -D warnings
-
-# GUI frontend
-cd packages/gui && pnpm typecheck && pnpm build
+cargo clippy -p gwenland-core -p gltui --all-targets -- -D warnings
 ```
 
 There's a GitLab pipeline in `.gitlab-ci.yml.disabled` that runs all of this. It's parked because GitLab's shared runners want a credit card; re-enable it by renaming it back once you've sorted that out, or just run the checks above by hand.
