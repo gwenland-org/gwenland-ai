@@ -499,15 +499,18 @@ impl<'m> Runner<'m> {
 
     /// Generate up to `max_new_tokens` continuation tokens for `prompt`.
     ///
-    /// `on_token` fires once per generated token. Generation stops early at
-    /// `eos_id` (the EOS token itself is not emitted), at the model's
-    /// context limit, or at the KV cache capacity.
+    /// `on_token` fires once per generated token. Generation stops early
+    /// when `is_stop` returns true for a sampled token (the stop token is
+    /// not emitted), at the model's context limit, or at the KV cache
+    /// capacity. Callers wire `is_stop` to the tokenizer's stop set so all
+    /// of a model's EOS variants (`<|im_end|>`, `<|endoftext|>`, ...) halt
+    /// generation, not just the single metadata EOS.
     pub fn generate(
         &mut self,
         prompt: &[u32],
         max_new_tokens: usize,
         sampler: &mut Sampler,
-        eos_id: u32,
+        is_stop: impl Fn(u32) -> bool,
         mut on_token: impl FnMut(u32),
     ) -> Result<Vec<u32>, GlError> {
         if prompt.is_empty() {
@@ -539,7 +542,7 @@ impl<'m> Runner<'m> {
             if let (Some(p), Some(t)) = (self.prof.as_deref_mut(), t) {
                 p.sampler += t.elapsed();
             }
-            if next == eos_id {
+            if is_stop(next) {
                 break;
             }
             on_token(next);
@@ -661,7 +664,7 @@ mod tests {
         });
         let mut streamed = Vec::new();
         let out = runner
-            .generate(&[1, 2, 3], 5, &mut sampler, u32::MAX, |t| streamed.push(t))
+            .generate(&[1, 2, 3], 5, &mut sampler, |_| false, |t| streamed.push(t))
             .unwrap();
         assert_eq!(out.len(), 5);
         assert_eq!(streamed, out);
@@ -669,11 +672,42 @@ mod tests {
     }
 
     #[test]
+    fn generate_halts_on_stop_token_without_emitting_it() {
+        let model = tiny_model();
+        let mut greedy = || {
+            Sampler::new(SamplerConfig {
+                temperature: 0.0,
+                top_k: 0,
+                top_p: 1.0,
+                seed: Some(1),
+            })
+        };
+        // Greedy decode with no stop set → learn the first sampled token.
+        let mut runner = Runner::new(&model);
+        let free = runner
+            .generate(&[1, 2, 3], 5, &mut greedy(), |_| false, |_| {})
+            .unwrap();
+        let first = free[0];
+        // Same decode, but the first token is now a stop token → nothing
+        // is emitted or returned.
+        let mut streamed = Vec::new();
+        let stopped = runner
+            .generate(&[1, 2, 3], 5, &mut greedy(), |t| t == first, |t| {
+                streamed.push(t)
+            })
+            .unwrap();
+        assert!(stopped.is_empty());
+        assert!(streamed.is_empty());
+    }
+
+    #[test]
     fn generate_rejects_empty_prompt() {
         let model = tiny_model();
         let mut runner = Runner::new(&model);
         let mut sampler = Sampler::new(SamplerConfig::default());
-        assert!(runner.generate(&[], 5, &mut sampler, 0, |_| {}).is_err());
+        assert!(runner
+            .generate(&[], 5, &mut sampler, |_| false, |_| {})
+            .is_err());
     }
 
     #[test]
@@ -695,7 +729,7 @@ mod tests {
             seed: Some(1),
         });
         let a = runner
-            .generate(&[1, 2, 3], 5, &mut s1, u32::MAX, |_| {})
+            .generate(&[1, 2, 3], 5, &mut s1, |_| false, |_| {})
             .unwrap();
         let mut s2 = Sampler::new(SamplerConfig {
             temperature: 0.0,
@@ -704,7 +738,7 @@ mod tests {
             seed: Some(1),
         });
         let b = runner
-            .generate(&[1, 2, 3], 5, &mut s2, u32::MAX, |_| {})
+            .generate(&[1, 2, 3], 5, &mut s2, |_| false, |_| {})
             .unwrap();
         assert_eq!(a, b);
     }

@@ -19,6 +19,22 @@ use crate::format::gguf::{GgufFile, GgufValue};
 /// The SentencePiece "lower one eighth block" space marker.
 const SPM_SPACE: char = '\u{2581}'; // ▁
 
+/// Token strings that end generation, across the model families GGUF ships:
+/// gpt2/qwen (`<|endoftext|>`, `<|im_end|>`), phi (`<|end|>`), gemma
+/// (`<eos>`, `<end_of_turn>`), llama2 (`</s>`), llama3 (`<|eot_id|>`,
+/// `<|end_of_text|>`). Resolved against the vocab at load time — absent
+/// strings are simply skipped.
+const STOP_TOKEN_STRINGS: &[&str] = &[
+    "<|endoftext|>",
+    "<|im_end|>",
+    "<|end|>",
+    "<eos>",
+    "<end_of_turn>",
+    "</s>",
+    "<|eot_id|>",
+    "<|end_of_text|>",
+];
+
 /// Which encoding convention the vocabulary uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Style {
@@ -38,6 +54,9 @@ pub struct Tokenizer {
     scores: Vec<f32>,
     /// Ids of control/special tokens (BOS, EOS, chat markers, ...).
     special_ids: HashSet<u32>,
+    /// Ids that end generation: the metadata EOS plus every
+    /// [`STOP_TOKEN_STRINGS`] entry present in the vocab.
+    stop_token_ids: HashSet<u32>,
     special_tokens: HashMap<String, u32>,
     style: Style,
     bos_id: u32,
@@ -101,6 +120,11 @@ impl Tokenizer {
             })
             .collect();
         let (byte_to_char, char_to_byte) = gpt2_byte_map();
+        let mut stop_token_ids: HashSet<u32> = STOP_TOKEN_STRINGS
+            .iter()
+            .filter_map(|s| vocab.get(*s).copied())
+            .collect();
+        stop_token_ids.insert(eos_id);
         Tokenizer {
             vocab,
             id_to_token,
@@ -108,6 +132,7 @@ impl Tokenizer {
             merge_ranks,
             scores,
             special_ids,
+            stop_token_ids,
             special_tokens,
             style,
             bos_id,
@@ -492,6 +517,18 @@ impl Tokenizer {
         self.eos_id
     }
 
+    /// True when `token_id` ends generation — the metadata EOS or any known
+    /// stop marker (`<|im_end|>`, `<|endoftext|>`, `</s>`, ...) found in
+    /// this model's vocab. O(1) lookup; safe to call per decoded token.
+    pub fn is_stop_token(&self, token_id: u32) -> bool {
+        self.stop_token_ids.contains(&token_id)
+    }
+
+    /// Every token id that ends generation for this model.
+    pub fn stop_token_ids(&self) -> &HashSet<u32> {
+        &self.stop_token_ids
+    }
+
     /// Beginning-of-sequence token id.
     pub fn bos_id(&self) -> u32 {
         self.bos_id
@@ -630,6 +667,44 @@ mod tests {
         // the merge actually fires: "Hi" is one token
         let ids = tk.encode("Hi", false);
         assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn eos_is_a_stop_token() {
+        let tk = spm_tokenizer();
+        assert!(tk.is_stop_token(tk.eos_id()));
+        // "</s>" is in the vocab (id 2 = eos here) — the resolver must not
+        // have added anything spurious for absent markers like <|im_end|>.
+        assert!(!tk.is_stop_token(tk.bos_id()));
+        assert!(!tk.is_stop_token(9999));
+    }
+
+    #[test]
+    fn qwen_style_stop_markers_resolve_from_vocab() {
+        // Byte-level vocab carrying both qwen stop tokens; eos metadata
+        // points at <|endoftext|> but <|im_end|> must stop generation too.
+        let (byte_to_char, _) = gpt2_byte_map();
+        let mut tokens: Vec<String> = vec!["<|endoftext|>".into(), "<|im_end|>".into()];
+        for b in 0..=255usize {
+            tokens.push(byte_to_char[b].to_string());
+        }
+        let mut specials = HashSet::new();
+        specials.insert(0);
+        specials.insert(1);
+        let tk = Tokenizer::build(
+            tokens,
+            Vec::new(),
+            Vec::new(),
+            specials,
+            Style::ByteLevel,
+            0,
+            0,
+            None,
+        );
+        assert!(tk.is_stop_token(0), "<|endoftext|> must stop");
+        assert!(tk.is_stop_token(1), "<|im_end|> must stop");
+        assert!(!tk.is_stop_token(2));
+        assert_eq!(tk.stop_token_ids().len(), 2);
     }
 
     #[test]

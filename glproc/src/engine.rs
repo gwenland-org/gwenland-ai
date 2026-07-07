@@ -79,7 +79,7 @@ impl GlprocEngine {
             &input.token_ids,
             input.max_new_tokens,
             &mut sampler,
-            tokenizer.eos_id(),
+            |id| tokenizer.is_stop_token(id),
             |id| {
                 let piece = tokenizer.decode_token_text(id);
                 if let Some(cb) = on_token.as_deref_mut() {
