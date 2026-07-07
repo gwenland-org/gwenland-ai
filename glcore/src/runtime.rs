@@ -84,13 +84,14 @@ impl Runtime {
         Ok(self.engine.infer(config)?.text)
     }
 
-    /// Stream generated text via callback, one token at a time.
+    /// Stream generated text via callback, one token at a time. Returns
+    /// the finished request's stats (token counts, prefill/decode timing).
     pub fn stream(
         &self,
         prompt: &str,
         mut config: InferInput,
         on_token: impl Fn(&str) + Send,
-    ) -> Result<(), GlError> {
+    ) -> Result<crate::engine_trait::InferOutput, GlError> {
         config.token_ids = self.encode_prompt(prompt)?;
         self.engine
             .stream(config, &move |_id, text| on_token(text))

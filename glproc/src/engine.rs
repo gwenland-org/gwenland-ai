@@ -76,7 +76,7 @@ impl GlprocEngine {
         let started = Instant::now();
         let mut text = String::new();
 
-        let token_ids = runner.generate(
+        let (token_ids, timing) = runner.generate(
             &input.token_ids,
             input.max_new_tokens,
             &mut sampler,
@@ -96,6 +96,9 @@ impl GlprocEngine {
             text,
             tokens_generated,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            prompt_tokens: timing.prompt_tokens,
+            prefill_ms: timing.prefill.as_secs_f64() * 1e3,
+            generation_ms: timing.decode.as_secs_f64() * 1e3,
         })
     }
 }
@@ -148,10 +151,9 @@ impl GlEngine for GlprocEngine {
         &self,
         input: InferInput,
         on_token: &(dyn Fn(u32, &str) + Send),
-    ) -> Result<(), GlError> {
+    ) -> Result<InferOutput, GlError> {
         let mut forward = |id: u32, piece: &str| on_token(id, piece);
-        self.run(&input, Some(&mut forward))?;
-        Ok(())
+        self.run(&input, Some(&mut forward))
     }
 
     fn shutdown(&mut self) {

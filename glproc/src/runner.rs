@@ -185,6 +185,20 @@ impl Prof {
     }
 }
 
+/// Wall-clock timing for one [`Runner::generate`] call, split at the
+/// prefill/decode boundary. Prefill (prompt processing) and generation
+/// (the decode loop) have very different tok/s — one blended number hides
+/// the real decode speed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenTiming {
+    /// Number of prompt tokens processed during prefill.
+    pub prompt_tokens: usize,
+    /// Time to process the prompt (forward passes, mostly without LM head).
+    pub prefill: std::time::Duration,
+    /// Time in the decode loop: sampling, stop check, forward per token.
+    pub decode: std::time::Duration,
+}
+
 /// Drives token-by-token inference over a loaded model.
 pub struct Runner<'m> {
     model: &'m GlprocModel,
@@ -509,6 +523,9 @@ impl<'m> Runner<'m> {
     /// capacity. Callers wire `is_stop` to the tokenizer's stop set so all
     /// of a model's EOS variants (`<|im_end|>`, `<|endoftext|>`, ...) halt
     /// generation, not just the single metadata EOS.
+    ///
+    /// Returns the generated tokens plus a [`GenTiming`] separating prefill
+    /// from decode wall time.
     pub fn generate(
         &mut self,
         prompt: &[u32],
@@ -516,7 +533,7 @@ impl<'m> Runner<'m> {
         sampler: &mut Sampler,
         is_stop: impl Fn(u32) -> bool,
         mut on_token: impl FnMut(u32),
-    ) -> Result<Vec<u32>, GlError> {
+    ) -> Result<(Vec<u32>, GenTiming), GlError> {
         if prompt.is_empty() {
             return Err(GlError::Engine("empty prompt".into()));
         }
@@ -525,6 +542,7 @@ impl<'m> Runner<'m> {
 
         // Prefill: run every prompt token; only the last one needs logits,
         // so earlier positions skip the (huge) LM-head matvec entirely.
+        let prefill_start = std::time::Instant::now();
         for (pos, &tok) in prompt.iter().enumerate() {
             if pos >= max_seq {
                 return Err(GlError::Engine(format!(
@@ -534,7 +552,9 @@ impl<'m> Runner<'m> {
             }
             self.step(tok, pos, pos + 1 == prompt.len())?;
         }
+        let prefill = prefill_start.elapsed();
 
+        let decode_start = std::time::Instant::now();
         let mut generated = Vec::with_capacity(max_new_tokens);
         // Sliding window of recent tokens for the repetition penalty.
         // Allocated once per generate call, outside the per-token loop.
@@ -570,7 +590,14 @@ impl<'m> Runner<'m> {
         if let Some(p) = &self.prof {
             p.report();
         }
-        Ok(generated)
+        Ok((
+            generated,
+            GenTiming {
+                prompt_tokens: prompt.len(),
+                prefill,
+                decode: decode_start.elapsed(),
+            },
+        ))
     }
 }
 
@@ -681,12 +708,15 @@ mod tests {
             seed: Some(1),
         });
         let mut streamed = Vec::new();
-        let out = runner
+        let (out, timing) = runner
             .generate(&[1, 2, 3], 5, &mut sampler, |_| false, |t| streamed.push(t))
             .unwrap();
         assert_eq!(out.len(), 5);
         assert_eq!(streamed, out);
         assert!(out.iter().all(|&t| (t as usize) < 16));
+        assert_eq!(timing.prompt_tokens, 3);
+        assert!(timing.prefill > std::time::Duration::ZERO);
+        assert!(timing.decode > std::time::Duration::ZERO);
     }
 
     #[test]
@@ -703,14 +733,14 @@ mod tests {
         };
         // Greedy decode with no stop set → learn the first sampled token.
         let mut runner = Runner::new(&model);
-        let free = runner
+        let (free, _) = runner
             .generate(&[1, 2, 3], 5, &mut greedy(), |_| false, |_| {})
             .unwrap();
         let first = free[0];
         // Same decode, but the first token is now a stop token → nothing
         // is emitted or returned.
         let mut streamed = Vec::new();
-        let stopped = runner
+        let (stopped, _) = runner
             .generate(&[1, 2, 3], 5, &mut greedy(), |t| t == first, |t| {
                 streamed.push(t)
             })
@@ -748,7 +778,7 @@ mod tests {
             repeat_penalty: 1.0,
             seed: Some(1),
         });
-        let a = runner
+        let (a, _) = runner
             .generate(&[1, 2, 3], 5, &mut s1, |_| false, |_| {})
             .unwrap();
         let mut s2 = Sampler::new(SamplerConfig {
@@ -758,7 +788,7 @@ mod tests {
             repeat_penalty: 1.0,
             seed: Some(1),
         });
-        let b = runner
+        let (b, _) = runner
             .generate(&[1, 2, 3], 5, &mut s2, |_| false, |_| {})
             .unwrap();
         assert_eq!(a, b);

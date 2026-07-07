@@ -7,8 +7,6 @@
 
 use std::io::Write as _;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use glcore::engine_trait::InferInput;
@@ -147,25 +145,37 @@ fn cmd_run(
     Ok(())
 }
 
-/// Stream one generation to stdout, token by token, then report speed.
+/// Stream one generation to stdout, token by token, then report prefill
+/// and generation speed separately — a single blended tok/s hides the
+/// real decode rate behind prompt-processing time.
 fn stream_answer(runtime: &Runtime, prompt: &str, config: InferInput) -> Result<(), GlError> {
-    let piece_count = AtomicU32::new(0);
-    let started = Instant::now();
-    runtime.stream(prompt, config, |piece| {
-        piece_count.fetch_add(1, Ordering::Relaxed);
+    let out = runtime.stream(prompt, config, |piece| {
         print!("{piece}");
         let _ = std::io::stdout().flush();
     })?;
-    let elapsed = started.elapsed();
     println!();
-    let tokens = piece_count.load(Ordering::Relaxed);
-    if tokens > 0 {
-        let tps = tokens as f64 / elapsed.as_secs_f64();
-        eprintln!(
-            "-- {tokens} tokens in {:.2}s ({tps:.2} tok/s) --",
-            elapsed.as_secs_f64()
-        );
+    if out.tokens_generated == 0 {
+        return Ok(());
     }
+    let tps = |tokens: usize, ms: f64| {
+        if ms > 0.0 {
+            tokens as f64 / (ms / 1000.0)
+        } else {
+            0.0
+        }
+    };
+    let prefill_tps = tps(out.prompt_tokens, out.prefill_ms);
+    let gen_tps = tps(out.tokens_generated, out.generation_ms);
+    eprintln!(
+        "[benchmark] prefill: {} tokens @ {prefill_tps:.2} tok/s | \
+         generation: {} tokens @ {gen_tps:.2} tok/s",
+        out.prompt_tokens, out.tokens_generated
+    );
+    eprintln!(
+        "-- {} tokens in {:.2}s ({gen_tps:.2} tok/s generation) --",
+        out.tokens_generated,
+        out.generation_ms / 1000.0
+    );
     Ok(())
 }
 
