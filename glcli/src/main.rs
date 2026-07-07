@@ -46,6 +46,9 @@ enum Commands {
         /// Top-p (nucleus) sampling cutoff (1.0 = disabled)
         #[arg(long, default_value_t = 0.95)]
         top_p: f32,
+        /// Repetition penalty over the last 64 tokens (1.0 = disabled)
+        #[arg(long, default_value_t = 1.1)]
+        repeat_penalty: f32,
     },
     /// Print model metadata from a GGUF or safetensors file
     Info {
@@ -66,7 +69,16 @@ fn main() -> ExitCode {
             temperature,
             top_k,
             top_p,
-        } => cmd_run(&model, prompt.as_deref(), max_tokens, temperature, top_k, top_p),
+            repeat_penalty,
+        } => cmd_run(
+            &model,
+            prompt.as_deref(),
+            max_tokens,
+            temperature,
+            top_k,
+            top_p,
+            repeat_penalty,
+        ),
         Commands::Info { model } => cmd_info(&model),
         Commands::Tui => cmd_tui(),
     };
@@ -86,6 +98,7 @@ fn cmd_run(
     temperature: f32,
     top_k: usize,
     top_p: f32,
+    repeat_penalty: f32,
 ) -> Result<(), GlError> {
     let mut runtime = Runtime::new(Box::new(GlprocEngine::new()))?;
     eprintln!("loading {model} ...");
@@ -98,6 +111,7 @@ fn cmd_run(
         temperature,
         top_k,
         top_p,
+        repeat_penalty,
     };
 
     match prompt {

@@ -15,6 +15,8 @@ pub struct InferInput {
     pub top_k: usize,
     /// Top-p (nucleus) cutoff. `1.0` = disabled.
     pub top_p: f32,
+    /// Repetition penalty on recently generated tokens. `1.0` = disabled.
+    pub repeat_penalty: f32,
 }
 
 impl Default for InferInput {
@@ -25,6 +27,7 @@ impl Default for InferInput {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
+            repeat_penalty: 1.1,
         }
     }
 }

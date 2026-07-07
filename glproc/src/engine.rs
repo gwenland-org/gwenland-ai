@@ -54,6 +54,7 @@ impl GlprocEngine {
             temperature: input.temperature,
             top_k: input.top_k,
             top_p: input.top_p,
+            repeat_penalty: input.repeat_penalty,
             seed: self.config.seed,
         })
     }

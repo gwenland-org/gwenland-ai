@@ -48,6 +48,10 @@ fn n_threads() -> usize {
 /// waking workers costs more than the work itself.
 const PAR_MIN_WORK: usize = 1 << 16;
 
+/// How many of the most recent generated tokens the repetition penalty
+/// looks back over. Matches llama.cpp's `repeat_last_n` default.
+const REPEAT_WINDOW: usize = 64;
+
 /// Apply rotary position embeddings in place to one head's vector.
 fn rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32, style: RopeStyle) {
     let half = head_dim / 2;
@@ -532,12 +536,21 @@ impl<'m> Runner<'m> {
         }
 
         let mut generated = Vec::with_capacity(max_new_tokens);
+        // Sliding window of recent tokens for the repetition penalty.
+        // Allocated once per generate call, outside the per-token loop.
+        let mut recent: std::collections::VecDeque<u32> =
+            std::collections::VecDeque::with_capacity(REPEAT_WINDOW);
         let mut pos = prompt.len();
         for _ in 0..max_new_tokens {
             if pos >= max_seq {
                 break;
             }
             let t = self.prof.as_ref().map(|_| std::time::Instant::now());
+            crate::sampler::apply_repetition_penalty(
+                &mut self.ws.logits,
+                recent.make_contiguous(),
+                sampler.repeat_penalty(),
+            );
             let next = sampler.sample(&self.ws.logits);
             if let (Some(p), Some(t)) = (self.prof.as_deref_mut(), t) {
                 p.sampler += t.elapsed();
@@ -547,6 +560,10 @@ impl<'m> Runner<'m> {
             }
             on_token(next);
             generated.push(next);
+            if recent.len() == REPEAT_WINDOW {
+                recent.pop_front();
+            }
+            recent.push_back(next);
             self.forward_into(next, pos)?;
             pos += 1;
         }
@@ -660,6 +677,7 @@ mod tests {
             temperature: 0.0, // greedy
             top_k: 0,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(1),
         });
         let mut streamed = Vec::new();
@@ -679,6 +697,7 @@ mod tests {
                 temperature: 0.0,
                 top_k: 0,
                 top_p: 1.0,
+                repeat_penalty: 1.0,
                 seed: Some(1),
             })
         };
@@ -726,6 +745,7 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(1),
         });
         let a = runner
@@ -735,6 +755,7 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(1),
         });
         let b = runner
