@@ -1,8 +1,33 @@
 # Changelog
 
-The notable changes, newest first. The blow-by-blow per-session notes live in [`gwen-cli/changelog/`](gwen-cli/changelog/).
+The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
 ## Unreleased
+
+### 2026-07-07 — M1.5 correctness fixes, M1.6 batched prefill, M1.7 fast load: the GL engine reaches llama.cpp parity
+
+The full architecture and benchmark story is in [`ArchGLML.md`](ArchGLML.md); the session notes are in [`changelog/Gwen-Changes-2026-07-07_16-30.md`](changelog/Gwen-Changes-2026-07-07_16-30.md).
+
+Correctness (post-audit):
+
+- Generation now stops at *any* of a model's stop tokens (`<|im_end|>`, `<|endoftext|>`, `</s>`, ...), not just the single metadata EOS id. The stop set is resolved from the vocab at load; stop tokens are never emitted.
+- Added a repetition penalty over a 64-token sliding window (default 1.1, `gwen run --repeat-penalty`, 1.0 disables). Small models no longer loop — which also ended the artificially inflated tok/s that looping produced by keeping the same weights hot in L3.
+- Chat models get their ChatML prompt template applied automatically (`<|im_start|>`/`<|im_end|>` emitted as special token ids); `--raw` opts out for base models. "What is 1+1" now answers "1+1 equals 2." and stops cleanly instead of rambling to `max_tokens`.
+- Benchmark output separates prefill from generation: `[benchmark] prefill: N tokens @ X tok/s | generation: M tokens @ Y tok/s`. The old blended number understated decode speed and hid the looping artifact.
+
+Performance (Qwen2.5-0.5B Q4_K_M on the i3-1115G4 dev box, quiet machine):
+
+- Batched prefill: prompts run through the transformer in 32-token chunks so every weight row streams from DRAM once per chunk instead of once per token, with grouped row-dot kernels (8 activations share each weight block's load, sign prep, and f16 scale conversion) and chunk attention parallelized across the pool.
+- Q4_K weights now repack to Q8_0 at load like Q5_0/Q6_K. This fixed the single biggest hidden cost: half the layers' `ffn_down` tensors are Q4_K in this file and were falling into the f32-bridge fallback, running ~15× slower than their repacked neighbors in prefill.
+- The token embedding table stays quantized; lookups dequantize one row on demand. Saves ~500 MB of RAM on 150k-vocab models (933 MB on the 1.5B) and the table's dequantization at load. Tied-head models reuse the quantized table as the LM head.
+- Model load is parallel across cores and reports a breakdown (`[load] tokenizer 0.08s | weights 0.72s | pin 0.07s`).
+- Net effect: prefill 35 → **128–132 tok/s** (llama.cpp: 124.5), generation 20-ish honest → **33.5–35.2 tok/s** (llama.cpp: 39.0), load 2.5s → **0.9s**, peak RAM ~1.7 GB → **1.19 GB**. The 1.5B went from 5.3 to 12.1 tok/s generation.
+
+Diagnostics:
+
+- `[simd]` startup line names the SIMD strategy and each hot weight class's kernel path, so a scalar fallback can't hide.
+- `GLPROC_PROFILE=1` now also prints a per-phase prefill profile alongside the decode profile.
+- Benchmark hygiene, learned the hard way: Windows Defender rescanning the binary and model after every build silently collapsed benchmarks by 2–4×; exclude the workspace and model folder, and check CPU load is below ~15% before trusting any number.
 
 ### 2026-06-20 — GUI packaging, a serve fix, and some CI housekeeping
 
