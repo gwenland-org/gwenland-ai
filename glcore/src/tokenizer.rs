@@ -434,6 +434,26 @@ impl Tokenizer {
         }
     }
 
+    /// Encode a single-turn chat prompt with the ChatML template, emitting
+    /// the `<|im_start|>`/`<|im_end|>` markers as their special-token ids
+    /// (plain [`Tokenizer::encode`] would shred them into text pieces).
+    /// Returns `None` when this model's vocab has no ChatML markers —
+    /// callers should fall back to raw completion encoding.
+    pub fn encode_chat(&self, user: &str) -> Option<Vec<u32>> {
+        let &im_start = self.special_tokens.get("<|im_start|>")?;
+        let &im_end = self.special_tokens.get("<|im_end|>")?;
+        let mut ids = Vec::new();
+        for (role, text) in [("system", "You are a helpful assistant."), ("user", user)] {
+            ids.push(im_start);
+            ids.extend(self.encode(&format!("{role}\n{text}"), false));
+            ids.push(im_end);
+            ids.extend(self.encode("\n", false));
+        }
+        ids.push(im_start);
+        ids.extend(self.encode("assistant\n", false));
+        Some(ids)
+    }
+
     /// Decode token ids back to text.
     ///
     /// With `skip_special = true`, control tokens (BOS/EOS/chat markers) are
@@ -705,6 +725,46 @@ mod tests {
         assert!(tk.is_stop_token(1), "<|im_end|> must stop");
         assert!(!tk.is_stop_token(2));
         assert_eq!(tk.stop_token_ids().len(), 2);
+    }
+
+    #[test]
+    fn encode_chat_wraps_in_chatml_special_tokens() {
+        // Byte-level vocab with ChatML markers as special tokens.
+        let (byte_to_char, _) = gpt2_byte_map();
+        let mut tokens: Vec<String> =
+            vec!["<|endoftext|>".into(), "<|im_start|>".into(), "<|im_end|>".into()];
+        for b in 0..=255usize {
+            tokens.push(byte_to_char[b].to_string());
+        }
+        let mut specials = HashSet::new();
+        specials.insert(0);
+        specials.insert(1);
+        specials.insert(2);
+        let tk = Tokenizer::build(
+            tokens,
+            Vec::new(),
+            Vec::new(),
+            specials,
+            Style::ByteLevel,
+            0,
+            0,
+            None,
+        );
+        let ids = tk.encode_chat("hi").expect("chat markers present");
+        // Template: system turn, user turn, then an open assistant turn.
+        assert_eq!(ids[0], 1, "starts with <|im_start|>");
+        assert_eq!(ids.iter().filter(|&&i| i == 1).count(), 3);
+        assert_eq!(ids.iter().filter(|&&i| i == 2).count(), 2);
+        // The markers arrive as single ids, never as re-encoded text, and
+        // the assistant turn stays open (no trailing <|im_end|>).
+        assert_ne!(ids.last(), Some(&2));
+        // Round-trip sanity: the user text survives inside the template.
+        assert!(tk.decode(&ids, true).contains("user\nhi"));
+    }
+
+    #[test]
+    fn encode_chat_is_none_without_chat_markers() {
+        assert!(spm_tokenizer().encode_chat("hi").is_none());
     }
 
     #[test]

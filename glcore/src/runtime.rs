@@ -15,6 +15,8 @@ use crate::tokenizer::Tokenizer;
 pub struct Runtime {
     engine: Box<dyn GlEngine>,
     tokenizer: Option<Tokenizer>,
+    /// Force raw completion encoding even for chat models.
+    raw_prompt: bool,
 }
 
 impl Runtime {
@@ -24,7 +26,14 @@ impl Runtime {
         Ok(Runtime {
             engine,
             tokenizer: None,
+            raw_prompt: false,
         })
+    }
+
+    /// Skip the chat template and encode prompts as raw completions
+    /// (base-model behavior) even when the vocab has chat markers.
+    pub fn set_raw_prompt(&mut self, raw: bool) {
+        self.raw_prompt = raw;
     }
 
     /// Load a model file — GGUF or safetensors, chosen by extension.
@@ -97,6 +106,14 @@ impl Runtime {
             .tokenizer
             .as_ref()
             .ok_or_else(|| GlError::Engine("no model loaded".into()))?;
+        if !self.raw_prompt {
+            // Chat models answer (and emit their stop token) only when the
+            // prompt is wrapped in their chat template; raw text makes them
+            // ramble as text completion until max_tokens.
+            if let Some(ids) = tk.encode_chat(prompt) {
+                return Ok(ids);
+            }
+        }
         Ok(tk.encode(prompt, tk.add_bos_default()))
     }
 }

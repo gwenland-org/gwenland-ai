@@ -49,6 +49,10 @@ enum Commands {
         /// Repetition penalty over the last 64 tokens (1.0 = disabled)
         #[arg(long, default_value_t = 1.1)]
         repeat_penalty: f32,
+        /// Encode the prompt as raw completion text, skipping the chat
+        /// template even for chat models
+        #[arg(long)]
+        raw: bool,
     },
     /// Print model metadata from a GGUF or safetensors file
     Info {
@@ -70,6 +74,7 @@ fn main() -> ExitCode {
             top_k,
             top_p,
             repeat_penalty,
+            raw,
         } => cmd_run(
             &model,
             prompt.as_deref(),
@@ -78,6 +83,7 @@ fn main() -> ExitCode {
             top_k,
             top_p,
             repeat_penalty,
+            raw,
         ),
         Commands::Info { model } => cmd_info(&model),
         Commands::Tui => cmd_tui(),
@@ -99,8 +105,10 @@ fn cmd_run(
     top_k: usize,
     top_p: f32,
     repeat_penalty: f32,
+    raw: bool,
 ) -> Result<(), GlError> {
     let mut runtime = Runtime::new(Box::new(GlprocEngine::new()))?;
+    runtime.set_raw_prompt(raw);
     eprintln!("loading {model} ...");
     runtime.load(model)?;
     eprintln!("model loaded.");
