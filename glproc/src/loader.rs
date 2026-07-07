@@ -103,6 +103,12 @@ pub fn warm_and_lock_model(model: &GlprocModel) {
     }
 
     // Step 2: pin the pages so they cannot be evicted.
+    // `GLPROC_NO_LOCK=1` skips pinning (and the working-set resize) — an
+    // A/B knob: the working-set cap the resize installs can make the OS
+    // trim the *unpinned* runtime buffers under memory pressure.
+    if std::env::var("GLPROC_NO_LOCK").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
     let mut failed = 0usize;
     #[cfg(windows)]
     {
@@ -215,6 +221,16 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<WeightMatrix, GlError> {
             Ok(WeightMatrix::Quant(
                 QuantFormat::Q8_0,
                 kernels::dequant::q6_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
+            ))
+        }
+        // Q4_K too: it has no integer-dot kernel, so unrepacked it takes
+        // the f32 bridge — which re-dequantizes every block once per batch
+        // row in the prefill matmul (measured ~15x slower than repacked
+        // layers). Requantization error is the same class as Q6_K's.
+        Some(QuantFormat::Q4K) if info.dimensions[0] as usize % 256 == 0 => {
+            Ok(WeightMatrix::Quant(
+                QuantFormat::Q8_0,
+                kernels::dequant::q4_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
             ))
         }
         // dimensions[0] is the contiguous axis = in_features; GGML packs

@@ -261,10 +261,46 @@ struct Prof {
     /// Token sampling (measured in `generate`).
     sampler: std::time::Duration,
     tokens: u32,
+
+    /// Prefill (step_chunk) buckets, per prompt token.
+    /// Embed + norms + activation quantizes (serial on the caller).
+    p_serial: std::time::Duration,
+    /// QKV batched matmul.
+    p_qkv: std::time::Duration,
+    /// Per-position bias/head-norm/RoPE/cache writes (serial).
+    p_fixup: std::time::Duration,
+    /// Chunk attention (parallel over positions).
+    p_attn: std::time::Duration,
+    /// Attention output projection matmul + residual.
+    p_wo: std::time::Duration,
+    /// Fused gate/up/SiLU batched matmul.
+    p_gateup: std::time::Duration,
+    /// Gate-vector quantize ahead of the down projection.
+    p_downq: std::time::Duration,
+    /// Down projection matmul + residual.
+    p_down: std::time::Duration,
+    p_tokens: u32,
 }
 
 impl Prof {
     fn report(&self) {
+        if self.p_tokens > 0 {
+            let toks = self.p_tokens;
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / toks as f64;
+            eprintln!(
+                "[profile] prefill per token over {toks} tokens: serial {:.2}ms | \
+                 qkv {:.2}ms | fixup {:.2}ms | attn {:.2}ms | wo {:.2}ms | \
+                 gateup {:.2}ms | downq {:.2}ms | down {:.2}ms",
+                ms(self.p_serial),
+                ms(self.p_qkv),
+                ms(self.p_fixup),
+                ms(self.p_attn),
+                ms(self.p_wo),
+                ms(self.p_gateup),
+                ms(self.p_downq),
+                ms(self.p_down),
+            );
+        }
         let toks = self.tokens.max(1);
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / toks as f64;
         eprintln!(
@@ -645,6 +681,15 @@ impl<'m> Runner<'m> {
         debug_assert_eq!(start_pos, self.cache.current_pos());
 
         let bws = &mut self.bws;
+        // One timestamp per phase boundary, only when profiling.
+        let mut t = self.prof.as_ref().map(|_| std::time::Instant::now());
+        let mut lap = |p: &mut Option<Box<Prof>>, pick: fn(&mut Prof) -> &mut std::time::Duration| {
+            if let Some(p) = p.as_deref_mut() {
+                let now = std::time::Instant::now();
+                *pick(p) += now - t.unwrap();
+                t = Some(now);
+            }
+        };
         for (b, &token) in tokens.iter().enumerate() {
             let start = (token as usize)
                 .checked_mul(dim)
@@ -666,11 +711,18 @@ impl<'m> Runner<'m> {
                     &mut bws.xnb[b * dim..(b + 1) * dim],
                 );
             }
+            let qkv_quant = match &layer.qkv {
+                QkvWeights::FusedQuant(..) => true,
+                QkvWeights::Split(wq, wk, wv) => needs_q8(wq) || needs_q8(wk) || needs_q8(wv),
+            };
+            if qkv_quant {
+                for b in 0..bsz {
+                    bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                }
+            }
+            lap(&mut self.prof, |p| &mut p.p_serial);
             match &layer.qkv {
                 QkvWeights::FusedQuant(fmt, packed) => {
-                    for b in 0..bsz {
-                        bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
-                    }
                     par_matmul_qdot(
                         &self.pool,
                         *fmt,
@@ -685,11 +737,6 @@ impl<'m> Runner<'m> {
                     );
                 }
                 QkvWeights::Split(wq, wk, wv) => {
-                    if needs_q8(wq) || needs_q8(wk) || needs_q8(wv) {
-                        for b in 0..bsz {
-                            bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
-                        }
-                    }
                     for (w, off, rows) in [
                         (wq, 0, q_dim),
                         (wk, q_dim, kv_dim),
@@ -712,6 +759,7 @@ impl<'m> Runner<'m> {
                     }
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_qkv);
 
             // Per-position fixups: biases, head norms, RoPE, cache writes.
             // Every position's K/V must land in the cache before any
@@ -776,6 +824,7 @@ impl<'m> Runner<'m> {
                         .write_v_at(l, h, pos, &v[h * head_dim..(h + 1) * head_dim]);
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_fixup);
 
             // Causal attention, positions split across the pool. Attention
             // cost grows with cached length, so for long prompts this loop
@@ -831,6 +880,8 @@ impl<'m> Runner<'m> {
                 });
             }
 
+            lap(&mut self.prof, |p| &mut p.p_attn);
+
             if needs_q8(&layer.wo) {
                 for b in 0..bsz {
                     bws.acts[b].quantize(&bws.attn_outb[b * q_dim..(b + 1) * q_dim]);
@@ -858,6 +909,7 @@ impl<'m> Runner<'m> {
                     *xi += pi;
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_wo);
 
             // --- SwiGLU feed-forward block ---
             for b in 0..bsz {
@@ -873,6 +925,7 @@ impl<'m> Runner<'m> {
                     for b in 0..bsz {
                         bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
                     }
+                    lap(&mut self.prof, |p| &mut p.p_serial);
                     par_matmul_swiglu(
                         &self.pool,
                         *fmt,
@@ -914,11 +967,13 @@ impl<'m> Runner<'m> {
                     }
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_gateup);
             if needs_q8(&layer.w_down) {
                 for b in 0..bsz {
                     bws.acts[b].quantize(&bws.gateb[b * c.hidden_dim..(b + 1) * c.hidden_dim]);
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_downq);
             matmul_w(
                 &self.pool,
                 self.strategy,
@@ -941,6 +996,10 @@ impl<'m> Runner<'m> {
                     *xi += di;
                 }
             }
+            lap(&mut self.prof, |p| &mut p.p_down);
+        }
+        if let Some(p) = self.prof.as_deref_mut() {
+            p.p_tokens += bsz as u32;
         }
 
         // Every layer committed K/V for all chunk positions.

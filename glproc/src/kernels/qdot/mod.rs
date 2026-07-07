@@ -163,6 +163,24 @@ pub fn supports(fmt: crate::kernels::bridge::QuantFormat) -> bool {
     !matches!(fmt, crate::kernels::bridge::QuantFormat::Q4K)
 }
 
+/// One Q8_0 row · a packed panel of 8 activations (quants `[block][act][32]`,
+/// scales `[block][act]`). Caller must have checked `fmt == Q8_0` and a wide
+/// strategy — this only dispatches between the VNNI and AVX2 kernels.
+///
+/// # Safety-relevant contract
+/// `strategy` must be a wide backend from `SimdStrategy::detect()`.
+pub fn row_dot_q8_packed8(row: &[u8], pq: &[u8], ps: &[f32]) -> [f32; 8] {
+    // SAFETY: only called on wide backends (AVX2+FMA+F16C present); the
+    // VNNI branch additionally checks vnni_256.
+    unsafe {
+        if has_vnni_256() {
+            q8_0::vnni::row_dot_packed8(row, pq, ps)
+        } else {
+            q8_0::avx2::row_dot_packed8(row, pq, ps)
+        }
+    }
+}
+
 /// One quantized weight row · `G` Q8 activations — the batched-prefill
 /// fast path. Q8_0 on a wide backend shares the weight-side work across
 /// the group; every other format/backend combination falls back to single

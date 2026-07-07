@@ -28,7 +28,9 @@ use std::thread::JoinHandle;
 
 use crate::kernels::bridge::{bridge_row_dot, QuantFormat};
 use crate::kernels::matmul;
-use crate::kernels::qdot::{row_dot_q8, row_dot_q8_xn, QuantizedActivation};
+use crate::kernels::qdot::{
+    row_dot_q8, row_dot_q8_packed8, row_dot_q8_xn, QuantizedActivation,
+};
 use crate::simd_strategy::SimdStrategy;
 
 /// Type-erased pointer to the job closure. Only valid while `ThreadPool::run`
@@ -485,6 +487,99 @@ pub fn par_matmul_qdot(
     let out = RowWriter(y.as_mut_ptr());
     let chunk = out_dim.div_ceil(n);
 
+    // Long rows stall on stream count: a group of G separate activations
+    // means up to 2G+1 concurrent read streams (quants + scales + weights),
+    // which outruns the core's fill buffers once rows are hundreds of
+    // blocks (the 4864-wide down projection ran at ~9 GMAC/s vs gate/up's
+    // ~50). Packing the group into one block-interleaved panel turns those
+    // into a single sequential stream. The pack itself is a one-pass copy
+    // (~in_dim*8 bytes per group), paid once per matmul and amortized over
+    // out_dim rows.
+    let wide = matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512);
+    if wide && fmt == QuantFormat::Q8_0 && batch >= 8 && in_dim % 32 == 0 {
+        let blocks = in_dim / 32;
+        let ngroups = batch / 8;
+        // Reused pack scratch: a fresh Vec per call means fresh demand-zero
+        // pages from the OS — under memory pressure those faults showed up
+        // as random 25-40ms stalls on individual matmul calls (measured
+        // bimodal: 1.6ms vs 30ms+ for identical layers). thread_local keeps
+        // the capacity across calls; steady-state this allocates nothing.
+        thread_local! {
+            static PACK: std::cell::RefCell<(Vec<u8>, Vec<f32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        }
+        let pack = PACK.with(|p| {
+            let mut p = p.borrow_mut();
+            p.0.resize(ngroups * blocks * 8 * 32, 0);
+            p.1.resize(ngroups * blocks * 8, 0.0);
+            // Move the buffers out so the closure below can borrow them
+            // without holding the RefCell guard across pool.run.
+            (std::mem::take(&mut p.0), std::mem::take(&mut p.1))
+        });
+        let (mut pq, mut ps) = pack;
+        for gi in 0..ngroups {
+            for (g, act) in acts[gi * 8..gi * 8 + 8].iter().enumerate() {
+                for j in 0..blocks {
+                    let dst = ((gi * blocks + j) * 8 + g) * 32;
+                    // SAFETY: reinterpreting i8 as u8 is a no-op; both
+                    // ranges are 32 bytes and in bounds (act quantized for
+                    // in_dim elements, pq sized above).
+                    let src = unsafe {
+                        std::slice::from_raw_parts(act.q.as_ptr().add(j * 32) as *const u8, 32)
+                    };
+                    pq[dst..dst + 32].copy_from_slice(src);
+                    ps[(gi * blocks + j) * 8 + g] = act.scales[j];
+                }
+            }
+        }
+
+        pool.run(&|tid| {
+            let out = &out;
+            let lo = (tid * chunk).min(out_dim);
+            let hi = (lo + chunk).min(out_dim);
+            for o in lo..hi {
+                let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+                for gi in 0..ngroups {
+                    let panel_q = &pq[gi * blocks * 8 * 32..(gi + 1) * blocks * 8 * 32];
+                    let panel_s = &ps[gi * blocks * 8..(gi + 1) * blocks * 8];
+                    let dots = row_dot_q8_packed8(row, panel_q, panel_s);
+                    for (g, dot) in dots.into_iter().enumerate() {
+                        // SAFETY: disjoint (b, col_off + o) cells per
+                        // thread, in bounds per the debug_assert above.
+                        unsafe {
+                            *out.0.add((gi * 8 + g) * y_stride + col_off + o) = dot
+                        };
+                    }
+                }
+                for b in ngroups * 8..batch {
+                    let dot = row_dot_q8(fmt, row, &acts[b], strategy);
+                    // SAFETY: as above.
+                    unsafe { *out.0.add(b * y_stride + col_off + o) = dot };
+                }
+            }
+        });
+        // Return the scratch for the next call.
+        PACK.with(|p| {
+            let mut p = p.borrow_mut();
+            p.0 = pq;
+            p.1 = ps;
+        });
+        return;
+    }
+
+    // Unpacked fallback (non-Q8_0 formats, scalar backend, small batches):
+    // group width capped so the group's activation span stays L1-resident
+    // next to the streaming weight row (halved budget — SMT threads share
+    // each core's L1D).
+    const GROUP_L1_BUDGET: usize = 12 * 1024;
+    let g_max = if 8 * in_dim <= GROUP_L1_BUDGET {
+        8
+    } else if 4 * in_dim <= GROUP_L1_BUDGET {
+        4
+    } else {
+        2
+    };
+
     pool.run(&|tid| {
         let out = &out;
         let lo = (tid * chunk).min(out_dim);
@@ -492,10 +587,10 @@ pub fn par_matmul_qdot(
         for o in lo..hi {
             let row = &weights[o * row_bytes..(o + 1) * row_bytes];
             // Groups share the row's weight-side work (loads, sign prep,
-            // f16 scale conversion) in one kernel call — 8 wide, then 4,
-            // then singles for the remainder.
+            // f16 scale conversion) in one kernel call, then singles for
+            // the remainder.
             let mut b = 0;
-            while b + 8 <= batch {
+            while g_max >= 8 && b + 8 <= batch {
                 let group: [&QuantizedActivation; 8] = std::array::from_fn(|g| &acts[b + g]);
                 let dots = row_dot_q8_xn::<8>(fmt, row, group, strategy);
                 for (g, dot) in dots.into_iter().enumerate() {
@@ -505,7 +600,7 @@ pub fn par_matmul_qdot(
                 }
                 b += 8;
             }
-            if b + 4 <= batch {
+            while g_max >= 4 && b + 4 <= batch {
                 let group: [&QuantizedActivation; 4] = std::array::from_fn(|g| &acts[b + g]);
                 let dots = row_dot_q8_xn::<4>(fmt, row, group, strategy);
                 for (g, dot) in dots.into_iter().enumerate() {
@@ -513,6 +608,15 @@ pub fn par_matmul_qdot(
                     unsafe { *out.0.add((b + g) * y_stride + col_off + o) = dot };
                 }
                 b += 4;
+            }
+            while b + 2 <= batch {
+                let group: [&QuantizedActivation; 2] = std::array::from_fn(|g| &acts[b + g]);
+                let dots = row_dot_q8_xn::<2>(fmt, row, group, strategy);
+                for (g, dot) in dots.into_iter().enumerate() {
+                    // SAFETY: as above.
+                    unsafe { *out.0.add((b + g) * y_stride + col_off + o) = dot };
+                }
+                b += 2;
             }
             while b < batch {
                 let dot = row_dot_q8(fmt, row, &acts[b], strategy);
@@ -738,6 +842,83 @@ mod tests {
                 let g = got[b * out_dim + o];
                 // x4 uses one accumulator chain per activation vs the
                 // single dot's two — tiny f32 ordering differences allowed.
+                let tol = want.abs().max(1.0) * 1e-5;
+                assert!((g - want).abs() < tol, "b={b} o={o}: got {g}, want {want}");
+            }
+        }
+    }
+
+    /// Shape probe, not a test — run explicitly with:
+    /// `cargo test -p glproc --release bench_matmul_shapes -- --ignored --nocapture`
+    /// Rotates through 8 weight copies so weights stream DRAM-cold like a
+    /// real chunk (L3 is 6 MB; one 4.2 MB matrix would go L3-warm).
+    #[test]
+    #[ignore]
+    fn bench_matmul_shapes() {
+        let pool = ThreadPool::new(4);
+        let strategy = SimdStrategy::detect();
+        let batch = 32;
+        for (out_dim, in_dim, name) in
+            [(4864usize, 896usize, "gateup-shape"), (896, 4864, "down-shape")]
+        {
+            let copies: Vec<Vec<u8>> = (0..8).map(|_| q8_0_weights(out_dim, in_dim)).collect();
+            let acts = test_acts(batch, in_dim);
+            let mut y = vec![0f32; batch * out_dim];
+            let run = |w: &[u8], y: &mut [f32]| {
+                par_matmul_qdot(
+                    &pool,
+                    QuantFormat::Q8_0,
+                    w,
+                    &acts,
+                    y,
+                    out_dim,
+                    0,
+                    out_dim,
+                    in_dim,
+                    strategy,
+                );
+            };
+            run(&copies[0], &mut y); // warm code path
+            let iters = 24;
+            let t = std::time::Instant::now();
+            for i in 0..iters {
+                run(&copies[i % copies.len()], &mut y);
+            }
+            let el = t.elapsed().as_secs_f64() / iters as f64;
+            let gmacs = (out_dim * in_dim * batch) as f64 / el / 1e9;
+            eprintln!("{name}: {:.2} ms/call | {gmacs:.1} GMAC/s", el * 1e3);
+        }
+    }
+
+    #[test]
+    fn par_matmul_qdot_packed_panel_matches_single_dots() {
+        // batch 12 = one packed panel of 8 + a 4-row unpacked remainder;
+        // on wide backends this exercises row_dot_q8_packed8.
+        let (out_dim, in_dim, batch) = (9, 128, 12);
+        let w = q8_0_weights(out_dim, in_dim);
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(4);
+        let strategy = SimdStrategy::detect();
+
+        let mut got = vec![f32::NAN; batch * out_dim];
+        par_matmul_qdot(
+            &pool,
+            QuantFormat::Q8_0,
+            &w,
+            &acts,
+            &mut got,
+            out_dim,
+            0,
+            out_dim,
+            in_dim,
+            strategy,
+        );
+
+        for (b, act) in acts.iter().enumerate() {
+            for o in 0..out_dim {
+                let row = &w[o * (in_dim / 32 * 34)..(o + 1) * (in_dim / 32 * 34)];
+                let want = row_dot_q8(QuantFormat::Q8_0, row, act, strategy);
+                let g = got[b * out_dim + o];
                 let tol = want.abs().max(1.0) * 1e-5;
                 assert!((g - want).abs() < tol, "b={b} o={o}: got {g}, want {want}");
             }

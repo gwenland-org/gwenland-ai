@@ -84,3 +84,16 @@ pub fn run(data: &[u8]) -> Result<Vec<f32>, GlError> {
     }
     Ok(out)
 }
+
+/// Repack Q4_K blocks to Q8_0 blocks (dequantize, then requantize).
+///
+/// Not bit-exact: Q4_K's per-32 affine (scale + min) values are requantized
+/// onto Q8_0's per-32 symmetric grid, adding at most one int8 rounding step
+/// (~0.4% relative) — well under Q4_K's own quantization noise, and the same
+/// trade already accepted for the Q6_K repack. Buys the integer-dot Q8_0
+/// kernels for both decode and the batched-prefill matmul; the f32 bridge
+/// fallback re-dequantized every block once per batch row, which made
+/// Q4_K layers ~15x slower than repacked ones in prefill.
+pub fn repack_to_q8_0(data: &[u8]) -> Result<Vec<u8>, GlError> {
+    Ok(crate::kernels::dequant::q8_0::scalar::quantize(&run(data)?))
+}
