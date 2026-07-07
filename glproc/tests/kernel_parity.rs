@@ -551,7 +551,7 @@ fn warm_model_pages_loaded() {
             rope_freq_base: 10_000.0,
             rope_style: RopeStyle::Neox,
         },
-        token_embd: vec![0.25; vocab * dim],
+        token_embd: WeightMatrix::F32(vec![0.25; vocab * dim]),
         layers: vec![layer],
         output_norm: vec![1.0; dim],
         output: WeightMatrix::F32(vec![0.5; vocab * dim]),
@@ -559,7 +559,7 @@ fn warm_model_pages_loaded() {
 
     warm_and_lock_model(&model);
 
-    assert!(model.token_embd.iter().all(|&v| v == 0.25));
+    assert!(model.token_embd.as_f32().unwrap().iter().all(|&v| v == 0.25));
     assert!(model.output_norm.iter().all(|&v| v == 1.0));
     match &model.layers[0].gate_up {
         GateUp::Split(WeightMatrix::Quant(QuantFormat::Q8_0, b), _) => {

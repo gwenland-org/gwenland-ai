@@ -170,11 +170,20 @@ impl GlEngine for GlprocEngine {
             });
         }
 
+        let t_parse = Instant::now();
         self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
+        let parse_s = t_parse.elapsed().as_secs_f64();
+        let t_weights = Instant::now();
         let model = load_gguf(&gguf)?;
+        let weights_s = t_weights.elapsed().as_secs_f64();
         // X5 step 1: fault every weight page in and pin it before the first
         // token, so no decode ever stalls on a page fault or swap-in.
+        let t_pin = Instant::now();
         crate::loader::warm_and_lock_model(&model);
+        eprintln!(
+            "[load] tokenizer {parse_s:.2}s | weights {weights_s:.2}s | pin {:.2}s",
+            t_pin.elapsed().as_secs_f64(),
+        );
         log_simd_paths(&model);
         self.model = Some(model);
         Ok(())

@@ -422,14 +422,8 @@ impl<'m> Runner<'m> {
         }
         debug_assert_eq!(pos, self.cache.current_pos());
 
-        let start = (token as usize)
-            .checked_mul(dim)
-            .filter(|&s| s + dim <= self.model.token_embd.len())
-            .ok_or_else(|| {
-                GlError::Engine(format!("token id {token} out of embedding range"))
-            })?;
         let ws = &mut self.ws;
-        ws.x.copy_from_slice(&self.model.token_embd[start..start + dim]);
+        self.model.embed_into(token, &mut ws.x)?;
 
         // One timestamp per phase boundary, only when profiling.
         let mut t = self.prof.as_ref().map(|_| std::time::Instant::now());
@@ -691,14 +685,8 @@ impl<'m> Runner<'m> {
             }
         };
         for (b, &token) in tokens.iter().enumerate() {
-            let start = (token as usize)
-                .checked_mul(dim)
-                .filter(|&s| s + dim <= self.model.token_embd.len())
-                .ok_or_else(|| {
-                    GlError::Engine(format!("token id {token} out of embedding range"))
-                })?;
-            bws.xb[b * dim..(b + 1) * dim]
-                .copy_from_slice(&self.model.token_embd[start..start + dim]);
+            self.model
+                .embed_into(token, &mut bws.xb[b * dim..(b + 1) * dim])?;
         }
 
         for (l, layer) in self.model.layers.iter().enumerate() {
@@ -1206,7 +1194,7 @@ mod tests {
                 rope_freq_base: 10_000.0,
                 rope_style: RopeStyle::Norm,
             },
-            token_embd: weights(vocab * dim, 99),
+            token_embd: WeightMatrix::F32(weights(vocab * dim, 99)),
             layers,
             output_norm: vec![1.0; dim],
             output: w(vocab * dim, 99), // tied

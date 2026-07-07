@@ -49,6 +49,7 @@ use crate::kernels::bridge::QuantFormat;
 /// at the quantized size (e.g. 7× smaller for Q4_K) — decode is
 /// memory-bandwidth-bound, so a smaller working set is proportionally
 /// faster.
+#[derive(Clone)]
 pub enum WeightMatrix {
     /// Dense f32, row-major `[out_features, in_features]`.
     F32(Vec<f32>),
@@ -129,8 +130,11 @@ pub struct LayerWeights {
 pub struct GlprocModel {
     /// Hyperparameters.
     pub config: ModelConfig,
-    /// Token embedding table, `[vocab_size, dim]`, always f32 (row lookup).
-    pub token_embd: Vec<f32>,
+    /// Token embedding table, `[vocab_size, dim]`. Kept quantized (Q8_0)
+    /// when possible — lookups dequantize one row on demand, which costs
+    /// well under a microsecond and saves the ~4x f32 blow-up in RAM
+    /// (~500 MB on 150k-vocab models) plus its dequantization at load.
+    pub token_embd: WeightMatrix,
     /// All transformer blocks, in order.
     pub layers: Vec<LayerWeights>,
     /// Final RMSNorm gain, `[dim]`.
@@ -138,4 +142,94 @@ pub struct GlprocModel {
     /// LM head, `[vocab_size, dim]`. Tied to `token_embd` when the file
     /// has no separate `output.weight`.
     pub output: WeightMatrix,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn model_with_embd(token_embd: WeightMatrix, vocab: usize, dim: usize) -> GlprocModel {
+        GlprocModel {
+            config: ModelConfig {
+                arch: "llama".into(),
+                dim,
+                n_layers: 0,
+                n_heads: 1,
+                n_kv_heads: 1,
+                head_dim: dim,
+                hidden_dim: dim,
+                vocab_size: vocab,
+                max_seq: 8,
+                rms_eps: 1e-5,
+                rope_freq_base: 10_000.0,
+                rope_style: RopeStyle::Norm,
+            },
+            token_embd,
+            layers: Vec::new(),
+            output_norm: vec![1.0; dim],
+            output: WeightMatrix::F32(vec![0.0; vocab * dim]),
+        }
+    }
+
+    #[test]
+    fn quantized_embedding_row_matches_f32() {
+        let (vocab, dim) = (5usize, 64usize);
+        let table: Vec<f32> = (0..vocab * dim).map(|i| (i % 23) as f32 * 0.5 - 5.0).collect();
+        // Quantize the table to Q8_0 and compare row lookups.
+        let q = crate::kernels::dequant::q8_0::scalar::quantize(&table);
+        let mf = model_with_embd(WeightMatrix::F32(table.clone()), vocab, dim);
+        let mq = model_with_embd(WeightMatrix::Quant(QuantFormat::Q8_0, q), vocab, dim);
+        let mut a = vec![0f32; dim];
+        let mut b = vec![0f32; dim];
+        for t in 0..vocab as u32 {
+            mf.embed_into(t, &mut a).unwrap();
+            mq.embed_into(t, &mut b).unwrap();
+            for (x, y) in a.iter().zip(&b) {
+                // One int8 quantization step of error at most: values span
+                // [-5, 6], so scale ≤ 6/127 and error ≤ half a step.
+                assert!((x - y).abs() <= 6.0 / 127.0 * 0.5 + 1e-6, "{x} vs {y}");
+            }
+        }
+        // Out-of-range ids error on both representations.
+        assert!(mf.embed_into(vocab as u32, &mut a).is_err());
+        assert!(mq.embed_into(9999, &mut b).is_err());
+    }
+}
+
+impl GlprocModel {
+    /// Copy `token`'s embedding row into `out` (`[dim]`), dequantizing on
+    /// the fly when the table is stored quantized.
+    pub fn embed_into(&self, token: u32, out: &mut [f32]) -> Result<(), glcore::GlError> {
+        let dim = self.config.dim;
+        debug_assert_eq!(out.len(), dim);
+        let row = token as usize;
+        if row >= self.config.vocab_size {
+            return Err(glcore::GlError::Engine(format!(
+                "token id {token} out of embedding range"
+            )));
+        }
+        match &self.token_embd {
+            WeightMatrix::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
+            WeightMatrix::Quant(QuantFormat::Q8_0, b) => {
+                // Q8_0 row: dim/32 blocks of [f16 scale][32 x i8].
+                let row_bytes = dim / 32 * 34;
+                let r = &b[row * row_bytes..(row + 1) * row_bytes];
+                for (j, block) in r.chunks_exact(34).enumerate() {
+                    let d = glcore::format::gguf::f16_to_f32(u16::from_le_bytes([
+                        block[0], block[1],
+                    ]));
+                    for (i, &q) in block[2..34].iter().enumerate() {
+                        out[j * 32 + i] = d * (q as i8) as f32;
+                    }
+                }
+            }
+            // The loader only stores the table as F32 or Q8_0.
+            WeightMatrix::Quant(fmt, _) => {
+                return Err(glcore::GlError::Engine(format!(
+                    "unsupported embedding format {fmt:?}"
+                )))
+            }
+        }
+        Ok(())
+    }
 }
