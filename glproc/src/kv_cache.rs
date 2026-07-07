@@ -81,11 +81,54 @@ impl KvCache {
         &self.data[off..off + (self.current_pos + 1) * self.head_dim]
     }
 
+    /// Write a K row at an explicit sequence position, independent of the
+    /// cursor. Batched prefill iterates layers outermost and positions
+    /// innermost, so it can't ride the one-position-at-a-time cursor.
+    #[inline]
+    pub fn write_k_at(&mut self, layer: usize, head: usize, pos: usize, data: &[f32]) {
+        debug_assert_eq!(data.len(), self.head_dim);
+        debug_assert!(pos < self.max_context);
+        let off = self.region(layer, 0, head) + pos * self.head_dim;
+        self.data[off..off + self.head_dim].copy_from_slice(data);
+    }
+
+    /// Write a V row at an explicit sequence position (see `write_k_at`).
+    #[inline]
+    pub fn write_v_at(&mut self, layer: usize, head: usize, pos: usize, data: &[f32]) {
+        debug_assert_eq!(data.len(), self.head_dim);
+        debug_assert!(pos < self.max_context);
+        let off = self.region(layer, 1, head) + pos * self.head_dim;
+        self.data[off..off + self.head_dim].copy_from_slice(data);
+    }
+
+    /// The first `len` cached K rows for `layer`/`head`, regardless of the
+    /// cursor. Batched prefill reads a different causal length per position.
+    #[inline]
+    pub fn read_k_to(&self, layer: usize, head: usize, len: usize) -> &[f32] {
+        debug_assert!(len <= self.max_context);
+        let off = self.region(layer, 0, head);
+        &self.data[off..off + len * self.head_dim]
+    }
+
+    /// The first `len` cached V rows for `layer`/`head` (see `read_k_to`).
+    #[inline]
+    pub fn read_v_to(&self, layer: usize, head: usize, len: usize) -> &[f32] {
+        let off = self.region(layer, 1, head);
+        &self.data[off..off + len * self.head_dim]
+    }
+
     /// Advance the cursor after every layer/head has written the current
     /// token. Call exactly once per decoded token.
     #[inline]
     pub fn advance(&mut self) {
         self.current_pos += 1;
+    }
+
+    /// Advance the cursor past `n` positions written via `write_k_at`/
+    /// `write_v_at` — one call per prefill chunk.
+    #[inline]
+    pub fn advance_by(&mut self, n: usize) {
+        self.current_pos += n;
     }
 
     /// Number of fully committed (advanced-past) tokens.

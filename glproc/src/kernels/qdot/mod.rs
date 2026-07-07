@@ -162,3 +162,31 @@ pub fn row_dot_q8(
 pub fn supports(fmt: crate::kernels::bridge::QuantFormat) -> bool {
     !matches!(fmt, crate::kernels::bridge::QuantFormat::Q4K)
 }
+
+/// One quantized weight row · `G` Q8 activations — the batched-prefill
+/// fast path. Q8_0 on a wide backend shares the weight-side work across
+/// the group; every other format/backend combination falls back to single
+/// dots (correct, just unamortized). `G` must stay ≤ 8 so the wide kernels'
+/// accumulators fit the 16 ymm registers.
+pub fn row_dot_q8_xn<const G: usize>(
+    fmt: crate::kernels::bridge::QuantFormat,
+    row: &[u8],
+    acts: [&QuantizedActivation; G],
+    strategy: SimdStrategy,
+) -> [f32; G] {
+    use crate::kernels::bridge::QuantFormat;
+    if matches!(fmt, QuantFormat::Q8_0)
+        && matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512)
+    {
+        // SAFETY: strategy comes from SimdStrategy::detect(), so AVX2/FMA/
+        // F16C are present; the VNNI branch additionally checks vnni_256.
+        unsafe {
+            return if has_vnni_256() {
+                q8_0::vnni::row_dot_xn::<G>(row, acts)
+            } else {
+                q8_0::avx2::row_dot_xn::<G>(row, acts)
+            };
+        }
+    }
+    std::array::from_fn(|g| row_dot_q8(fmt, row, acts[g], strategy))
+}

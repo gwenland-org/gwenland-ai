@@ -19,7 +19,8 @@ use crate::model::{GateUp, GlprocModel, QkvWeights, RopeStyle, WeightMatrix};
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
 use crate::threading::{
-    par_matvec, par_matvec_qdot, par_matvec_quant, par_matvec_swiglu, ThreadPool,
+    par_matmul, par_matmul_qdot, par_matmul_swiglu, par_matvec, par_matvec_qdot,
+    par_matvec_quant, par_matvec_swiglu, ThreadPool,
 };
 
 /// KV cache sequence capacity cap. Qwen-class models advertise 32k context;
@@ -47,6 +48,12 @@ fn n_threads() -> usize {
 /// Below this many multiply-accumulates a matvec runs on the calling thread —
 /// waking workers costs more than the work itself.
 const PAR_MIN_WORK: usize = 1 << 16;
+
+/// Prompt tokens processed per batched-prefill chunk. Batching lets every
+/// weight row stream from DRAM once per chunk instead of once per token —
+/// prefill flips from bandwidth-bound to compute-bound. 32 keeps the chunk's
+/// activation set (32 × hidden_dim Q8 rows) inside L2.
+const PREFILL_CHUNK: usize = 32;
 
 /// How many of the most recent generated tokens the repetition penalty
 /// looks back over. Matches llama.cpp's `repeat_last_n` default.
@@ -121,6 +128,53 @@ fn matvec_w(
     }
 }
 
+/// Batched matmul over either weight representation. The batched analog of
+/// [`matvec_w`]: quantized formats with an integer kernel consume `acts`
+/// (one pre-quantized activation per batch row); f32 weights read rows of
+/// `xb` directly; bridge-only formats fall back to per-row bridge dots.
+/// Output cell `(b, col_off + o)` lands at `yb[b * y_stride + col_off + o]`.
+#[allow(clippy::too_many_arguments)]
+fn matmul_w(
+    pool: &ThreadPool,
+    strategy: SimdStrategy,
+    w: &WeightMatrix,
+    xb: &[f32],
+    x_stride: usize,
+    acts: &[QuantizedActivation],
+    yb: &mut [f32],
+    y_stride: usize,
+    col_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+) {
+    match w {
+        WeightMatrix::F32(data) => {
+            par_matmul(
+                pool, data, xb, x_stride, yb, y_stride, col_off, out_dim, in_dim, batch,
+                strategy,
+            );
+        }
+        WeightMatrix::Quant(fmt, blocks) => {
+            if qdot::supports(*fmt) {
+                debug_assert_eq!(acts.len(), batch, "caller must quantize xb rows first");
+                par_matmul_qdot(
+                    pool, *fmt, blocks, acts, yb, y_stride, col_off, out_dim, in_dim,
+                    strategy,
+                );
+            } else {
+                // No integer kernel (Q4_K): correctness fallback through the
+                // f32 bridge, one batch row at a time.
+                for b in 0..batch {
+                    let x = &xb[b * x_stride..b * x_stride + in_dim];
+                    let y = &mut yb[b * y_stride + col_off..b * y_stride + col_off + out_dim];
+                    bridge_matvec_quant(*fmt, blocks, x, y, out_dim, in_dim, strategy);
+                }
+            }
+        }
+    }
+}
+
 /// Every buffer the forward pass writes to, allocated once at Runner
 /// construction and reused for each token (Rule 6: zero alloc in decode loop).
 struct Workspace {
@@ -150,6 +204,43 @@ struct Workspace {
     act: QuantizedActivation,
 }
 
+/// Batched-prefill buffers: the per-token [`Workspace`] fields with a
+/// leading batch dimension of [`PREFILL_CHUNK`] rows, allocated once at
+/// Runner construction (~1.5 MB for Qwen2.5-0.5B dims). All row-major
+/// `[batch][width]`.
+struct BatchWorkspace {
+    /// Residual streams, `[chunk][dim]`.
+    xb: Vec<f32>,
+    /// RMSNorm outputs, `[chunk][dim]`.
+    xnb: Vec<f32>,
+    /// Q/K/V projections, `[chunk][q_dim + 2 * kv_dim]`.
+    qkvb: Vec<f32>,
+    /// Attention outputs, `[chunk][n_heads * head_dim]`.
+    attn_outb: Vec<f32>,
+    /// Projections back to the residual, `[chunk][dim]`.
+    projb: Vec<f32>,
+    /// SwiGLU gate (or fused gate·silu·up) outputs, `[chunk][hidden_dim]`.
+    gateb: Vec<f32>,
+    /// SwiGLU up outputs for the split-weights path, `[chunk][hidden_dim]`.
+    upb: Vec<f32>,
+    /// Attention score scratch, one row per chunk position — positions run
+    /// attention in parallel, so they cannot share the decode scratch.
+    /// `[chunk][kv capacity]`.
+    scoresb: Vec<f32>,
+    /// One Q8 activation per batch row for the integer-dot matmuls.
+    acts: Vec<QuantizedActivation>,
+}
+
+/// Raw pointer into a batch buffer, handed to the pool for disjoint
+/// per-position writes during chunk attention.
+struct PtrShare(*mut f32);
+
+// SAFETY: threads write disjoint per-position regions (each position `b`
+// is owned by exactly one thread) and nobody reads until the pool's
+// barrier in `run` has passed.
+unsafe impl Send for PtrShare {}
+unsafe impl Sync for PtrShare {}
+
 /// Per-phase wall-time accumulators for the decode loop, enabled by setting
 /// `GLPROC_PROFILE=1`. A measurement tool for finding the fat — when
 /// disabled (`None`) the decode loop takes zero timestamps.
@@ -159,8 +250,12 @@ struct Prof {
     qkv: std::time::Duration,
     /// Per-head single-query attention against the KV cache.
     attn: std::time::Duration,
-    /// Output projection + FFN norm + gate/up/SiLU/down + residuals.
-    ffn: std::time::Duration,
+    /// Attention output projection (+ its activation quantize) + residual.
+    wo: std::time::Duration,
+    /// FFN norm + activation quantize + fused gate/up/SiLU matvec.
+    gateup: std::time::Duration,
+    /// Gate-vector quantize + down matvec + residual.
+    down: std::time::Duration,
     /// Final norm + LM-head matvec over the full vocabulary.
     lm_head: std::time::Duration,
     /// Token sampling (measured in `generate`).
@@ -174,11 +269,14 @@ impl Prof {
         let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3 / toks as f64;
         eprintln!(
             "[profile] per token over {} tokens: qkv {:.2}ms | attn {:.2}ms | \
-             ffn {:.2}ms | lm_head {:.2}ms | sampler {:.2}ms",
+             wo {:.2}ms | gateup {:.2}ms | down {:.2}ms | lm_head {:.2}ms | \
+             sampler {:.2}ms",
             self.tokens,
             ms(self.qkv),
             ms(self.attn),
-            ms(self.ffn),
+            ms(self.wo),
+            ms(self.gateup),
+            ms(self.down),
             ms(self.lm_head),
             ms(self.sampler),
         );
@@ -206,6 +304,7 @@ pub struct Runner<'m> {
     pool: ThreadPool,
     strategy: SimdStrategy,
     ws: Workspace,
+    bws: BatchWorkspace,
     /// `Some` only when `GLPROC_PROFILE` is set in the environment.
     prof: Option<Box<Prof>>,
 }
@@ -237,6 +336,21 @@ impl<'m> Runner<'m> {
                 act: QuantizedActivation::with_capacity(
                     c.dim.max(c.hidden_dim).max(q_dim),
                 ),
+            },
+            bws: BatchWorkspace {
+                xb: vec![0.0; PREFILL_CHUNK * c.dim],
+                xnb: vec![0.0; PREFILL_CHUNK * c.dim],
+                qkvb: vec![0.0; PREFILL_CHUNK * (q_dim + 2 * kv_dim)],
+                attn_outb: vec![0.0; PREFILL_CHUNK * q_dim],
+                projb: vec![0.0; PREFILL_CHUNK * c.dim],
+                gateb: vec![0.0; PREFILL_CHUNK * c.hidden_dim],
+                upb: vec![0.0; PREFILL_CHUNK * c.hidden_dim],
+                scoresb: vec![0.0; PREFILL_CHUNK * kv_capacity],
+                acts: (0..PREFILL_CHUNK)
+                    .map(|_| {
+                        QuantizedActivation::with_capacity(c.dim.max(c.hidden_dim).max(q_dim))
+                    })
+                    .collect(),
             },
             prof: std::env::var("GLPROC_PROFILE")
                 .ok()
@@ -410,6 +524,7 @@ impl<'m> Runner<'m> {
             for (xi, pi) in ws.x.iter_mut().zip(&ws.proj) {
                 *xi += pi;
             }
+            lap(&mut self.prof, |p| &mut p.wo);
 
             // --- SwiGLU feed-forward block ---
             kernels::rms_norm_into(&ws.x, &layer.ffn_norm, c.rms_eps, &mut ws.xn);
@@ -457,6 +572,7 @@ impl<'m> Runner<'m> {
                     kernels::silu_mul(&mut ws.gate, &ws.up);
                 }
             }
+            lap(&mut self.prof, |p| &mut p.gateup);
             if needs_q8(&layer.w_down) {
                 ws.act.quantize(&ws.gate);
             }
@@ -473,7 +589,7 @@ impl<'m> Runner<'m> {
             for (xi, di) in ws.x.iter_mut().zip(&ws.proj) {
                 *xi += di;
             }
-            lap(&mut self.prof, |p| &mut p.ffn);
+            lap(&mut self.prof, |p| &mut p.down);
         }
 
         // All layers committed this token's K/V — advance the cursor once.
@@ -498,6 +614,360 @@ impl<'m> Runner<'m> {
         }
         if let Some(p) = self.prof.as_deref_mut() {
             p.tokens += 1;
+        }
+        Ok(())
+    }
+
+    /// Batched prefill step: run a chunk of `tokens` (≤ [`PREFILL_CHUNK`])
+    /// through all layers together, writing K/V at explicit positions
+    /// `start_pos..start_pos + tokens.len()`. The batched matmuls stream
+    /// each weight row from DRAM once per *chunk* instead of once per
+    /// token — the weight-row reuse that makes prefill compute-bound.
+    /// Causality holds because a chunk's K/V rows are all written before
+    /// any of its positions run attention, and position `p` only attends
+    /// to rows `0..=p`. Advances the KV cursor by the chunk length; leaves
+    /// the last token's logits in the workspace when `want_logits`.
+    fn step_chunk(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want_logits: bool,
+    ) -> Result<(), GlError> {
+        let c = &self.model.config;
+        let dim = c.dim;
+        let head_dim = c.head_dim;
+        let q_dim = c.n_heads * head_dim;
+        let kv_dim = c.n_kv_heads * head_dim;
+        let q2kv = q_dim + 2 * kv_dim;
+        let heads_per_kv = c.n_heads / c.n_kv_heads.max(1);
+        let bsz = tokens.len();
+        debug_assert!(bsz >= 1 && bsz <= PREFILL_CHUNK);
+        debug_assert_eq!(start_pos, self.cache.current_pos());
+
+        let bws = &mut self.bws;
+        for (b, &token) in tokens.iter().enumerate() {
+            let start = (token as usize)
+                .checked_mul(dim)
+                .filter(|&s| s + dim <= self.model.token_embd.len())
+                .ok_or_else(|| {
+                    GlError::Engine(format!("token id {token} out of embedding range"))
+                })?;
+            bws.xb[b * dim..(b + 1) * dim]
+                .copy_from_slice(&self.model.token_embd[start..start + dim]);
+        }
+
+        for (l, layer) in self.model.layers.iter().enumerate() {
+            // --- attention block ---
+            for b in 0..bsz {
+                kernels::rms_norm_into(
+                    &bws.xb[b * dim..(b + 1) * dim],
+                    &layer.attn_norm,
+                    c.rms_eps,
+                    &mut bws.xnb[b * dim..(b + 1) * dim],
+                );
+            }
+            match &layer.qkv {
+                QkvWeights::FusedQuant(fmt, packed) => {
+                    for b in 0..bsz {
+                        bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                    }
+                    par_matmul_qdot(
+                        &self.pool,
+                        *fmt,
+                        packed,
+                        &bws.acts[..bsz],
+                        &mut bws.qkvb,
+                        q2kv,
+                        0,
+                        q2kv,
+                        dim,
+                        self.strategy,
+                    );
+                }
+                QkvWeights::Split(wq, wk, wv) => {
+                    if needs_q8(wq) || needs_q8(wk) || needs_q8(wv) {
+                        for b in 0..bsz {
+                            bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                        }
+                    }
+                    for (w, off, rows) in [
+                        (wq, 0, q_dim),
+                        (wk, q_dim, kv_dim),
+                        (wv, q_dim + kv_dim, kv_dim),
+                    ] {
+                        matmul_w(
+                            &self.pool,
+                            self.strategy,
+                            w,
+                            &bws.xnb,
+                            dim,
+                            &bws.acts[..bsz],
+                            &mut bws.qkvb,
+                            q2kv,
+                            off,
+                            rows,
+                            dim,
+                            bsz,
+                        );
+                    }
+                }
+            }
+
+            // Per-position fixups: biases, head norms, RoPE, cache writes.
+            // Every position's K/V must land in the cache before any
+            // position of this chunk runs attention.
+            for b in 0..bsz {
+                let pos = start_pos + b;
+                let row = &mut bws.qkvb[b * q2kv..(b + 1) * q2kv];
+                let (q, rest) = row.split_at_mut(q_dim);
+                let (k, v) = rest.split_at_mut(kv_dim);
+
+                if let Some(bias) = &layer.bq {
+                    for (qi, bi) in q.iter_mut().zip(bias) {
+                        *qi += bi;
+                    }
+                }
+                if let Some(bias) = &layer.bk {
+                    for (ki, bi) in k.iter_mut().zip(bias) {
+                        *ki += bi;
+                    }
+                }
+                if let Some(bias) = &layer.bv {
+                    for (vi, bi) in v.iter_mut().zip(bias) {
+                        *vi += bi;
+                    }
+                }
+
+                if let Some(qn) = &layer.q_norm {
+                    for h in 0..c.n_heads {
+                        let seg = &q[h * head_dim..(h + 1) * head_dim];
+                        kernels::rms_norm_into(seg, qn, c.rms_eps, &mut self.ws.head);
+                        q[h * head_dim..(h + 1) * head_dim].copy_from_slice(&self.ws.head);
+                    }
+                }
+                if let Some(kn) = &layer.k_norm {
+                    for h in 0..c.n_kv_heads {
+                        let seg = &k[h * head_dim..(h + 1) * head_dim];
+                        kernels::rms_norm_into(seg, kn, c.rms_eps, &mut self.ws.head);
+                        k[h * head_dim..(h + 1) * head_dim].copy_from_slice(&self.ws.head);
+                    }
+                }
+
+                for h in 0..c.n_heads {
+                    rope(
+                        &mut q[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        head_dim,
+                        c.rope_freq_base,
+                        c.rope_style,
+                    );
+                }
+                for h in 0..c.n_kv_heads {
+                    rope(
+                        &mut k[h * head_dim..(h + 1) * head_dim],
+                        pos,
+                        head_dim,
+                        c.rope_freq_base,
+                        c.rope_style,
+                    );
+                    self.cache
+                        .write_k_at(l, h, pos, &k[h * head_dim..(h + 1) * head_dim]);
+                    self.cache
+                        .write_v_at(l, h, pos, &v[h * head_dim..(h + 1) * head_dim]);
+                }
+            }
+
+            // Causal attention, positions split across the pool. Attention
+            // cost grows with cached length, so for long prompts this loop
+            // dominates the chunk — run it on all threads. Every position
+            // gets its own scores row; output rows are disjoint per position.
+            {
+                let n = self.pool.n_threads();
+                let bchunk = bsz.div_ceil(n);
+                let qkvb = &bws.qkvb;
+                let cache = &self.cache;
+                let n_heads = c.n_heads;
+                let scores_stride = self.cache.max_context;
+                let out_ptr = PtrShare(bws.attn_outb.as_mut_ptr());
+                let scores_ptr = PtrShare(bws.scoresb.as_mut_ptr());
+                self.pool.run(&|tid| {
+                    let out_ptr = &out_ptr;
+                    let scores_ptr = &scores_ptr;
+                    let lo = (tid * bchunk).min(bsz);
+                    let hi = (lo + bchunk).min(bsz);
+                    for b in lo..hi {
+                        let cached_len = start_pos + b + 1;
+                        let q = &qkvb[b * q2kv..b * q2kv + q_dim];
+                        // SAFETY: position b belongs to exactly one thread;
+                        // its scores row and output row are disjoint from
+                        // every other position's, and both are in bounds
+                        // (b < bsz ≤ PREFILL_CHUNK, cached_len ≤ capacity).
+                        let scores = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                scores_ptr.0.add(b * scores_stride),
+                                cached_len,
+                            )
+                        };
+                        for h in 0..n_heads {
+                            let kv_head = h / heads_per_kv.max(1);
+                            // SAFETY: as above — (b, h) output segments are
+                            // disjoint across threads.
+                            let head_out = unsafe {
+                                std::slice::from_raw_parts_mut(
+                                    out_ptr.0.add(b * q_dim + h * head_dim),
+                                    head_dim,
+                                )
+                            };
+                            attention_one_into(
+                                &q[h * head_dim..(h + 1) * head_dim],
+                                cache.read_k_to(l, kv_head, cached_len),
+                                cache.read_v_to(l, kv_head, cached_len),
+                                head_dim,
+                                scores,
+                                head_out,
+                            );
+                        }
+                    }
+                });
+            }
+
+            if needs_q8(&layer.wo) {
+                for b in 0..bsz {
+                    bws.acts[b].quantize(&bws.attn_outb[b * q_dim..(b + 1) * q_dim]);
+                }
+            }
+            matmul_w(
+                &self.pool,
+                self.strategy,
+                &layer.wo,
+                &bws.attn_outb,
+                q_dim,
+                &bws.acts[..bsz],
+                &mut bws.projb,
+                dim,
+                0,
+                dim,
+                q_dim,
+                bsz,
+            );
+            for b in 0..bsz {
+                for (xi, pi) in bws.xb[b * dim..(b + 1) * dim]
+                    .iter_mut()
+                    .zip(&bws.projb[b * dim..(b + 1) * dim])
+                {
+                    *xi += pi;
+                }
+            }
+
+            // --- SwiGLU feed-forward block ---
+            for b in 0..bsz {
+                kernels::rms_norm_into(
+                    &bws.xb[b * dim..(b + 1) * dim],
+                    &layer.ffn_norm,
+                    c.rms_eps,
+                    &mut bws.xnb[b * dim..(b + 1) * dim],
+                );
+            }
+            match &layer.gate_up {
+                GateUp::FusedQuant(fmt, packed) => {
+                    for b in 0..bsz {
+                        bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                    }
+                    par_matmul_swiglu(
+                        &self.pool,
+                        *fmt,
+                        packed,
+                        &bws.acts[..bsz],
+                        &mut bws.gateb,
+                        c.hidden_dim,
+                        c.hidden_dim,
+                        dim,
+                        self.strategy,
+                    );
+                }
+                GateUp::Split(w_gate, w_up) => {
+                    if needs_q8(w_gate) || needs_q8(w_up) {
+                        for b in 0..bsz {
+                            bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                        }
+                    }
+                    for (w, y) in [(w_gate, &mut bws.gateb), (w_up, &mut bws.upb)] {
+                        matmul_w(
+                            &self.pool,
+                            self.strategy,
+                            w,
+                            &bws.xnb,
+                            dim,
+                            &bws.acts[..bsz],
+                            y,
+                            c.hidden_dim,
+                            0,
+                            c.hidden_dim,
+                            dim,
+                            bsz,
+                        );
+                    }
+                    for b in 0..bsz {
+                        let lo = b * c.hidden_dim;
+                        let hi = lo + c.hidden_dim;
+                        kernels::silu_mul(&mut bws.gateb[lo..hi], &bws.upb[lo..hi]);
+                    }
+                }
+            }
+            if needs_q8(&layer.w_down) {
+                for b in 0..bsz {
+                    bws.acts[b].quantize(&bws.gateb[b * c.hidden_dim..(b + 1) * c.hidden_dim]);
+                }
+            }
+            matmul_w(
+                &self.pool,
+                self.strategy,
+                &layer.w_down,
+                &bws.gateb,
+                c.hidden_dim,
+                &bws.acts[..bsz],
+                &mut bws.projb,
+                dim,
+                0,
+                dim,
+                c.hidden_dim,
+                bsz,
+            );
+            for b in 0..bsz {
+                for (xi, di) in bws.xb[b * dim..(b + 1) * dim]
+                    .iter_mut()
+                    .zip(&bws.projb[b * dim..(b + 1) * dim])
+                {
+                    *xi += di;
+                }
+            }
+        }
+
+        // Every layer committed K/V for all chunk positions.
+        self.cache.advance_by(bsz);
+
+        if want_logits {
+            let last = bsz - 1;
+            let ws = &mut self.ws;
+            kernels::rms_norm_into(
+                &bws.xb[last * dim..(last + 1) * dim],
+                &self.model.output_norm,
+                c.rms_eps,
+                &mut ws.xn,
+            );
+            if needs_q8(&self.model.output) {
+                ws.act.quantize(&ws.xn);
+            }
+            matvec_w(
+                &self.pool,
+                self.strategy,
+                &self.model.output,
+                &ws.xn,
+                &ws.act,
+                &mut ws.logits,
+                c.vocab_size,
+                dim,
+            );
         }
         Ok(())
     }
@@ -540,17 +1010,22 @@ impl<'m> Runner<'m> {
         self.cache.reset();
         let max_seq = self.model.config.max_seq.min(self.cache.max_context);
 
-        // Prefill: run every prompt token; only the last one needs logits,
-        // so earlier positions skip the (huge) LM-head matvec entirely.
+        // Prefill in batched chunks: each weight row streams from DRAM once
+        // per chunk instead of once per token. Only the last chunk's last
+        // token computes logits, so earlier positions still skip the (huge)
+        // LM-head matvec entirely.
+        if prompt.len() > max_seq {
+            return Err(GlError::Engine(format!(
+                "prompt length {} exceeds context window {max_seq}",
+                prompt.len()
+            )));
+        }
         let prefill_start = std::time::Instant::now();
-        for (pos, &tok) in prompt.iter().enumerate() {
-            if pos >= max_seq {
-                return Err(GlError::Engine(format!(
-                    "prompt length {} exceeds context window {max_seq}",
-                    prompt.len()
-                )));
-            }
-            self.step(tok, pos, pos + 1 == prompt.len())?;
+        let mut consumed = 0;
+        for chunk in prompt.chunks(PREFILL_CHUNK) {
+            let is_last = consumed + chunk.len() == prompt.len();
+            self.step_chunk(chunk, consumed, is_last)?;
+            consumed += chunk.len();
         }
         let prefill = prefill_start.elapsed();
 
@@ -694,6 +1169,67 @@ mod tests {
         let a = Runner::new(&model).forward(5, 0).unwrap();
         let b = Runner::new(&model).forward(5, 0).unwrap();
         assert_eq!(a, b);
+    }
+
+    /// Batched prefill must produce the same logits (and KV state) as the
+    /// sequential per-token path — checked here by comparing final logits
+    /// and one greedy continuation after prefill.
+    fn assert_chunked_prefill_matches_sequential(prompt: &[u32]) {
+        let model = tiny_model();
+
+        // Sequential ground truth: one step per token.
+        let mut seq = Runner::new(&model);
+        for (pos, &tok) in prompt.iter().enumerate() {
+            seq.step(tok, pos, pos + 1 == prompt.len()).unwrap();
+        }
+        let want: Vec<f32> = seq.logits().to_vec();
+
+        // Chunked path, exactly as generate() drives it.
+        let mut bat = Runner::new(&model);
+        let mut consumed = 0;
+        for chunk in prompt.chunks(PREFILL_CHUNK) {
+            let is_last = consumed + chunk.len() == prompt.len();
+            bat.step_chunk(chunk, consumed, is_last).unwrap();
+            consumed += chunk.len();
+        }
+        let got = bat.logits();
+
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert!(
+                (g - w).abs() < 1e-4,
+                "logit {i}: chunked {g} vs sequential {w} (prompt len {})",
+                prompt.len()
+            );
+        }
+
+        // KV parity: the greedy next token and one more step must agree.
+        let next = Sampler::greedy(got);
+        assert_eq!(next, Sampler::greedy(&want));
+        seq.forward_into(next, prompt.len()).unwrap();
+        bat.forward_into(next, prompt.len()).unwrap();
+        for (g, w) in bat.logits().iter().zip(seq.logits()) {
+            assert!((g - w).abs() < 1e-4, "post-prefill decode diverged");
+        }
+    }
+
+    #[test]
+    fn chunked_prefill_matches_sequential_single_chunk() {
+        assert_chunked_prefill_matches_sequential(&[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn chunked_prefill_matches_sequential_multi_chunk() {
+        // 40 tokens: one full 32-chunk plus a ragged 8-token tail, crossing
+        // the chunk boundary (max_seq of the tiny model is 64).
+        let prompt: Vec<u32> = (0..40).map(|i| (i % 16) as u32).collect();
+        assert_chunked_prefill_matches_sequential(&prompt);
+    }
+
+    #[test]
+    fn chunked_prefill_rejects_bad_token() {
+        let model = tiny_model();
+        let mut runner = Runner::new(&model);
+        assert!(runner.step_chunk(&[1, 9999], 0, true).is_err());
     }
 
     #[test]
