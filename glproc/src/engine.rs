@@ -103,6 +103,42 @@ impl GlprocEngine {
     }
 }
 
+/// One startup line naming the SIMD strategy and the kernel path each hot
+/// weight class will take — a scalar fallback in the FFN would silently eat
+/// the whole token budget, so make the dispatch visible.
+fn log_simd_paths(model: &GlprocModel) {
+    use crate::model::{GateUp, WeightMatrix};
+    let strategy = crate::simd_strategy::SimdStrategy::detect();
+    let vnni = crate::kernels::qdot::has_vnni_256();
+    let path = |w: &WeightMatrix| match w {
+        WeightMatrix::F32(_) => "f32 dense".to_string(),
+        WeightMatrix::Quant(fmt, _) if crate::kernels::qdot::supports(*fmt) => {
+            format!("{fmt:?} integer-dot")
+        }
+        WeightMatrix::Quant(fmt, _) => format!("{fmt:?} f32-bridge"),
+    };
+    let (ffn_gateup, ffn_down) = model
+        .layers
+        .first()
+        .map(|l| {
+            let gu = match &l.gate_up {
+                GateUp::FusedQuant(fmt, _) => format!("{fmt:?} fused-swiglu integer-dot"),
+                GateUp::Split(g, _) => path(g),
+            };
+            (gu, path(&l.w_down))
+        })
+        .unwrap_or_else(|| ("?".into(), "?".into()));
+    eprintln!(
+        "[simd] strategy: {strategy:?}{} | ffn gate/up: {ffn_gateup} | \
+         ffn down: {ffn_down} | lm_head: {}",
+        if vnni { "+vnni256" } else { "" },
+        path(&model.output),
+    );
+    if strategy == crate::simd_strategy::SimdStrategy::Scalar {
+        eprintln!("[simd] WARNING: scalar fallback — AVX2 not active, expect ~10x slowdown");
+    }
+}
+
 impl GlEngine for GlprocEngine {
     fn init(&mut self) -> Result<(), GlError> {
         // CPU backend: nothing to detect or allocate up front.
@@ -139,6 +175,7 @@ impl GlEngine for GlprocEngine {
         // X5 step 1: fault every weight page in and pin it before the first
         // token, so no decode ever stalls on a page fault or swap-in.
         crate::loader::warm_and_lock_model(&model);
+        log_simd_paths(&model);
         self.model = Some(model);
         Ok(())
     }

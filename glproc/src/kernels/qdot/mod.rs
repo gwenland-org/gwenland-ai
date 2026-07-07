@@ -107,7 +107,7 @@ impl QuantizedActivation {
 /// Detected once — this is AVX512VL+VNNI encoding-wise, but it is a 256-bit
 /// datapath running at the AVX2 frequency license, so the X5 AVX-512
 /// thermal ban does not apply (explicitly approved for use).
-fn has_vnni_256() -> bool {
+pub fn has_vnni_256() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
