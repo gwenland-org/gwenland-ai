@@ -4,6 +4,42 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+## 0.1.48-alpha — 2026-07-08
+
+First tagged alpha release. Bundles the M1.5–M1.7 GL engine wave with a full
+TUI visual overhaul, and cleans up release plumbing. All workspace crates are
+versioned `0.1.48`; published as a GitHub **pre-release**.
+
+TUI (`gltui`) — OpenCode-inspired visual redesign:
+
+- Retired the ASCII "haunted mansion" welcome logo. The welcome card now shows
+  the **GwenLand** wordmark in the ANSI Shadow figlet font (the Claude Code CLI
+  banner style) in the accent orange, with a graceful plain-text fallback on
+  narrow terminals.
+- The card also reports live **device info** — CPU (brand + core count), RAM
+  (available / total), arch/OS, and GPU — probed once at startup via
+  `gwenland-core`'s hardware profiler so it never runs on the render path.
+- Reworked the palette to a single warm accent (`#b56936`) on a near-black
+  surface, a floating rounded command palette (search line + right-aligned
+  shortcuts + orange selection), a rounded input box that lights up when
+  focused, and a tab-style status bar. No logic, command, or keybinding changes.
+
+Packaging & licensing:
+
+- Consolidated the two overlapping license files into a single `LICENSE`
+  (MIT + Commons Clause v1.0). All crate `license-file` fields and the README
+  now point at it; fixed a stale `license-file` path in `gwenland-core`.
+- Every workspace crate bumped to `0.1.48`.
+
+CI/CD:
+
+- Release build (`build.yml`) now builds the real package: `--package glcli`
+  (the `gwen` binary) instead of the nonexistent `gwenland-tui`, with binary
+  paths corrected from `gwenland` to `gwen`. The serve+chat e2e workflow builds
+  `glcli`/`gltui` and tests against `gltui`.
+- Tags matching `-alpha`/`-beta`/`-rc` publish as GitHub pre-releases; this
+  release ships under `v0.1.48-alpha`.
+
 ### 2026-07-07 — M1.5 correctness fixes, M1.6 batched prefill, M1.7 fast load: the GL engine reaches llama.cpp parity
 
 The full architecture and benchmark story is in [`ArchGLML.md`](ArchGLML.md); the session notes are in [`changelog/Gwen-Changes-2026-07-07_16-30.md`](changelog/Gwen-Changes-2026-07-07_16-30.md).

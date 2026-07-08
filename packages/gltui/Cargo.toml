@@ -1,7 +1,8 @@
 [package]
 name = "gltui"
-version = "1.0.0"
+version = "0.1.48"
 edition = "2024"
+license-file = "../../LICENSE"
 
 [features]
 default = []

@@ -1,9 +1,9 @@
 [package]
 name = "glcli"
-version = "0.1.0"
+version = "0.1.48"
 edition = "2021"
 description = "GwenLand AI CLI — run local inference with the GL engines"
-license-file = "../LICENSE.txt"
+license-file = "../LICENSE"
 
 [[bin]]
 name = "gwen"

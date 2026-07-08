@@ -104,12 +104,12 @@ jobs:
             libxi-dev
 
       # =======================================================================
-      # 5. Build gwenland-tui release binary
-      #    The integration test locates the binary via CARGO_MANIFEST_DIR +
-      #    target/release/gwenland — it must be built before tests run.
+      # 5. Build the gwen CLI + gltui release binaries
+      #    The serve+chat integration test lives in the gltui crate and drives
+      #    the `gwen` binary, so build both before tests run.
       # =======================================================================
-      - name: Build gwenland-tui (release)
-        run: cargo build --release -p gwenland-tui
+      - name: Build release binaries
+        run: cargo build --release -p glcli -p gltui
         shell: bash
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: true
@@ -130,7 +130,7 @@ jobs:
         run: |
           cargo test \
             --release \
-            -p gwenland-tui \
+            -p gltui \
             --test serve_chat_test \
             -- \
             --nocapture

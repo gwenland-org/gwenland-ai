@@ -126,4 +126,4 @@ Training and inference run on your machine. The only network calls are the model
 
 ## License
 
-MIT with the Commons Clause — see [LICENSE.txt](LICENSE.txt). Free for personal and research use; commercial use needs a separate agreement.
+MIT with the Commons Clause — see [LICENSE](LICENSE). Free for personal and research use; commercial use needs a separate agreement.
