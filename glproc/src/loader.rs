@@ -58,7 +58,7 @@ pub fn warm_and_lock_model(model: &GlprocModel) {
     let mut push_f32 = |regions: &mut Vec<_>, v: &[f32]| {
         regions.push((v.as_ptr() as *const u8, std::mem::size_of_val(v)));
     };
-    push_f32(&mut regions, &model.token_embd);
+    regions.push(weight_region(&model.token_embd));
     push_f32(&mut regions, &model.output_norm);
     regions.push(weight_region(&model.output));
     for l in &model.layers {
@@ -103,6 +103,12 @@ pub fn warm_and_lock_model(model: &GlprocModel) {
     }
 
     // Step 2: pin the pages so they cannot be evicted.
+    // `GLPROC_NO_LOCK=1` skips pinning (and the working-set resize) — an
+    // A/B knob: the working-set cap the resize installs can make the OS
+    // trim the *unpinned* runtime buffers under memory pressure.
+    if std::env::var("GLPROC_NO_LOCK").is_ok_and(|v| !v.is_empty() && v != "0") {
+        return;
+    }
     let mut failed = 0usize;
     #[cfg(windows)]
     {
@@ -217,6 +223,16 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<WeightMatrix, GlError> {
                 kernels::dequant::q6_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
             ))
         }
+        // Q4_K too: it has no integer-dot kernel, so unrepacked it takes
+        // the f32 bridge — which re-dequantizes every block once per batch
+        // row in the prefill matmul (measured ~15x slower than repacked
+        // layers). Requantization error is the same class as Q6_K's.
+        Some(QuantFormat::Q4K) if info.dimensions[0] as usize % 256 == 0 => {
+            Ok(WeightMatrix::Quant(
+                QuantFormat::Q8_0,
+                kernels::dequant::q4_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
+            ))
+        }
         // dimensions[0] is the contiguous axis = in_features; GGML packs
         // quantization blocks along it, so it is always a whole number of
         // blocks — guard anyway and fall back to f32 if not.
@@ -272,6 +288,32 @@ fn fuse_qkv(q: WeightMatrix, k: WeightMatrix, v: WeightMatrix) -> QkvWeights {
     }
 }
 
+/// Build one transformer block's weights: copy, dequantize and repack all
+/// of layer `i`'s tensors. Pure per-layer work — safe to run in parallel.
+fn build_layer(gguf: &GgufFile, i: usize, hidden_dim: usize) -> Result<LayerWeights, GlError> {
+    Ok(LayerWeights {
+        attn_norm: tensor(gguf, &format!("blk.{i}.attn_norm.weight"))?,
+        qkv: fuse_qkv(
+            weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
+            weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
+            weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
+        ),
+        wo: weight(gguf, &format!("blk.{i}.attn_output.weight"))?,
+        bq: tensor_opt(gguf, &format!("blk.{i}.attn_q.bias"))?,
+        bk: tensor_opt(gguf, &format!("blk.{i}.attn_k.bias"))?,
+        bv: tensor_opt(gguf, &format!("blk.{i}.attn_v.bias"))?,
+        q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
+        k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
+        ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
+        gate_up: fuse_gate_up(
+            weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
+            weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+            hidden_dim,
+        ),
+        w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
+    })
+}
+
 /// Parse config and dequantize every weight of a GGUF transformer.
 ///
 /// Supports llama-family architectures (llama, mistral, qwen2, tinyllama...)
@@ -314,39 +356,57 @@ pub fn load_gguf(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
         _ => RopeStyle::Neox,
     };
 
-    let token_embd = tensor(gguf, "token_embd.weight")?;
-    let vocab_size = token_embd.len() / dim;
+    // The embedding table is the single biggest tensor (vocab × dim); keep
+    // it quantized and dequantize one row per lookup instead of paying the
+    // ~4x f32 blow-up in RAM and its dequantization at load. Row lookup
+    // needs a whole number of Q8_0 blocks per row, and formats other than
+    // Q8_0 (post-repack) fall back to f32.
+    let embd_info = gguf
+        .find_tensor("token_embd.weight")
+        .ok_or_else(|| GlError::Parse("GGUF: missing tensor 'token_embd.weight'".into()))?;
+    let vocab_size = embd_info.dimensions.get(1).copied().unwrap_or(0) as usize;
+    let token_embd = match weight(gguf, "token_embd.weight")? {
+        w @ WeightMatrix::Quant(QuantFormat::Q8_0, _) if dim % 32 == 0 => w,
+        WeightMatrix::Quant(..) => WeightMatrix::F32(dequant_any(gguf, embd_info)?),
+        w => w,
+    };
+    if vocab_size == 0 {
+        return Err(GlError::Parse(
+            "GGUF: token_embd.weight has no vocab dimension".into(),
+        ));
+    }
 
+    // Layers are independent — copy/dequantize/repack them in parallel.
+    // The work is a mix of mmap reads and requantization compute, so it
+    // scales with cores until the disk saturates. Workers pull layer
+    // indices from a shared counter; results land in per-index slots.
+    let n_workers = num_cpus::get().clamp(1, 8).min(n_layers.max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<std::sync::Mutex<Option<Result<LayerWeights, GlError>>>> =
+        (0..n_layers).map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..n_workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if i >= n_layers {
+                    break;
+                }
+                let built = build_layer(gguf, i, hidden_dim);
+                *slots[i].lock().unwrap() = Some(built);
+            });
+        }
+    });
     let mut layers = Vec::with_capacity(n_layers);
-    for i in 0..n_layers {
-        layers.push(LayerWeights {
-            attn_norm: tensor(gguf, &format!("blk.{i}.attn_norm.weight"))?,
-            qkv: fuse_qkv(
-                weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
-                weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
-                weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
-            ),
-            wo: weight(gguf, &format!("blk.{i}.attn_output.weight"))?,
-            bq: tensor_opt(gguf, &format!("blk.{i}.attn_q.bias"))?,
-            bk: tensor_opt(gguf, &format!("blk.{i}.attn_k.bias"))?,
-            bv: tensor_opt(gguf, &format!("blk.{i}.attn_v.bias"))?,
-            q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
-            k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
-            ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
-            gate_up: fuse_gate_up(
-                weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-                weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
-                hidden_dim,
-            ),
-            w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
-        });
+    for slot in slots {
+        layers.push(slot.into_inner().unwrap().expect("worker built every slot")?);
     }
 
     let output_norm = tensor(gguf, "output_norm.weight")?;
-    // Tied embeddings: fall back to the embedding table as LM head.
+    // Tied embeddings: fall back to the embedding table as LM head — a
+    // quantized table doubles as a quantized head (integer-dot path).
     let output = match gguf.find_tensor("output.weight") {
         Some(_) => weight(gguf, "output.weight")?,
-        None => WeightMatrix::F32(token_embd.clone()),
+        None => token_embd.clone(),
     };
 
     Ok(GlprocModel {

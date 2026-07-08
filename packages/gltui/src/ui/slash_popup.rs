@@ -1,7 +1,8 @@
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Clear},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Clear},
     Frame,
 };
 use crossterm::event::{KeyCode, KeyEvent};
@@ -29,6 +30,9 @@ pub struct SlashPopup<'a> {
     commands: Vec<(&'static str, &'static str, &'static str)>,
     filtered_commands: Vec<(&'static str, &'static str, &'static str)>,
     list_state: ListState,
+    // Current filter text, mirrored here so the popup can render its own
+    // search line. Display-only — filtering logic is unchanged.
+    query: String,
     
     // Settings form fields
     model_dir: TextArea<'a>,
@@ -59,6 +63,7 @@ impl<'a> SlashPopup<'a> {
             filtered_commands: commands.clone(),
             commands,
             list_state: ListState::default(),
+            query: String::new(),
             model_dir: TextArea::default(),
             default_model: TextArea::default(),
             temp: TextArea::default(),
@@ -74,6 +79,18 @@ impl<'a> SlashPopup<'a> {
         sl
     }
     
+    /// Height the popup wants for the current state: border (2) + search line +
+    /// separator + one row per visible command (settings uses a fixed height).
+    pub fn desired_height(&self) -> u16 {
+        match self.state {
+            PopupState::Commands => {
+                let rows = self.filtered_commands.len().max(1) as u16;
+                2 + 1 + 1 + rows
+            }
+            PopupState::Settings => 15,
+        }
+    }
+
     pub fn open(&mut self) {
         self.active = true;
         self.state = PopupState::Commands;
@@ -85,6 +102,7 @@ impl<'a> SlashPopup<'a> {
     }
     
     pub fn update_filter(&mut self, query: &str) {
+        self.query = query.to_string();
         let q = query.strip_prefix('/').unwrap_or(query).to_lowercase();
         self.filtered_commands = self.commands.iter()
             .filter(|(cmd, desc, _)| cmd.to_lowercase().contains(&q) || desc.to_lowercase().contains(&q))
@@ -98,30 +116,77 @@ impl<'a> SlashPopup<'a> {
         
         f.render_widget(Clear, area);
         let block = Block::default()
-            .padding(ratatui::widgets::Padding::symmetric(2, 1))
-            .style(Style::default().bg(theme::SURFACE));
-            
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme::BORDER_ACTIVE))
+            .style(Style::default().bg(theme::SURFACE))
+            .padding(ratatui::widgets::Padding::symmetric(1, 0));
+
         let inner = block.inner(area);
         f.render_widget(block, area);
-        
+
         match self.state {
             PopupState::Commands => {
+                // Top: search/input line. Middle: separator. Rest: command list.
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1), // search line
+                        Constraint::Length(1), // separator
+                        Constraint::Min(0),    // command list
+                    ])
+                    .split(inner);
+
+                // Search line: "> " prompt, the current query, and a block cursor.
+                let query_body = self.query.strip_prefix('/').unwrap_or(&self.query);
+                let search_line = Line::from(vec![
+                    Span::styled("> ", Style::default().fg(theme::ACCENT)),
+                    Span::styled("/", Style::default().fg(theme::TEXT)),
+                    Span::styled(query_body.to_string(), Style::default().fg(theme::TEXT)),
+                    Span::styled("█", Style::default().fg(theme::ACCENT)),
+                ]);
+                f.render_widget(
+                    Paragraph::new(search_line).style(Style::default().bg(theme::SURFACE)),
+                    rows[0],
+                );
+
+                // Separator rule spanning the inner width.
+                let sep = "─".repeat(rows[1].width as usize);
+                f.render_widget(
+                    Paragraph::new(sep).style(Style::default().fg(theme::BORDER).bg(theme::SURFACE)),
+                    rows[1],
+                );
+
+                let w = rows[2].width as usize;
                 let list_items: Vec<ListItem> = self.filtered_commands.iter().enumerate().map(|(i, (cmd, desc, key))| {
-                    let style = if Some(i) == self.list_state.selected() {
-                        Style::default().bg(theme::PRIMARY).fg(Color::Black)
+                    let selected = Some(i) == self.list_state.selected();
+
+                    // Left segment is "<cmd>  <desc>"; shortcut is right-aligned.
+                    let left = format!("{}  {}", cmd, desc);
+                    let pad = w.saturating_sub(left.chars().count() + key.chars().count());
+
+                    if selected {
+                        // Whole row painted orange with dark text, bold.
+                        let content = format!("{}{}{}", left, " ".repeat(pad), key);
+                        let style = Style::default()
+                            .bg(theme::SELECTION_BG)
+                            .fg(theme::SELECTION_FG)
+                            .add_modifier(Modifier::BOLD);
+                        ListItem::new(Line::from(content)).style(style)
                     } else {
-                        Style::default().fg(theme::TEXT)
-                    };
-                    
-                    let w = inner.width as usize;
-                    let c = format!("{} - {}", cmd, desc);
-                    let pad = w.saturating_sub(c.len() + key.len());
-                    let content = format!("{}{}{}", c, " ".repeat(pad), key);
-                    ListItem::new(content).style(style)
+                        // Per-segment coloring: cmd primary, desc secondary, key dim.
+                        let line = Line::from(vec![
+                            Span::styled(cmd.to_string(), Style::default().fg(theme::TEXT)),
+                            Span::styled(format!("  {}", desc), Style::default().fg(theme::TEXT_SECONDARY)),
+                            Span::styled(" ".repeat(pad), Style::default()),
+                            Span::styled(key.to_string(), Style::default().fg(theme::TEXT_DIM)),
+                        ]);
+                        ListItem::new(line).style(Style::default().bg(theme::SURFACE))
+                    }
                 }).collect();
-                
+
                 let list = List::new(list_items);
-                f.render_stateful_widget(list, inner, &mut self.list_state);
+                f.render_stateful_widget(list, rows[2], &mut self.list_state);
             }
             PopupState::Settings => {
                 let chunks = Layout::default()

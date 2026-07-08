@@ -1,7 +1,8 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Paragraph},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -10,22 +11,115 @@ use crate::ui::theme;
 use super::{Pane, PaneAction};
 use crate::ui::slash_popup::{SlashPopup, SlashAction};
 
+/// "GwenLand" rendered in the ANSI Shadow figlet font (as used by the Claude
+/// Code CLI banner). Six rows, each exactly 71 display columns wide.
+const GWENLAND_BANNER: &str = r#" ██████╗ ██╗    ██╗███████╗███╗   ██╗██╗      █████╗ ███╗   ██╗██████╗
+██╔════╝ ██║    ██║██╔════╝████╗  ██║██║     ██╔══██╗████╗  ██║██╔══██╗
+██║  ███╗██║ █╗ ██║█████╗  ██╔██╗ ██║██║     ███████║██╔██╗ ██║██║  ██║
+██║   ██║██║███╗██║██╔══╝  ██║╚██╗██║██║     ██╔══██║██║╚██╗██║██║  ██║
+╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║███████╗██║  ██║██║ ╚████║██████╔╝
+ ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ "#;
+
+/// Display width of the banner in columns (all rows are padded to this).
+const BANNER_WIDTH: u16 = 71;
+
+/// Truncate a string to `max` characters, appending an ellipsis if cut.
+fn truncate(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        format!("{}…", s.chars().take(keep).collect::<String>())
+    }
+}
+
 pub struct ChatPane<'a> {
     textarea: TextArea<'a>,
     history: Vec<String>,
     popup: SlashPopup<'a>,
+    /// Device summary rows (label, value) shown on the welcome card. Detected
+    /// once at construction so GPU/RAM probing never runs on the render path.
+    device_info: Vec<(String, String)>,
 }
 
 impl<'a> ChatPane<'a> {
     pub fn new() -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-        textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+        let textarea = Self::styled_textarea();
         Self {
             textarea,
             history: Vec::new(),
             popup: SlashPopup::new(),
+            device_info: Self::detect_device_info(),
         }
+    }
+
+    /// Probe host hardware via gwenland-core and format it into compact
+    /// label/value rows for the welcome card. Runs once at startup.
+    fn detect_device_info() -> Vec<(String, String)> {
+        use gwenland_core::platform::hardware::{self, Arch, GpuType};
+
+        let p = hardware::profile();
+
+        let arch = match p.arch {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+            Arch::Unknown => std::env::consts::ARCH,
+        };
+
+        // CPU brand can be long ("11th Gen Intel(R) Core(TM) i3-1115G4 @ ...");
+        // strip vendor noise and the clock suffix so the row fits the card.
+        let cpu = {
+            let brand = p.cpu_brand.trim();
+            let short = brand.split('@').next().unwrap_or(brand);
+            let short = short
+                .replace("(R)", "")
+                .replace("(TM)", "")
+                .replace("CPU", "");
+            let short = short.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{}  ·  {} cores", truncate(&short, 26), p.cpu_count)
+        };
+
+        let mut rows = vec![
+            ("CPU".to_string(), cpu),
+            (
+                "RAM".to_string(),
+                format!(
+                    "{:.1} / {:.1} GB free",
+                    p.available_ram_gb, p.total_ram_gb
+                ),
+            ),
+            ("Arch".to_string(), format!("{}  ·  {}", arch, std::env::consts::OS)),
+        ];
+
+        // Prefer a dedicated GPU, else the first detected adapter.
+        let gpu = p
+            .gpus
+            .iter()
+            .find(|g| g.gpu_type == GpuType::Dedicated)
+            .or_else(|| p.gpus.first());
+        if let Some(g) = gpu {
+            let kind = match g.gpu_type {
+                GpuType::Dedicated => "dedicated",
+                GpuType::Integrated => "integrated",
+                GpuType::Unknown => "gpu",
+            };
+            let gpu_name = g.name.replace("(R)", "").replace("(TM)", "");
+            let gpu_name = gpu_name.split_whitespace().collect::<Vec<_>>().join(" ");
+            rows.push(("GPU".to_string(), format!("{}  ·  {}", truncate(&gpu_name, 26), kind)));
+        }
+
+        rows
+    }
+
+    /// A fresh composer textarea styled for the input box (placeholder + colors).
+    fn styled_textarea() -> TextArea<'a> {
+        let mut textarea = TextArea::default();
+        textarea.set_style(Style::default().bg(theme::INPUT_BG).fg(theme::TEXT));
+        textarea.set_cursor_line_style(Style::default().bg(theme::INPUT_BG));
+        textarea.set_placeholder_text("Type a message or / for commands");
+        textarea.set_placeholder_style(Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG));
+        textarea
     }
 }
 
@@ -46,39 +140,117 @@ impl<'a> Pane for ChatPane<'a> {
         f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
         if self.history.is_empty() {
-             let welcome_layout = Layout::default()
+             // The ANSI Shadow banner needs 71 cols + borders + padding. Use it
+             // when the pane is wide enough, otherwise fall back to plain text.
+             let banner_card_width = BANNER_WIDTH + 2 /*borders*/ + 2 /*padding*/;
+             let use_banner = chunks[0].width >= banner_card_width;
+
+             // Title occupies 6 rows for the banner, 2 rows for plain text.
+             let title_rows: u16 = if use_banner { 6 } else { 2 };
+             let device_rows = self.device_info.len() as u16;
+             // top-pad + title + subtitle + pad + sep + device rows + pad + hint
+             let box_height: u16 = 1 + title_rows + 1 + 1 + 1 + device_rows + 1 + 1;
+             let v = Layout::default()
                  .direction(Direction::Vertical)
                  .constraints([
                      Constraint::Min(0),
-                     Constraint::Length(12),
+                     Constraint::Length(box_height),
                      Constraint::Min(0),
                  ])
                  .split(chunks[0]);
-                 
-             let logo = r#"   ____                     __                  __ 
-  / ___|__      _____ _ __  \ \   __ _ _ __   __| |
- | |  _ \ \ /\ / / _ \ '_ \  | | / _` | '_ \ / _` |
- | |_| | \ V  V /  __/ | | | | || (_| | | | | (_| |
-  \____|  \_/\_/ \___|_| |_| |___\__,_|_| |_|\__,_|"#;
 
-             let mut text = vec![];
-             for line in logo.lines() {
-                 if !line.is_empty() {
-                     text.push(ratatui::text::Line::from(ratatui::text::Span::styled(line, Style::default().fg(theme::PRIMARY).add_modifier(ratatui::style::Modifier::BOLD))));
+             // Horizontally center the card. Widen it to hug the banner.
+             let box_width: u16 = if use_banner { banner_card_width } else { 52 };
+             let h = Layout::default()
+                 .direction(Direction::Horizontal)
+                 .constraints([
+                     Constraint::Min(0),
+                     Constraint::Length(box_width),
+                     Constraint::Min(0),
+                 ])
+                 .split(v[1]);
+
+             let card = Block::default()
+                 .borders(Borders::ALL)
+                 .border_type(BorderType::Rounded)
+                 .border_style(Style::default().fg(theme::BORDER))
+                 .style(Style::default().bg(theme::BG))
+                 .padding(ratatui::widgets::Padding::horizontal(1));
+             let inner = card.inner(h[1]);
+             f.render_widget(card, h[1]);
+
+             let mut text: Vec<Line> = vec![Line::from("")];
+
+             if use_banner {
+                 // Each banner row, padded to the full width and accent-colored.
+                 for row in GWENLAND_BANNER.lines() {
+                     let pad = (BANNER_WIDTH as usize).saturating_sub(row.chars().count());
+                     text.push(
+                         Line::from(Span::styled(
+                             format!("{}{}", row, " ".repeat(pad)),
+                             Style::default().fg(theme::ACCENT),
+                         ))
+                         .alignment(Alignment::Center),
+                     );
                  }
+             } else {
+                 text.push(
+                     Line::from(Span::styled(
+                         "GwenLand",
+                         Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                     ))
+                     .alignment(Alignment::Center),
+                 );
              }
-             text.push(ratatui::text::Line::from(""));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Welcome to GwenLand Core", Style::default().fg(theme::TEXT).add_modifier(ratatui::style::Modifier::BOLD))));
-             text.push(ratatui::text::Line::from(""));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Type / for commands", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+T to Train Models", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+F to Fetch Models", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+E to manage Engines", Style::default().fg(theme::MUTED))));
 
-             f.render_widget(
-                 Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
-                 welcome_layout[1]
+             text.push(
+                 Line::from(Span::styled(
+                     "Local AI. Your machine.",
+                     Style::default().fg(theme::TEXT_SECONDARY),
+                 ))
+                 .alignment(Alignment::Center),
              );
+
+             // Separator rule between the header and the device block.
+             let rule_w = inner.width as usize;
+             text.push(
+                 Line::from(Span::styled(
+                     "─".repeat(rule_w),
+                     Style::default().fg(theme::BORDER),
+                 )),
+             );
+
+             // Device rows: dim label on the left, value on the right, padded so
+             // values line up in a column.
+             let label_w = self
+                 .device_info
+                 .iter()
+                 .map(|(l, _)| l.chars().count())
+                 .max()
+                 .unwrap_or(0);
+             for (label, value) in &self.device_info {
+                 let pad = label_w.saturating_sub(label.chars().count());
+                 text.push(Line::from(vec![
+                     Span::styled(
+                         format!("{}{}  ", label, " ".repeat(pad)),
+                         Style::default().fg(theme::TEXT_DIM),
+                     ),
+                     Span::styled(value.clone(), Style::default().fg(theme::TEXT_SECONDARY)),
+                 ]));
+             }
+
+             text.push(Line::from(""));
+             text.push(
+                 Line::from(vec![
+                     Span::styled("/ ", Style::default().fg(theme::ACCENT)),
+                     Span::styled("commands    ", Style::default().fg(theme::TEXT_DIM)),
+                     Span::styled("ctrl+c ", Style::default().fg(theme::ACCENT)),
+                     Span::styled("chat", Style::default().fg(theme::TEXT_DIM)),
+                 ])
+                 .alignment(Alignment::Center),
+             );
+
+             f.render_widget(Paragraph::new(text), inner);
         } else {
             let history_text = self.history.join("\n\n");
             let history_widget = Paragraph::new(history_text)
@@ -92,52 +264,50 @@ impl<'a> Pane for ChatPane<'a> {
                 Constraint::Percentage(100),
             ])
             .split(chunks[2]);
-        
+
+        // Input is "focused" whenever the slash popup is not capturing keys.
+        let input_focused = !self.popup.active;
+        let border_color = if input_focused { theme::BORDER_ACTIVE } else { theme::BORDER };
+
         let input_block = Block::default()
-            .padding(ratatui::widgets::Padding::symmetric(2, 1))
-            .style(Style::default().bg(theme::SURFACE));
-            
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .padding(ratatui::widgets::Padding::horizontal(1))
+            .style(Style::default().bg(theme::INPUT_BG));
+
         let inner_area = input_block.inner(composer_layout[0]);
         f.render_widget(input_block, composer_layout[0]);
-        
+
         let prompt_chunk = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(2), Constraint::Min(0)])
             .split(inner_area);
-            
-        f.render_widget(Paragraph::new("> ").style(Style::default().fg(theme::CYAN).bg(theme::SURFACE)), prompt_chunk[0]);
+
+        f.render_widget(Paragraph::new("> ").style(Style::default().fg(theme::ACCENT).bg(theme::INPUT_BG)), prompt_chunk[0]);
         f.render_widget(&self.textarea, prompt_chunk[1]);
         
-        let status_row_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(100),
-            ])
-            .split(chunks[3]);
-            
-        let status_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(status_row_layout[0]);
-            
-        let left_status = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("enter ", Style::default().fg(theme::TEXT)),
-            ratatui::text::Span::styled("send", Style::default().fg(theme::MUTED)),
+        // Subtle single hint below the composer. Branding/version now lives in
+        // the global status bar, so this row stays quiet.
+        let hint = Line::from(vec![
+            Span::styled("enter ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("send   ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("esc ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("close", Style::default().fg(theme::TEXT_DIM)),
         ]);
-        f.render_widget(Paragraph::new(left_status), status_layout[0]);
-        
-        let right_status = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("GwenLand ", Style::default().fg(theme::MUTED)),
-            ratatui::text::Span::styled("Core 1.0", Style::default().fg(theme::TEXT)),
-        ]);
-        f.render_widget(Paragraph::new(right_status).alignment(ratatui::layout::Alignment::Right), status_layout[1]);
+        f.render_widget(Paragraph::new(hint), chunks[3]);
 
         if self.popup.active {
-            let popup_height = 12;
+            // Float the popup just above the composer, clamped so it never runs
+            // off the top of the pane.
+            let composer = composer_layout[0];
+            let want = self.popup.desired_height();
+            let available = composer.y.saturating_sub(area.y);
+            let popup_height = want.min(available).max(3);
             let popup_area = Rect {
-                x: composer_layout[0].x,
-                y: composer_layout[0].y.saturating_sub(popup_height),
-                width: composer_layout[0].width,
+                x: composer.x,
+                y: composer.y.saturating_sub(popup_height),
+                width: composer.width,
                 height: popup_height,
             };
             self.popup.draw(f, popup_area);
@@ -151,24 +321,18 @@ impl<'a> Pane for ChatPane<'a> {
             match action {
                 SlashAction::Close => {
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::None;
                 }
                 SlashAction::SwitchPane(p) => {
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::SwitchPane(p);
                 }
                 SlashAction::ClearHistory => {
                     self.history.clear();
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::None;
                 }
                 SlashAction::Handled => {
@@ -193,9 +357,7 @@ impl<'a> Pane for ChatPane<'a> {
                 let text = self.textarea.lines().join("\n");
                 if !text.is_empty() {
                     self.history.push(format!("User: {}\n\nModel: ...", text));
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                 }
                 PaneAction::None
             }

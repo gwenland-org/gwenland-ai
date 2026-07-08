@@ -1,6 +1,6 @@
 [package]
 name = "gwenland-core"
-version = "1.0.0"
+version = "0.1.48"
 authors = ["JinXSuper <jinxsuper@vercel.app>"]
 edition = "2024"
 description = "GwenLand — AI toolkit. Local-first, <50MB, zero Python."
@@ -8,7 +8,7 @@ homepage = "https://jinxsuper.vercel.app"
 documentation = "https://gwenland.vercel.app"
 repository = "https://github.com/JinXSuper/gwenland"
 readme = "README.md"
-license-file = "LICENSE.txt"
+license-file = "../../LICENSE"
 publish = true
 keywords = ["gwenland", "ai", "trainer", "tester", "modular", "orchestration", "rust"]
 categories = ["command-line-interface", "development-tools", "artificial-intelligence"]

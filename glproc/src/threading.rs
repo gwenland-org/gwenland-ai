@@ -28,7 +28,9 @@ use std::thread::JoinHandle;
 
 use crate::kernels::bridge::{bridge_row_dot, QuantFormat};
 use crate::kernels::matmul;
-use crate::kernels::qdot::{row_dot_q8, QuantizedActivation};
+use crate::kernels::qdot::{
+    row_dot_q8, row_dot_q8_packed8, row_dot_q8_xn, QuantizedActivation,
+};
 use crate::simd_strategy::SimdStrategy;
 
 /// Type-erased pointer to the job closure. Only valid while `ThreadPool::run`
@@ -407,6 +409,294 @@ pub fn par_matvec_swiglu(
     });
 }
 
+/// Threaded f32 matmul for batched prefill: `y[b][col_off + o] = dot(w[o],
+/// xb[b])`. `xb` holds `batch` input rows spaced `x_stride` apart (first
+/// `in_dim` of each valid); `y` holds `batch` output rows spaced `y_stride`
+/// apart. Threads chunk the *weight rows*, and each row is dotted with every
+/// batch input while it is cache-hot — the weight matrix streams from DRAM
+/// once per chunk instead of once per token, which is the entire point of
+/// batching prefill.
+#[allow(clippy::too_many_arguments)]
+pub fn par_matmul(
+    pool: &ThreadPool,
+    w: &[f32],
+    xb: &[f32],
+    x_stride: usize,
+    y: &mut [f32],
+    y_stride: usize,
+    col_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    strategy: SimdStrategy,
+) {
+    debug_assert_eq!(w.len(), out_dim * in_dim);
+    debug_assert!(xb.len() >= (batch - 1) * x_stride + in_dim);
+    debug_assert!(y.len() >= (batch - 1) * y_stride + col_off + out_dim);
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    let chunk = out_dim.div_ceil(n);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let row = &w[o * in_dim..(o + 1) * in_dim];
+            for b in 0..batch {
+                let x = &xb[b * x_stride..b * x_stride + in_dim];
+                // SAFETY: strategy comes from SimdStrategy::detect().
+                let dot = match strategy {
+                    SimdStrategy::Avx512 => unsafe { matmul::avx512::dot_f32(row, x) },
+                    SimdStrategy::Avx2 => unsafe { matmul::avx2::dot_f32(row, x) },
+                    SimdStrategy::Scalar => matmul::scalar::dot_f32(row, x),
+                };
+                // SAFETY: (b, col_off + o) cells are disjoint across threads
+                // (each thread owns a row range o) and within bounds per the
+                // debug_assert above.
+                unsafe { *out.0.add(b * y_stride + col_off + o) = dot };
+            }
+        }
+    });
+}
+
+/// Threaded integer-domain matmul: quantized weights × a batch of Q8
+/// activations. Same row-chunk/batch-inner structure as [`par_matmul`];
+/// `acts[b]` must each be quantized for `in_dim` elements.
+#[allow(clippy::too_many_arguments)]
+pub fn par_matmul_qdot(
+    pool: &ThreadPool,
+    fmt: QuantFormat,
+    weights: &[u8],
+    acts: &[QuantizedActivation],
+    y: &mut [f32],
+    y_stride: usize,
+    col_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+    strategy: SimdStrategy,
+) {
+    let batch = acts.len();
+    debug_assert!(batch > 0);
+    debug_assert_eq!(in_dim % fmt.block_numel(), 0);
+    debug_assert!(acts.iter().all(|a| a.len == in_dim));
+    let row_bytes = in_dim / fmt.block_numel() * fmt.block_bytes();
+    debug_assert_eq!(weights.len(), out_dim * row_bytes);
+    debug_assert!(y.len() >= (batch - 1) * y_stride + col_off + out_dim);
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    let chunk = out_dim.div_ceil(n);
+
+    // Long rows stall on stream count: a group of G separate activations
+    // means up to 2G+1 concurrent read streams (quants + scales + weights),
+    // which outruns the core's fill buffers once rows are hundreds of
+    // blocks (the 4864-wide down projection ran at ~9 GMAC/s vs gate/up's
+    // ~50). Packing the group into one block-interleaved panel turns those
+    // into a single sequential stream. The pack itself is a one-pass copy
+    // (~in_dim*8 bytes per group), paid once per matmul and amortized over
+    // out_dim rows.
+    let wide = matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512);
+    if wide && fmt == QuantFormat::Q8_0 && batch >= 8 && in_dim % 32 == 0 {
+        let blocks = in_dim / 32;
+        let ngroups = batch / 8;
+        // Reused pack scratch: a fresh Vec per call means fresh demand-zero
+        // pages from the OS — under memory pressure those faults showed up
+        // as random 25-40ms stalls on individual matmul calls (measured
+        // bimodal: 1.6ms vs 30ms+ for identical layers). thread_local keeps
+        // the capacity across calls; steady-state this allocates nothing.
+        thread_local! {
+            static PACK: std::cell::RefCell<(Vec<u8>, Vec<f32>)> =
+                const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+        }
+        let pack = PACK.with(|p| {
+            let mut p = p.borrow_mut();
+            p.0.resize(ngroups * blocks * 8 * 32, 0);
+            p.1.resize(ngroups * blocks * 8, 0.0);
+            // Move the buffers out so the closure below can borrow them
+            // without holding the RefCell guard across pool.run.
+            (std::mem::take(&mut p.0), std::mem::take(&mut p.1))
+        });
+        let (mut pq, mut ps) = pack;
+        for gi in 0..ngroups {
+            for (g, act) in acts[gi * 8..gi * 8 + 8].iter().enumerate() {
+                for j in 0..blocks {
+                    let dst = ((gi * blocks + j) * 8 + g) * 32;
+                    // SAFETY: reinterpreting i8 as u8 is a no-op; both
+                    // ranges are 32 bytes and in bounds (act quantized for
+                    // in_dim elements, pq sized above).
+                    let src = unsafe {
+                        std::slice::from_raw_parts(act.q.as_ptr().add(j * 32) as *const u8, 32)
+                    };
+                    pq[dst..dst + 32].copy_from_slice(src);
+                    ps[(gi * blocks + j) * 8 + g] = act.scales[j];
+                }
+            }
+        }
+
+        pool.run(&|tid| {
+            let out = &out;
+            let lo = (tid * chunk).min(out_dim);
+            let hi = (lo + chunk).min(out_dim);
+            for o in lo..hi {
+                let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+                for gi in 0..ngroups {
+                    let panel_q = &pq[gi * blocks * 8 * 32..(gi + 1) * blocks * 8 * 32];
+                    let panel_s = &ps[gi * blocks * 8..(gi + 1) * blocks * 8];
+                    let dots = row_dot_q8_packed8(row, panel_q, panel_s);
+                    for (g, dot) in dots.into_iter().enumerate() {
+                        // SAFETY: disjoint (b, col_off + o) cells per
+                        // thread, in bounds per the debug_assert above.
+                        unsafe {
+                            *out.0.add((gi * 8 + g) * y_stride + col_off + o) = dot
+                        };
+                    }
+                }
+                for b in ngroups * 8..batch {
+                    let dot = row_dot_q8(fmt, row, &acts[b], strategy);
+                    // SAFETY: as above.
+                    unsafe { *out.0.add(b * y_stride + col_off + o) = dot };
+                }
+            }
+        });
+        // Return the scratch for the next call.
+        PACK.with(|p| {
+            let mut p = p.borrow_mut();
+            p.0 = pq;
+            p.1 = ps;
+        });
+        return;
+    }
+
+    // Unpacked fallback (non-Q8_0 formats, scalar backend, small batches):
+    // group width capped so the group's activation span stays L1-resident
+    // next to the streaming weight row (halved budget — SMT threads share
+    // each core's L1D).
+    const GROUP_L1_BUDGET: usize = 12 * 1024;
+    let g_max = if 8 * in_dim <= GROUP_L1_BUDGET {
+        8
+    } else if 4 * in_dim <= GROUP_L1_BUDGET {
+        4
+    } else {
+        2
+    };
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+            // Groups share the row's weight-side work (loads, sign prep,
+            // f16 scale conversion) in one kernel call, then singles for
+            // the remainder.
+            let mut b = 0;
+            while g_max >= 8 && b + 8 <= batch {
+                let group: [&QuantizedActivation; 8] = std::array::from_fn(|g| &acts[b + g]);
+                let dots = row_dot_q8_xn::<8>(fmt, row, group, strategy);
+                for (g, dot) in dots.into_iter().enumerate() {
+                    // SAFETY: disjoint (b, col_off + o) cells per thread, in
+                    // bounds per the debug_assert above.
+                    unsafe { *out.0.add((b + g) * y_stride + col_off + o) = dot };
+                }
+                b += 8;
+            }
+            while g_max >= 4 && b + 4 <= batch {
+                let group: [&QuantizedActivation; 4] = std::array::from_fn(|g| &acts[b + g]);
+                let dots = row_dot_q8_xn::<4>(fmt, row, group, strategy);
+                for (g, dot) in dots.into_iter().enumerate() {
+                    // SAFETY: as above.
+                    unsafe { *out.0.add((b + g) * y_stride + col_off + o) = dot };
+                }
+                b += 4;
+            }
+            while b + 2 <= batch {
+                let group: [&QuantizedActivation; 2] = std::array::from_fn(|g| &acts[b + g]);
+                let dots = row_dot_q8_xn::<2>(fmt, row, group, strategy);
+                for (g, dot) in dots.into_iter().enumerate() {
+                    // SAFETY: as above.
+                    unsafe { *out.0.add((b + g) * y_stride + col_off + o) = dot };
+                }
+                b += 2;
+            }
+            while b < batch {
+                let dot = row_dot_q8(fmt, row, &acts[b], strategy);
+                // SAFETY: as above.
+                unsafe { *out.0.add(b * y_stride + col_off + o) = dot };
+                b += 1;
+            }
+        }
+    });
+}
+
+/// Batched fused SwiGLU matmul over row-interleaved gate/up weights:
+/// `y[b][o] = silu(gate[o]·acts[b]) * (up[o]·acts[b])`. The batched analog
+/// of [`par_matvec_swiglu`] — both weight rows of a pair are dotted with
+/// every batch activation while cache-hot.
+#[allow(clippy::too_many_arguments)]
+pub fn par_matmul_swiglu(
+    pool: &ThreadPool,
+    fmt: QuantFormat,
+    packed: &[u8],
+    acts: &[QuantizedActivation],
+    y: &mut [f32],
+    y_stride: usize,
+    out_dim: usize,
+    in_dim: usize,
+    strategy: SimdStrategy,
+) {
+    let batch = acts.len();
+    debug_assert!(batch > 0);
+    debug_assert_eq!(in_dim % fmt.block_numel(), 0);
+    debug_assert!(acts.iter().all(|a| a.len == in_dim));
+    let row_bytes = in_dim / fmt.block_numel() * fmt.block_bytes();
+    debug_assert_eq!(packed.len(), out_dim * 2 * row_bytes);
+    debug_assert!(y.len() >= (batch - 1) * y_stride + out_dim);
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    let chunk = out_dim.div_ceil(n);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let pair = &packed[o * 2 * row_bytes..(o + 1) * 2 * row_bytes];
+            let mut b = 0;
+            while b + 8 <= batch {
+                let group: [&QuantizedActivation; 8] = std::array::from_fn(|g| &acts[b + g]);
+                let gs = row_dot_q8_xn::<8>(fmt, &pair[..row_bytes], group, strategy);
+                let us = row_dot_q8_xn::<8>(fmt, &pair[row_bytes..], group, strategy);
+                for g in 0..8 {
+                    let s = gs[g] / (1.0 + crate::kernels::fast_exp(-gs[g])) * us[g];
+                    // SAFETY: disjoint (b, o) cells per thread, in bounds
+                    // per the debug_assert above.
+                    unsafe { *out.0.add((b + g) * y_stride + o) = s };
+                }
+                b += 8;
+            }
+            if b + 4 <= batch {
+                let group: [&QuantizedActivation; 4] = std::array::from_fn(|g| &acts[b + g]);
+                let gs = row_dot_q8_xn::<4>(fmt, &pair[..row_bytes], group, strategy);
+                let us = row_dot_q8_xn::<4>(fmt, &pair[row_bytes..], group, strategy);
+                for g in 0..4 {
+                    let s = gs[g] / (1.0 + crate::kernels::fast_exp(-gs[g])) * us[g];
+                    // SAFETY: as above.
+                    unsafe { *out.0.add((b + g) * y_stride + o) = s };
+                }
+                b += 4;
+            }
+            while b < batch {
+                let g = row_dot_q8(fmt, &pair[..row_bytes], &acts[b], strategy);
+                let u = row_dot_q8(fmt, &pair[row_bytes..], &acts[b], strategy);
+                let s = g / (1.0 + crate::kernels::fast_exp(-g)) * u;
+                // SAFETY: as above.
+                unsafe { *out.0.add(b * y_stride + o) = s };
+                b += 1;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +735,316 @@ mod tests {
             flag.store(true, Ordering::SeqCst);
         });
         assert!(flag.load(Ordering::SeqCst));
+    }
+
+    /// Synthetic Q8_0 rows: each 34-byte block is a 1.0 f16 scale (0x3C00)
+    /// followed by 32 deterministic int8 quants.
+    fn q8_0_weights(out_dim: usize, in_dim: usize) -> Vec<u8> {
+        let blocks_per_row = in_dim / 32;
+        let mut w = Vec::with_capacity(out_dim * blocks_per_row * 34);
+        for o in 0..out_dim {
+            for j in 0..blocks_per_row {
+                w.extend_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+                for i in 0..32 {
+                    w.push(((o * 7 + j * 3 + i * 11) % 251) as i8 as u8);
+                }
+            }
+        }
+        w
+    }
+
+    fn test_acts(batch: usize, in_dim: usize) -> Vec<QuantizedActivation> {
+        (0..batch)
+            .map(|b| {
+                let x: Vec<f32> = (0..in_dim)
+                    .map(|i| ((b * 13 + i * 5) % 17) as f32 * 0.25 - 2.0)
+                    .collect();
+                let mut a = QuantizedActivation::with_capacity(in_dim);
+                a.quantize(&x);
+                a
+            })
+            .collect()
+    }
+
+    #[test]
+    fn par_matmul_qdot_matches_matvec_per_batch_row() {
+        let (out_dim, in_dim, batch) = (11, 64, 5);
+        let w = q8_0_weights(out_dim, in_dim);
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(4);
+
+        let y_stride = out_dim + 3; // deliberately padded
+        let mut got = vec![f32::NAN; batch * y_stride];
+        par_matmul_qdot(
+            &pool,
+            QuantFormat::Q8_0,
+            &w,
+            &acts,
+            &mut got,
+            y_stride,
+            0,
+            out_dim,
+            in_dim,
+            SimdStrategy::Scalar,
+        );
+
+        for (b, act) in acts.iter().enumerate() {
+            let mut want = vec![0f32; out_dim];
+            par_matvec_qdot(
+                &pool,
+                QuantFormat::Q8_0,
+                &w,
+                act,
+                &mut want,
+                out_dim,
+                in_dim,
+                SimdStrategy::Scalar,
+            );
+            for o in 0..out_dim {
+                let g = got[b * y_stride + o];
+                assert!(
+                    (g - want[o]).abs() < 1e-4,
+                    "b={b} o={o}: got {g}, want {}",
+                    want[o]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn par_matmul_qdot_x4_path_matches_single_dots_on_detected_backend() {
+        // batch 6 = one x4 group + a 2-row remainder; the detected strategy
+        // exercises the wide x4 kernel on AVX2/VNNI machines.
+        let (out_dim, in_dim, batch) = (7, 96, 6);
+        let w = q8_0_weights(out_dim, in_dim);
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(4);
+        let strategy = SimdStrategy::detect();
+
+        let mut got = vec![f32::NAN; batch * out_dim];
+        par_matmul_qdot(
+            &pool,
+            QuantFormat::Q8_0,
+            &w,
+            &acts,
+            &mut got,
+            out_dim,
+            0,
+            out_dim,
+            in_dim,
+            strategy,
+        );
+
+        for (b, act) in acts.iter().enumerate() {
+            for o in 0..out_dim {
+                let row = &w[o * (in_dim / 32 * 34)..(o + 1) * (in_dim / 32 * 34)];
+                let want = row_dot_q8(QuantFormat::Q8_0, row, act, strategy);
+                let g = got[b * out_dim + o];
+                // x4 uses one accumulator chain per activation vs the
+                // single dot's two — tiny f32 ordering differences allowed.
+                let tol = want.abs().max(1.0) * 1e-5;
+                assert!((g - want).abs() < tol, "b={b} o={o}: got {g}, want {want}");
+            }
+        }
+    }
+
+    /// Shape probe, not a test — run explicitly with:
+    /// `cargo test -p glproc --release bench_matmul_shapes -- --ignored --nocapture`
+    /// Rotates through 8 weight copies so weights stream DRAM-cold like a
+    /// real chunk (L3 is 6 MB; one 4.2 MB matrix would go L3-warm).
+    #[test]
+    #[ignore]
+    fn bench_matmul_shapes() {
+        let pool = ThreadPool::new(4);
+        let strategy = SimdStrategy::detect();
+        let batch = 32;
+        for (out_dim, in_dim, name) in
+            [(4864usize, 896usize, "gateup-shape"), (896, 4864, "down-shape")]
+        {
+            let copies: Vec<Vec<u8>> = (0..8).map(|_| q8_0_weights(out_dim, in_dim)).collect();
+            let acts = test_acts(batch, in_dim);
+            let mut y = vec![0f32; batch * out_dim];
+            let run = |w: &[u8], y: &mut [f32]| {
+                par_matmul_qdot(
+                    &pool,
+                    QuantFormat::Q8_0,
+                    w,
+                    &acts,
+                    y,
+                    out_dim,
+                    0,
+                    out_dim,
+                    in_dim,
+                    strategy,
+                );
+            };
+            run(&copies[0], &mut y); // warm code path
+            let iters = 24;
+            let t = std::time::Instant::now();
+            for i in 0..iters {
+                run(&copies[i % copies.len()], &mut y);
+            }
+            let el = t.elapsed().as_secs_f64() / iters as f64;
+            let gmacs = (out_dim * in_dim * batch) as f64 / el / 1e9;
+            eprintln!("{name}: {:.2} ms/call | {gmacs:.1} GMAC/s", el * 1e3);
+        }
+    }
+
+    #[test]
+    fn par_matmul_qdot_packed_panel_matches_single_dots() {
+        // batch 12 = one packed panel of 8 + a 4-row unpacked remainder;
+        // on wide backends this exercises row_dot_q8_packed8.
+        let (out_dim, in_dim, batch) = (9, 128, 12);
+        let w = q8_0_weights(out_dim, in_dim);
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(4);
+        let strategy = SimdStrategy::detect();
+
+        let mut got = vec![f32::NAN; batch * out_dim];
+        par_matmul_qdot(
+            &pool,
+            QuantFormat::Q8_0,
+            &w,
+            &acts,
+            &mut got,
+            out_dim,
+            0,
+            out_dim,
+            in_dim,
+            strategy,
+        );
+
+        for (b, act) in acts.iter().enumerate() {
+            for o in 0..out_dim {
+                let row = &w[o * (in_dim / 32 * 34)..(o + 1) * (in_dim / 32 * 34)];
+                let want = row_dot_q8(QuantFormat::Q8_0, row, act, strategy);
+                let g = got[b * out_dim + o];
+                let tol = want.abs().max(1.0) * 1e-5;
+                assert!((g - want).abs() < tol, "b={b} o={o}: got {g}, want {want}");
+            }
+        }
+    }
+
+    #[test]
+    fn par_matmul_qdot_col_off_places_columns() {
+        let (out_dim, in_dim, batch) = (4, 32, 2);
+        let w = q8_0_weights(out_dim, in_dim);
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(2);
+
+        let y_stride = 10;
+        let col_off = 5;
+        let mut y = vec![f32::NAN; batch * y_stride];
+        par_matmul_qdot(
+            &pool,
+            QuantFormat::Q8_0,
+            &w,
+            &acts,
+            &mut y,
+            y_stride,
+            col_off,
+            out_dim,
+            in_dim,
+            SimdStrategy::Scalar,
+        );
+        for b in 0..batch {
+            // Untouched columns stay NaN; written columns are finite.
+            for c in 0..y_stride {
+                let v = y[b * y_stride + c];
+                if (col_off..col_off + out_dim).contains(&c) {
+                    assert!(v.is_finite(), "b={b} c={c} should be written");
+                } else {
+                    assert!(v.is_nan(), "b={b} c={c} should be untouched");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn par_matmul_swiglu_matches_matvec_per_batch_row() {
+        let (out_dim, in_dim, batch) = (9, 64, 4);
+        let packed = q8_0_weights(out_dim * 2, in_dim); // gate/up interleaved
+        let acts = test_acts(batch, in_dim);
+        let pool = ThreadPool::new(4);
+
+        let mut got = vec![f32::NAN; batch * out_dim];
+        par_matmul_swiglu(
+            &pool,
+            QuantFormat::Q8_0,
+            &packed,
+            &acts,
+            &mut got,
+            out_dim,
+            out_dim,
+            in_dim,
+            SimdStrategy::Scalar,
+        );
+
+        for (b, act) in acts.iter().enumerate() {
+            let mut want = vec![0f32; out_dim];
+            par_matvec_swiglu(
+                &pool,
+                QuantFormat::Q8_0,
+                &packed,
+                act,
+                &mut want,
+                out_dim,
+                in_dim,
+                SimdStrategy::Scalar,
+            );
+            for o in 0..out_dim {
+                let g = got[b * out_dim + o];
+                assert!(
+                    (g - want[o]).abs() < 1e-4,
+                    "b={b} o={o}: got {g}, want {}",
+                    want[o]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn par_matmul_f32_matches_matvec_per_batch_row() {
+        let (out_dim, in_dim, batch) = (13, 24, 3);
+        let w: Vec<f32> = (0..out_dim * in_dim).map(|i| (i % 13) as f32 - 6.0).collect();
+        let xb: Vec<f32> = (0..batch * in_dim)
+            .map(|i| (i % 7) as f32 * 0.5 - 1.0)
+            .collect();
+        let pool = ThreadPool::new(4);
+
+        let mut got = vec![f32::NAN; batch * out_dim];
+        par_matmul(
+            &pool,
+            &w,
+            &xb,
+            in_dim,
+            &mut got,
+            out_dim,
+            0,
+            out_dim,
+            in_dim,
+            batch,
+            SimdStrategy::Scalar,
+        );
+
+        for b in 0..batch {
+            let mut want = vec![0f32; out_dim];
+            par_matvec(
+                &pool,
+                &w,
+                &xb[b * in_dim..(b + 1) * in_dim],
+                &mut want,
+                out_dim,
+                in_dim,
+                SimdStrategy::Scalar,
+            );
+            for o in 0..out_dim {
+                assert!(
+                    (got[b * out_dim + o] - want[o]).abs() < 1e-5,
+                    "b={b} o={o}"
+                );
+            }
+        }
     }
 
     #[test]

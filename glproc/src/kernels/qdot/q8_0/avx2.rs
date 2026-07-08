@@ -49,3 +49,97 @@ pub unsafe fn row_dot(row: &[u8], act: &QuantizedActivation) -> f32 {
     _mm256_storeu_ps(tmp.as_mut_ptr(), _mm256_add_ps(acc[0], acc[1]));
     tmp.iter().sum()
 }
+
+/// One Q8_0 row · `G` Q8 activations at once — the batched-prefill inner
+/// kernel (see the VNNI variant for the rationale): the weight block load,
+/// sign prep and f16 scale conversion are shared across all `G`
+/// activations, and `G` accumulator chains keep the FMA pipe busy.
+///
+/// # Safety
+/// Same CPU-feature contract as [`row_dot`]; every activation must be
+/// quantized for at least `row.len() / 34 * 32` elements.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+pub unsafe fn row_dot_xn<const G: usize>(
+    row: &[u8],
+    acts: [&QuantizedActivation; G],
+) -> [f32; G] {
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); G];
+
+    for (j, block) in row.chunks_exact(34).enumerate() {
+        // SAFETY: prefetch is a hint; past-the-end addresses are harmless.
+        _mm_prefetch::<_MM_HINT_T0>(block.as_ptr().add(544) as *const i8);
+        let d = f16_hw(u16::from_le_bytes([block[0], block[1]]));
+
+        // SAFETY: block has 34 bytes (2 header + 32 quants); each act.q
+        // holds at least (j+1)*32 int8 values per the function contract.
+        let w = _mm256_loadu_si256(block.as_ptr().add(2) as *const __m256i);
+        let w_abs = _mm256_sign_epi8(w, w);
+
+        for g in 0..G {
+            let a = _mm256_loadu_si256(acts[g].q.as_ptr().add(j * 32) as *const __m256i);
+            let a_signed = _mm256_sign_epi8(a, w);
+            let p16 = _mm256_maddubs_epi16(w_abs, a_signed);
+            let p32 = _mm256_madd_epi16(p16, ones);
+            acc[g] = _mm256_fmadd_ps(
+                _mm256_set1_ps(d * acts[g].scales[j]),
+                _mm256_cvtepi32_ps(p32),
+                acc[g],
+            );
+        }
+    }
+
+    let mut out = [0f32; G];
+    let mut tmp = [0f32; 8];
+    for g in 0..G {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc[g]);
+        out[g] = tmp.iter().sum();
+    }
+    out
+}
+
+/// One Q8_0 row · a packed panel of 8 Q8 activations (see the VNNI variant
+/// for the layout and rationale): quants `[block][act][32]`, scales
+/// `[block][act]` — one sequential activation stream.
+///
+/// # Safety
+/// Same CPU-feature contract as [`row_dot`]. `pq` must hold
+/// `row.len() / 34 * 8 * 32` quant bytes and `ps` `row.len() / 34 * 8` scales.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+pub unsafe fn row_dot_packed8(row: &[u8], pq: &[u8], ps: &[f32]) -> [f32; 8] {
+    let ones = _mm256_set1_epi16(1);
+    let mut acc = [_mm256_setzero_ps(); 8];
+
+    for (j, block) in row.chunks_exact(34).enumerate() {
+        // SAFETY: prefetch is a hint; past-the-end addresses are harmless.
+        _mm_prefetch::<_MM_HINT_T0>(block.as_ptr().add(544) as *const i8);
+        let d = f16_hw(u16::from_le_bytes([block[0], block[1]]));
+
+        // SAFETY: block has 34 bytes; pq/ps hold 8 interleaved lanes per
+        // block per the function contract.
+        let w = _mm256_loadu_si256(block.as_ptr().add(2) as *const __m256i);
+        let w_abs = _mm256_sign_epi8(w, w);
+
+        let qbase = j * 8 * 32;
+        let sbase = j * 8;
+        for g in 0..8 {
+            let a = _mm256_loadu_si256(pq.as_ptr().add(qbase + g * 32) as *const __m256i);
+            let a_signed = _mm256_sign_epi8(a, w);
+            let p16 = _mm256_maddubs_epi16(w_abs, a_signed);
+            let p32 = _mm256_madd_epi16(p16, ones);
+            acc[g] = _mm256_fmadd_ps(
+                _mm256_set1_ps(d * *ps.get_unchecked(sbase + g)),
+                _mm256_cvtepi32_ps(p32),
+                acc[g],
+            );
+        }
+    }
+
+    let mut out = [0f32; 8];
+    let mut tmp = [0f32; 8];
+    for g in 0..8 {
+        _mm256_storeu_ps(tmp.as_mut_ptr(), acc[g]);
+        out[g] = tmp.iter().sum();
+    }
+    out
+}

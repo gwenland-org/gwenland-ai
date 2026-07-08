@@ -1,6 +1,37 @@
-MIT License with Commons Clause
+GwenLand
+Copyright (c) 2026 JinXSuper
 
-Copyright (c) 2026 JinXSuper / GwenLand Contributors
+This software is provided under the MIT License, subject to the
+"Commons Clause" License Condition v1.0 stated below.
+
+
+================================================================================
+COMMONS CLAUSE LICENSE CONDITION v1.0
+================================================================================
+
+The Software is provided to you by the Licensor under the License, as defined
+below, subject to the following condition.
+
+Without limiting other conditions in the License, the grant of rights under the
+License will not include, and the License does not grant to you, the right to
+Sell the Software.
+
+For purposes of the foregoing, "Sell" means practicing any or all of the rights
+granted to you under the License to provide to third parties, for a fee or other
+consideration (including without limitation fees for hosting or consulting/
+support services related to the Software), a product or service whose value
+derives, entirely or substantially, from the functionality of the Software. Any
+license notice or attribution required by the License must also include this
+Commons Clause License Condition notice.
+
+Software:  GwenLand
+License:   MIT License (below)
+Licensor:  JinXSuper
+
+
+================================================================================
+MIT LICENSE
+================================================================================
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -20,36 +51,17 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
----
 
-Commons Clause Restriction
+================================================================================
+SUMMARY (not legally binding)
+================================================================================
 
-The Software is provided under the MIT License above, with the following
-additional restriction ("Commons Clause"):
-
-Without limiting other conditions in the License, the grant of rights under
-the License will not include, and the License does not grant to you, the right
-to Sell the Software.
-
-For purposes of the foregoing, "Sell" means practicing any or all of the
-rights granted to you under the License to provide to third parties, for a
-fee or other consideration (including without limitation fees for hosting or
-consulting/support services related to the Software), a product or service
-whose value derives, entirely or substantially, from the functionality of the
-Software.
-
-Any license notice or attribution required by the License must also include
-this Commons Clause License Condition notice.
-
----
-
-Summary (not legally binding):
-
-- Personal use:         Allowed
-- Research use:         Allowed
-- Internal business:    Allowed
-- Modification/forking: Allowed
-- Selling GwenLand as a product or hosted service: NOT allowed without a
-  separate commercial agreement with JinXSuper.
+- Personal use .......................................... Allowed
+- Research / academic use ................................ Allowed
+- Internal business use ................................. Allowed
+- Modification, forking, embedding in other projects .... Allowed
+- Selling GwenLand as a product, or offering it as a
+  commercial hosted service, substantially unchanged .... NOT allowed
+  without a separate commercial agreement with JinXSuper.
 
 For commercial licensing enquiries: jinxsuperdev@gmail.com

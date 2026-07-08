@@ -11,6 +11,9 @@ pub struct SamplerConfig {
     pub top_k: usize,
     /// Nucleus sampling probability mass. `1.0` = disabled.
     pub top_p: f32,
+    /// Repetition penalty on recently generated tokens. `1.0` = disabled;
+    /// `1.1` is a subtle-but-effective default for small models.
+    pub repeat_penalty: f32,
     /// RNG seed; `None` seeds from the system clock.
     pub seed: Option<u64>,
 }
@@ -21,7 +24,28 @@ impl Default for SamplerConfig {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
+            repeat_penalty: 1.1,
             seed: None,
+        }
+    }
+}
+
+/// Apply a repetition penalty to `logits` in place, discouraging the tokens
+/// in `recent_tokens` (per occurrence — a token looping inside the window
+/// is pushed down harder each time it recurs). `penalty > 1.0` shrinks
+/// positive logits and amplifies negative ones; `1.0` is a no-op.
+pub fn apply_repetition_penalty(logits: &mut [f32], recent_tokens: &[u32], penalty: f32) {
+    if penalty == 1.0 {
+        return;
+    }
+    for &token_id in recent_tokens {
+        let idx = token_id as usize;
+        if idx < logits.len() {
+            if logits[idx] > 0.0 {
+                logits[idx] /= penalty;
+            } else {
+                logits[idx] *= penalty;
+            }
         }
     }
 }
@@ -76,6 +100,11 @@ impl Sampler {
             candidates: Vec::new(),
             probs: Vec::new(),
         }
+    }
+
+    /// The configured repetition penalty (`1.0` = disabled).
+    pub fn repeat_penalty(&self) -> f32 {
+        self.config.repeat_penalty
     }
 
     /// Greedy sampling: always pick the argmax logit.
@@ -166,6 +195,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repetition_penalty_shrinks_positive_and_amplifies_negative() {
+        let mut logits = vec![2.0f32, -2.0, 1.0];
+        apply_repetition_penalty(&mut logits, &[0, 1], 2.0);
+        assert_eq!(logits, vec![1.0, -4.0, 1.0]); // untouched token unchanged
+    }
+
+    #[test]
+    fn repetition_penalty_one_is_noop() {
+        let mut logits = vec![2.0f32, -2.0, 1.0];
+        apply_repetition_penalty(&mut logits, &[0, 1, 2], 1.0);
+        assert_eq!(logits, vec![2.0, -2.0, 1.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_compounds_per_occurrence() {
+        // A token looping inside the window is penalized once per recurrence.
+        let mut logits = vec![4.0f32];
+        apply_repetition_penalty(&mut logits, &[0, 0], 2.0);
+        assert_eq!(logits, vec![1.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_ignores_out_of_range_ids() {
+        let mut logits = vec![1.0f32, 1.0];
+        apply_repetition_penalty(&mut logits, &[57], 2.0);
+        assert_eq!(logits, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn repetition_penalty_flips_greedy_choice() {
+        // Token 0 barely wins; penalizing it hands the argmax to token 1.
+        let mut logits = vec![2.0f32, 1.95];
+        apply_repetition_penalty(&mut logits, &[0], 1.1);
+        assert_eq!(Sampler::greedy(&logits), 1);
+    }
+
+    #[test]
     fn greedy_picks_argmax() {
         assert_eq!(Sampler::greedy(&[0.1, 0.9, 0.3]), 1);
         assert_eq!(Sampler::greedy(&[5.0, -1.0, 4.9]), 0);
@@ -177,6 +243,7 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(42),
         });
         for _ in 0..10 {
@@ -190,6 +257,7 @@ mod tests {
             temperature: 1.0,
             top_k: 1,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(7),
         });
         for _ in 0..10 {
@@ -203,6 +271,7 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 1.0,
+            repeat_penalty: 1.0,
             seed: Some(123),
         };
         let logits = [1.0, 2.0, 3.0, 0.5];
@@ -224,6 +293,7 @@ mod tests {
             temperature: 1.0,
             top_k: 0,
             top_p: 0.9,
+            repeat_penalty: 1.0,
             seed: Some(99),
         });
         let mut logits = vec![0.0f32; 100];

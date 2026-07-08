@@ -107,7 +107,7 @@ impl QuantizedActivation {
 /// Detected once — this is AVX512VL+VNNI encoding-wise, but it is a 256-bit
 /// datapath running at the AVX2 frequency license, so the X5 AVX-512
 /// thermal ban does not apply (explicitly approved for use).
-fn has_vnni_256() -> bool {
+pub fn has_vnni_256() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         #[cfg(target_arch = "x86_64")]
@@ -161,4 +161,50 @@ pub fn row_dot_q8(
 /// True if `fmt` has an integer-domain kernel.
 pub fn supports(fmt: crate::kernels::bridge::QuantFormat) -> bool {
     !matches!(fmt, crate::kernels::bridge::QuantFormat::Q4K)
+}
+
+/// One Q8_0 row · a packed panel of 8 activations (quants `[block][act][32]`,
+/// scales `[block][act]`). Caller must have checked `fmt == Q8_0` and a wide
+/// strategy — this only dispatches between the VNNI and AVX2 kernels.
+///
+/// # Safety-relevant contract
+/// `strategy` must be a wide backend from `SimdStrategy::detect()`.
+pub fn row_dot_q8_packed8(row: &[u8], pq: &[u8], ps: &[f32]) -> [f32; 8] {
+    // SAFETY: only called on wide backends (AVX2+FMA+F16C present); the
+    // VNNI branch additionally checks vnni_256.
+    unsafe {
+        if has_vnni_256() {
+            q8_0::vnni::row_dot_packed8(row, pq, ps)
+        } else {
+            q8_0::avx2::row_dot_packed8(row, pq, ps)
+        }
+    }
+}
+
+/// One quantized weight row · `G` Q8 activations — the batched-prefill
+/// fast path. Q8_0 on a wide backend shares the weight-side work across
+/// the group; every other format/backend combination falls back to single
+/// dots (correct, just unamortized). `G` must stay ≤ 8 so the wide kernels'
+/// accumulators fit the 16 ymm registers.
+pub fn row_dot_q8_xn<const G: usize>(
+    fmt: crate::kernels::bridge::QuantFormat,
+    row: &[u8],
+    acts: [&QuantizedActivation; G],
+    strategy: SimdStrategy,
+) -> [f32; G] {
+    use crate::kernels::bridge::QuantFormat;
+    if matches!(fmt, QuantFormat::Q8_0)
+        && matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512)
+    {
+        // SAFETY: strategy comes from SimdStrategy::detect(), so AVX2/FMA/
+        // F16C are present; the VNNI branch additionally checks vnni_256.
+        unsafe {
+            return if has_vnni_256() {
+                q8_0::vnni::row_dot_xn::<G>(row, acts)
+            } else {
+                q8_0::avx2::row_dot_xn::<G>(row, acts)
+            };
+        }
+    }
+    std::array::from_fn(|g| row_dot_q8(fmt, row, acts[g], strategy))
 }

@@ -15,6 +15,8 @@ pub struct InferInput {
     pub top_k: usize,
     /// Top-p (nucleus) cutoff. `1.0` = disabled.
     pub top_p: f32,
+    /// Repetition penalty on recently generated tokens. `1.0` = disabled.
+    pub repeat_penalty: f32,
 }
 
 impl Default for InferInput {
@@ -25,6 +27,7 @@ impl Default for InferInput {
             temperature: 0.8,
             top_k: 40,
             top_p: 0.95,
+            repeat_penalty: 1.1,
         }
     }
 }
@@ -40,6 +43,14 @@ pub struct InferOutput {
     pub tokens_generated: usize,
     /// Wall-clock generation time in milliseconds.
     pub elapsed_ms: u64,
+    /// Number of prompt tokens processed during prefill.
+    pub prompt_tokens: usize,
+    /// Wall-clock prefill (prompt processing) time in milliseconds.
+    pub prefill_ms: f64,
+    /// Wall-clock decode-loop time in milliseconds. Report tok/s against
+    /// this, not `elapsed_ms` — blending prefill into the rate hides the
+    /// real generation speed.
+    pub generation_ms: f64,
 }
 
 /// Static metadata about an engine.
@@ -68,18 +79,19 @@ pub trait GlEngine: Send + Sync {
     /// Run synchronous inference.
     fn infer(&self, input: InferInput) -> Result<InferOutput, GlError>;
 
-    /// Stream tokens via callback — the default implementation wraps
-    /// [`GlEngine::infer`] and replays tokens after the fact.
+    /// Stream tokens via callback, returning the same stats as
+    /// [`GlEngine::infer`] — the default implementation wraps `infer` and
+    /// replays tokens after the fact.
     fn stream(
         &self,
         input: InferInput,
         on_token: &(dyn Fn(u32, &str) + Send),
-    ) -> Result<(), GlError> {
+    ) -> Result<InferOutput, GlError> {
         let out = self.infer(input)?;
         for (id, ch) in out.token_ids.iter().zip(out.text.chars()) {
             on_token(*id, &ch.to_string());
         }
-        Ok(())
+        Ok(out)
     }
 
     /// Graceful shutdown (free GPU memory, close handles).

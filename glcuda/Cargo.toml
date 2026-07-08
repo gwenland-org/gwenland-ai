@@ -1,9 +1,9 @@
 [package]
 name = "glcuda"
-version = "0.1.0"
+version = "0.1.48"
 edition = "2021"
 description = "GwenLand AI NVIDIA CUDA engine (stub — implemented in M2+)"
-license-file = "../LICENSE.txt"
+license-file = "../LICENSE"
 
 [dependencies]
 glcore = { path = "../glcore" }

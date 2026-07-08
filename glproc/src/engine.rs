@@ -54,6 +54,7 @@ impl GlprocEngine {
             temperature: input.temperature,
             top_k: input.top_k,
             top_p: input.top_p,
+            repeat_penalty: input.repeat_penalty,
             seed: self.config.seed,
         })
     }
@@ -75,11 +76,11 @@ impl GlprocEngine {
         let started = Instant::now();
         let mut text = String::new();
 
-        let token_ids = runner.generate(
+        let (token_ids, timing) = runner.generate(
             &input.token_ids,
             input.max_new_tokens,
             &mut sampler,
-            tokenizer.eos_id(),
+            |id| tokenizer.is_stop_token(id),
             |id| {
                 let piece = tokenizer.decode_token_text(id);
                 if let Some(cb) = on_token.as_deref_mut() {
@@ -95,7 +96,46 @@ impl GlprocEngine {
             text,
             tokens_generated,
             elapsed_ms: started.elapsed().as_millis() as u64,
+            prompt_tokens: timing.prompt_tokens,
+            prefill_ms: timing.prefill.as_secs_f64() * 1e3,
+            generation_ms: timing.decode.as_secs_f64() * 1e3,
         })
+    }
+}
+
+/// One startup line naming the SIMD strategy and the kernel path each hot
+/// weight class will take — a scalar fallback in the FFN would silently eat
+/// the whole token budget, so make the dispatch visible.
+fn log_simd_paths(model: &GlprocModel) {
+    use crate::model::{GateUp, WeightMatrix};
+    let strategy = crate::simd_strategy::SimdStrategy::detect();
+    let vnni = crate::kernels::qdot::has_vnni_256();
+    let path = |w: &WeightMatrix| match w {
+        WeightMatrix::F32(_) => "f32 dense".to_string(),
+        WeightMatrix::Quant(fmt, _) if crate::kernels::qdot::supports(*fmt) => {
+            format!("{fmt:?} integer-dot")
+        }
+        WeightMatrix::Quant(fmt, _) => format!("{fmt:?} f32-bridge"),
+    };
+    let (ffn_gateup, ffn_down) = model
+        .layers
+        .first()
+        .map(|l| {
+            let gu = match &l.gate_up {
+                GateUp::FusedQuant(fmt, _) => format!("{fmt:?} fused-swiglu integer-dot"),
+                GateUp::Split(g, _) => path(g),
+            };
+            (gu, path(&l.w_down))
+        })
+        .unwrap_or_else(|| ("?".into(), "?".into()));
+    eprintln!(
+        "[simd] strategy: {strategy:?}{} | ffn gate/up: {ffn_gateup} | \
+         ffn down: {ffn_down} | lm_head: {}",
+        if vnni { "+vnni256" } else { "" },
+        path(&model.output),
+    );
+    if strategy == crate::simd_strategy::SimdStrategy::Scalar {
+        eprintln!("[simd] WARNING: scalar fallback — AVX2 not active, expect ~10x slowdown");
     }
 }
 
@@ -130,11 +170,21 @@ impl GlEngine for GlprocEngine {
             });
         }
 
+        let t_parse = Instant::now();
         self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
+        let parse_s = t_parse.elapsed().as_secs_f64();
+        let t_weights = Instant::now();
         let model = load_gguf(&gguf)?;
+        let weights_s = t_weights.elapsed().as_secs_f64();
         // X5 step 1: fault every weight page in and pin it before the first
         // token, so no decode ever stalls on a page fault or swap-in.
+        let t_pin = Instant::now();
         crate::loader::warm_and_lock_model(&model);
+        eprintln!(
+            "[load] tokenizer {parse_s:.2}s | weights {weights_s:.2}s | pin {:.2}s",
+            t_pin.elapsed().as_secs_f64(),
+        );
+        log_simd_paths(&model);
         self.model = Some(model);
         Ok(())
     }
@@ -147,10 +197,9 @@ impl GlEngine for GlprocEngine {
         &self,
         input: InferInput,
         on_token: &(dyn Fn(u32, &str) + Send),
-    ) -> Result<(), GlError> {
+    ) -> Result<InferOutput, GlError> {
         let mut forward = |id: u32, piece: &str| on_token(id, piece);
-        self.run(&input, Some(&mut forward))?;
-        Ok(())
+        self.run(&input, Some(&mut forward))
     }
 
     fn shutdown(&mut self) {

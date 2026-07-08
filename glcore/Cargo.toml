@@ -1,9 +1,9 @@
 [package]
 name = "glcore"
-version = "0.1.0"
+version = "0.1.48"
 edition = "2021"
 description = "GwenLand AI core: shared types, traits, format parsers, tokenizer"
-license-file = "../LICENSE.txt"
+license-file = "../LICENSE"
 
 [dependencies]
 thiserror = "1"
