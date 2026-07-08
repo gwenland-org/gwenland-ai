@@ -105,13 +105,16 @@ mod render_snapshot {
 
     #[test]
     fn welcome_screen() {
+        // Use a realistic terminal height so the full card (banner + all device
+        // rows) fits without vertical clipping.
         let mut app = App::new(PaneId::Chat);
-        let buf = render(&mut app, 80, 24);
+        let buf = render(&mut app, 90, 40);
         dump("Welcome (Chat)", &buf);
         let text = buf_text(&buf);
-        // ASCII-art logo is gone; plain title present.
-        assert!(text.contains("GwenLand"));
-        assert!(!text.contains("____"), "ASCII art must be removed");
+        // ANSI Shadow banner present (wide enough for the banner path);
+        // the old haunted-mansion "____" logo stays gone.
+        assert!(text.contains('█'), "ANSI Shadow banner block char");
+        assert!(!text.contains("____"), "old ASCII logo must stay removed");
         assert!(text.contains("Local AI. Your machine."));
         // Rounded box corner rendered.
         assert!(text.contains('╭') || text.contains('╮'), "rounded card border");
@@ -120,6 +123,17 @@ mod render_snapshot {
         assert!(text.contains("RAM"), "device: RAM row");
         assert!(text.contains("GB free"), "device: RAM value");
         assert!(text.contains("Arch"), "device: Arch row");
+    }
+
+    #[test]
+    fn welcome_screen_narrow_falls_back_to_plain_title() {
+        // Too narrow for the 71-col banner → plain bold "GwenLand".
+        let mut app = App::new(PaneId::Chat);
+        let buf = render(&mut app, 60, 30);
+        dump("Welcome (Chat, narrow)", &buf);
+        let text = buf_text(&buf);
+        assert!(!text.contains('█'), "banner suppressed when too narrow");
+        assert!(text.contains("GwenLand"), "plain title fallback present");
     }
 
     #[test]

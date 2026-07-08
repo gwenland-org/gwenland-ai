@@ -11,6 +11,18 @@ use crate::ui::theme;
 use super::{Pane, PaneAction};
 use crate::ui::slash_popup::{SlashPopup, SlashAction};
 
+/// "GwenLand" rendered in the ANSI Shadow figlet font (as used by the Claude
+/// Code CLI banner). Six rows, each exactly 71 display columns wide.
+const GWENLAND_BANNER: &str = r#" ██████╗ ██╗    ██╗███████╗███╗   ██╗██╗      █████╗ ███╗   ██╗██████╗
+██╔════╝ ██║    ██║██╔════╝████╗  ██║██║     ██╔══██╗████╗  ██║██╔══██╗
+██║  ███╗██║ █╗ ██║█████╗  ██╔██╗ ██║██║     ███████║██╔██╗ ██║██║  ██║
+██║   ██║██║███╗██║██╔══╝  ██║╚██╗██║██║     ██╔══██║██║╚██╗██║██║  ██║
+╚██████╔╝╚███╔███╔╝███████╗██║ ╚████║███████╗██║  ██║██║ ╚████║██████╔╝
+ ╚═════╝  ╚══╝╚══╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝ "#;
+
+/// Display width of the banner in columns (all rows are padded to this).
+const BANNER_WIDTH: u16 = 71;
+
 /// Truncate a string to `max` characters, appending an ellipsis if cut.
 fn truncate(s: &str, max: usize) -> String {
     let count = s.chars().count();
@@ -128,10 +140,16 @@ impl<'a> Pane for ChatPane<'a> {
         f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
         if self.history.is_empty() {
-             // Card = header (title + subtitle) + separator + device rows + hint.
-             // Height grows with the number of device rows detected.
+             // The ANSI Shadow banner needs 71 cols + borders + padding. Use it
+             // when the pane is wide enough, otherwise fall back to plain text.
+             let banner_card_width = BANNER_WIDTH + 2 /*borders*/ + 2 /*padding*/;
+             let use_banner = chunks[0].width >= banner_card_width;
+
+             // Title occupies 6 rows for the banner, 2 rows for plain text.
+             let title_rows: u16 = if use_banner { 6 } else { 2 };
              let device_rows = self.device_info.len() as u16;
-             let box_height: u16 = 4 + 1 + device_rows + 2; // header(3)+pad+sep+rows+pad+hint
+             // top-pad + title + subtitle + pad + sep + device rows + pad + hint
+             let box_height: u16 = 1 + title_rows + 1 + 1 + 1 + device_rows + 1 + 1;
              let v = Layout::default()
                  .direction(Direction::Vertical)
                  .constraints([
@@ -141,8 +159,8 @@ impl<'a> Pane for ChatPane<'a> {
                  ])
                  .split(chunks[0]);
 
-             // Horizontally center the card at a fixed comfortable width.
-             let box_width: u16 = 52;
+             // Horizontally center the card. Widen it to hug the banner.
+             let box_width: u16 = if use_banner { banner_card_width } else { 52 };
              let h = Layout::default()
                  .direction(Direction::Horizontal)
                  .constraints([
@@ -157,23 +175,41 @@ impl<'a> Pane for ChatPane<'a> {
                  .border_type(BorderType::Rounded)
                  .border_style(Style::default().fg(theme::BORDER))
                  .style(Style::default().bg(theme::BG))
-                 .padding(ratatui::widgets::Padding::horizontal(2));
+                 .padding(ratatui::widgets::Padding::horizontal(1));
              let inner = card.inner(h[1]);
              f.render_widget(card, h[1]);
 
-             let mut text = vec![
-                 Line::from(""),
-                 Line::from(Span::styled(
-                     "GwenLand",
-                     Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
-                 ))
-                 .alignment(Alignment::Center),
+             let mut text: Vec<Line> = vec![Line::from("")];
+
+             if use_banner {
+                 // Each banner row, padded to the full width and accent-colored.
+                 for row in GWENLAND_BANNER.lines() {
+                     let pad = (BANNER_WIDTH as usize).saturating_sub(row.chars().count());
+                     text.push(
+                         Line::from(Span::styled(
+                             format!("{}{}", row, " ".repeat(pad)),
+                             Style::default().fg(theme::ACCENT),
+                         ))
+                         .alignment(Alignment::Center),
+                     );
+                 }
+             } else {
+                 text.push(
+                     Line::from(Span::styled(
+                         "GwenLand",
+                         Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                     ))
+                     .alignment(Alignment::Center),
+                 );
+             }
+
+             text.push(
                  Line::from(Span::styled(
                      "Local AI. Your machine.",
                      Style::default().fg(theme::TEXT_SECONDARY),
                  ))
                  .alignment(Alignment::Center),
-             ];
+             );
 
              // Separator rule between the header and the device block.
              let rule_w = inner.width as usize;
