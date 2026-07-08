@@ -19,7 +19,8 @@ impl RootLayout {
             ])
             .split(size);
         
+        let active = app.active_pane;
         app.active_pane_mut().draw(f, chunks[0]);
-        ShortcutBar::draw(f, chunks[1]);
+        ShortcutBar::draw(f, chunks[1], active);
     }
 }

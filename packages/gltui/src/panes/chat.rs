@@ -1,7 +1,8 @@
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::Style,
-    widgets::{Block, Borders, Paragraph},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Paragraph},
     Frame,
 };
 use crossterm::event::{KeyEvent, MouseEvent};
@@ -18,14 +19,22 @@ pub struct ChatPane<'a> {
 
 impl<'a> ChatPane<'a> {
     pub fn new() -> Self {
-        let mut textarea = TextArea::default();
-        textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-        textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+        let textarea = Self::styled_textarea();
         Self {
             textarea,
             history: Vec::new(),
             popup: SlashPopup::new(),
         }
+    }
+
+    /// A fresh composer textarea styled for the input box (placeholder + colors).
+    fn styled_textarea() -> TextArea<'a> {
+        let mut textarea = TextArea::default();
+        textarea.set_style(Style::default().bg(theme::INPUT_BG).fg(theme::TEXT));
+        textarea.set_cursor_line_style(Style::default().bg(theme::INPUT_BG));
+        textarea.set_placeholder_text("Type a message or / for commands");
+        textarea.set_placeholder_style(Style::default().fg(theme::TEXT_DIM).bg(theme::INPUT_BG));
+        textarea
     }
 }
 
@@ -46,38 +55,58 @@ impl<'a> Pane for ChatPane<'a> {
         f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
         if self.history.is_empty() {
-             let welcome_layout = Layout::default()
+             // Vertically center a compact welcome card in the history area.
+             let box_height: u16 = 8;
+             let v = Layout::default()
                  .direction(Direction::Vertical)
                  .constraints([
                      Constraint::Min(0),
-                     Constraint::Length(12),
+                     Constraint::Length(box_height),
                      Constraint::Min(0),
                  ])
                  .split(chunks[0]);
-                 
-             let logo = r#"   ____                     __                  __ 
-  / ___|__      _____ _ __  \ \   __ _ _ __   __| |
- | |  _ \ \ /\ / / _ \ '_ \  | | / _` | '_ \ / _` |
- | |_| | \ V  V /  __/ | | | | || (_| | | | | (_| |
-  \____|  \_/\_/ \___|_| |_| |___\__,_|_| |_|\__,_|"#;
 
-             let mut text = vec![];
-             for line in logo.lines() {
-                 if !line.is_empty() {
-                     text.push(ratatui::text::Line::from(ratatui::text::Span::styled(line, Style::default().fg(theme::PRIMARY).add_modifier(ratatui::style::Modifier::BOLD))));
-                 }
-             }
-             text.push(ratatui::text::Line::from(""));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Welcome to GwenLand Core", Style::default().fg(theme::TEXT).add_modifier(ratatui::style::Modifier::BOLD))));
-             text.push(ratatui::text::Line::from(""));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Type / for commands", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+T to Train Models", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+F to Fetch Models", Style::default().fg(theme::MUTED))));
-             text.push(ratatui::text::Line::from(ratatui::text::Span::styled("Ctrl+E to manage Engines", Style::default().fg(theme::MUTED))));
+             // Horizontally center the card at a fixed comfortable width.
+             let box_width: u16 = 44;
+             let h = Layout::default()
+                 .direction(Direction::Horizontal)
+                 .constraints([
+                     Constraint::Min(0),
+                     Constraint::Length(box_width),
+                     Constraint::Min(0),
+                 ])
+                 .split(v[1]);
+
+             let card = Block::default()
+                 .borders(Borders::ALL)
+                 .border_type(BorderType::Rounded)
+                 .border_style(Style::default().fg(theme::BORDER))
+                 .style(Style::default().bg(theme::BG));
+             let inner = card.inner(h[1]);
+             f.render_widget(card, h[1]);
+
+             let text = vec![
+                 Line::from(""),
+                 Line::from(Span::styled(
+                     "GwenLand",
+                     Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
+                 )),
+                 Line::from(Span::styled(
+                     "Local AI. Your machine.",
+                     Style::default().fg(theme::TEXT_SECONDARY),
+                 )),
+                 Line::from(""),
+                 Line::from(vec![
+                     Span::styled("/ ", Style::default().fg(theme::ACCENT)),
+                     Span::styled("commands    ", Style::default().fg(theme::TEXT_DIM)),
+                     Span::styled("ctrl+c ", Style::default().fg(theme::ACCENT)),
+                     Span::styled("chat", Style::default().fg(theme::TEXT_DIM)),
+                 ]),
+             ];
 
              f.render_widget(
-                 Paragraph::new(text).alignment(ratatui::layout::Alignment::Center),
-                 welcome_layout[1]
+                 Paragraph::new(text).alignment(Alignment::Center),
+                 inner,
              );
         } else {
             let history_text = self.history.join("\n\n");
@@ -92,52 +121,50 @@ impl<'a> Pane for ChatPane<'a> {
                 Constraint::Percentage(100),
             ])
             .split(chunks[2]);
-        
+
+        // Input is "focused" whenever the slash popup is not capturing keys.
+        let input_focused = !self.popup.active;
+        let border_color = if input_focused { theme::BORDER_ACTIVE } else { theme::BORDER };
+
         let input_block = Block::default()
-            .padding(ratatui::widgets::Padding::symmetric(2, 1))
-            .style(Style::default().bg(theme::SURFACE));
-            
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color))
+            .padding(ratatui::widgets::Padding::horizontal(1))
+            .style(Style::default().bg(theme::INPUT_BG));
+
         let inner_area = input_block.inner(composer_layout[0]);
         f.render_widget(input_block, composer_layout[0]);
-        
+
         let prompt_chunk = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(2), Constraint::Min(0)])
             .split(inner_area);
-            
-        f.render_widget(Paragraph::new("> ").style(Style::default().fg(theme::CYAN).bg(theme::SURFACE)), prompt_chunk[0]);
+
+        f.render_widget(Paragraph::new("> ").style(Style::default().fg(theme::ACCENT).bg(theme::INPUT_BG)), prompt_chunk[0]);
         f.render_widget(&self.textarea, prompt_chunk[1]);
         
-        let status_row_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(100),
-            ])
-            .split(chunks[3]);
-            
-        let status_layout = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(status_row_layout[0]);
-            
-        let left_status = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("enter ", Style::default().fg(theme::TEXT)),
-            ratatui::text::Span::styled("send", Style::default().fg(theme::MUTED)),
+        // Subtle single hint below the composer. Branding/version now lives in
+        // the global status bar, so this row stays quiet.
+        let hint = Line::from(vec![
+            Span::styled("enter ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("send   ", Style::default().fg(theme::TEXT_DIM)),
+            Span::styled("esc ", Style::default().fg(theme::TEXT_SECONDARY)),
+            Span::styled("close", Style::default().fg(theme::TEXT_DIM)),
         ]);
-        f.render_widget(Paragraph::new(left_status), status_layout[0]);
-        
-        let right_status = ratatui::text::Line::from(vec![
-            ratatui::text::Span::styled("GwenLand ", Style::default().fg(theme::MUTED)),
-            ratatui::text::Span::styled("Core 1.0", Style::default().fg(theme::TEXT)),
-        ]);
-        f.render_widget(Paragraph::new(right_status).alignment(ratatui::layout::Alignment::Right), status_layout[1]);
+        f.render_widget(Paragraph::new(hint), chunks[3]);
 
         if self.popup.active {
-            let popup_height = 12;
+            // Float the popup just above the composer, clamped so it never runs
+            // off the top of the pane.
+            let composer = composer_layout[0];
+            let want = self.popup.desired_height();
+            let available = composer.y.saturating_sub(area.y);
+            let popup_height = want.min(available).max(3);
             let popup_area = Rect {
-                x: composer_layout[0].x,
-                y: composer_layout[0].y.saturating_sub(popup_height),
-                width: composer_layout[0].width,
+                x: composer.x,
+                y: composer.y.saturating_sub(popup_height),
+                width: composer.width,
                 height: popup_height,
             };
             self.popup.draw(f, popup_area);
@@ -151,24 +178,18 @@ impl<'a> Pane for ChatPane<'a> {
             match action {
                 SlashAction::Close => {
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::None;
                 }
                 SlashAction::SwitchPane(p) => {
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::SwitchPane(p);
                 }
                 SlashAction::ClearHistory => {
                     self.history.clear();
                     self.popup.close();
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                     return PaneAction::None;
                 }
                 SlashAction::Handled => {
@@ -193,9 +214,7 @@ impl<'a> Pane for ChatPane<'a> {
                 let text = self.textarea.lines().join("\n");
                 if !text.is_empty() {
                     self.history.push(format!("User: {}\n\nModel: ...", text));
-                    self.textarea = TextArea::default();
-                    self.textarea.set_style(Style::default().bg(theme::SURFACE).fg(theme::TEXT));
-                    self.textarea.set_cursor_line_style(Style::default().bg(theme::SURFACE));
+                    self.textarea = Self::styled_textarea();
                 }
                 PaneAction::None
             }
