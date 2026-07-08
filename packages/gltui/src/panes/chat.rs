@@ -11,10 +11,24 @@ use crate::ui::theme;
 use super::{Pane, PaneAction};
 use crate::ui::slash_popup::{SlashPopup, SlashAction};
 
+/// Truncate a string to `max` characters, appending an ellipsis if cut.
+fn truncate(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        s.to_string()
+    } else {
+        let keep = max.saturating_sub(1);
+        format!("{}…", s.chars().take(keep).collect::<String>())
+    }
+}
+
 pub struct ChatPane<'a> {
     textarea: TextArea<'a>,
     history: Vec<String>,
     popup: SlashPopup<'a>,
+    /// Device summary rows (label, value) shown on the welcome card. Detected
+    /// once at construction so GPU/RAM probing never runs on the render path.
+    device_info: Vec<(String, String)>,
 }
 
 impl<'a> ChatPane<'a> {
@@ -24,7 +38,66 @@ impl<'a> ChatPane<'a> {
             textarea,
             history: Vec::new(),
             popup: SlashPopup::new(),
+            device_info: Self::detect_device_info(),
         }
+    }
+
+    /// Probe host hardware via gwenland-core and format it into compact
+    /// label/value rows for the welcome card. Runs once at startup.
+    fn detect_device_info() -> Vec<(String, String)> {
+        use gwenland_core::platform::hardware::{self, Arch, GpuType};
+
+        let p = hardware::profile();
+
+        let arch = match p.arch {
+            Arch::X86_64 => "x86_64",
+            Arch::Aarch64 => "aarch64",
+            Arch::Unknown => std::env::consts::ARCH,
+        };
+
+        // CPU brand can be long ("11th Gen Intel(R) Core(TM) i3-1115G4 @ ...");
+        // strip vendor noise and the clock suffix so the row fits the card.
+        let cpu = {
+            let brand = p.cpu_brand.trim();
+            let short = brand.split('@').next().unwrap_or(brand);
+            let short = short
+                .replace("(R)", "")
+                .replace("(TM)", "")
+                .replace("CPU", "");
+            let short = short.split_whitespace().collect::<Vec<_>>().join(" ");
+            format!("{}  ·  {} cores", truncate(&short, 26), p.cpu_count)
+        };
+
+        let mut rows = vec![
+            ("CPU".to_string(), cpu),
+            (
+                "RAM".to_string(),
+                format!(
+                    "{:.1} / {:.1} GB free",
+                    p.available_ram_gb, p.total_ram_gb
+                ),
+            ),
+            ("Arch".to_string(), format!("{}  ·  {}", arch, std::env::consts::OS)),
+        ];
+
+        // Prefer a dedicated GPU, else the first detected adapter.
+        let gpu = p
+            .gpus
+            .iter()
+            .find(|g| g.gpu_type == GpuType::Dedicated)
+            .or_else(|| p.gpus.first());
+        if let Some(g) = gpu {
+            let kind = match g.gpu_type {
+                GpuType::Dedicated => "dedicated",
+                GpuType::Integrated => "integrated",
+                GpuType::Unknown => "gpu",
+            };
+            let gpu_name = g.name.replace("(R)", "").replace("(TM)", "");
+            let gpu_name = gpu_name.split_whitespace().collect::<Vec<_>>().join(" ");
+            rows.push(("GPU".to_string(), format!("{}  ·  {}", truncate(&gpu_name, 26), kind)));
+        }
+
+        rows
     }
 
     /// A fresh composer textarea styled for the input box (placeholder + colors).
@@ -55,8 +128,10 @@ impl<'a> Pane for ChatPane<'a> {
         f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
 
         if self.history.is_empty() {
-             // Vertically center a compact welcome card in the history area.
-             let box_height: u16 = 8;
+             // Card = header (title + subtitle) + separator + device rows + hint.
+             // Height grows with the number of device rows detected.
+             let device_rows = self.device_info.len() as u16;
+             let box_height: u16 = 4 + 1 + device_rows + 2; // header(3)+pad+sep+rows+pad+hint
              let v = Layout::default()
                  .direction(Direction::Vertical)
                  .constraints([
@@ -67,7 +142,7 @@ impl<'a> Pane for ChatPane<'a> {
                  .split(chunks[0]);
 
              // Horizontally center the card at a fixed comfortable width.
-             let box_width: u16 = 44;
+             let box_width: u16 = 52;
              let h = Layout::default()
                  .direction(Direction::Horizontal)
                  .constraints([
@@ -81,33 +156,65 @@ impl<'a> Pane for ChatPane<'a> {
                  .borders(Borders::ALL)
                  .border_type(BorderType::Rounded)
                  .border_style(Style::default().fg(theme::BORDER))
-                 .style(Style::default().bg(theme::BG));
+                 .style(Style::default().bg(theme::BG))
+                 .padding(ratatui::widgets::Padding::horizontal(2));
              let inner = card.inner(h[1]);
              f.render_widget(card, h[1]);
 
-             let text = vec![
+             let mut text = vec![
                  Line::from(""),
                  Line::from(Span::styled(
                      "GwenLand",
                      Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD),
-                 )),
+                 ))
+                 .alignment(Alignment::Center),
                  Line::from(Span::styled(
                      "Local AI. Your machine.",
                      Style::default().fg(theme::TEXT_SECONDARY),
+                 ))
+                 .alignment(Alignment::Center),
+             ];
+
+             // Separator rule between the header and the device block.
+             let rule_w = inner.width as usize;
+             text.push(
+                 Line::from(Span::styled(
+                     "─".repeat(rule_w),
+                     Style::default().fg(theme::BORDER),
                  )),
-                 Line::from(""),
+             );
+
+             // Device rows: dim label on the left, value on the right, padded so
+             // values line up in a column.
+             let label_w = self
+                 .device_info
+                 .iter()
+                 .map(|(l, _)| l.chars().count())
+                 .max()
+                 .unwrap_or(0);
+             for (label, value) in &self.device_info {
+                 let pad = label_w.saturating_sub(label.chars().count());
+                 text.push(Line::from(vec![
+                     Span::styled(
+                         format!("{}{}  ", label, " ".repeat(pad)),
+                         Style::default().fg(theme::TEXT_DIM),
+                     ),
+                     Span::styled(value.clone(), Style::default().fg(theme::TEXT_SECONDARY)),
+                 ]));
+             }
+
+             text.push(Line::from(""));
+             text.push(
                  Line::from(vec![
                      Span::styled("/ ", Style::default().fg(theme::ACCENT)),
                      Span::styled("commands    ", Style::default().fg(theme::TEXT_DIM)),
                      Span::styled("ctrl+c ", Style::default().fg(theme::ACCENT)),
                      Span::styled("chat", Style::default().fg(theme::TEXT_DIM)),
-                 ]),
-             ];
-
-             f.render_widget(
-                 Paragraph::new(text).alignment(Alignment::Center),
-                 inner,
+                 ])
+                 .alignment(Alignment::Center),
              );
+
+             f.render_widget(Paragraph::new(text), inner);
         } else {
             let history_text = self.history.join("\n\n");
             let history_widget = Paragraph::new(history_text)

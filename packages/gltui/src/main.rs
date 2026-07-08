@@ -115,6 +115,11 @@ mod render_snapshot {
         assert!(text.contains("Local AI. Your machine."));
         // Rounded box corner rendered.
         assert!(text.contains('╭') || text.contains('╮'), "rounded card border");
+        // Device info block present.
+        assert!(text.contains("CPU"), "device: CPU row");
+        assert!(text.contains("RAM"), "device: RAM row");
+        assert!(text.contains("GB free"), "device: RAM value");
+        assert!(text.contains("Arch"), "device: Arch row");
     }
 
     #[test]
