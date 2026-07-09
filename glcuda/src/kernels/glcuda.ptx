@@ -821,6 +821,242 @@ SOA_DONE:
 }
 
 // ---------------------------------------------------------------------------
+// gl_gemm_q8_0_soa: batched GEMM Y[ntok, out] = X[ntok, in] @ W[out, in]^T,
+// Q8_0 SoA weights + int8 activations. For PREFILL: the weight row is streamed
+// ONCE and reused across a tile of T=4 tokens (4x fewer weight streams than
+// looping the GEMV per token). One warp per output row; each warp walks all
+// token tiles. Requires in_dim % 128 == 0 (n_blocks % 4 == 0 - holds for every
+// real model dim) so there is no block tail. Tokens are padded to a multiple
+// of 4 by the caller (extra rows read safely, their outputs are not written).
+//   p_wqs [out,in] int8, p_wsc [out,nb] f16, p_xqs [ntok_pad,in] int8,
+//   p_xsc [ntok_pad,nb] f32, p_y [ntok,out] f32.
+// Launch: grid ceil(out/(ntid/32)) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemm_q8_0_soa(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in,
+    .param .u32 p_ntok
+)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %h<3>;
+    .reg .b32 %r<48>;
+    .reg .f32 %f<40>;
+    .reg .b64 %rd<48>;
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    ld.param.u32 %r40, [p_ntok];
+
+    mov.u32 %r3, %tid.x;
+    shr.u32 %r4, %r3, 5;
+    and.b32 %r5, %r3, 31;                // lane
+    mov.u32 %r6, %ntid.x;
+    shr.u32 %r7, %r6, 5;
+    mov.u32 %r8, %ctaid.x;
+    mad.lo.s32 %r9, %r8, %r7, %r4;       // output row
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra GEMM_DONE;
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd5, %rd5;
+
+    shr.u32 %r10, %r2, 5;                // n_blocks
+    shr.u32 %r11, %r10, 2;              // n_groups (in % 128 == 0)
+
+    mul.wide.u32 %rd10, %r9, %r2;        // wqs row base
+    add.s64 %rd10, %rd6, %rd10;
+    mul.wide.u32 %rd11, %r9, %r10;       // wsc row base
+    shl.b64 %rd11, %rd11, 1;
+    add.s64 %rd11, %rd7, %rd11;
+    shl.b32 %r12, %r5, 2;                // lane * 4
+    cvt.u64.u32 %rd12, %r12;
+    shr.u32 %r13, %r5, 3;                // lane / 8 (block in group)
+    cvt.u64.u32 %rd13, %r13;
+    shl.b64 %rd14, %rd13, 1;             // (lane/8) * 2  (wsc)
+    shl.b64 %rd15, %rd13, 2;             // (lane/8) * 4  (xsc)
+
+    mov.u32 %r14, 0;                     // t0 (token tile base)
+
+GEMM_TILE:
+    setp.ge.u32 %p2, %r14, %r40;
+    @%p2 bra GEMM_DONE;
+
+    add.s64 %rd20, %rd10, %rd12;         // wqs lane ptr (reset per tile)
+    add.s64 %rd21, %rd11, %rd14;         // wsc lane ptr
+
+    add.s32 %r15, %r14, 0;               // slot 0 x ptrs
+    mul.wide.u32 %rd22, %r15, %r2;
+    add.s64 %rd22, %rd8, %rd22;
+    add.s64 %rd22, %rd22, %rd12;
+    mul.wide.u32 %rd23, %r15, %r10;
+    shl.b64 %rd23, %rd23, 2;
+    add.s64 %rd23, %rd9, %rd23;
+    add.s64 %rd23, %rd23, %rd15;
+    add.s32 %r15, %r14, 1;               // slot 1
+    mul.wide.u32 %rd24, %r15, %r2;
+    add.s64 %rd24, %rd8, %rd24;
+    add.s64 %rd24, %rd24, %rd12;
+    mul.wide.u32 %rd25, %r15, %r10;
+    shl.b64 %rd25, %rd25, 2;
+    add.s64 %rd25, %rd9, %rd25;
+    add.s64 %rd25, %rd25, %rd15;
+    add.s32 %r15, %r14, 2;               // slot 2
+    mul.wide.u32 %rd26, %r15, %r2;
+    add.s64 %rd26, %rd8, %rd26;
+    add.s64 %rd26, %rd26, %rd12;
+    mul.wide.u32 %rd27, %r15, %r10;
+    shl.b64 %rd27, %rd27, 2;
+    add.s64 %rd27, %rd9, %rd27;
+    add.s64 %rd27, %rd27, %rd15;
+    add.s32 %r15, %r14, 3;               // slot 3
+    mul.wide.u32 %rd28, %r15, %r2;
+    add.s64 %rd28, %rd8, %rd28;
+    add.s64 %rd28, %rd28, %rd12;
+    mul.wide.u32 %rd29, %r15, %r10;
+    shl.b64 %rd29, %rd29, 2;
+    add.s64 %rd29, %rd9, %rd29;
+    add.s64 %rd29, %rd29, %rd15;
+
+    mov.f32 %f10, 0f00000000;
+    mov.f32 %f11, 0f00000000;
+    mov.f32 %f12, 0f00000000;
+    mov.f32 %f13, 0f00000000;
+    mov.u32 %r16, 0;
+
+GEMM_WLOOP:
+    setp.ge.u32 %p3, %r16, %r11;
+    @%p3 bra GEMM_WRITE;
+
+    ld.global.u32 %r17, [%rd20];         // weight qs (once, reused x4)
+    ld.global.u16 %h1, [%rd21];          // weight scale (once)
+    cvt.f32.f16 %f3, %h1;
+
+    ld.global.u32 %r18, [%rd22];
+    dp4a.s32.s32 %r19, %r17, %r18, 0;
+    cvt.rn.f32.s32 %f2, %r19;
+    ld.global.f32 %f4, [%rd23];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f10, %f2, %f5, %f10;
+
+    ld.global.u32 %r18, [%rd24];
+    dp4a.s32.s32 %r19, %r17, %r18, 0;
+    cvt.rn.f32.s32 %f2, %r19;
+    ld.global.f32 %f4, [%rd25];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f11, %f2, %f5, %f11;
+
+    ld.global.u32 %r18, [%rd26];
+    dp4a.s32.s32 %r19, %r17, %r18, 0;
+    cvt.rn.f32.s32 %f2, %r19;
+    ld.global.f32 %f4, [%rd27];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f12, %f2, %f5, %f12;
+
+    ld.global.u32 %r18, [%rd28];
+    dp4a.s32.s32 %r19, %r17, %r18, 0;
+    cvt.rn.f32.s32 %f2, %r19;
+    ld.global.f32 %f4, [%rd29];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f13, %f2, %f5, %f13;
+
+    add.s64 %rd20, %rd20, 128;
+    add.s64 %rd21, %rd21, 8;
+    add.s64 %rd22, %rd22, 128;
+    add.s64 %rd23, %rd23, 16;
+    add.s64 %rd24, %rd24, 128;
+    add.s64 %rd25, %rd25, 16;
+    add.s64 %rd26, %rd26, 128;
+    add.s64 %rd27, %rd27, 16;
+    add.s64 %rd28, %rd28, 128;
+    add.s64 %rd29, %rd29, 16;
+    add.s32 %r16, %r16, 1;
+    bra GEMM_WLOOP;
+
+GEMM_WRITE:
+    mov.b32 %r20, %f10;
+    shfl.sync.down.b32 %r21, %r20, 16, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f10, %f10, %f6; mov.b32 %r20, %f10;
+    shfl.sync.down.b32 %r21, %r20, 8, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f10, %f10, %f6; mov.b32 %r20, %f10;
+    shfl.sync.down.b32 %r21, %r20, 4, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f10, %f10, %f6; mov.b32 %r20, %f10;
+    shfl.sync.down.b32 %r21, %r20, 2, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f10, %f10, %f6; mov.b32 %r20, %f10;
+    shfl.sync.down.b32 %r21, %r20, 1, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f10, %f10, %f6;
+
+    mov.b32 %r20, %f11;
+    shfl.sync.down.b32 %r21, %r20, 16, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f11, %f11, %f6; mov.b32 %r20, %f11;
+    shfl.sync.down.b32 %r21, %r20, 8, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f11, %f11, %f6; mov.b32 %r20, %f11;
+    shfl.sync.down.b32 %r21, %r20, 4, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f11, %f11, %f6; mov.b32 %r20, %f11;
+    shfl.sync.down.b32 %r21, %r20, 2, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f11, %f11, %f6; mov.b32 %r20, %f11;
+    shfl.sync.down.b32 %r21, %r20, 1, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f11, %f11, %f6;
+
+    mov.b32 %r20, %f12;
+    shfl.sync.down.b32 %r21, %r20, 16, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f12, %f12, %f6; mov.b32 %r20, %f12;
+    shfl.sync.down.b32 %r21, %r20, 8, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f12, %f12, %f6; mov.b32 %r20, %f12;
+    shfl.sync.down.b32 %r21, %r20, 4, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f12, %f12, %f6; mov.b32 %r20, %f12;
+    shfl.sync.down.b32 %r21, %r20, 2, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f12, %f12, %f6; mov.b32 %r20, %f12;
+    shfl.sync.down.b32 %r21, %r20, 1, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f12, %f12, %f6;
+
+    mov.b32 %r20, %f13;
+    shfl.sync.down.b32 %r21, %r20, 16, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f13, %f13, %f6; mov.b32 %r20, %f13;
+    shfl.sync.down.b32 %r21, %r20, 8, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f13, %f13, %f6; mov.b32 %r20, %f13;
+    shfl.sync.down.b32 %r21, %r20, 4, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f13, %f13, %f6; mov.b32 %r20, %f13;
+    shfl.sync.down.b32 %r21, %r20, 2, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f13, %f13, %f6; mov.b32 %r20, %f13;
+    shfl.sync.down.b32 %r21, %r20, 1, 31, 0xffffffff; mov.b32 %f6, %r21; add.f32 %f13, %f13, %f6;
+
+    setp.ne.u32 %p4, %r5, 0;             // only lane 0 writes
+    @%p4 bra GEMM_ADV;
+
+    add.s32 %r22, %r14, 0;               // slot 0: always in range
+    mad.lo.s32 %r23, %r22, %r1, %r9;
+    mul.wide.u32 %rd30, %r23, 4;
+    add.s64 %rd30, %rd5, %rd30;
+    st.global.f32 [%rd30], %f10;
+
+    add.s32 %r22, %r14, 1;
+    setp.ge.u32 %p5, %r22, %r40;
+    @%p5 bra GEMM_ADV;
+    mad.lo.s32 %r23, %r22, %r1, %r9;
+    mul.wide.u32 %rd30, %r23, 4;
+    add.s64 %rd30, %rd5, %rd30;
+    st.global.f32 [%rd30], %f11;
+
+    add.s32 %r22, %r14, 2;
+    setp.ge.u32 %p6, %r22, %r40;
+    @%p6 bra GEMM_ADV;
+    mad.lo.s32 %r23, %r22, %r1, %r9;
+    mul.wide.u32 %rd30, %r23, 4;
+    add.s64 %rd30, %rd5, %rd30;
+    st.global.f32 [%rd30], %f12;
+
+    add.s32 %r22, %r14, 3;
+    setp.ge.u32 %p7, %r22, %r40;
+    @%p7 bra GEMM_ADV;
+    mad.lo.s32 %r23, %r22, %r1, %r9;
+    mul.wide.u32 %rd30, %r23, 4;
+    add.s64 %rd30, %rd5, %rd30;
+    st.global.f32 [%rd30], %f13;
+
+GEMM_ADV:
+    add.s32 %r14, %r14, 4;
+    bra GEMM_TILE;
+
+GEMM_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
 // gl_gemv_t_f32: y[c] = sum_r x[r] * A[r*cols + c]  (A column access).
 // The attention weighted-V sum: A = V cache [rows, cols], x = softmaxed
 // scores, y = head output. One thread per column, sequential over rows -

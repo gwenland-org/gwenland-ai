@@ -227,6 +227,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2e. Batched GEMM (gl_gemm_q8_0_soa) — the prefill path. Validates vs a
+    //     CPU reference and times it against looping the SoA GEMV once per
+    //     token (what sequential prefill does today). The GEMM streams each
+    //     weight row once per 4-token tile, so it should be markedly faster.
+    // ============================================================
+    {
+        let scale_bits: [u16; 4] = [0x3C00, 0x3800, 0x3E00, 0x3400];
+        let scale_vals: [f32; 4] = [1.0, 0.5, 1.5, 0.25];
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let mark = buf.mark();
+        let ntok = 32usize; // multiple of 4
+        let (out_dim, in_dim) = (2 * hidden, dim); // gate/up shape
+        let nb = in_dim / 32;
+
+        let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+        let wsc_bits: Vec<u16> = (0..out_dim * nb).map(|i| scale_bits[i % 4]).collect();
+        let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
+        let xsc: Vec<f32> = (0..ntok * nb).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
+
+        let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+        let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+        let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
+        let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
+        let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let wsc_u8 =
+            unsafe { std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2) };
+        cuda.htod(d_wqs, as_u8(&wqs))?;
+        cuda.htod(d_wsc, wsc_u8)?;
+        cuda.htod(d_xqs, as_u8(&xqs))?;
+        cuda.htod_f32(d_xsc, &xsc)?;
+
+        k.gemm_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
+        cuda.synchronize()?;
+        let mut y_host = vec![0f32; ntok * out_dim];
+        cuda.dtoh_f32(&mut y_host, d_y)?;
+
+        let mut max_rel = 0f32;
+        for t in 0..ntok {
+            for r in 0..out_dim {
+                let mut acc = 0f32;
+                for b in 0..nb {
+                    let mut dot = 0i32;
+                    for j in 0..32 {
+                        dot += wqs[r * in_dim + b * 32 + j] as i32 * xqs[t * in_dim + b * 32 + j] as i32;
+                    }
+                    acc += dot as f32 * (scale_vals[(r * nb + b) % 4] * xsc[t * nb + b]);
+                }
+                let g = y_host[t * out_dim + r];
+                max_rel = max_rel.max((acc - g).abs() / acc.abs().max(1.0));
+            }
+        }
+
+        let iters = 50;
+        let t = Instant::now();
+        for _ in 0..iters {
+            k.gemm_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
+        }
+        cuda.synchronize()?;
+        let gemm = t.elapsed().as_secs_f64() / iters as f64;
+        // baseline: N sequential GEMVs (one weight stream per token).
+        let t = Instant::now();
+        for _ in 0..iters {
+            for tk in 0..ntok {
+                let xq = d_xqs + (tk * in_dim) as u64;
+                let xs = d_xsc + (tk * nb * 4) as u64;
+                let yy = d_y + (tk * out_dim * 4) as u64;
+                k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, xq, xs, yy, out_dim as u32, in_dim as u32)?;
+            }
+        }
+        cuda.synchronize()?;
+        let looped = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "\n[gemm gate ] {ntok}x{out_dim}x{in_dim}  batched {:.0} us | {ntok}x-gemv {:.0} us | speedup {:.2}x | max_rel_err {:.1e}",
+            gemm * 1e6,
+            looped * 1e6,
+            looped / gemm,
+            max_rel,
+        );
+        buf.reset_to(mark);
+    }
+
+    // ============================================================
     // 2c. The dp4a QUANTIZE TAX. Every Q8_0 matmul first quantizes its input
     //     activation (quantize_q8) — an extra kernel the dp4a path added that
     //     did not exist before. Per decode token there are ~4/layer (qkv,

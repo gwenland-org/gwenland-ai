@@ -36,6 +36,7 @@ pub struct KernelSet {
     f_quantize_q8: Kernel,
     f_gemv_q8_0: Kernel,
     f_gemv_q8_0_soa: Kernel,
+    f_gemm_q8_0_soa: Kernel,
     f_gemv_q4_0: Kernel,
     f_gemv_t: Kernel,
     f_rms_norm: Kernel,
@@ -56,6 +57,7 @@ impl KernelSet {
             f_quantize_q8: module.get_function("gl_quantize_q8")?,
             f_gemv_q8_0: module.get_function("gl_gemv_q8_0")?,
             f_gemv_q8_0_soa: module.get_function("gl_gemv_q8_0_soa")?,
+            f_gemm_q8_0_soa: module.get_function("gl_gemm_q8_0_soa")?,
             f_gemv_q4_0: module.get_function("gl_gemv_q4_0")?,
             f_gemv_t: module.get_function("gl_gemv_t_f32")?,
             f_rms_norm: module.get_function("gl_rms_norm_f32")?,
@@ -240,6 +242,41 @@ impl KernelSet {
         ];
         // 256 threads = 8 warps = 8 rows/block.
         cuda.launch(self.f_gemv_q8_0_soa, (ceil_div(out_dim, 8), 1, 1), (256, 1, 1), 0, &mut params)
+    }
+
+    /// Batched GEMM `Y[ntok, out] = X[ntok, in] @ W[out, in]^T` for Q8_0 SoA
+    /// weights + int8 activations — the prefill path. The weight row is streamed
+    /// once and reused across a tile of 4 tokens. `in_dim % 128 == 0` is
+    /// required; `ntok` is the real token count but `x_qs`/`x_scales` must be
+    /// allocated for `ntok` rounded up to a multiple of 4 (extra rows are read
+    /// but never written).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_q8_0_soa(
+        &self,
+        cuda: &Cuda,
+        w_qs: CUdeviceptr,
+        w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(in_dim % 128, 0, "gemm_q8_0_soa requires in_dim % 128 == 0");
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) = (w_qs, w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_gemm_q8_0_soa, (ceil_div(out_dim, 8), 1, 1), (256, 1, 1), 0, &mut params)
     }
 
     /// Dynamically quantize `x` into `qs` and `scales`.
@@ -433,6 +470,7 @@ mod tests {
             "gl_gemv_f32",
             "gl_gemv_q8_0",
             "gl_gemv_q8_0_soa",
+            "gl_gemm_q8_0_soa",
             "gl_gemv_t_f32",
             "gl_rms_norm_f32",
             "gl_softmax_scale_f32",
