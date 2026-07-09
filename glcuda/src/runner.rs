@@ -326,16 +326,33 @@ impl GpuModel {
         let mut recent: std::collections::VecDeque<u32> =
             std::collections::VecDeque::with_capacity(REPEAT_WINDOW);
         let mut pos = prompt.len();
+        // Opt-in split timing: GLCUDA_PROFILE_DECODE=1 attributes each token's
+        // wall time to GPU (waiting on the in-flight decode graph) vs HOST
+        // (logits DtoH + repetition penalty + CPU sample over the full vocab).
+        // The GPU is idle during the host portion, so a large host share means
+        // GPU-side kernel work is NOT the decode bottleneck.
+        let profile = std::env::var_os("GLCUDA_PROFILE_DECODE").is_some();
+        let (mut t_gpu, mut t_host) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         for _ in 0..max_new_tokens {
             if pos >= max_seq {
                 break;
             }
+            // Attribute the wait on the previous token's graph to the GPU.
+            if profile {
+                let g = Instant::now();
+                cuda.synchronize()?;
+                t_gpu += g.elapsed();
+            }
+            let h = Instant::now();
             let penalty = sampler.repeat_penalty();
             let next = {
                 let logits = self.logits_host(cuda)?;
                 apply_repetition_penalty(logits, recent.make_contiguous(), penalty);
                 sampler.sample(logits)
             };
+            if profile {
+                t_host += h.elapsed();
+            }
             if is_stop(next) {
                 break;
             }
@@ -348,6 +365,16 @@ impl GpuModel {
             // Decode via the captured graph (one launch replaces ~600).
             self.decode_step(cuda, k, next, pos)?;
             pos += 1;
+        }
+        if profile {
+            let n = generated.len().max(1) as f64;
+            eprintln!(
+                "[decode split] {} tokens | GPU {:.2} ms/tok | HOST {:.2} ms/tok | host share {:.0}%",
+                generated.len(),
+                t_gpu.as_secs_f64() * 1e3 / n,
+                t_host.as_secs_f64() * 1e3 / n,
+                100.0 * t_host.as_secs_f64() / (t_gpu.as_secs_f64() + t_host.as_secs_f64()).max(1e-9),
+            );
         }
         Ok((
             generated,
