@@ -277,6 +277,12 @@ mod tests {
         assert!(PTX.contains(".version 7.0"));
         assert!(PTX.contains(".target sm_70"));
         assert!(!PTX.contains('\0'), "NUL would truncate cuModuleLoadData");
+        // ptxas rejects any non-ASCII byte with a fatal "Unexpected non-ASCII
+        // character" before it parses a single instruction — a stray em-dash
+        // in a comment kills the whole module. Catch it here, not on the GPU.
+        if let Some(line) = PTX.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            panic!("PTX line {} contains non-ASCII: {:?}", line.0 + 1, line.1);
+        }
     }
 
     #[test]

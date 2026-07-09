@@ -1,8 +1,8 @@
 //
-// glcuda.ptx — hand-authored SIMT kernels for the GwenLand CUDA engine.
+// glcuda.ptx - hand-authored SIMT kernels for the GwenLand CUDA engine.
 //
-// ArchGLML_X2 §16: SIMT-first, warp-shuffle reductions, FP32 accumulation
-// everywhere. Hand-written PTX (no nvcc in the toolchain — ADR-004's
+// ArchGLML_X2 section 16: SIMT-first, warp-shuffle reductions, FP32 accumulation
+// everywhere. Hand-written PTX (no nvcc in the toolchain - ADR-004's
 // "PTX embedded in binary" option); the driver JIT-compiles this for the
 // actual device at module load.
 //
@@ -101,7 +101,7 @@ SILU_DONE:
 
 // ---------------------------------------------------------------------------
 // gl_rope_f32: rotate dimension pairs of every head in x [n_heads*head_dim].
-// cos/sin are host-computed tables [head_dim/2] for the current position —
+// cos/sin are host-computed tables [head_dim/2] for the current position -
 // the host owns transcendental precision (RoPE epsilon is 1e-7; device
 // sin.approx cannot honor that, exact host tables + mul/sub can).
 // neox = 0: pair (2i, 2i+1);  neox = 1: pair (i, i + half).
@@ -162,7 +162,7 @@ ROPE_IDX_DONE:
     add.s64 %rd13, %rd4, %rd12;
     ld.global.f32 %f3, [%rd11];         // x0
     ld.global.f32 %f4, [%rd13];         // x1
-    // Same operation order as glproc's rope: mul, mul, sub / mul, mul, add —
+    // Same operation order as glproc's rope: mul, mul, sub / mul, mul, add -
     // bit-identical rounding given identical cos/sin inputs.
     mul.f32 %f5, %f3, %f1;
     mul.f32 %f6, %f4, %f2;
@@ -178,9 +178,9 @@ ROPE_DONE:
 
 // ---------------------------------------------------------------------------
 // gl_gemv_f32: y = W @ x, W row-major [out_dim, in_dim] (decode GEMV).
-// One warp per output row (§16 kernel inventory): lane l accumulates
+// One warp per output row (section 16 kernel inventory): lane l accumulates
 // k = l, l+32, ... (coalesced across the row), then a warp-shuffle tree
-// reduces — deterministic order for a fixed warp size, FP32 accumulation.
+// reduces - deterministic order for a fixed warp size, FP32 accumulation.
 // Launch: grid (out_dim) x 32 threads.
 // ---------------------------------------------------------------------------
 .visible .entry gl_gemv_f32(
@@ -260,8 +260,8 @@ GEMV_DONE:
 
 // ---------------------------------------------------------------------------
 // gl_gemv_q8_0: y = W @ x with W in GGML Q8_0 blocks (34 B: f16 scale d +
-// 32 signed bytes; weight = d * q). Weights stay quantized in VRAM — the
-// 4x traffic saving is the whole point — and are dequantized in registers.
+// 32 signed bytes; weight = d * q). Weights stay quantized in VRAM - the
+// 4x traffic saving is the whole point - and are dequantized in registers.
 // One warp per row; lane l owns element l of every block, so per block:
 // acc += (d * q[l]) * x[b*32 + l], FP32 accumulation throughout, then the
 // same warp-shuffle tree as gl_gemv_f32. in_dim must be a multiple of 32.
@@ -312,7 +312,7 @@ GEMVQ8_LOOP:
     ld.global.s8 %r8, [%rd12];          // q, sign-extended
     cvt.rn.f32.s32 %f3, %r8;
     ld.global.f32 %f4, [%rd10];         // x
-    mul.rn.f32 %f5, %f2, %f3;           // d * q — dequantized weight
+    mul.rn.f32 %f5, %f2, %f3;           // d * q - dequantized weight
     fma.rn.f32 %f1, %f5, %f4, %f1;
     add.s32 %r7, %r7, 1;
     add.s64 %rd8, %rd8, 34;
@@ -320,7 +320,7 @@ GEMVQ8_LOOP:
     add.s64 %rd10, %rd10, 128;
     bra GEMVQ8_LOOP;
 GEMVQ8_REDUCE:
-    // Reinterpret f32 → .b32 for shfl, back to f32 for the add (%r9/%r10).
+    // Reinterpret f32 -> .b32 for shfl, back to f32 for the add (%r9/%r10).
     mov.b32 %r9, %f1;
     shfl.sync.down.b32 %r10, %r9, 16, 31, 0xffffffff;
     mov.b32 %f6, %r10;
@@ -353,7 +353,7 @@ GEMVQ8_DONE:
 // ---------------------------------------------------------------------------
 // gl_gemv_t_f32: y[c] = sum_r x[r] * A[r*cols + c]  (A column access).
 // The attention weighted-V sum: A = V cache [rows, cols], x = softmaxed
-// scores, y = head output. One thread per column, sequential over rows —
+// scores, y = head output. One thread per column, sequential over rows -
 // same accumulation order as glproc's scalar loop; consecutive threads
 // read consecutive addresses (coalesced).
 // Launch: grid ceil(cols/256) x 256 threads.
@@ -396,7 +396,7 @@ GEMVT_LOOP:
     @%p2 bra GEMVT_STORE;
     ld.global.f32 %f2, [%rd8];
     ld.global.f32 %f3, [%rd9];
-    // mul then add (not fma) — matches glproc's `out[d] += w * v_row[d]`
+    // mul then add (not fma) - matches glproc's `out[d] += w * v_row[d]`
     // rounding exactly, given the identical sequential order over r.
     mul.rn.f32 %f4, %f3, %f2;
     add.f32 %f1, %f1, %f4;
@@ -413,7 +413,7 @@ GEMVT_DONE:
 
 // ---------------------------------------------------------------------------
 // gl_rms_norm_f32: out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i].
-// One block per position (§16): strided per-thread sum of squares, warp
+// One block per position (section 16): strided per-thread sum of squares, warp
 // shuffle tree, cross-warp partials through shared memory, thread 0
 // finishes with IEEE sqrt + reciprocal (rsqrt.approx would burn the
 // 1e-6 epsilon), broadcast via shared memory.
@@ -464,7 +464,7 @@ RMS_ACC:
     add.s64 %rd8, %rd8, %rd9;
     bra RMS_ACC;
 RMS_WARP_RED:
-    // f32 → .b32 for shfl, back to f32 for the add (%r16/%r17).
+    // f32 -> .b32 for shfl, back to f32 for the add (%r16/%r17).
     mov.b32 %r16, %f2;
     shfl.sync.down.b32 %r17, %r16, 16, 31, 0xffffffff;
     mov.b32 %f4, %r17;
@@ -588,7 +588,7 @@ SF_MAX_LOOP:
     add.s64 %rd6, %rd6, %rd3;
     bra SF_MAX_LOOP;
 SF_MAX_RED:
-    // f32 → .b32 for shfl, back to f32 for the max (%r18/%r19).
+    // f32 -> .b32 for shfl, back to f32 for the max (%r18/%r19).
     mov.b32 %r18, %f2;
     shfl.sync.down.b32 %r19, %r18, 16, 31, 0xffffffff;
     mov.b32 %f4, %r19;
@@ -668,7 +668,7 @@ SF_EXP_LOOP:
     add.s64 %rd8, %rd8, %rd3;
     bra SF_EXP_LOOP;
 SF_SUM_RED:
-    // f32 → .b32 for shfl, back to f32 for the add (%r18/%r19).
+    // f32 -> .b32 for shfl, back to f32 for the add (%r18/%r19).
     mov.b32 %r18, %f10;
     shfl.sync.down.b32 %r19, %r18, 16, 31, 0xffffffff;
     mov.b32 %f4, %r19;
