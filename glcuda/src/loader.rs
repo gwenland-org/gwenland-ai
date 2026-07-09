@@ -66,6 +66,37 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
     Ok(HostMat { w, out_dim, in_dim })
 }
 
+/// Fuse the FFN gate and up projections into one `[2*hidden, dim]` matrix
+/// (gate rows then up rows) so the decode FFN is one GEMV instead of two —
+/// the input is streamed once and one launch replaces two. Gate and up in a
+/// GGUF always share a dtype, so the fast path stacks them directly; the
+/// defensive fallback re-loads both as dense f32 (always stackable).
+fn fuse_gate_up(
+    gate: HostMat,
+    up: HostMat,
+    gguf: &GgufFile,
+    layer: usize,
+) -> Result<HostMat, GlError> {
+    if gate.stackable(&up) {
+        return Ok(gate.stack_rows(up));
+    }
+    // Mismatched representations (shouldn't happen for a real gate/up pair):
+    // reload both as dense f32 and stack.
+    let g = dequant_any(
+        gguf,
+        gguf.find_tensor(&format!("blk.{layer}.ffn_gate.weight"))
+            .ok_or_else(|| GlError::Parse(format!("GGUF: missing blk.{layer}.ffn_gate.weight")))?,
+    )?;
+    let u = dequant_any(
+        gguf,
+        gguf.find_tensor(&format!("blk.{layer}.ffn_up.weight"))
+            .ok_or_else(|| GlError::Parse(format!("GGUF: missing blk.{layer}.ffn_up.weight")))?,
+    )?;
+    let gm = HostMat { w: HostWeight::F32(g), out_dim: gate.out_dim, in_dim: gate.in_dim };
+    let um = HostMat { w: HostWeight::F32(u), out_dim: up.out_dim, in_dim: up.in_dim };
+    Ok(gm.stack_rows(um))
+}
+
 /// Parse config and stage every weight of a GGUF transformer for upload.
 /// Supports the same llama-family architectures as glproc (standard
 /// `blk.N.*` tensor naming).
@@ -136,8 +167,12 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
             q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
             k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
             ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
-            w_gate: weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-            w_up: weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+            w_gate_up: fuse_gate_up(
+                weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
+                weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+                gguf,
+                i,
+            )?,
             w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
         });
     }

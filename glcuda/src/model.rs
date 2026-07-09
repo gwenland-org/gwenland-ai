@@ -90,6 +90,43 @@ pub struct HostMat {
     pub in_dim: usize,
 }
 
+impl HostMat {
+    /// Vertically stack `self` on top of `other` into one matrix whose rows
+    /// are `self`'s rows followed by `other`'s. Both must share `in_dim` and
+    /// weight representation. Used to fuse the FFN gate and up projections
+    /// into a single `[2*hidden, dim]` weight so one GEMV streams the input
+    /// once and one launch replaces two — the FFN is ~60% of a decode token.
+    pub(crate) fn stack_rows(self, other: HostMat) -> HostMat {
+        debug_assert_eq!(self.in_dim, other.in_dim);
+        let w = match (self.w, other.w) {
+            (HostWeight::F32(mut a), HostWeight::F32(b)) => {
+                a.extend_from_slice(&b);
+                HostWeight::F32(a)
+            }
+            (HostWeight::Q8_0(mut a), HostWeight::Q8_0(b)) => {
+                // Rows are whole Q8_0 blocks; concatenation stacks them.
+                a.extend_from_slice(&b);
+                HostWeight::Q8_0(a)
+            }
+            // Mixed representations shouldn't happen for a matched gate/up
+            // pair, but if they do, the caller must keep them separate.
+            _ => panic!("stack_rows: mismatched weight representations"),
+        };
+        HostMat { w, out_dim: self.out_dim + other.out_dim, in_dim: self.in_dim }
+    }
+
+    /// True when `self` and `other` can be [`stack_rows`]-fused (same input
+    /// width and same representation).
+    pub(crate) fn stackable(&self, other: &HostMat) -> bool {
+        self.in_dim == other.in_dim
+            && matches!(
+                (&self.w, &other.w),
+                (HostWeight::F32(_), HostWeight::F32(_))
+                    | (HostWeight::Q8_0(_), HostWeight::Q8_0(_))
+            )
+    }
+}
+
 /// Host-staged weights of one transformer block (glproc's `LayerWeights`
 /// without the CPU-specific fusion — the GPU engine dispatches per matrix).
 pub struct HostLayer {
@@ -115,10 +152,10 @@ pub struct HostLayer {
     pub k_norm: Option<Vec<f32>>,
     /// Pre-FFN RMSNorm gain, `[dim]`.
     pub ffn_norm: Vec<f32>,
-    /// SwiGLU gate projection, `[hidden_dim, dim]`.
-    pub w_gate: HostMat,
-    /// SwiGLU up projection, `[hidden_dim, dim]`.
-    pub w_up: HostMat,
+    /// Fused SwiGLU gate+up projection, `[2*hidden_dim, dim]` — gate rows
+    /// `[0, hidden)` then up rows `[hidden, 2*hidden)`. One GEMV computes
+    /// both, streaming the input once (FFN is ~60% of a decode token).
+    pub w_gate_up: HostMat,
     /// Down projection, `[dim, hidden_dim]`.
     pub w_down: HostMat,
 }
@@ -187,8 +224,8 @@ pub struct GpuLayer {
     pub(crate) q_norm: Option<DevSlice>,
     pub(crate) k_norm: Option<DevSlice>,
     pub(crate) ffn_norm: DevSlice,
-    pub(crate) w_gate: GpuMat,
-    pub(crate) w_up: GpuMat,
+    /// Fused gate+up, `[2*hidden, dim]` (gate rows then up rows).
+    pub(crate) w_gate_up: GpuMat,
     pub(crate) w_down: GpuMat,
 }
 
@@ -206,10 +243,10 @@ pub(crate) struct Workspace {
     pub attn_out: DevSlice,
     /// Projection back to the residual, `[dim]`.
     pub proj: DevSlice,
-    /// SwiGLU gate, `[hidden_dim]`.
-    pub gate: DevSlice,
-    /// SwiGLU up, `[hidden_dim]`.
-    pub up: DevSlice,
+    /// Fused SwiGLU gate+up output, `[2*hidden_dim]` — the one GEMV over the
+    /// fused gate+up weight writes gate into `[0, hidden)` and up into
+    /// `[hidden, 2*hidden)`; `silu_mul` then folds them into the first half.
+    pub gate_up: DevSlice,
     /// Output logits, `[vocab_size]`.
     pub logits: DevSlice,
     /// Host-precomputed RoPE cos table for every position,
@@ -266,7 +303,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     let mut total = 0u64;
     for l in &host.layers {
         total += f32s(l.attn_norm.len()) + f32s(l.ffn_norm.len());
-        for m in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate, &l.w_up, &l.w_down] {
+        for m in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate_up, &l.w_down] {
             total += mat(m);
         }
         for v in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm].into_iter().flatten() {
@@ -279,7 +316,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += f32s(c.dim) * 3; // x, xn, proj
     total += f32s(q_dim + 2 * kv_dim); // qkv
     total += f32s(q_dim); // attn_out
-    total += f32s(c.hidden_dim) * 2; // gate, up
+    total += f32s(2 * c.hidden_dim); // fused gate+up
     total += f32s(c.vocab_size); // logits
     total += f32s(kv_capacity * (c.head_dim / 2)) * 2; // rope tables
     total += align_up(2 * 4); // token_params [pos, cached_len]
@@ -349,8 +386,7 @@ impl GpuModel {
                 q_norm: up_f32_opt(cuda, &mut buf, &l.q_norm)?,
                 k_norm: up_f32_opt(cuda, &mut buf, &l.k_norm)?,
                 ffn_norm: up_f32(cuda, &mut buf, &l.ffn_norm)?,
-                w_gate: up_mat(cuda, &mut buf, &l.w_gate)?,
-                w_up: up_mat(cuda, &mut buf, &l.w_up)?,
+                w_gate_up: up_mat(cuda, &mut buf, &l.w_gate_up)?,
                 w_down: up_mat(cuda, &mut buf, &l.w_down)?,
             });
         }
@@ -381,8 +417,7 @@ impl GpuModel {
             qkv: buf.alloc_f32(q_dim + 2 * kv_dim)?,
             attn_out: buf.alloc_f32(q_dim)?,
             proj: buf.alloc_f32(c.dim)?,
-            gate: buf.alloc_f32(c.hidden_dim)?,
-            up: buf.alloc_f32(c.hidden_dim)?,
+            gate_up: buf.alloc_f32(2 * c.hidden_dim)?,
             logits: buf.alloc_f32(c.vocab_size)?,
             rope_cos: up_f32(cuda, &mut buf, &cos_all)?,
             rope_sin: up_f32(cuda, &mut buf, &sin_all)?,

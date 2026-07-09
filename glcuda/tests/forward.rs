@@ -138,6 +138,13 @@ fn host_model() -> HostModel {
         out_dim: n_out,
         in_dim: n_in,
     };
+    // Fused gate+up: gate rows (seed g) stacked on up rows (seed u), matching
+    // the loader's stack_rows and the glproc reference's separate gate/up.
+    let gate_up = |g: u64, u: u64| {
+        let mut w = weights(HIDDEN * DIM, g);
+        w.extend_from_slice(&weights(HIDDEN * DIM, u));
+        HostMat { w: HostWeight::F32(w), out_dim: 2 * HIDDEN, in_dim: DIM }
+    };
     let layers = (0..N_LAYERS as u64)
         .map(|i| {
             let s = seeds(i);
@@ -153,8 +160,7 @@ fn host_model() -> HostModel {
                 q_norm: Some(gain(HEAD_DIM, s[10])),
                 k_norm: Some(gain(HEAD_DIM, s[11])),
                 ffn_norm: gain(DIM, s[12] + 1000),
-                w_gate: m(HIDDEN, DIM, s[4]),
-                w_up: m(HIDDEN, DIM, s[5]),
+                w_gate_up: gate_up(s[4], s[5]),
                 w_down: m(DIM, HIDDEN, s[6]),
             }
         })

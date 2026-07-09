@@ -166,11 +166,14 @@ impl GpuModel {
             k.add(cuda, x, ws.proj.dptr, dim)?;
 
             // --- SwiGLU feed-forward block ---
+            // One GEMV over the fused gate+up weight streams `xn` once and
+            // writes gate into [0, hidden) and up into [hidden, 2*hidden).
             k.rms_norm(cuda, x, layer.ffn_norm.dptr, xn, dim, c.rms_eps)?;
-            gemv_w(cuda, k, &layer.w_gate, xn, ws.gate.dptr)?;
-            gemv_w(cuda, k, &layer.w_up, xn, ws.up.dptr)?;
-            k.silu_mul(cuda, ws.gate.dptr, ws.up.dptr, c.hidden_dim as u32)?;
-            gemv_w(cuda, k, &layer.w_down, ws.gate.dptr, ws.proj.dptr)?;
+            let gate = ws.gate_up.dptr;
+            let up = at(ws.gate_up.dptr, c.hidden_dim);
+            gemv_w(cuda, k, &layer.w_gate_up, xn, gate)?;
+            k.silu_mul(cuda, gate, up, c.hidden_dim as u32)?;
+            gemv_w(cuda, k, &layer.w_down, gate, ws.proj.dptr)?;
             k.add(cuda, x, ws.proj.dptr, dim)?;
         }
 
