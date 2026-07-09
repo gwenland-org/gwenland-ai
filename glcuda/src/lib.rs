@@ -89,6 +89,29 @@ impl GlcudaEngine {
         self.kernels.as_ref()
     }
 
+    /// Encode `text` to token ids with the loaded model's tokenizer, adding
+    /// the BOS token. Available after [`GlEngine::load_model`]; the runtime
+    /// normally tokenizes upstream, but front-ends and examples that hold
+    /// only the engine need a way in.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, GlError> {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
+        Ok(tok.encode(text, true))
+    }
+
+    /// Encode a chat turn using the model's chat template (ChatML for the
+    /// Qwen/Llama-instruct families), falling back to plain [`Self::encode`]
+    /// when the tokenizer defines no template.
+    pub fn encode_chat(&self, user: &str) -> Result<Vec<u32>, GlError> {
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
+        Ok(tok.encode_chat(user).unwrap_or_else(|| tok.encode(user, true)))
+    }
+
     fn sampler_for(&self, input: &InferInput) -> Sampler {
         Sampler::new(SamplerConfig {
             temperature: input.temperature,
