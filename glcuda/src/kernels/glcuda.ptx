@@ -106,9 +106,12 @@ SILU_DONE:
 
 // ---------------------------------------------------------------------------
 // gl_rope_f32: rotate dimension pairs of every head in x [n_heads*head_dim].
-// cos/sin are host-computed tables [head_dim/2] for the current position -
+// cos/sin are host-computed tables for EVERY position [max_ctx * head_dim/2];
 // the host owns transcendental precision (RoPE epsilon is 1e-7; device
-// sin.approx cannot honor that, exact host tables + mul/sub can).
+// sin.approx cannot honor that). The current position is read from device
+// memory (p_pos) so this kernel's launch args never change token-to-token,
+// which lets the per-token graph be captured once and replayed (M2.2). The
+// row for `pos` starts at cos[pos*half].
 // neox = 0: pair (2i, 2i+1);  neox = 1: pair (i, i + half).
 // Launch: grid ceil(n_heads*head_dim/2 / 256) x 256 threads.
 // ---------------------------------------------------------------------------
@@ -118,7 +121,8 @@ SILU_DONE:
     .param .u64 p_sin,
     .param .u32 p_heads,
     .param .u32 p_head_dim,
-    .param .u32 p_neox
+    .param .u32 p_neox,
+    .param .u64 p_pos
 )
 {
     .reg .pred %p<3>;
@@ -132,6 +136,7 @@ SILU_DONE:
     ld.param.u32 %r1, [p_heads];
     ld.param.u32 %r2, [p_head_dim];
     ld.param.u32 %r3, [p_neox];
+    ld.param.u64 %rd14, [p_pos];
     shr.u32 %r4, %r2, 1;                // half = head_dim / 2
     mov.u32 %r5, %ctaid.x;
     mov.u32 %r6, %ntid.x;
@@ -156,11 +161,16 @@ ROPE_IDX_DONE:
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
     cvta.to.global.u64 %rd6, %rd3;
-    mul.wide.u32 %rd7, %r11, 4;
+    // table index = pos*half + i  (pos read from device memory)
+    cvta.to.global.u64 %rd15, %rd14;
+    ld.global.u32 %r16, [%rd15];        // pos
+    mul.lo.s32 %r17, %r16, %r4;         // pos * half
+    add.s32 %r18, %r17, %r11;           // pos*half + i
+    mul.wide.u32 %rd7, %r18, 4;
     add.s64 %rd8, %rd5, %rd7;
     add.s64 %rd9, %rd6, %rd7;
-    ld.global.f32 %f1, [%rd8];          // cos[i]
-    ld.global.f32 %f2, [%rd9];          // sin[i]
+    ld.global.f32 %f1, [%rd8];          // cos[pos*half + i]
+    ld.global.f32 %f2, [%rd9];          // sin[pos*half + i]
     mul.wide.u32 %rd10, %r14, 4;
     add.s64 %rd11, %rd4, %rd10;
     mul.wide.u32 %rd12, %r15, 4;
@@ -757,13 +767,16 @@ SF_END:
 // Shared: sm_sc[4096 f32] scores + sm_red[36] reduction/broadcast scratch.
 // cached_len is bounded by MAX_KV_CONTEXT (4096); one block's scores fit.
 // ---------------------------------------------------------------------------
+// p_cached_len is a DEVICE POINTER (u64) to the current cached length, read
+// at launch time from device memory, so this kernel's launch arguments never
+// change token-to-token (M2.2 graph capture).
 .visible .entry gl_attn_decode_f32(
     .param .u64 p_q,
     .param .u64 p_k,
     .param .u64 p_v,
     .param .u64 p_out,
     .param .u32 p_head_dim,
-    .param .u32 p_cached_len,
+    .param .u64 p_cached_len,
     .param .u32 p_heads_per_kv,
     .param .u32 p_head_stride,
     .param .f32 p_scale
@@ -781,7 +794,9 @@ SF_END:
     ld.param.u64 %rd3, [p_v];
     ld.param.u64 %rd4, [p_out];
     ld.param.u32 %r1, [p_head_dim];
-    ld.param.u32 %r2, [p_cached_len];
+    ld.param.u64 %rd30, [p_cached_len];  // device ptr to cached_len
+    cvta.to.global.u64 %rd31, %rd30;
+    ld.global.u32 %r2, [%rd31];          // cached_len
     ld.param.u32 %r3, [p_heads_per_kv];
     ld.param.u32 %r4, [p_head_stride];
     ld.param.f32 %f1, [p_scale];
@@ -1008,5 +1023,66 @@ ATTN_OUT_STORE:
     add.s32 %r35, %r35, %r7;
     bra ATTN_OUT;
 ATTN_OUT_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_kv_write: copy this token's K (or V) rows for all KV heads from the
+// workspace into the cache at sequence position `pos` (read from device
+// memory, so launch args are token-invariant for M2.2 graph capture).
+//
+//   src is [n_kv_heads * head_dim] contiguous (the workspace k_ptr / v_ptr).
+//   dst_base is the cache region for (layer, kv, head 0); head h lives at
+//   dst_base + h*head_stride, and this token's row at + pos*head_dim.
+//   element e -> kv_head = e / head_dim, d = e % head_dim
+//              -> dst_base + kv_head*head_stride + pos*head_dim + d
+// Launch: grid ceil(n_kv_heads*head_dim / 256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_kv_write(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u64 p_pos,
+    .param .u32 p_head_dim,
+    .param .u32 p_n_kv,
+    .param .u32 p_head_stride
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_src];
+    ld.param.u64 %rd3, [p_pos];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u32 %r2, [p_n_kv];
+    ld.param.u32 %r3, [p_head_stride];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;       // e = global element index
+    mul.lo.s32 %r8, %r2, %r1;            // n_kv * head_dim
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra KVW_DONE;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    ld.global.u32 %r9, [%rd6];           // pos
+    div.u32 %r10, %r7, %r1;              // kv_head = e / head_dim
+    rem.u32 %r11, %r7, %r1;              // d = e % head_dim
+    mul.lo.s32 %r12, %r10, %r3;          // kv_head * head_stride
+    mul.lo.s32 %r13, %r9, %r1;           // pos * head_dim
+    add.s32 %r14, %r12, %r13;
+    add.s32 %r15, %r14, %r11;            // dst element index
+    // load src[e]
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    ld.global.f32 %f1, [%rd8];
+    // store dst[idx]
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.f32 [%rd10], %f1;
+KVW_DONE:
     ret;
 }

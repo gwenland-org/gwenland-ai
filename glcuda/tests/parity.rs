@@ -278,13 +278,18 @@ fn rope_matches_reference_both_styles() {
         let mut want = x.clone();
         rope_ref(&mut want, pos, n_heads, head_dim, base, neox);
 
+        // The kernel indexes cos/sin at row `pos` (read from device). Build
+        // the table for exactly this `pos` as row 0 and pass a device pos=0,
+        // so row 0 holds this position's cos/sin.
         let (cos, sin) = rope_tables(pos, head_dim, base);
         let mut buf =
             BackendBuffer::new(&cuda, ((x.len() + head_dim) * 4 + 4096) as u64).unwrap();
         let dx = upload(&cuda, &mut buf, &x);
         let dcos = upload(&cuda, &mut buf, &cos);
         let dsin = upload(&cuda, &mut buf, &sin);
-        k.rope(&cuda, dx, dcos, dsin, n_heads as u32, head_dim as u32, neox).unwrap();
+        let dpos = buf.alloc(4).unwrap().dptr;
+        cuda.htod(dpos, &0u32.to_ne_bytes()).unwrap();
+        k.rope(&cuda, dx, dcos, dsin, n_heads as u32, head_dim as u32, neox, dpos).unwrap();
         cuda.synchronize().unwrap();
         let mut got = vec![0f32; x.len()];
         cuda.dtoh_f32(&mut got, dx).unwrap();
@@ -392,6 +397,9 @@ fn fused_attn_decode_matches_per_head_reference() {
     let dk = upload(&cuda, &mut buf, &kc);
     let dv = upload(&cuda, &mut buf, &vc);
     let dout = buf.alloc_f32(n_heads * head_dim).unwrap().dptr;
+    // cached_len is now read from device memory (token-invariant graph args).
+    let dclen = buf.alloc(4).unwrap().dptr;
+    cuda.htod(dclen, &(cached_len as u32).to_ne_bytes()).unwrap();
 
     k.attn_decode(
         &cuda,
@@ -401,7 +409,7 @@ fn fused_attn_decode_matches_per_head_reference() {
         dout,
         n_heads as u32,
         head_dim as u32,
-        cached_len as u32,
+        dclen,
         heads_per_kv as u32,
         head_stride as u32,
         scale,
@@ -414,6 +422,44 @@ fn fused_attn_decode_matches_per_head_reference() {
     buf.free(&cuda).unwrap();
 
     assert_close(&got, &want, EPS_MATMUL, "fused_attn_decode");
+}
+
+/// M2.2: gl_kv_write must place each KV head's row at the device-`pos`
+/// slot of its cache region — the graph-static replacement for the per-head
+/// cuMemcpyDtoD. Write two heads' rows at pos=3, read them back from the
+/// computed offsets.
+#[test]
+fn kv_write_places_rows_at_device_pos() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (head_dim, n_kv, max_ctx, pos) = (64usize, 2usize, 128usize, 3usize);
+    let head_stride = max_ctx * head_dim;
+    let src = randv(n_kv * head_dim, 90, 1.0); // both heads' rows, contiguous
+
+    let mut buf = BackendBuffer::new(&cuda, ((n_kv * head_stride + src.len()) * 4 + 4096) as u64).unwrap();
+    let dst = buf.alloc_f32(n_kv * head_stride).unwrap().dptr; // zeroed region
+    cuda.htod_f32(dst, &vec![0f32; n_kv * head_stride]).unwrap();
+    let dsrc = upload(&cuda, &mut buf, &src);
+    let dpos = buf.alloc(4).unwrap().dptr;
+    cuda.htod(dpos, &(pos as u32).to_ne_bytes()).unwrap();
+
+    k.kv_write(&cuda, dst, dsrc, dpos, head_dim as u32, n_kv as u32, head_stride as u32).unwrap();
+    cuda.synchronize().unwrap();
+
+    let mut got = vec![0f32; n_kv * head_stride];
+    cuda.dtoh_f32(&mut got, dst).unwrap();
+    buf.free(&cuda).unwrap();
+
+    // Each head h's row must land at [h*head_stride + pos*head_dim ..][..head_dim].
+    for h in 0..n_kv {
+        let off = h * head_stride + pos * head_dim;
+        for d in 0..head_dim {
+            assert_eq!(
+                got[off + d],
+                src[h * head_dim + d],
+                "kv_write head {h} elem {d} landed wrong"
+            );
+        }
+    }
 }
 
 /// M2.2 stage 1: prove CUDA graph capture + replay works on this hardware

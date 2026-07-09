@@ -217,6 +217,11 @@ pub(crate) struct Workspace {
     pub rope_cos: DevSlice,
     /// RoPE sin table, same shape.
     pub rope_sin: DevSlice,
+    /// Per-token parameters read by the kernels from device memory:
+    /// `[0] = pos`, `[1] = cached_len` (both u32). Updated by one tiny HtoD
+    /// before each graph replay so the captured graph stays valid across
+    /// tokens without re-capture (M2.2).
+    pub token_params: DevSlice,
     /// Host copy of the logits, filled once per sampled token.
     pub logits_host: Vec<f32>,
     /// Host staging for the embedding row uploaded per token.
@@ -235,6 +240,10 @@ pub struct GpuModel {
     pub(crate) output: GpuMat,
     pub(crate) kv: KvCacheDev,
     pub(crate) ws: Workspace,
+    /// The captured per-token decode graph (M2.2), built lazily on the first
+    /// decode step and replayed thereafter. `None` until captured; the
+    /// prefill path never uses it.
+    pub(crate) graph: Option<crate::driver::GraphExec>,
     buffer: BackendBuffer,
     /// Total VRAM reserved, for the load-time report.
     pub total_vram_bytes: u64,
@@ -273,6 +282,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += f32s(c.hidden_dim) * 2; // gate, up
     total += f32s(c.vocab_size); // logits
     total += f32s(kv_capacity * (c.head_dim / 2)) * 2; // rope tables
+    total += align_up(2 * 4); // token_params [pos, cached_len]
     total
 }
 
@@ -376,6 +386,7 @@ impl GpuModel {
             logits: buf.alloc_f32(c.vocab_size)?,
             rope_cos: up_f32(cuda, &mut buf, &cos_all)?,
             rope_sin: up_f32(cuda, &mut buf, &sin_all)?,
+            token_params: buf.alloc(2 * 4)?, // [pos, cached_len] as u32
             logits_host: vec![0.0; c.vocab_size],
             embed_host: vec![0.0; c.dim],
         };
@@ -388,6 +399,7 @@ impl GpuModel {
             output,
             kv,
             ws,
+            graph: None,
             buffer: buf,
             total_vram_bytes: total,
         })

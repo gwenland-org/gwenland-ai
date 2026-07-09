@@ -38,6 +38,7 @@ pub struct KernelSet {
     f_rms_norm: Kernel,
     f_softmax_scale: Kernel,
     f_attn_decode: Kernel,
+    f_kv_write: Kernel,
 }
 
 impl KernelSet {
@@ -54,6 +55,7 @@ impl KernelSet {
             f_rms_norm: module.get_function("gl_rms_norm_f32")?,
             f_softmax_scale: module.get_function("gl_softmax_scale_f32")?,
             f_attn_decode: module.get_function("gl_attn_decode_f32")?,
+            f_kv_write: module.get_function("gl_kv_write")?,
             _module: module,
         })
     }
@@ -87,9 +89,13 @@ impl KernelSet {
     }
 
     /// Rotary embedding over all heads of `x` (`[n_heads * head_dim]`).
-    /// `cos`/`sin` are device tables of `head_dim / 2` values for the
-    /// current position, computed on the host (host owns transcendental
-    /// precision — the RoPE ε is 1e-7).
+    /// `cos`/`sin` are the FULL device tables covering every position
+    /// (`[max_ctx * head_dim/2]`), computed on the host (host owns
+    /// transcendental precision — the RoPE ε is 1e-7). `pos` is a device
+    /// pointer to the current position (a `u32` in device memory); the
+    /// kernel reads it and indexes row `pos`. Passing `pos` by device
+    /// pointer rather than value keeps the launch arguments token-invariant
+    /// so the per-token graph can be captured once (M2.2).
     #[allow(clippy::too_many_arguments)]
     pub fn rope(
         &self,
@@ -100,9 +106,10 @@ impl KernelSet {
         n_heads: u32,
         head_dim: u32,
         neox: bool,
+        pos: CUdeviceptr,
     ) -> Result<(), GlError> {
         let (mut x, mut cos, mut sin) = (x, cos, sin);
-        let (mut h, mut hd, mut nx) = (n_heads, head_dim, neox as u32);
+        let (mut h, mut hd, mut nx, mut p) = (n_heads, head_dim, neox as u32, pos);
         let mut params = [
             &mut x as *mut _ as *mut c_void,
             &mut cos as *mut _ as *mut c_void,
@@ -110,9 +117,39 @@ impl KernelSet {
             &mut h as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut nx as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
         ];
         let pairs = n_heads * (head_dim / 2);
         cuda.launch(self.f_rope, (ceil_div(pairs, BLOCK), 1, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Write this token's K (or V) rows for all KV heads into the cache at
+    /// device-side position `pos` (M2.2 graph-static replacement for the
+    /// per-head `cuMemcpyDtoD`). `dst_base` is the layer's cache region for
+    /// head 0; `src` is the contiguous `[n_kv * head_dim]` workspace rows.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_write(
+        &self,
+        cuda: &Cuda,
+        dst_base: CUdeviceptr,
+        src: CUdeviceptr,
+        pos: CUdeviceptr,
+        head_dim: u32,
+        n_kv: u32,
+        head_stride: u32,
+    ) -> Result<(), GlError> {
+        let (mut d, mut s, mut p) = (dst_base, src, pos);
+        let (mut hd, mut nk, mut hs) = (head_dim, n_kv, head_stride);
+        let mut params = [
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+        ];
+        let n = n_kv * head_dim;
+        cuda.launch(self.f_kv_write, (ceil_div(n, BLOCK), 1, 1), (BLOCK, 1, 1), 0, &mut params)
     }
 
     /// Decode GEMV: `y = W @ x`, `W` row-major `[out_dim, in_dim]`.
@@ -247,13 +284,14 @@ impl KernelSet {
         out: CUdeviceptr,
         n_heads: u32,
         head_dim: u32,
-        cached_len: u32,
+        cached_len: CUdeviceptr,
         heads_per_kv: u32,
         head_stride: u32,
         scale: f32,
     ) -> Result<(), GlError> {
-        // Scores live in a fixed 16 KiB shared array (max_context 4096).
-        debug_assert!(cached_len <= 4096, "cached_len exceeds fused-attn shared scores");
+        // `cached_len` is a device pointer read at launch (token-invariant
+        // args for M2.2 graph capture). Scores live in a fixed 16 KiB shared
+        // array, so the caller must keep cached_len <= 4096.
         let (mut q, mut k, mut v, mut o) = (q, k_base, v_base, out);
         let (mut hd, mut cl, mut hpk, mut hs, mut sc) =
             (head_dim, cached_len, heads_per_kv, head_stride, scale);
@@ -310,6 +348,7 @@ mod tests {
             "gl_rms_norm_f32",
             "gl_softmax_scale_f32",
             "gl_attn_decode_f32",
+            "gl_kv_write",
         ] {
             assert!(
                 PTX.contains(&format!(".visible .entry {entry}(")),

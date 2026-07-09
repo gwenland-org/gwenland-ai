@@ -61,53 +61,49 @@ fn at(base: CUdeviceptr, elems: usize) -> CUdeviceptr {
 }
 
 impl GpuModel {
-    /// Run one forward pass for `token` at position `pos`, leaving the
-    /// logits in device memory (fetch via [`GpuModel::logits_host`]).
-    /// Advances the KV cursor — call with strictly increasing `pos`.
-    pub fn step(
-        &mut self,
-        cuda: &Cuda,
-        k: &KernelSet,
-        token: u32,
-        pos: usize,
-        want_logits: bool,
-    ) -> Result<(), GlError> {
-        let c = self.config.clone();
+    /// Upload `token`'s embedding into the residual stream and write the
+    /// per-token params (`pos`, `cached_len`) into device memory — the only
+    /// host→device work each token, done *before* the kernel sequence (or
+    /// its graph replay) reads them.
+    fn set_token_inputs(&mut self, cuda: &Cuda, token: u32, pos: usize) -> Result<(), GlError> {
+        let mut embed = std::mem::take(&mut self.ws.embed_host);
+        let r = self.embed_row(token, &mut embed);
+        self.ws.embed_host = embed;
+        r?;
+        cuda.htod_f32(self.ws.x.dptr, &self.ws.embed_host)?;
+        // token_params = [pos, cached_len] (cached_len = pos + 1).
+        let params = [pos as u32, (pos + 1) as u32];
+        // SAFETY: reinterpret the 2 u32s as bytes for the HtoD.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), std::mem::size_of_val(&params))
+        };
+        cuda.htod(self.ws.token_params.dptr, bytes)
+    }
+
+    /// Issue the per-token forward-pass kernel sequence. Reads `pos` /
+    /// `cached_len` from `token_params` in device memory (set by
+    /// [`Self::set_token_inputs`]), so the exact same sequence is valid for
+    /// every token — which is what lets it be captured once into a graph and
+    /// replayed (M2.2). Does no host↔device transfer and does not touch the
+    /// KV cursor; the caller advances it.
+    fn record_forward(&self, cuda: &Cuda, k: &KernelSet, want_logits: bool) -> Result<(), GlError> {
+        let c = &self.config;
         let dim = c.dim as u32;
         let head_dim = c.head_dim;
         let q_dim = c.n_heads * head_dim;
         let kv_dim = c.n_kv_heads * head_dim;
-        let heads_per_kv = c.n_heads / c.n_kv_heads.max(1);
-        let half = head_dim / 2;
-        let scale = 1.0 / (head_dim as f32).sqrt();
+        let heads_per_kv = (c.n_heads / c.n_kv_heads.max(1)).max(1) as u32;
         let neox = c.rope_style == RopeStyle::Neox;
-
-        if self.kv.is_full() {
-            return Err(GlError::Engine(format!(
-                "KV cache full ({} tokens) — context limit reached",
-                self.kv.max_context
-            )));
-        }
-        debug_assert_eq!(pos, self.kv.current_pos());
-
-        // Embedding on the host, one small HtoD (the residual stream x).
-        {
-            let mut embed = std::mem::take(&mut self.ws.embed_host);
-            let r = self.embed_row(token, &mut embed);
-            self.ws.embed_host = embed;
-            r?;
-        }
-        cuda.htod_f32(self.ws.x.dptr, &self.ws.embed_host)?;
+        let head_stride = self.kv.head_stride() as u32;
+        let pos_ptr = self.ws.token_params.dptr; // &token_params[0] == pos
+        let clen_ptr = self.ws.token_params.dptr + 4; // &token_params[1] == cached_len
 
         let ws = &self.ws;
         let (x, xn) = (ws.x.dptr, ws.xn.dptr);
         let q_ptr = ws.qkv.dptr;
         let k_ptr = at(ws.qkv.dptr, q_dim);
         let v_ptr = at(ws.qkv.dptr, q_dim + kv_dim);
-        let cos_pos = at(ws.rope_cos.dptr, pos * half);
-        let sin_pos = at(ws.rope_sin.dptr, pos * half);
 
-        let kv = &mut self.kv;
         for (l, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
             k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
@@ -125,10 +121,7 @@ impl GpuModel {
                 k.add(cuda, v_ptr, b.dptr, kv_dim as u32)?;
             }
 
-            // qwen3-style per-head RMSNorm on Q/K, before RoPE. In place is
-            // safe: the kernel's reduction completes (barrier) before the
-            // element-wise write, and each thread rewrites only its own
-            // elements.
+            // qwen3-style per-head RMSNorm on Q/K, before RoPE.
             if let Some(qn) = &layer.q_norm {
                 for h in 0..c.n_heads {
                     let seg = at(q_ptr, h * head_dim);
@@ -142,33 +135,30 @@ impl GpuModel {
                 }
             }
 
-            // RoPE over all heads in one launch each (tables are position-
-            // indexed device memory, uploaded once at model load).
-            k.rope(cuda, q_ptr, cos_pos, sin_pos, c.n_heads as u32, head_dim as u32, neox)?;
-            k.rope(cuda, k_ptr, cos_pos, sin_pos, c.n_kv_heads as u32, head_dim as u32, neox)?;
+            // RoPE reads `pos` from device memory (token-invariant args).
+            k.rope(cuda, q_ptr, ws.rope_cos.dptr, ws.rope_sin.dptr, c.n_heads as u32, head_dim as u32, neox, pos_ptr)?;
+            k.rope(cuda, k_ptr, ws.rope_cos.dptr, ws.rope_sin.dptr, c.n_kv_heads as u32, head_dim as u32, neox, pos_ptr)?;
 
-            for h in 0..c.n_kv_heads {
-                kv.write_k(cuda, l, h, at(k_ptr, h * head_dim))?;
-                kv.write_v(cuda, l, h, at(v_ptr, h * head_dim))?;
-            }
+            // KV write is a single kernel per K/V per layer (computes the
+            // destination from device `pos`) — replaces the per-head memcpy
+            // and is graph-static. read_k/read_v(l, 0) give this layer's
+            // cache base (independent of the cursor).
+            k.kv_write(cuda, self.kv.read_k(l, 0), k_ptr, pos_ptr, head_dim as u32, c.n_kv_heads as u32, head_stride)?;
+            k.kv_write(cuda, self.kv.read_v(l, 0), v_ptr, pos_ptr, head_dim as u32, c.n_kv_heads as u32, head_stride)?;
 
-            // Fused decode attention over ALL heads in one launch (M2.1):
-            // one block per head does Q·K, scaled softmax and the weighted-V
-            // sum in shared memory. Replaces the per-head triple of
-            // gemv+softmax+gemv_t (3*n_heads launches -> 1), which was ~2/3
-            // of the per-token launch count and the decode bottleneck.
-            let cached_len = (kv.current_pos() + 1) as u32;
+            // Fused decode attention over ALL heads (cached_len from device).
+            let scale = 1.0 / (head_dim as f32).sqrt();
             k.attn_decode(
                 cuda,
                 q_ptr,
-                kv.read_k(l, 0),
-                kv.read_v(l, 0),
+                self.kv.read_k(l, 0),
+                self.kv.read_v(l, 0),
                 ws.attn_out.dptr,
                 c.n_heads as u32,
                 head_dim as u32,
-                cached_len,
-                heads_per_kv.max(1) as u32,
-                kv.head_stride() as u32,
+                clen_ptr,
+                heads_per_kv,
+                head_stride,
                 scale,
             )?;
 
@@ -184,13 +174,79 @@ impl GpuModel {
             k.add(cuda, x, ws.proj.dptr, dim)?;
         }
 
-        // All layers committed this token's K/V — advance the cursor once.
-        kv.advance();
-
         if want_logits {
             k.rms_norm(cuda, x, self.output_norm.dptr, xn, dim, c.rms_eps)?;
             gemv_w(cuda, k, &self.output, xn, ws.logits.dptr)?;
         }
+        Ok(())
+    }
+
+    /// Run one forward pass for `token` at position `pos` (direct execution,
+    /// no graph — the prefill path). Advances the KV cursor.
+    pub fn step(
+        &mut self,
+        cuda: &Cuda,
+        k: &KernelSet,
+        token: u32,
+        pos: usize,
+        want_logits: bool,
+    ) -> Result<(), GlError> {
+        if self.kv.is_full() {
+            return Err(GlError::Engine(format!(
+                "KV cache full ({} tokens) — context limit reached",
+                self.kv.max_context
+            )));
+        }
+        debug_assert_eq!(pos, self.kv.current_pos());
+        self.set_token_inputs(cuda, token, pos)?;
+        self.record_forward(cuda, k, want_logits)?;
+        self.kv.advance();
+        Ok(())
+    }
+
+    /// Decode one token via the captured graph (M2.2): update the device
+    /// token inputs, replay the whole per-token kernel sequence in a single
+    /// graph launch, advance the cursor. The graph is captured on first use.
+    /// Always computes logits (decode needs them every token).
+    pub fn decode_step(
+        &mut self,
+        cuda: &Cuda,
+        k: &KernelSet,
+        token: u32,
+        pos: usize,
+    ) -> Result<(), GlError> {
+        if self.kv.is_full() {
+            return Err(GlError::Engine(format!(
+                "KV cache full ({} tokens) — context limit reached",
+                self.kv.max_context
+            )));
+        }
+        debug_assert_eq!(pos, self.kv.current_pos());
+        self.set_token_inputs(cuda, token, pos)?;
+
+        if self.graph.is_none() {
+            // Capture the sequence once. record_forward reads pos/cached_len
+            // from device memory, so the captured graph is valid for every
+            // subsequent token.
+            //
+            // SAFETY of the borrow dance: capture() takes a closure that
+            // only issues launches; we borrow &self inside it via a raw
+            // pointer because the closure cannot also hold &mut self. The
+            // launches touch only device memory owned by self and mutate no
+            // Rust state.
+            let this: *const GpuModel = self;
+            let graph = cuda.capture(|| {
+                // SAFETY: `this` outlives the capture call; record_forward
+                // takes &self and does not alias the &mut borrow (no Rust
+                // field is written).
+                unsafe { (*this).record_forward(cuda, k, true) }
+            })?;
+            self.graph = Some(graph);
+        }
+        // Replay.
+        let graph = self.graph.as_ref().expect("graph captured above");
+        cuda.graph_launch(graph)?;
+        self.kv.advance();
         Ok(())
     }
 
@@ -281,7 +337,8 @@ impl GpuModel {
                 recent.pop_front();
             }
             recent.push_back(next);
-            self.step(cuda, k, next, pos, true)?;
+            // Decode via the captured graph (one launch replaces ~600).
+            self.decode_step(cuda, k, next, pos)?;
             pos += 1;
         }
         Ok((
