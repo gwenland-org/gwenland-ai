@@ -2,8 +2,16 @@
 name = "glcuda"
 version = "0.1.48"
 edition = "2021"
-description = "GwenLand AI NVIDIA CUDA engine (stub — implemented in M2+)"
+description = "GwenLand AI NVIDIA CUDA engine (M2 — SIMT backend per ArchGLML_X2)"
 license-file = "../LICENSE"
 
 [dependencies]
 glcore = { path = "../glcore" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Parity tests validate every kernel against the glproc scalar ground truth
+# (ArchGLML_X2 §8 Principle 2). Dev-only: the engine itself never links glproc.
+glproc = { path = "../glproc" }

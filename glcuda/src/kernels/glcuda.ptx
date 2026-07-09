@@ -1,0 +1,676 @@
+//
+// glcuda.ptx — hand-authored SIMT kernels for the GwenLand CUDA engine.
+//
+// ArchGLML_X2 §16: SIMT-first, warp-shuffle reductions, FP32 accumulation
+// everywhere. Hand-written PTX (no nvcc in the toolchain — ADR-004's
+// "PTX embedded in binary" option); the driver JIT-compiles this for the
+// actual device at module load.
+//
+// Semantic translation table (Appendix A):
+//   gl_gemv_f32          <-> glproc matmul::scalar::run_matvec (decode GEMV)
+//   gl_gemv_q8_0         <-> dequant(Q8_0) + f32 GEMV (weights stay quantized
+//                            in VRAM; dequantized in registers per element)
+//   gl_gemv_t_f32        <-> glproc attention weighted-V sum (column access)
+//   gl_rms_norm_f32      <-> glproc ops::rms_norm::scalar::run_into
+//   gl_softmax_scale_f32 <-> glproc attention::softmax (scale folded in)
+//   gl_silu_mul_f32      <-> glproc ops::silu::scalar::run
+//   gl_rope_f32          <-> glproc runner::rope (host supplies cos/sin)
+//   gl_add_f32           <-> residual add in glproc runner::step
+//
+.version 7.0
+.target sm_70
+.address_size 64
+
+// ---------------------------------------------------------------------------
+// gl_add_f32: y[i] += x[i].  Launch: grid ceil(n/256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_add_f32(
+    .param .u64 p_y,
+    .param .u64 p_x,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<8>;
+
+    ld.param.u64 %rd1, [p_y];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra ADD_DONE;
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];
+    ld.global.f32 %f2, [%rd7];
+    add.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd6], %f3;
+ADD_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_silu_mul_f32: gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i].
+// exp via ex2.approx (rel err ~2^-22, far inside the SwiGLU epsilon).
+// Launch: grid ceil(n/256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_silu_mul_f32(
+    .param .u64 p_gate,
+    .param .u64 p_up,
+    .param .u32 p_n
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [p_gate];
+    ld.param.u64 %rd2, [p_up];
+    ld.param.u32 %r1, [p_n];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r5, %r2, %r3, %r4;
+    setp.ge.u32 %p1, %r5, %r1;
+    @%p1 bra SILU_DONE;
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    mul.wide.u32 %rd5, %r5, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    add.s64 %rd7, %rd4, %rd5;
+    ld.global.f32 %f1, [%rd6];          // x = gate[i]
+    ld.global.f32 %f2, [%rd7];          // u = up[i]
+    mul.f32 %f3, %f1, 0fBFB8AA3B;       // -x * log2(e)
+    ex2.approx.f32 %f4, %f3;            // exp(-x)
+    add.f32 %f5, %f4, 0f3F800000;       // 1 + exp(-x)
+    div.rn.f32 %f6, %f1, %f5;           // silu(x), same op order as glproc
+    mul.f32 %f7, %f6, %f2;
+    st.global.f32 [%rd6], %f7;
+SILU_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_rope_f32: rotate dimension pairs of every head in x [n_heads*head_dim].
+// cos/sin are host-computed tables [head_dim/2] for the current position —
+// the host owns transcendental precision (RoPE epsilon is 1e-7; device
+// sin.approx cannot honor that, exact host tables + mul/sub can).
+// neox = 0: pair (2i, 2i+1);  neox = 1: pair (i, i + half).
+// Launch: grid ceil(n_heads*head_dim/2 / 256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_rope_f32(
+    .param .u64 p_x,
+    .param .u64 p_cos,
+    .param .u64 p_sin,
+    .param .u32 p_heads,
+    .param .u32 p_head_dim,
+    .param .u32 p_neox
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_cos];
+    ld.param.u64 %rd3, [p_sin];
+    ld.param.u32 %r1, [p_heads];
+    ld.param.u32 %r2, [p_head_dim];
+    ld.param.u32 %r3, [p_neox];
+    shr.u32 %r4, %r2, 1;                // half = head_dim / 2
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %tid.x;
+    mad.lo.s32 %r8, %r5, %r6, %r7;      // pair index
+    mul.lo.s32 %r9, %r1, %r4;           // total pairs
+    setp.ge.u32 %p1, %r8, %r9;
+    @%p1 bra ROPE_DONE;
+    div.u32 %r10, %r8, %r4;             // h
+    rem.u32 %r11, %r8, %r4;             // i
+    mul.lo.s32 %r12, %r10, %r2;         // base = h * head_dim
+    setp.ne.u32 %p2, %r3, 0;
+    @%p2 bra ROPE_NEOX;
+    shl.b32 %r13, %r11, 1;
+    add.s32 %r14, %r12, %r13;           // a = base + 2i
+    add.s32 %r15, %r14, 1;              // b = a + 1
+    bra ROPE_IDX_DONE;
+ROPE_NEOX:
+    add.s32 %r14, %r12, %r11;           // a = base + i
+    add.s32 %r15, %r14, %r4;            // b = a + half
+ROPE_IDX_DONE:
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r11, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    add.s64 %rd9, %rd6, %rd7;
+    ld.global.f32 %f1, [%rd8];          // cos[i]
+    ld.global.f32 %f2, [%rd9];          // sin[i]
+    mul.wide.u32 %rd10, %r14, 4;
+    add.s64 %rd11, %rd4, %rd10;
+    mul.wide.u32 %rd12, %r15, 4;
+    add.s64 %rd13, %rd4, %rd12;
+    ld.global.f32 %f3, [%rd11];         // x0
+    ld.global.f32 %f4, [%rd13];         // x1
+    // Same operation order as glproc's rope: mul, mul, sub / mul, mul, add —
+    // bit-identical rounding given identical cos/sin inputs.
+    mul.f32 %f5, %f3, %f1;
+    mul.f32 %f6, %f4, %f2;
+    sub.f32 %f7, %f5, %f6;              // x0*cos - x1*sin
+    mul.f32 %f8, %f3, %f2;
+    mul.f32 %f9, %f4, %f1;
+    add.f32 %f10, %f8, %f9;             // x0*sin + x1*cos
+    st.global.f32 [%rd11], %f7;
+    st.global.f32 [%rd13], %f10;
+ROPE_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemv_f32: y = W @ x, W row-major [out_dim, in_dim] (decode GEMV).
+// One warp per output row (§16 kernel inventory): lane l accumulates
+// k = l, l+32, ... (coalesced across the row), then a warp-shuffle tree
+// reduces — deterministic order for a fixed warp size, FP32 accumulation.
+// Launch: grid (out_dim) x 32 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_f32(
+    .param .u64 p_w,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<8>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [p_w];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    mov.u32 %r3, %ctaid.x;              // row
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra GEMV_DONE;
+    mov.u32 %r4, %tid.x;                // lane
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r3, %r2;        // row * in_dim
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd4, %rd8;           // W row base
+    mul.wide.u32 %rd10, %r4, 4;
+    add.s64 %rd11, %rd9, %rd10;         // w ptr = row base + lane*4
+    add.s64 %rd12, %rd5, %rd10;         // x ptr = x + lane*4
+    mov.f32 %f1, 0f00000000;            // FP32 accumulator
+    mov.u32 %r5, %r4;                   // k = lane
+GEMV_LOOP:
+    setp.ge.u32 %p2, %r5, %r2;
+    @%p2 bra GEMV_REDUCE;
+    ld.global.f32 %f2, [%rd11];
+    ld.global.f32 %f3, [%rd12];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.s32 %r5, %r5, 32;
+    add.s64 %rd11, %rd11, 128;
+    add.s64 %rd12, %rd12, 128;
+    bra GEMV_LOOP;
+GEMV_REDUCE:
+    shfl.sync.down.b32 %f4, %f1, 16, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f4;
+    shfl.sync.down.b32 %f4, %f1, 8, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f4;
+    shfl.sync.down.b32 %f4, %f1, 4, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f4;
+    shfl.sync.down.b32 %f4, %f1, 2, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f4;
+    shfl.sync.down.b32 %f4, %f1, 1, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f4;
+    setp.ne.u32 %p3, %r4, 0;
+    @%p3 bra GEMV_DONE;
+    mul.wide.u32 %rd13, %r3, 4;
+    add.s64 %rd14, %rd6, %rd13;
+    st.global.f32 [%rd14], %f1;
+GEMV_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemv_q8_0: y = W @ x with W in GGML Q8_0 blocks (34 B: f16 scale d +
+// 32 signed bytes; weight = d * q). Weights stay quantized in VRAM — the
+// 4x traffic saving is the whole point — and are dequantized in registers.
+// One warp per row; lane l owns element l of every block, so per block:
+// acc += (d * q[l]) * x[b*32 + l], FP32 accumulation throughout, then the
+// same warp-shuffle tree as gl_gemv_f32. in_dim must be a multiple of 32.
+// Launch: grid (out_dim) x 32 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_q8_0(
+    .param .u64 p_w,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<4>;
+    .reg .b16 %h<2>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [p_w];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    mov.u32 %r3, %ctaid.x;              // row
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra GEMVQ8_DONE;
+    mov.u32 %r4, %tid.x;                // lane
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    shr.u32 %r5, %r2, 5;                // n_blocks = in_dim / 32
+    mul.lo.s32 %r6, %r5, 34;            // row bytes
+    mul.wide.u32 %rd7, %r3, %r6;
+    add.s64 %rd8, %rd4, %rd7;           // block ptr (f16 scale at +0)
+    mul.wide.u32 %rd9, %r4, 4;
+    add.s64 %rd10, %rd5, %rd9;          // x ptr = x + lane*4
+    cvt.u64.u32 %rd11, %r4;
+    add.s64 %rd12, %rd8, %rd11;
+    add.s64 %rd12, %rd12, 2;            // q ptr = block ptr + 2 + lane
+    mov.f32 %f1, 0f00000000;            // FP32 accumulator
+    mov.u32 %r7, 0;                     // block index
+GEMVQ8_LOOP:
+    setp.ge.u32 %p2, %r7, %r5;
+    @%p2 bra GEMVQ8_REDUCE;
+    ld.global.b16 %h1, [%rd8];          // f16 scale bits (uniform per warp)
+    cvt.f32.f16 %f2, %h1;               // d
+    ld.global.s8 %r8, [%rd12];          // q, sign-extended
+    cvt.rn.f32.s32 %f3, %r8;
+    ld.global.f32 %f4, [%rd10];         // x
+    mul.rn.f32 %f5, %f2, %f3;           // d * q — dequantized weight
+    fma.rn.f32 %f1, %f5, %f4, %f1;
+    add.s32 %r7, %r7, 1;
+    add.s64 %rd8, %rd8, 34;
+    add.s64 %rd12, %rd12, 34;
+    add.s64 %rd10, %rd10, 128;
+    bra GEMVQ8_LOOP;
+GEMVQ8_REDUCE:
+    shfl.sync.down.b32 %f6, %f1, 16, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f6;
+    shfl.sync.down.b32 %f6, %f1, 8, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f6;
+    shfl.sync.down.b32 %f6, %f1, 4, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f6;
+    shfl.sync.down.b32 %f6, %f1, 2, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f6;
+    shfl.sync.down.b32 %f6, %f1, 1, 31, 0xffffffff;
+    add.f32 %f1, %f1, %f6;
+    setp.ne.u32 %p3, %r4, 0;
+    @%p3 bra GEMVQ8_DONE;
+    mul.wide.u32 %rd13, %r3, 4;
+    add.s64 %rd14, %rd6, %rd13;
+    st.global.f32 [%rd14], %f1;
+GEMVQ8_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemv_t_f32: y[c] = sum_r x[r] * A[r*cols + c]  (A column access).
+// The attention weighted-V sum: A = V cache [rows, cols], x = softmaxed
+// scores, y = head output. One thread per column, sequential over rows —
+// same accumulation order as glproc's scalar loop; consecutive threads
+// read consecutive addresses (coalesced).
+// Launch: grid ceil(cols/256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_t_f32(
+    .param .u64 p_a,
+    .param .u64 p_x,
+    .param .u64 p_y,
+    .param .u32 p_rows,
+    .param .u32 p_cols
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<12>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<16>;
+
+    ld.param.u64 %rd1, [p_a];
+    ld.param.u64 %rd2, [p_x];
+    ld.param.u64 %rd3, [p_y];
+    ld.param.u32 %r1, [p_rows];
+    ld.param.u32 %r2, [p_cols];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r3, %r4, %r5;      // c
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra GEMVT_DONE;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r6, 4;
+    add.s64 %rd8, %rd4, %rd7;           // A ptr = A + c*4
+    mov.u64 %rd9, %rd5;                 // x ptr
+    mul.wide.u32 %rd10, %r2, 4;         // row stride in bytes
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r7, 0;                     // r
+GEMVT_LOOP:
+    setp.ge.u32 %p2, %r7, %r1;
+    @%p2 bra GEMVT_STORE;
+    ld.global.f32 %f2, [%rd8];
+    ld.global.f32 %f3, [%rd9];
+    // mul then add (not fma) — matches glproc's `out[d] += w * v_row[d]`
+    // rounding exactly, given the identical sequential order over r.
+    mul.rn.f32 %f4, %f3, %f2;
+    add.f32 %f1, %f1, %f4;
+    add.s64 %rd8, %rd8, %rd10;
+    add.s64 %rd9, %rd9, 4;
+    add.s32 %r7, %r7, 1;
+    bra GEMVT_LOOP;
+GEMVT_STORE:
+    add.s64 %rd11, %rd6, %rd7;
+    st.global.f32 [%rd11], %f1;
+GEMVT_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_rms_norm_f32: out[i] = x[i] * rsqrt(mean(x^2) + eps) * w[i].
+// One block per position (§16): strided per-thread sum of squares, warp
+// shuffle tree, cross-warp partials through shared memory, thread 0
+// finishes with IEEE sqrt + reciprocal (rsqrt.approx would burn the
+// 1e-6 epsilon), broadcast via shared memory.
+// Launch: grid (1) x 256 threads. Shared: 36 B (8 partials + broadcast).
+// ---------------------------------------------------------------------------
+.visible .entry gl_rms_norm_f32(
+    .param .u64 p_x,
+    .param .u64 p_w,
+    .param .u64 p_out,
+    .param .u32 p_dim,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<20>;
+    .shared .align 4 .b8 sm_rms[36];
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_w];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_dim];
+    ld.param.f32 %f1, [p_eps];
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ntid.x;
+    and.b32 %r5, %r2, 31;               // lane
+    shr.u32 %r6, %r2, 5;                // warp id
+    mov.u32 %r7, sm_rms;                // shared base
+    add.s32 %r10, %r3, 31;
+    shr.u32 %r11, %r10, 5;              // n_warps
+
+    // strided sum of squares
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r4, %r2;
+    mul.wide.u32 %rd7, %r2, 4;
+    add.s64 %rd8, %rd4, %rd7;           // x ptr
+    mul.wide.u32 %rd9, %r3, 4;          // stride bytes
+RMS_ACC:
+    setp.ge.u32 %p1, %r4, %r1;
+    @%p1 bra RMS_WARP_RED;
+    ld.global.f32 %f3, [%rd8];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s32 %r4, %r4, %r3;
+    add.s64 %rd8, %rd8, %rd9;
+    bra RMS_ACC;
+RMS_WARP_RED:
+    shfl.sync.down.b32 %f4, %f2, 16, 31, 0xffffffff;
+    add.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 8, 31, 0xffffffff;
+    add.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 4, 31, 0xffffffff;
+    add.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 2, 31, 0xffffffff;
+    add.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 1, 31, 0xffffffff;
+    add.f32 %f2, %f2, %f4;
+    setp.ne.u32 %p2, %r5, 0;
+    @%p2 bra RMS_BARRIER1;
+    shl.b32 %r8, %r6, 2;
+    add.s32 %r9, %r7, %r8;
+    st.shared.f32 [%r9], %f2;
+RMS_BARRIER1:
+    bar.sync 0;
+    setp.ne.u32 %p3, %r2, 0;
+    @%p3 bra RMS_BCAST;
+    // thread 0: sequential sum of warp partials (deterministic)
+    mov.f32 %f5, 0f00000000;
+    mov.u32 %r12, 0;
+RMS_SUM_WARPS:
+    setp.ge.u32 %p4, %r12, %r11;
+    @%p4 bra RMS_FINISH;
+    shl.b32 %r13, %r12, 2;
+    add.s32 %r14, %r7, %r13;
+    ld.shared.f32 %f6, [%r14];
+    add.f32 %f5, %f5, %f6;
+    add.s32 %r12, %r12, 1;
+    bra RMS_SUM_WARPS;
+RMS_FINISH:
+    cvt.rn.f32.u32 %f7, %r1;
+    div.rn.f32 %f8, %f5, %f7;           // mean of squares
+    add.f32 %f9, %f8, %f1;              // + eps
+    sqrt.rn.f32 %f10, %f9;              // IEEE sqrt
+    rcp.rn.f32 %f11, %f10;              // IEEE reciprocal
+    st.shared.f32 [%r7+32], %f11;
+RMS_BCAST:
+    bar.sync 0;
+    ld.shared.f32 %f12, [%r7+32];       // inv, uniform
+    // out[i] = x[i] * inv * w[i]  (same op order as glproc)
+    mov.u32 %r15, %r2;
+    mul.wide.u32 %rd10, %r2, 4;
+    add.s64 %rd11, %rd4, %rd10;
+    add.s64 %rd12, %rd5, %rd10;
+    add.s64 %rd13, %rd6, %rd10;
+RMS_OUT:
+    setp.ge.u32 %p5, %r15, %r1;
+    @%p5 bra RMS_DONE;
+    ld.global.f32 %f13, [%rd11];
+    ld.global.f32 %f14, [%rd12];
+    mul.rn.f32 %f15, %f13, %f12;
+    mul.rn.f32 %f16, %f15, %f14;
+    st.global.f32 [%rd13], %f16;
+    add.s32 %r15, %r15, %r3;
+    add.s64 %rd11, %rd11, %rd9;
+    add.s64 %rd12, %rd12, %rd9;
+    add.s64 %rd13, %rd13, %rd9;
+    bra RMS_OUT;
+RMS_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_softmax_scale_f32: s[i] = softmax(s * scale)[i], in place.
+// Mirrors glproc attention::softmax including the degenerate branches:
+// non-finite max -> uniform 1/n fill; sum <= 0 -> exp values left as-is.
+// Two-pass (max, then exp+sum+normalize), one block, warp-shuffle
+// reductions with cross-warp partials in shared memory.
+// Launch: grid (1) x 256 threads. Shared: 36 B.
+// ---------------------------------------------------------------------------
+.visible .entry gl_softmax_scale_f32(
+    .param .u64 p_s,
+    .param .u32 p_n,
+    .param .f32 p_scale
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<24>;
+    .reg .b64 %rd<16>;
+    .shared .align 4 .b8 sm_sf[36];
+
+    ld.param.u64 %rd1, [p_s];
+    ld.param.u32 %r1, [p_n];
+    ld.param.f32 %f1, [p_scale];
+    cvta.to.global.u64 %rd2, %rd1;
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ntid.x;
+    and.b32 %r4, %r2, 31;               // lane
+    shr.u32 %r5, %r2, 5;                // warp id
+    mov.u32 %r6, sm_sf;                 // shared base
+    add.s32 %r11, %r3, 31;
+    shr.u32 %r12, %r11, 5;              // n_warps
+    mul.wide.u32 %rd3, %r3, 4;          // stride bytes
+    mul.wide.u32 %rd4, %r2, 4;
+    add.s64 %rd5, %rd2, %rd4;           // this thread's base ptr
+
+    // ---- pass 1: max of s[i] * scale ----
+    mov.f32 %f2, 0fFF800000;            // -inf
+    mov.u32 %r7, %r2;
+    mov.u64 %rd6, %rd5;
+SF_MAX_LOOP:
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra SF_MAX_RED;
+    ld.global.f32 %f3, [%rd6];
+    mul.rn.f32 %f3, %f3, %f1;
+    max.f32 %f2, %f2, %f3;
+    add.s32 %r7, %r7, %r3;
+    add.s64 %rd6, %rd6, %rd3;
+    bra SF_MAX_LOOP;
+SF_MAX_RED:
+    shfl.sync.down.b32 %f4, %f2, 16, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 8, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 4, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 2, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f4;
+    shfl.sync.down.b32 %f4, %f2, 1, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f4;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra SF_MAX_BARRIER;
+    shl.b32 %r8, %r5, 2;
+    add.s32 %r9, %r6, %r8;
+    st.shared.f32 [%r9], %f2;
+SF_MAX_BARRIER:
+    bar.sync 0;
+    setp.ne.u32 %p3, %r2, 0;
+    @%p3 bra SF_MAX_BCAST;
+    mov.f32 %f5, 0fFF800000;
+    mov.u32 %r10, 0;
+SF_MAX_WARPS:
+    setp.ge.u32 %p4, %r10, %r12;
+    @%p4 bra SF_MAX_STORE;
+    shl.b32 %r13, %r10, 2;
+    add.s32 %r14, %r6, %r13;
+    ld.shared.f32 %f6, [%r14];
+    max.f32 %f5, %f5, %f6;
+    add.s32 %r10, %r10, 1;
+    bra SF_MAX_WARPS;
+SF_MAX_STORE:
+    st.shared.f32 [%r6+32], %f5;
+SF_MAX_BCAST:
+    bar.sync 0;
+    ld.shared.f32 %f7, [%r6+32];        // m, uniform
+    testp.finite.f32 %p5, %f7;
+    @%p5 bra SF_EXP;
+    // degenerate row (all -inf): uniform 1/n, like glproc
+    cvt.rn.f32.u32 %f8, %r1;
+    rcp.rn.f32 %f9, %f8;
+    mov.u32 %r15, %r2;
+    mov.u64 %rd7, %rd5;
+SF_FILL:
+    setp.ge.u32 %p6, %r15, %r1;
+    @%p6 bra SF_END;
+    st.global.f32 [%rd7], %f9;
+    add.s32 %r15, %r15, %r3;
+    add.s64 %rd7, %rd7, %rd3;
+    bra SF_FILL;
+
+    // ---- pass 2: exp(v - m), sum, normalize ----
+SF_EXP:
+    mov.f32 %f10, 0f00000000;
+    mov.u32 %r16, %r2;
+    mov.u64 %rd8, %rd5;
+SF_EXP_LOOP:
+    setp.ge.u32 %p6, %r16, %r1;
+    @%p6 bra SF_SUM_RED;
+    ld.global.f32 %f11, [%rd8];
+    mul.rn.f32 %f11, %f11, %f1;         // v = s[i] * scale
+    sub.f32 %f12, %f11, %f7;            // v - m
+    mul.f32 %f13, %f12, 0f3FB8AA3B;     // * log2(e)
+    ex2.approx.f32 %f14, %f13;          // exp(v - m)
+    st.global.f32 [%rd8], %f14;
+    add.f32 %f10, %f10, %f14;
+    add.s32 %r16, %r16, %r3;
+    add.s64 %rd8, %rd8, %rd3;
+    bra SF_EXP_LOOP;
+SF_SUM_RED:
+    shfl.sync.down.b32 %f4, %f10, 16, 31, 0xffffffff;
+    add.f32 %f10, %f10, %f4;
+    shfl.sync.down.b32 %f4, %f10, 8, 31, 0xffffffff;
+    add.f32 %f10, %f10, %f4;
+    shfl.sync.down.b32 %f4, %f10, 4, 31, 0xffffffff;
+    add.f32 %f10, %f10, %f4;
+    shfl.sync.down.b32 %f4, %f10, 2, 31, 0xffffffff;
+    add.f32 %f10, %f10, %f4;
+    shfl.sync.down.b32 %f4, %f10, 1, 31, 0xffffffff;
+    add.f32 %f10, %f10, %f4;
+    setp.ne.u32 %p2, %r4, 0;
+    @%p2 bra SF_SUM_BARRIER;
+    shl.b32 %r8, %r5, 2;
+    add.s32 %r9, %r6, %r8;
+    st.shared.f32 [%r9], %f10;
+SF_SUM_BARRIER:
+    bar.sync 0;
+    setp.ne.u32 %p3, %r2, 0;
+    @%p3 bra SF_SUM_BCAST;
+    mov.f32 %f15, 0f00000000;
+    mov.u32 %r10, 0;
+SF_SUM_WARPS:
+    setp.ge.u32 %p4, %r10, %r12;
+    @%p4 bra SF_SUM_STORE;
+    shl.b32 %r13, %r10, 2;
+    add.s32 %r14, %r6, %r13;
+    ld.shared.f32 %f16, [%r14];
+    add.f32 %f15, %f15, %f16;
+    add.s32 %r10, %r10, 1;
+    bra SF_SUM_WARPS;
+SF_SUM_STORE:
+    st.shared.f32 [%r6+32], %f15;
+SF_SUM_BCAST:
+    bar.sync 0;
+    ld.shared.f32 %f17, [%r6+32];       // sum, uniform
+    setp.gt.f32 %p7, %f17, 0f00000000;
+    @!%p7 bra SF_END;                   // sum <= 0: leave exp values
+    mov.u32 %r17, %r2;
+    mov.u64 %rd9, %rd5;
+SF_DIV_LOOP:
+    setp.ge.u32 %p6, %r17, %r1;
+    @%p6 bra SF_END;
+    ld.global.f32 %f18, [%rd9];
+    div.rn.f32 %f18, %f18, %f17;        // v /= sum, like glproc
+    st.global.f32 [%rd9], %f18;
+    add.s32 %r17, %r17, %r3;
+    add.s64 %rd9, %rd9, %rd3;
+    bra SF_DIV_LOOP;
+SF_END:
+    ret;
+}
