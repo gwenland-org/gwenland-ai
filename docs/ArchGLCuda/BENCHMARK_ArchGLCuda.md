@@ -31,6 +31,7 @@ python docs/ArchGLCuda/gen_graphs.py
 | Load time | ~0.76 s (tokenizer 0.10 + stage 0.41 + upload 0.18) |
 | Prompt | 29 tokens (ChatML-wrapped) |
 | Sampling | temperature 0.7, top-k 40, top-p 0.95, repeat-penalty 1.1 |
+| Protocol | 50 runs of 128-token generation, run 1 discarded as warmup |
 | Build | `--release` |
 
 Reproduce with `glcuda_t4_validation.ipynb` (§8 runs the model, §9 the
@@ -40,26 +41,34 @@ microbenchmark).
 
 ## Throughput
 
-### Decode warms up
+### Decode: 50-run distribution
 
-Decode tok/s is not flat run-to-run — it ramps over the first several runs as
-caches and clocks warm, then settles. The two sessions below are the same
-binary on the same T4; the "warmed" session had the GPU already hot.
+Reported as a distribution, not a peak (ArchGLML_X2 §22). Warmed T4, 50 runs of
+128-token generation, run 1 discarded as warmup:
 
-![decode throughput per run](benchmark_img1.png)
+| Metric | Decode | Prefill |
+|---|---|---|
+| **P50 (median)** | **147.1 tok/s** | **221.7 tok/s** |
+| P95 | 149.9 | 224.5 |
+| P99 | 150.2 | — |
+| min | 132.4 | 216.4 |
+| max | 150.4 | 230.9 |
+| stdev | 5.1 | 2.2 |
 
-Steady-state decode lands around **150 tok/s**; a cold GPU starts nearer
-**105–110 tok/s**. Always discard warmup runs when quoting a number (the
-benchmark protocol in ArchGLML_X2 §22 says exactly this).
+![decode throughput, 50 runs](benchmark_img1.png)
+
+Decode is tight (σ 5.1) around **147 tok/s**, except a dip to ~133 across runs
+15–21 — a thermal/clock throttle on the shared Colab T4 that recovers on its
+own. Prefill is rock-steady (σ 2.2). A cold GPU starts nearer 105–110; always
+discard warmup.
 
 ### Prefill vs decode
 
 ![prefill vs decode](benchmark_img2.png)
 
-Prefill (~227 tok/s) is faster than decode (~150 tok/s) because prompt tokens
-are processed with the weights already resident and warm, and prefill does not
-pay the per-token host round-trip that decode does. Reported separately on
-purpose — blending them hides the real decode speed.
+Prefill (~222 tok/s) outpaces decode (~147 tok/s): prompt tokens run with the
+weights already warm and skip the per-token host round-trip that decode pays.
+Reported separately on purpose — blending them hides the real decode speed.
 
 ---
 
@@ -76,9 +85,9 @@ memory bandwidth**.
 |---|---|---|
 | Peak bandwidth | ~640 | 320 GB/s / 0.5 GB per token |
 | Achievable (~80%) | ~512 | GDDR6 rarely sustains peak |
-| **Measured (now)** | **~150** | steady-state decode |
+| **Measured (P50)** | **147** | steady-state decode |
 
-That puts decode at roughly **29% of achievable bandwidth** — about a **3.4x**
+That puts decode at roughly **29% of achievable bandwidth** — about a **3.5x**
 headroom remaining. `nvidia-smi` reports ~22% GPU utilization during decode,
 consistent with the GPU being **idle most of the time**: the bottleneck is
 latency / serialization, not throughput.
