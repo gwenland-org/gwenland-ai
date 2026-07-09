@@ -150,6 +150,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2c. The dp4a QUANTIZE TAX. Every Q8_0 matmul first quantizes its input
+    //     activation (quantize_q8) — an extra kernel the dp4a path added that
+    //     did not exist before. Per decode token there are ~4/layer (qkv,
+    //     o_proj, gate_up, down) + 1 lm_head = 4*n_layers + 1 launches. Sum
+    //     their cost at the real input sizes to see how much of the ~4.4 ms
+    //     GPU token this tax is — i.e. whether killing it (fusing quantize into
+    //     the producing rms_norm / silu_mul) is worth it, or whether dp4a's
+    //     flat result is simply "decode GEMV is BW-bound so dp4a can't help".
+    // ============================================================
+    {
+        let n_layers = 24usize; // Qwen2.5-0.5B
+        // (input_dim, count/token) for each quantize the runner issues.
+        let quants = [
+            (dim, n_layers),    // attn-norm -> qkv
+            (dim, n_layers),    // attn-out  -> o_proj
+            (dim, n_layers),    // ffn-norm  -> gate_up
+            (hidden, n_layers), // silu_mul  -> down
+            (dim, 1),           // final-norm -> lm_head
+        ];
+        let iters = 200;
+        let mut total_us = 0.0;
+        for (in_dim, count) in quants {
+            let mark = buf.mark();
+            let x = buf.alloc_f32(in_dim)?.dptr;
+            let qs = buf.alloc(in_dim as u64)?.dptr;
+            let sc = buf.alloc_f32(in_dim / 32)?.dptr;
+            k.quantize_q8(&cuda, x, qs, sc, in_dim as u32)?;
+            cuda.synchronize()?;
+            let t = Instant::now();
+            for _ in 0..iters {
+                k.quantize_q8(&cuda, x, qs, sc, in_dim as u32)?;
+            }
+            cuda.synchronize()?;
+            let each = t.elapsed().as_secs_f64() / iters as f64;
+            total_us += each * 1e6 * count as f64;
+            buf.reset_to(mark);
+        }
+        println!(
+            "\n[quantize tax] {} launches/token: {:.0} us/token ({:.1}% of a 4.4 ms GPU token)",
+            4 * n_layers + 1,
+            total_us,
+            total_us / 4400.0 * 100.0,
+        );
+    }
+
+    // ============================================================
     // 3. Synchronous DtoD at KV-write granularity (head_dim=64 f32 = 256 B),
     //    96 copies per token — is the per-copy latency the stall?
     // ============================================================
