@@ -33,7 +33,6 @@ pub struct KernelSet {
     f_silu_mul: Kernel,
     f_rope: Kernel,
     f_gemv: Kernel,
-    f_quantize_q8: Kernel,
     f_gemv_q8_0: Kernel,
     f_gemv_q4_0: Kernel,
     f_gemv_t: Kernel,
@@ -52,7 +51,6 @@ impl KernelSet {
             f_silu_mul: module.get_function("gl_silu_mul_f32")?,
             f_rope: module.get_function("gl_rope_f32")?,
             f_gemv: module.get_function("gl_gemv_f32")?,
-            f_quantize_q8: module.get_function("gl_quantize_q8")?,
             f_gemv_q8_0: module.get_function("gl_gemv_q8_0")?,
             f_gemv_q4_0: module.get_function("gl_gemv_q4_0")?,
             f_gemv_t: module.get_function("gl_gemv_t_f32")?,
@@ -180,51 +178,29 @@ impl KernelSet {
     }
 
     /// `y = x * w^T` for Q8_0 weights (row-major). `w` is `[out_dim, in_dim]`.
-    /// `x` must be pre-quantized using `quantize_q8`.
+    /// `in_dim` must be a multiple of 32 (Q8_0 block size).
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8_0(
         &self,
         cuda: &Cuda,
         w: CUdeviceptr,
-        x_qs: CUdeviceptr,
-        x_scales: CUdeviceptr,
+        x: CUdeviceptr,
         y: CUdeviceptr,
         out_dim: u32,
         in_dim: u32,
     ) -> Result<(), GlError> {
         debug_assert_eq!(in_dim % 32, 0, "Q8_0 rows are whole blocks");
         debug_assert_eq!(out_dim % 4, 0, "Q8_0 out_dim must be multiple of 4 for Thread Coarsening");
-        let (mut w, mut x_qs, mut x_scales, mut y) = (w, x_qs, x_scales, y);
+        let (mut w, mut x, mut y) = (w, x, y);
         let (mut o, mut i) = (out_dim, in_dim);
         let mut params = [
             &mut w as *mut _ as *mut c_void,
-            &mut x_qs as *mut _ as *mut c_void,
-            &mut x_scales as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
             &mut y as *mut _ as *mut c_void,
             &mut o as *mut _ as *mut c_void,
             &mut i as *mut _ as *mut c_void,
         ];
         cuda.launch(self.f_gemv_q8_0, (ceil_div(out_dim, 16), 1, 1), (128, 1, 1), 0, &mut params)
-    }
-
-    /// Dynamically quantize `x` into `qs` and `scales`.
-    pub fn quantize_q8(
-        &self,
-        cuda: &Cuda,
-        x: CUdeviceptr,
-        qs: CUdeviceptr,
-        scales: CUdeviceptr,
-        n: u32,
-    ) -> Result<(), GlError> {
-        debug_assert_eq!(n % 32, 0, "quantize_q8 n must be a multiple of 32");
-        let (mut x, mut qs, mut scales, mut n_) = (x, qs, scales, n);
-        let mut params = [
-            &mut x as *mut _ as *mut c_void,
-            &mut qs as *mut _ as *mut c_void,
-            &mut scales as *mut _ as *mut c_void,
-            &mut n_ as *mut _ as *mut c_void,
-        ];
-        cuda.launch(self.f_quantize_q8, (ceil_div(n, 32), 1, 1), (WARP, 1, 1), 0, &mut params)
     }
 
     /// `y = x * w^T` for Q4_0 weights (row-major). `w` is `[out_dim, in_dim]`.
