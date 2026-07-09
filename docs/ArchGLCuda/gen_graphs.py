@@ -150,8 +150,37 @@ def graph_ceiling():
     plt.close(fig)
     print("wrote benchmark_img3.png")
 
+# ==========================================================================
+# GRAPH 4 — per-kernel bandwidth efficiency (the bench finding)
+# ==========================================================================
+def graph_kernel_bandwidth():
+    # measured GB/s per kernel vs the 265 GB/s achievable ceiling
+    kernels = ["qkv\n1152x896", "gate\n4864x896", "down\n896x4864", "lm_head\n151936x896"]
+    gbps = [264, 233, 222, 264]
+    achievable = 265
+    fig, ax = plt.subplots(figsize=(7.2, 4.0))
+    style(ax)
+    bars = ax.bar(kernels, gbps, color=BLUE, width=0.6, zorder=3)
+    ax.axhline(achievable, color=RED, linewidth=1.5, linestyle=(0, (4, 3)), zorder=2)
+    ax.annotate(f"achievable BW = {achievable} GB/s", (1.5, achievable),
+                textcoords="offset points", xytext=(0, 6), ha="center",
+                color=RED, fontsize=10, fontweight="bold")
+    for b, v in zip(bars, gbps):
+        ax.annotate(f"{v}\n{v/achievable*100:.0f}%",
+                    (b.get_x() + b.get_width()/2, v),
+                    textcoords="offset points", xytext=(0, 4), ha="center",
+                    color=INK, fontsize=9, fontweight="bold")
+    ax.set_ylabel("GB/s (batched)")
+    ax.set_title("Every GEMV already runs near bandwidth (T4 microbench)",
+                 fontweight="bold", loc="left", color=INK)
+    ax.set_ylim(0, 310)
+    fig.savefig(os.path.join(OUT, "benchmark_img4.png"))
+    plt.close(fig)
+    print("wrote benchmark_img4.png")
+
 if __name__ == "__main__":
     graph_decode_runs()
     graph_prefill_vs_decode()
     graph_ceiling()
+    graph_kernel_bandwidth()
     print("done ->", OUT)

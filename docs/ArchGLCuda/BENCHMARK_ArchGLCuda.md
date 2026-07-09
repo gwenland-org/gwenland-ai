@@ -108,30 +108,56 @@ the number. It did not.
 
 The fusion still stands — it is correct, it is a prerequisite for CUDA Graphs,
 and it removes real work — but it was not the bottleneck. The lesson: **measure
-before optimizing.** Hence `examples/bench.rs` and the section below.
+before optimizing.** The microbenchmark below then disproved the *next* guess
+too (GEMV geometry), and pointed at the real answer: inter-kernel
+serialization. Two wrong hypotheses, one measurement that settled it.
 
 ---
 
 ## Bottleneck analysis
 
-> **Pending T4 measurement** (`examples/bench.rs`, notebook §9). This section
-> is filled in from the microbenchmark, not from speculation. The prime
-> suspects it tests, in order of likelihood:
+Measured with `examples/bench.rs` (notebook §9) on the T4, at Qwen2.5-0.5B
+decode sizes. **The result overturned the working hypothesis** — the GEMV
+kernels are *not* the problem.
 
-1. **GEMV geometry.** The decode matvec kernels launch **one warp (32 threads)
-   per output row**. A T4 SM wants ~1024 resident threads to hide memory
-   latency; 32 leaves it starved, so each warp stalls on memory with nothing to
-   overlap — exactly the "GPU idle 78%" signature. Likely fix: multiple warps
-   per row with a block-level reduction.
-2. **KV-cache writes.** The runner issues **96 synchronous `cuMemcpyDtoD`
-   copies per token** (one per KV head per layer, x2). Synchronous memcpy on the
-   default stream blocks the host on each call. Likely fix: a single
-   write-into-cache kernel per layer.
-3. **Per-op serialization** on the default stream.
+| Kernel | shape | batched | GB/s | % of achievable | stall |
+|---|---|---|---|---|---|
+| achievable BW | `gl_add` stream | — | **265** | 100% | — |
+| gemv qkv | 1152×896 | 15.6 µs | 264 | ~100% | 5.5 µs |
+| gemv gate | 4864×896 | 74.7 µs | 233 | 88% | 5.3 µs |
+| gemv down | 896×4864 | 78.5 µs | 222 | 84% | 5.4 µs |
+| gemv lm_head | 151936×896 | 2062 µs | 264 | ~100% | 0 µs |
+| KV writes | 96 copies/tok | — | — | — | 0.36 ms/tok |
 
-The bench reports achievable bandwidth, GEMV throughput (batched vs
-per-call-synced — the gap is the stall), and the KV-copy cost, so the fix
-targets the measured wall rather than a guessed one.
+![per-kernel bandwidth efficiency](benchmark_img4.png)
+
+**Every matvec already runs at 84–100% of memory bandwidth**, the per-launch
+`stall` is ~5 µs (negligible), and the 96 KV-cache copies cost only 0.36
+ms/token total. The earlier theories — 1-warp-per-row GEMV starving the SMs,
+and synchronous KV copies stalling the host — are **both disproved by the
+data.** The kernels are good.
+
+### So why is decode only 29% of bandwidth?
+
+Because the kernels do not **overlap.** Decode issues ~600 kernel launches per
+token on a single serial stream: each runs to completion, then the next starts.
+Each matvec's input depends on the previous op's output, so there is no overlap
+of one kernel's compute with the next kernel's weight fetch, and a small gap
+sits between every launch. Per-kernel bandwidth is excellent; the *pipeline* is
+serial. `nvidia-smi` at ~22% during decode is the direct symptom — the GPU sits
+idle between ops.
+
+Per-token weight stream (why decode is bandwidth-work in the first place):
+
+| Category | streamed/token | share |
+|---|---|---|
+| 24 transformer layers | 380 MB | 72% |
+| LM head (full vocab) | 145 MB | 28% |
+| **total** | **525 MB** | 100% |
+
+The LM head alone is 28% of every token and runs at full bandwidth — it is big,
+not slow. At 265 GB/s the *back-to-back* ceiling is ~505 tok/s; we get 147
+because of the serial gaps, not because any kernel is slow.
 
 ---
 
@@ -141,14 +167,19 @@ In expected order of payoff:
 
 | Step | Expected | Status |
 |---|---|---|
-| Fuse attention over all heads | (prerequisite) | **done** — no direct gain |
-| Microbenchmark to locate the wall | (diagnosis) | **pending T4 run** |
-| Fix the measured bottleneck (likely GEMV geometry) | 150 -> ~300+ | next |
-| CUDA Graphs (M2.2): one replay per token | -> ~70–90% of BW | later |
+| Fuse attention over all heads | (prerequisite for graphs) | **done** — no direct gain |
+| Microbenchmark to locate the wall | (diagnosis) | **done** — it is serialization, not the kernels |
+| **CUDA Graphs (M2.2): replay ~600 launches as one** | 147 -> toward ~300–450 | **next — this is the lever** |
 | Native q4_0 / q4_k GEMV kernels | smaller stream/token | later |
+| KV-cache f16 | 2x less KV traffic | later |
 
-Above 50% of bandwidth (~256 tok/s) is the near-term target; CUDA Graphs is the
-path to 70–90%.
+The bench redirected the roadmap: since every kernel already runs near
+bandwidth and the loss is inter-kernel serialization, **CUDA Graphs is the
+correct next step**, not a GEMV rewrite. Collapsing the per-token launch
+sequence into a single graph replay removes the gaps that keep the GPU ~78%
+idle. The attention fusion done earlier is a prerequisite (fewer, more uniform
+nodes to capture). Target: above 50% of achievable bandwidth (~250+ tok/s),
+with 70–90% reachable if capture overhead is low.
 
 ---
 
