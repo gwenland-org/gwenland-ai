@@ -327,22 +327,20 @@ impl GpuModel {
             std::collections::VecDeque::with_capacity(REPEAT_WINDOW);
         let mut pos = prompt.len();
         // Opt-in split timing: GLCUDA_PROFILE_DECODE=1 attributes each token's
-        // wall time to GPU (waiting on the in-flight decode graph) vs HOST
-        // (logits DtoH + repetition penalty + CPU sample over the full vocab).
-        // The GPU is idle during the host portion, so a large host share means
-        // GPU-side kernel work is NOT the decode bottleneck.
+        // wall time to GPU (the decode graph + a trailing sync so all kernel
+        // work is captured regardless of whether graph_launch blocks) vs HOST
+        // (logits DtoH + repetition penalty + CPU sample over the full vocab,
+        // during which the GPU is idle). A large host share means GPU-side
+        // kernel work is NOT the decode bottleneck.
         let profile = std::env::var_os("GLCUDA_PROFILE_DECODE").is_some();
         let (mut t_gpu, mut t_host) = (std::time::Duration::ZERO, std::time::Duration::ZERO);
         for _ in 0..max_new_tokens {
             if pos >= max_seq {
                 break;
             }
-            // Attribute the wait on the previous token's graph to the GPU.
-            if profile {
-                let g = Instant::now();
-                cuda.synchronize()?;
-                t_gpu += g.elapsed();
-            }
+            // HOST: the logits consumed here were produced by the previous
+            // token's graph (or prefill), which we already synced below, so
+            // logits_host's internal sync is a no-op and this is pure CPU.
             let h = Instant::now();
             let penalty = sampler.repeat_penalty();
             let next = {
@@ -362,8 +360,14 @@ impl GpuModel {
                 recent.pop_front();
             }
             recent.push_back(next);
-            // Decode via the captured graph (one launch replaces ~600).
+            // GPU: launch the decode graph and (in profile mode) sync so the
+            // full kernel time lands in t_gpu even if graph_launch is async.
+            let g = Instant::now();
             self.decode_step(cuda, k, next, pos)?;
+            if profile {
+                cuda.synchronize()?;
+                t_gpu += g.elapsed();
+            }
             pos += 1;
         }
         if profile {
