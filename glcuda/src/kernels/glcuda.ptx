@@ -686,6 +686,141 @@ GEMVQ8_DONE:
 }
 
 // ---------------------------------------------------------------------------
+// gl_gemv_q8_0_soa: y = W @ x, Q8_0 weights in STRUCTURE-OF-ARRAYS layout.
+//   p_wqs : contiguous int8 weights [out_dim * in_dim]
+//   p_wsc : contiguous f16 block scales [out_dim * (in_dim/32)]
+//   p_xqs : int8 quantized activation [in_dim]
+//   p_xsc : f32 activation block scales [in_dim/32]
+//   p_y   : f32 output [out_dim]
+// One warp per output row. Each iteration the 32 lanes read 128 CONTIGUOUS qs
+// bytes (4 blocks) -> one coalesced 128-byte transaction, no padding, no
+// interleaved scales (the AoS gl_gemv_q8_0 wastes ~23% BW on those). dp4a on
+// 4 int8/lane; per-block scales folded in f32; 32-lane shuffle reduction.
+// Lanes 0-7 cover block 0, 8-15 block 1, ... (block-in-group = lane/8).
+// Launch: grid ceil(out_dim / (ntid/32)) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_q8_0_soa(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<5>;
+    .reg .b16 %h<3>;
+    .reg .b32 %r<40>;
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+
+    mov.u32 %r3, %tid.x;
+    shr.u32 %r4, %r3, 5;                 // warp_id
+    and.b32 %r5, %r3, 31;                // lane
+    mov.u32 %r6, %ntid.x;
+    shr.u32 %r7, %r6, 5;                 // warps per block
+    mov.u32 %r8, %ctaid.x;
+    mad.lo.s32 %r9, %r8, %r7, %r4;       // output row
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra SOA_DONE;
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+
+    shr.u32 %r10, %r2, 5;                // n_blocks = in_dim / 32
+
+    mul.wide.u32 %rd10, %r9, %r2;        // wqs row base = row * in_dim
+    add.s64 %rd11, %rd6, %rd10;
+    mul.wide.u32 %rd12, %r9, %r10;       // wsc row base = row * n_blocks
+    shl.b64 %rd12, %rd12, 1;             // * 2 (f16)
+    add.s64 %rd13, %rd7, %rd12;
+
+    shl.b32 %r11, %r5, 2;                // lane * 4 (byte offset in group)
+    cvt.u64.u32 %rd14, %r11;
+    add.s64 %rd15, %rd11, %rd14;         // wqs lane ptr
+    add.s64 %rd16, %rd8, %rd14;          // xqs lane ptr
+    shr.u32 %r12, %r5, 3;                // block-in-group = lane / 8 (0..3)
+    cvt.u64.u32 %rd17, %r12;
+    shl.b64 %rd18, %rd17, 1;
+    add.s64 %rd19, %rd13, %rd18;         // wsc block ptr
+    shl.b64 %rd20, %rd17, 2;
+    add.s64 %rd21, %rd9, %rd20;          // xsc block ptr
+
+    mov.f32 %f1, 0f00000000;             // accumulator
+    shr.u32 %r13, %r10, 2;               // n_groups = n_blocks / 4
+    mov.u32 %r14, 0;
+
+SOA_LOOP:
+    setp.ge.u32 %p2, %r14, %r13;
+    @%p2 bra SOA_TAIL;
+
+    ld.global.u32 %r15, [%rd15];
+    ld.global.u32 %r16, [%rd16];
+    dp4a.s32.s32 %r17, %r15, %r16, 0;
+    cvt.rn.f32.s32 %f2, %r17;
+    ld.global.u16 %h1, [%rd19];
+    cvt.f32.f16 %f3, %h1;
+    ld.global.f32 %f4, [%rd21];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f1, %f2, %f5, %f1;
+
+    add.s64 %rd15, %rd15, 128;
+    add.s64 %rd16, %rd16, 128;
+    add.s64 %rd19, %rd19, 8;             // 4 blocks * 2 B
+    add.s64 %rd21, %rd21, 16;            // 4 blocks * 4 B
+    add.s32 %r14, %r14, 1;
+    bra SOA_LOOP;
+
+SOA_TAIL:
+    and.b32 %r18, %r10, 3;               // remaining blocks (n_blocks % 4)
+    setp.lt.u32 %p3, %r12, %r18;         // this lane's block within remainder?
+    @!%p3 bra SOA_REDUCE;
+    ld.global.u32 %r15, [%rd15];
+    ld.global.u32 %r16, [%rd16];
+    dp4a.s32.s32 %r17, %r15, %r16, 0;
+    cvt.rn.f32.s32 %f2, %r17;
+    ld.global.u16 %h1, [%rd19];
+    cvt.f32.f16 %f3, %h1;
+    ld.global.f32 %f4, [%rd21];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f1, %f2, %f5, %f1;
+
+SOA_REDUCE:
+    mov.b32 %r20, %f1;
+    shfl.sync.down.b32 %r21, %r20, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r21; add.f32 %f1, %f1, %f6; mov.b32 %r20, %f1;
+    shfl.sync.down.b32 %r21, %r20, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r21; add.f32 %f1, %f1, %f6; mov.b32 %r20, %f1;
+    shfl.sync.down.b32 %r21, %r20, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r21; add.f32 %f1, %f1, %f6; mov.b32 %r20, %f1;
+    shfl.sync.down.b32 %r21, %r20, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r21; add.f32 %f1, %f1, %f6; mov.b32 %r20, %f1;
+    shfl.sync.down.b32 %r21, %r20, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r21; add.f32 %f1, %f1, %f6;
+
+    setp.ne.u32 %p4, %r5, 0;            // only lane 0 writes
+    @%p4 bra SOA_DONE;
+    mul.wide.u32 %rd30, %r9, 4;
+    add.s64 %rd31, %rd5, %rd30;
+    cvta.to.global.u64 %rd31, %rd31;
+    st.global.f32 [%rd31], %f1;
+
+SOA_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
 // gl_gemv_t_f32: y[c] = sum_r x[r] * A[r*cols + c]  (A column access).
 // The attention weighted-V sum: A = V cache [rows, cols], x = softmaxed
 // scores, y = head output. One thread per column, sequential over rows -

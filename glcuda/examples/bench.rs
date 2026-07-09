@@ -150,6 +150,83 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2d. Q8_0 SoA GEMV — new contiguous-qs kernel. Validates correctness vs a
+    //     CPU reference (the correct oracle) and times it vs the AoS kernel to
+    //     see the bandwidth gain from killing the interleaved-scale/padding
+    //     coalescing loss. Useful stream = out*in qs + out*nblocks*2 scale
+    //     bytes (no 36 B padding), so GB/s is on real bytes moved.
+    // ============================================================
+    {
+        // Deterministic pseudo-data (no host f16 conversion: we pick f16 scale
+        // bit patterns whose exact f32 value we also know for the CPU ref).
+        let scale_bits: [u16; 4] = [0x3C00, 0x3800, 0x3E00, 0x3400]; // 1.0 0.5 1.5 0.25
+        let scale_vals: [f32; 4] = [1.0, 0.5, 1.5, 0.25];
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+
+        for (label, out_dim, in_dim) in
+            [("gate  ", 2 * hidden, dim), ("down  ", dim, hidden), ("lmhead", vocab, dim)]
+        {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            // host weights: qs (int8) + per-block f16 scales.
+            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+            let wsc_bits: Vec<u16> = (0..out_dim * nb).map(|i| scale_bits[i % 4]).collect();
+            let xqs: Vec<i8> = (0..in_dim).map(|i| qb(i * 7 + 3)).collect();
+            let xsc: Vec<f32> = (0..nb).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
+
+            // device SoA buffers.
+            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            let d_xqs = buf.alloc(in_dim as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(nb)?.dptr;
+            let d_y = buf.alloc_f32(out_dim)?.dptr;
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let wsc_u8 =
+                unsafe { std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2) };
+            cuda.htod(d_wqs, as_u8(&wqs))?;
+            cuda.htod(d_wsc, wsc_u8)?;
+            cuda.htod(d_xqs, as_u8(&xqs))?;
+            cuda.htod_f32(d_xsc, &xsc)?;
+
+            k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
+            cuda.synchronize()?;
+
+            // CPU reference: y[r] = sum_b (wsc*xsc) * sum_j wqs*xqs.
+            let mut y_host = vec![0f32; out_dim];
+            cuda.dtoh_f32(&mut y_host, d_y)?;
+            let mut max_rel = 0f32;
+            for r in 0..out_dim {
+                let mut acc = 0f32;
+                for b in 0..nb {
+                    let mut dot = 0i32;
+                    for j in 0..32 {
+                        dot += wqs[r * in_dim + b * 32 + j] as i32 * xqs[b * 32 + j] as i32;
+                    }
+                    acc += dot as f32 * (scale_vals[(r * nb + b) % 4] * xsc[b]);
+                }
+                let d = (acc - y_host[r]).abs() / acc.abs().max(1.0);
+                max_rel = max_rel.max(d);
+            }
+
+            let iters = 200;
+            let t = Instant::now();
+            for _ in 0..iters {
+                k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
+            }
+            cuda.synchronize()?;
+            let soa = t.elapsed().as_secs_f64() / iters as f64;
+            let sbytes = out_dim * in_dim + out_dim * nb * 2;
+            println!(
+                "[soa  {label}] {out_dim:>6}x{in_dim:<5}  batched {:>6.1} us ({:>5.0} GB/s of {sbytes} B) | max_rel_err {:.1e}",
+                soa * 1e6,
+                sbytes as f64 / soa / 1e9,
+                max_rel,
+            );
+            buf.reset_to(mark);
+        }
+    }
+
+    // ============================================================
     // 2c. The dp4a QUANTIZE TAX. Every Q8_0 matmul first quantizes its input
     //     activation (quantize_q8) — an extra kernel the dp4a path added that
     //     did not exist before. Per decode token there are ~4/layer (qkv,
