@@ -190,6 +190,7 @@ impl KernelSet {
         in_dim: u32,
     ) -> Result<(), GlError> {
         debug_assert_eq!(in_dim % 32, 0, "Q8_0 rows are whole blocks");
+        debug_assert_eq!(out_dim % 4, 0, "Q8_0 out_dim must be multiple of 4 for Thread Coarsening");
         let (mut w, mut x, mut y) = (w, x, y);
         let (mut o, mut i) = (out_dim, in_dim);
         let mut params = [
@@ -199,7 +200,7 @@ impl KernelSet {
             &mut o as *mut _ as *mut c_void,
             &mut i as *mut _ as *mut c_void,
         ];
-        cuda.launch(self.f_gemv_q8_0, (out_dim, 1, 1), (WARP, 1, 1), 0, &mut params)
+        cuda.launch(self.f_gemv_q8_0, (out_dim / 4, 1, 1), (WARP, 1, 1), 0, &mut params)
     }
 
     /// `y = x * w^T` for Q4_0 weights (row-major). `w` is `[out_dim, in_dim]`.
