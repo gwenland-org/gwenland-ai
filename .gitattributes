@@ -1,0 +1,4 @@
+# Hand-authored PTX is fed verbatim to ptxas, which is ASCII-only and
+# line-oriented. Pin it to LF so checkout on any platform delivers exactly
+# what was committed, regardless of core.autocrlf.
+*.ptx text eol=lf
