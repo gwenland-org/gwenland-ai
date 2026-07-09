@@ -345,7 +345,19 @@ GEMVQ8_LOOP4:
     cvt.f32.f16 %f2, %h1;
     
     ld.global.v4.f32 {%f10, %f11, %f12, %f13}, [%rd21];
-    ld.global.u32 %r29, [%rd19];
+    
+    // Q8_0 block is 34 bytes (f16 + 32 bytes qs). 
+    // This means block boundaries are NOT 4-byte aligned (e.g. block 0 qs starts at 2, block 1 qs starts at 36).
+    // The pointer %rd19 is only guaranteed to be 2-byte aligned.
+    // So we MUST load 4 bytes using two 2-byte loads (ld.global.u16), otherwise we hit CUDA_ERROR_MISALIGNED_ADDRESS!
+    .reg .b16 %q16_0, %q16_1;
+    .reg .b32 %q32_0, %q32_1;
+    ld.global.u16 %q16_0, [%rd19];
+    ld.global.u16 %q16_1, [%rd19+2];
+    cvt.u32.u16 %q32_0, %q16_0;
+    cvt.u32.u16 %q32_1, %q16_1;
+    shl.b32 %q32_1, %q32_1, 16;
+    or.b32 %r29, %q32_0, %q32_1;
     
     cvt.s32.s8 %r30, %r29;
     cvt.rn.f32.s32 %f14, %r30;
