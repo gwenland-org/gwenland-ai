@@ -378,7 +378,6 @@ QUANT_DONE:
 
     .reg .b32 %r3_0, %r3_1, %r3_2, %r3_3;
     .reg .b64 %rd_x_scales;
-    .reg .b64 %rd_x_scales, %rd23;
     .reg .b64 %rd7_0, %rd7_1, %rd7_2, %rd7_3;
     .reg .b64 %rd15_0, %rd15_1, %rd15_2, %rd15_3;
     .reg .b64 %rd17_0, %rd17_1, %rd17_2, %rd17_3;
@@ -391,9 +390,7 @@ QUANT_DONE:
     .reg .b32 %r8_0, %r8_1, %r8_2, %r8_3;
     .reg .f32 %f3_0, %f3_1, %f3_2, %f3_3;
     .reg .f32 %f_x_scale;
-    .reg .f32 %f_x_scale;
     .reg .b32 %q32_0, %q32_1, %q32_2, %q32_3;
-    .reg .b32 %xq32_0;
     .reg .b32 %xq32_0;
 
     ld.param.u64 %rd1, [p_w];
