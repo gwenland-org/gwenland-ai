@@ -298,6 +298,20 @@ GEMV_DONE:
     .reg .f32 %f<30>;
     .reg .b64 %rd<40>;
 
+    .reg .b32 %r3_0, %r3_1, %r3_2, %r3_3;
+    .reg .b64 %rd7_0, %rd7_1, %rd7_2, %rd7_3;
+    .reg .b64 %rd15_0, %rd15_1, %rd15_2, %rd15_3;
+    .reg .b64 %rd17_0, %rd17_1, %rd17_2, %rd17_3;
+    .reg .b64 %rd19_0, %rd19_1, %rd19_2, %rd19_3;
+    .reg .b64 %rd8_0, %rd8_1, %rd8_2, %rd8_3;
+    .reg .b64 %rd12_0, %rd12_1, %rd12_2, %rd12_3;
+    .reg .f32 %f1_0, %f1_1, %f1_2, %f1_3;
+    .reg .f32 %f2_0, %f2_1, %f2_2, %f2_3;
+    .reg .b16 %h1_0, %h1_1, %h1_2, %h1_3;
+    .reg .b32 %r8_0, %r8_1, %r8_2, %r8_3;
+    .reg .f32 %f3_0, %f3_1, %f3_2, %f3_3;
+    .reg .b32 %q32_0, %q32_1, %q32_2, %q32_3;
+
     ld.param.u64 %rd1, [p_w];
     ld.param.u64 %rd2, [p_x];
     ld.param.u64 %rd3, [p_y];
@@ -371,7 +385,6 @@ GEMVQ8_LOOP4:
     // ROW 0
     ld.global.u16 %h1_0, [%rd17_0];
     cvt.f32.f16 %f2_0, %h1_0;
-    .reg .b32 %q32_0;
     ld.global.u32 %q32_0, [%rd19_0];
     
     cvt.s32.s8 %r30, %q32_0;
@@ -398,7 +411,6 @@ GEMVQ8_LOOP4:
     // ROW 1
     ld.global.u16 %h1_1, [%rd17_1];
     cvt.f32.f16 %f2_1, %h1_1;
-    .reg .b32 %q32_1;
     ld.global.u32 %q32_1, [%rd19_1];
     
     cvt.s32.s8 %r30, %q32_1;
@@ -425,7 +437,6 @@ GEMVQ8_LOOP4:
     // ROW 2
     ld.global.u16 %h1_2, [%rd17_2];
     cvt.f32.f16 %f2_2, %h1_2;
-    .reg .b32 %q32_2;
     ld.global.u32 %q32_2, [%rd19_2];
     
     cvt.s32.s8 %r30, %q32_2;
@@ -452,7 +463,6 @@ GEMVQ8_LOOP4:
     // ROW 3
     ld.global.u16 %h1_3, [%rd17_3];
     cvt.f32.f16 %f2_3, %h1_3;
-    .reg .b32 %q32_3;
     ld.global.u32 %q32_3, [%rd19_3];
     
     cvt.s32.s8 %r30, %q32_3;
