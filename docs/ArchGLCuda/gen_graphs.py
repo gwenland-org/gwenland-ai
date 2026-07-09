@@ -178,9 +178,39 @@ def graph_kernel_bandwidth():
     plt.close(fig)
     print("wrote benchmark_img4.png")
 
+# ==========================================================================
+# GRAPH 5 — glcuda vs llama.cpp vs theoretical (the honest target)
+# ==========================================================================
+def graph_vs_llamacpp():
+    # Measured on the same T4 / model / quant. llama.cpp is fully optimized
+    # (uses CUDA Graphs on this path); the theoretical limit is peak-BW.
+    labels = ["glcuda\n(pre-graph)", "llama.cpp\n(optimized)", "T4 peak-BW\n(theoretical)"]
+    vals = [155, 228, 640]
+    colors = [BLUE, AQUA, "#cccccc"]
+    fig, ax = plt.subplots(figsize=(7.6, 4.2))
+    style(ax)
+    bars = ax.bar(labels, vals, color=colors, width=0.6, zorder=3)
+    for b, v in zip(bars, vals):
+        ax.annotate(f"{v} tok/s", (b.get_x() + b.get_width()/2, v),
+                    textcoords="offset points", xytext=(0, 4), ha="center",
+                    color=INK, fontweight="bold")
+    # the closeable gap: glcuda -> llama.cpp
+    ax.annotate("", xy=(1, 228), xytext=(0, 155),
+                arrowprops=dict(arrowstyle="->", color=RED, linewidth=1.6))
+    ax.annotate("+47% to parity\n(CUDA Graphs target)", (0.5, 245),
+                color=RED, fontsize=10, ha="center", fontweight="bold")
+    ax.set_ylabel("decode tok/s")
+    ax.set_title("Decode vs llama.cpp (Tesla T4, Qwen2.5-0.5B Q8_0)",
+                 fontweight="bold", loc="left", color=INK)
+    ax.set_ylim(0, 720)
+    fig.savefig(os.path.join(OUT, "benchmark_img5.png"))
+    plt.close(fig)
+    print("wrote benchmark_img5.png")
+
 if __name__ == "__main__":
     graph_decode_runs()
     graph_prefill_vs_decode()
     graph_ceiling()
     graph_kernel_bandwidth()
+    graph_vs_llamacpp()
     print("done ->", OUT)

@@ -92,6 +92,25 @@ headroom remaining. `nvidia-smi` reports ~22% GPU utilization during decode,
 consistent with the GPU being **idle most of the time**: the bottleneck is
 latency / serialization, not throughput.
 
+### The realistic target is llama.cpp, not the theoretical peak
+
+The 640 tok/s peak-bandwidth figure is an upper bound no engine actually reaches
+on this model. Measured on the **same T4, same model, same Q8_0 quant**,
+llama.cpp — fully optimized, and using CUDA Graphs on this path — decodes at
+**228 tok/s**, i.e. ~36% of the theoretical peak. That is the honest bar.
+
+![decode vs llama.cpp](benchmark_img5.png)
+
+| Engine | decode tok/s | vs theoretical |
+|---|---|---|
+| glcuda (pre-graph) | 155 | 24% |
+| **llama.cpp (optimized)** | **228** | 36% |
+| T4 peak-BW (theoretical) | 640 | 100% |
+
+So the concrete goal is **155 → ~228 (+47%)** to reach parity with the best
+production engine. That gap is almost exactly the inter-kernel serialization the
+bench identified — and CUDA Graphs is how llama.cpp closes it too.
+
 ---
 
 ## What we learned (and un-learned)
@@ -165,21 +184,26 @@ because of the serial gaps, not because any kernel is slow.
 
 In expected order of payoff:
 
+In expected order of payoff. **Target: llama.cpp parity (~228 tok/s), a +47%
+gain over the pre-graph 155.**
+
 | Step | Expected | Status |
 |---|---|---|
 | Fuse attention over all heads | (prerequisite for graphs) | **done** — no direct gain |
 | Microbenchmark to locate the wall | (diagnosis) | **done** — it is serialization, not the kernels |
-| **CUDA Graphs (M2.2): replay ~600 launches as one** | 147 -> toward ~300–450 | **next — this is the lever** |
+| CUDA Graphs stage 1: capture/replay mechanism | (derisk the API) | **done** — self-test on T4 |
+| **CUDA Graphs stage 2: one graph per token** | 155 -> ~228 (llama.cpp) | **in progress** |
 | Native q4_0 / q4_k GEMV kernels | smaller stream/token | later |
 | KV-cache f16 | 2x less KV traffic | later |
 
 The bench redirected the roadmap: since every kernel already runs near
 bandwidth and the loss is inter-kernel serialization, **CUDA Graphs is the
-correct next step**, not a GEMV rewrite. Collapsing the per-token launch
-sequence into a single graph replay removes the gaps that keep the GPU ~78%
-idle. The attention fusion done earlier is a prerequisite (fewer, more uniform
-nodes to capture). Target: above 50% of achievable bandwidth (~250+ tok/s),
-with 70–90% reachable if capture overhead is low.
+correct lever** — collapsing the per-token launch sequence into a single graph
+replay removes the gaps that keep the GPU ~78% idle. This is also exactly how
+llama.cpp reaches 228 on this path, so parity is the concrete goal. The
+attention fusion done earlier is a prerequisite (fewer, more uniform nodes to
+capture). Stage 2 makes the graph static across tokens by moving `pos` /
+`cached_len` into device memory the kernels read.
 
 ---
 
