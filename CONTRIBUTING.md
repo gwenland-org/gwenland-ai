@@ -4,55 +4,70 @@ Thanks for wanting to help out. GwenLand is a local-first AI toolkit written in 
 
 ## Getting oriented
 
-The code is a Cargo workspace under `gwen-cli/` — that's the workspace root, not the repo root, so run cargo commands from there. Inside it, `packages/core` (`gwenland-core`) is where the real work lives: inference, training, benchmarks, storage, diagnostics. `packages/gltui` (`gltui`) is the `gwenland` binary and its terminal UI; you invoke it as `gwen`. Per-session notes go in `gwen-cli/changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+The repo is a single Cargo workspace rooted at the repository root — run cargo commands from there. The engine stack is a set of `gl*` crates:
+
+- `glcore` — shared foundation: tensor types, error handling, GGUF/safetensors parsers, the from-scratch tokenizer, the `GlEngine` trait every backend implements, and the runtime.
+- `glproc` — the CPU inference engine (pure Rust, SIMD). This is the **numerical ground truth** the GPU backends are validated against.
+- `glcuda`, `glvulkan`, `glmetal` — the GPU backends (CUDA is the furthest along; see `architecture/ArchGLML_X2.md`).
+- `glcli` — the `gwen` binary: `cargo run -p glcli` runs local inference through the engines.
+
+There is also a `packages/` group (`packages/core`, `packages/gltui`, `packages/mcp`) — the `gltui` terminal UI and MCP server. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+
+Note the workspace mixes editions: `glcore`/`glproc`/`glcli` are edition 2021, `packages/gltui` is edition 2024.
 
 ## What you'll need
 
-A recent Rust toolchain — edition 2024, so 1.85 or newer, via [rustup](https://rustup.rs).
+A recent Rust toolchain via [rustup](https://rustup.rs) — 1.85 or newer, since some crates use edition 2024.
 
 ## Building and running
 
-For the CLI, which is the main thing:
+The CLI is the main entry point:
 
 ```bash
-cd gwen-cli
-cargo build --release -p gltui     # produces target/release/gwenland
-cargo run -p gltui -- doctor        # quick smoke test
+cargo build --release -p glcli          # produces target/release/gwen
+cargo run -p glcli -- --help            # see the available commands
 ```
 
+The terminal UI:
 
+```bash
+cargo run -p gltui
+```
 
-GPU support is off by default; turn it on at runtime with `CANDLE_CUDA=1` or `CANDLE_METAL=1`.
+GPU support is opt-in. The CUDA backend (`glcuda`) loads the NVIDIA driver at runtime — no CUDA toolkit needed to build — and reports itself unavailable on machines without a driver, so the runtime falls back to the CPU engine.
 
 ## Running the checks
 
 ```bash
-cd gwen-cli
-
-# Core tests run single-threaded on purpose — a few touch process-global state
-# (the panic hook, the GWEN_HOME test env) and race each other otherwise.
-cargo test -p gwenland-core --lib -- --test-threads=1
-
+cargo test -p glcore -p glproc -p glcuda
 cargo test -p gltui
+
 cargo fmt --all
-cargo clippy -p gwenland-core -p gltui --all-targets -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-There's a GitLab pipeline in `.gitlab-ci.yml.disabled` that runs all of this. It's parked because GitLab's shared runners want a credit card; re-enable it by renaming it back once you've sorted that out, or just run the checks above by hand.
+A few notes on the test suites:
+
+- **glcuda's GPU tests skip themselves when no CUDA device is present** — they print `SKIP` and pass, so the suite is green on a GPU-less machine and meaningful on one with a GPU. On a GPU runner, run the parity/forward suites with `--test-threads=1` so the VRAM-leak check isn't perturbed by concurrent allocations.
+- If any core tests touch process-global state (a panic hook, a test env var), run them single-threaded (`-- --test-threads=1`) so they don't race each other.
+
+There's a GitLab pipeline in `.gitlab-ci.yml.disabled` that runs the checks. It's parked because GitLab's shared runners want a credit card; re-enable it by renaming it back once you've sorted that out, or just run the checks above by hand.
 
 ## A note on platform-specific code
 
-GwenLand targets modest hardware — think an 11th-gen i3, 8 GB of RAM, no GPU, on Linux — served by an mmap loader that keeps roughly one model layer in memory at a time. Two things follow from that. Don't hold extra full-size copies of weights and blow the memory budget. And when you write OS-specific code, gate it as narrowly as you can and actually compile it on the platforms it claims to support. We got bitten by exactly this: `MADV_DONTNEED` was under `#[cfg(unix)]`, but `memmap2::Advice::DontNeed` is gated off on macOS in some versions, so it built fine on Windows (where the block is skipped) and Linux, then broke a contributor's macOS build. It should have been `#[cfg(target_os = "linux")]`. If you touch a `cfg`-gated path, build it somewhere other than your own machine before you assume it compiles.
+GwenLand targets modest hardware — think an 11th-gen i3, 8 GB of RAM, no GPU, on Linux — served by an mmap loader that keeps the weight working set small. Two things follow. Don't hold extra full-size copies of weights and blow the memory budget. And when you write OS-specific code, gate it as narrowly as you can and actually compile it on the platforms it claims to support. We got bitten by exactly this: `MADV_DONTNEED` was under `#[cfg(unix)]`, but `memmap2::Advice::DontNeed` is gated off on macOS in some versions, so it built fine on Windows (where the block is skipped) and Linux, then broke a contributor's macOS build. It should have been `#[cfg(target_os = "linux")]`. If you touch a `cfg`-gated path, build it somewhere other than your own machine before you assume it compiles.
+
+The same discipline applies to the GPU backends: hand-authored PTX must be pure ASCII with LF line endings (`ptxas` rejects a stray em-dash before it parses a single instruction), and every GPU kernel is validated against `glproc` within an explicit per-operation tolerance — see `architecture/ArchGLML_X2.md`.
 
 ## Branches, commits, and changelogs
 
-Branch off `main` with something like `feature/gwen-123-short-description` — tie it to a Linear `GWEN-XXX` issue when there is one. Keep commits focused and use conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, with an optional scope like `fix(serve):`). Prefer a new commit over rewriting shared history. For anything more than a trivial change, add a note under `gwen-cli/changelog/` named `Gwen-Changes-YYYY-MM-DD...md` that walks through the problem, the root cause, and the fix — match the existing entries.
+Branch off `main` with something like `feature/gwen-123-short-description` — tie it to a `GWEN-XXX` issue when there is one. Keep commits focused and use conventional prefixes (`feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, with an optional scope like `fix(glcuda):`). Prefer a new commit over rewriting shared history. For anything more than a trivial change, add a note under `changelog/` that walks through the problem, the root cause, and the fix — match the existing entries.
 
 One hard rule: never commit secrets, and never put a token in a git remote URL (use a credential helper instead). If you spot a leaked credential, say something and get it rotated.
 
 ## Sending a change
 
-Make your change, add tests and a changelog note, run the checks, then open a merge request against `main` on [GitLab](https://gitlab.com/jinxsuperdev/gwenland) and reference the issue. Keep each MR to one thing — split unrelated fixes apart.
+Make your change, add tests and a changelog note, run the checks, then open a merge/pull request against `main` and reference the issue. Keep each PR to one thing — split unrelated fixes apart.
 
 ## License
 
