@@ -200,7 +200,7 @@ impl KernelSet {
             &mut o as *mut _ as *mut c_void,
             &mut i as *mut _ as *mut c_void,
         ];
-        cuda.launch(self.f_gemv_q8_0, (out_dim / 4, 1, 1), (WARP, 1, 1), 0, &mut params)
+        cuda.launch(self.f_gemv_q8_0, (ceil_div(out_dim, 16), 1, 1), (128, 1, 1), 0, &mut params)
     }
 
     /// `y = x * w^T` for Q4_0 weights (row-major). `w` is `[out_dim, in_dim]`.

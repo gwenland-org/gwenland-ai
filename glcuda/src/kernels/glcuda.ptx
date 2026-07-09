@@ -317,17 +317,24 @@ GEMV_DONE:
     ld.param.u64 %rd3, [p_y];
     ld.param.u32 %r1, [p_out];
     ld.param.u32 %r2, [p_in];
-    
+    .reg .b32 %warp_id, %global_warp, %lane;
     mov.u32 %r3, %ctaid.x;              // row block
-    mul.lo.s32 %r3_0, %r3, 4;           // row_0 = ctaid.x * 4
+    mov.u32 %r4, %tid.x;                // thread index (0-127)
+    
+    shr.u32 %warp_id, %r4, 5;           // warp_id = tid.x / 32
+    and.b32 %lane, %r4, 31;             // lane = tid.x % 32
+    mov.u32 %r4, %lane;                 // r4 is now lane (0-31)
+
+    mul.lo.s32 %global_warp, %r3, 4;    // assuming 4 warps per block
+    add.s32 %global_warp, %global_warp, %warp_id;
+
+    mul.lo.s32 %r3_0, %global_warp, 4;  // row_0 = global_warp * 4
     setp.ge.u32 %p1, %r3_0, %r1;
     @%p1 bra GEMVQ8_DONE;
     
     add.s32 %r3_1, %r3_0, 1;
     add.s32 %r3_2, %r3_0, 2;
     add.s32 %r3_3, %r3_0, 3;
-
-    mov.u32 %r4, %tid.x;                // lane
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
     cvta.to.global.u64 %rd6, %rd3;
