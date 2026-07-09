@@ -10,9 +10,9 @@ use std::sync::{Arc, OnceLock};
 use glcore::GlError;
 
 use crate::ffi::{
-    CUcontext, CUdevice, CUdeviceptr, CUfunction, CUmodule, CUresult, DriverApi,
-    ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR, ATTR_MULTIPROCESSOR_COUNT,
-    CUDA_SUCCESS,
+    CUcontext, CUdevice, CUdeviceptr, CUfunction, CUgraph, CUgraphExec, CUmodule, CUresult,
+    CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
+    ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
 };
 
 /// The process-wide driver API table, loaded on first use. `None` when the
@@ -83,6 +83,12 @@ pub struct Cuda {
     api: Arc<DriverApi>,
     device: CUdevice,
     ctx: CUcontext,
+    /// The stream every kernel launch targets. NULL = the default stream
+    /// (normal execution). During graph capture it is pointed at the
+    /// capture stream so the unchanged `KernelSet` wrappers record into the
+    /// graph instead of executing. `AtomicPtr` so `Cuda` stays `Sync`;
+    /// only ever flipped between launches by the single owning thread.
+    launch_stream: std::sync::atomic::AtomicPtr<c_void>,
     /// Facts about the device this handle is bound to.
     pub info: DeviceInfo,
 }
@@ -162,6 +168,7 @@ impl Cuda {
                 api,
                 device,
                 ctx,
+                launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 info: DeviceInfo { name, sm_major, sm_minor, sm_count, total_mem, driver_version },
             })
         }
@@ -299,9 +306,11 @@ impl Cuda {
         Ok(Module { api: self.api.clone(), raw })
     }
 
-    /// Launch `f` with the given geometry. `params` holds one pointer per
-    /// kernel parameter, in declaration order, each pointing at a live
-    /// host value (the driver copies them synchronously at launch).
+    /// Launch `f` with the given geometry onto the current launch stream
+    /// ([`Cuda::launch_stream`] — NULL for normal execution, or the capture
+    /// stream while a graph is being recorded). `params` holds one pointer
+    /// per kernel parameter, in declaration order, each pointing at a live
+    /// host value (the driver reads them at launch/record time).
     pub fn launch(
         &self,
         f: Kernel,
@@ -310,8 +319,10 @@ impl Cuda {
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<(), GlError> {
+        let stream = self.launch_stream.load(std::sync::atomic::Ordering::Relaxed);
         // SAFETY: f belongs to a live module on this context; params
-        // pointers are valid for the duration of the (synchronous) call.
+        // pointers are valid for the duration of the call; stream is NULL
+        // or a live stream owned for the length of a capture.
         unsafe {
             check(
                 &self.api,
@@ -324,13 +335,96 @@ impl Cuda {
                     block.1,
                     block.2,
                     shared_bytes,
-                    std::ptr::null_mut(), // default stream
+                    stream,
                     params.as_mut_ptr(),
                     std::ptr::null_mut(),
                 ),
                 "cuLaunchKernel",
             )
         }
+    }
+
+    /// Capture everything launched by `body` into a replayable [`GraphExec`].
+    ///
+    /// Creates a fresh non-blocking stream, points all launches at it for
+    /// the duration of `body` (so the unchanged `KernelSet` wrappers record
+    /// instead of execute), ends capture, and instantiates the graph. The
+    /// launch stream is restored to NULL afterward even on error.
+    ///
+    /// `body` must issue only stream-ordered work (kernel launches, async
+    /// copies) — a synchronizing call inside capture aborts it.
+    pub fn capture<F>(&self, body: F) -> Result<GraphExec, GlError>
+    where
+        F: FnOnce() -> Result<(), GlError>,
+    {
+        use crate::ffi::{CU_STREAM_CAPTURE_MODE_GLOBAL, CU_STREAM_NON_BLOCKING};
+        use std::sync::atomic::Ordering;
+
+        // Dedicated capturable stream.
+        let mut stream: CUstream = std::ptr::null_mut();
+        // SAFETY: out pointer valid.
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_stream_create)(&mut stream, CU_STREAM_NON_BLOCKING),
+                "cuStreamCreate",
+            )?
+        };
+
+        // Point launches at the capture stream; guarantee restore + destroy.
+        self.launch_stream.store(stream, Ordering::Relaxed);
+        let result = (|| -> Result<GraphExec, GlError> {
+            // SAFETY: stream is live and idle.
+            unsafe {
+                check(
+                    &self.api,
+                    (self.api.cu_stream_begin_capture)(stream, CU_STREAM_CAPTURE_MODE_GLOBAL),
+                    "cuStreamBeginCapture",
+                )?
+            };
+            body()?;
+            let mut graph: CUgraph = std::ptr::null_mut();
+            // SAFETY: ends the capture opened above; out pointer valid.
+            unsafe {
+                check(
+                    &self.api,
+                    (self.api.cu_stream_end_capture)(stream, &mut graph),
+                    "cuStreamEndCapture",
+                )?
+            };
+            let mut exec: CUgraphExec = std::ptr::null_mut();
+            // SAFETY: graph is a valid captured graph; flags 0.
+            let inst = unsafe { (self.api.cu_graph_instantiate)(&mut exec, graph, 0) };
+            // The graph template is no longer needed once instantiated.
+            // SAFETY: graph is live and owned here.
+            unsafe {
+                let _ = (self.api.cu_graph_destroy)(graph);
+            }
+            check(&self.api, inst, "cuGraphInstantiate")?;
+            Ok(GraphExec { api: self.api.clone(), exec })
+        })();
+
+        // Restore normal (default-stream) execution and free the capture
+        // stream regardless of outcome.
+        self.launch_stream.store(std::ptr::null_mut(), Ordering::Relaxed);
+        // SAFETY: stream is live and no longer referenced.
+        unsafe {
+            let _ = (self.api.cu_stream_destroy)(stream);
+        }
+        result
+    }
+
+    /// Replay a captured graph on the default stream and wait for it.
+    pub fn graph_launch(&self, exec: &GraphExec) -> Result<(), GlError> {
+        // SAFETY: exec is a live instantiated graph; NULL = default stream.
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_graph_launch)(exec.exec, std::ptr::null_mut()),
+                "cuGraphLaunch",
+            )?
+        };
+        self.synchronize()
     }
 }
 
@@ -389,6 +483,29 @@ impl Drop for Module {
         // SAFETY: raw is live and owned by us; teardown errors ignored.
         unsafe {
             let _ = (self.api.cu_module_unload)(self.raw);
+        }
+    }
+}
+
+/// An instantiated, replayable CUDA graph — the captured per-token kernel
+/// sequence collapsed into a single launchable unit (M2.2). Replay it with
+/// [`Cuda::graph_launch`]; one launch submits the whole DAG, removing the
+/// per-kernel host round-trips that leave the GPU idle between ops.
+pub struct GraphExec {
+    api: Arc<DriverApi>,
+    exec: CUgraphExec,
+}
+
+// SAFETY: graph-exec handles are context-level objects; the driver API is
+// thread-safe.
+unsafe impl Send for GraphExec {}
+unsafe impl Sync for GraphExec {}
+
+impl Drop for GraphExec {
+    fn drop(&mut self) {
+        // SAFETY: exec is live and owned by us; teardown errors ignored.
+        unsafe {
+            let _ = (self.api.cu_graph_exec_destroy)(self.exec);
         }
     }
 }

@@ -416,6 +416,47 @@ fn fused_attn_decode_matches_per_head_reference() {
     assert_close(&got, &want, EPS_MATMUL, "fused_attn_decode");
 }
 
+/// M2.2 stage 1: prove CUDA graph capture + replay works on this hardware
+/// before wiring it into the runner. Capture a fixed sequence of kernel
+/// launches (three `gl_add`s) into a graph, then replay the graph N times
+/// and confirm the arithmetic matches doing the launches directly — i.e.
+/// the captured graph really executes the recorded work each replay.
+#[test]
+fn cuda_graph_capture_replay_executes() {
+    let Some((cuda, k)) = gpu() else { return };
+    let n = 1024usize;
+    let base = randv(n, 80, 1.0);
+    let addend = vec![1.0f32; n];
+
+    let mut buf = BackendBuffer::new(&cuda, (n * 2 * 4 + 4096) as u64).unwrap();
+    let acc = buf.alloc_f32(n).unwrap().dptr;
+    let one = upload(&cuda, &mut buf, &addend);
+    cuda.htod_f32(acc, &base).unwrap();
+
+    // Capture "acc += one" three times into one graph. During capture the
+    // launches are recorded, not executed, so acc is unchanged afterward.
+    let graph = cuda
+        .capture(|| {
+            k.add(&cuda, acc, one, n as u32)?;
+            k.add(&cuda, acc, one, n as u32)?;
+            k.add(&cuda, acc, one, n as u32)?;
+            Ok(())
+        })
+        .unwrap();
+
+    // Two replays => acc should be base + 3 + 3 = base + 6.
+    cuda.graph_launch(&graph).unwrap();
+    cuda.graph_launch(&graph).unwrap();
+
+    let mut got = vec![0f32; n];
+    cuda.dtoh_f32(&mut got, acc).unwrap();
+    buf.free(&cuda).unwrap();
+
+    for (g, b) in got.iter().zip(&base) {
+        assert_eq!(*g, b + 6.0, "graph replay did not execute the recorded adds");
+    }
+}
+
 /// ADR-005 / M2 definition of done: the backend buffer must give VRAM back
 /// exactly — free VRAM identical before and after a full alloc/use/free
 /// cycle. Requires `--test-threads=1` to be meaningful (see module doc).

@@ -22,10 +22,20 @@ pub type CUmodule = *mut c_void;
 pub type CUfunction = *mut c_void;
 /// Opaque stream handle. Null = the default stream.
 pub type CUstream = *mut c_void;
+/// Opaque graph handle (a captured/constructed DAG of GPU work).
+pub type CUgraph = *mut c_void;
+/// Opaque executable-graph handle (an instantiated, launch-ready graph).
+pub type CUgraphExec = *mut c_void;
 /// Device memory address. Always 64-bit, even on 32-bit hosts.
 pub type CUdeviceptr = u64;
 
 pub const CUDA_SUCCESS: CUresult = 0;
+
+/// `cuStreamCreate` flag: non-blocking w.r.t. the default (NULL) stream —
+/// required for a stream to be capturable.
+pub const CU_STREAM_NON_BLOCKING: u32 = 1;
+/// `cuStreamBeginCapture` mode: global (the standard capture mode).
+pub const CU_STREAM_CAPTURE_MODE_GLOBAL: u32 = 0;
 
 // cuDeviceGetAttribute selectors (CUdevice_attribute).
 pub const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
@@ -145,6 +155,24 @@ pub struct DriverApi {
         *mut *mut c_void, // kernelParams
         *mut *mut c_void, // extra
     ) -> CUresult,
+
+    // --- Streams + CUDA Graphs (M2.2) ---
+    pub cu_stream_create: unsafe extern "system" fn(*mut CUstream, u32) -> CUresult,
+    pub cu_stream_destroy: unsafe extern "system" fn(CUstream) -> CUresult,
+    pub cu_stream_synchronize: unsafe extern "system" fn(CUstream) -> CUresult,
+    pub cu_stream_begin_capture:
+        unsafe extern "system" fn(CUstream, u32 /* mode */) -> CUresult,
+    pub cu_stream_end_capture:
+        unsafe extern "system" fn(CUstream, *mut CUgraph) -> CUresult,
+    pub cu_graph_instantiate: unsafe extern "system" fn(
+        *mut CUgraphExec,
+        CUgraph,
+        u64, // flags (0)
+    ) -> CUresult,
+    pub cu_graph_launch: unsafe extern "system" fn(CUgraphExec, CUstream) -> CUresult,
+    pub cu_graph_exec_destroy: unsafe extern "system" fn(CUgraphExec) -> CUresult,
+    pub cu_graph_destroy: unsafe extern "system" fn(CUgraph) -> CUresult,
+
     pub cu_get_error_name: unsafe extern "system" fn(CUresult, *mut *const i8) -> CUresult,
 }
 
@@ -207,6 +235,26 @@ impl DriverApi {
             cu_memcpy_dtod: sym_v2(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0")?,
             cu_mem_get_info: sym_v2(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0")?,
             cu_launch_kernel: sym(lib, b"cuLaunchKernel\0")?,
+
+            cu_stream_create: sym(lib, b"cuStreamCreate\0")?,
+            cu_stream_destroy: sym_v2(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
+            cu_stream_synchronize: sym(lib, b"cuStreamSynchronize\0")?,
+            cu_stream_begin_capture: sym_v2(
+                lib,
+                b"cuStreamBeginCapture_v2\0",
+                b"cuStreamBeginCapture\0",
+            )?,
+            cu_stream_end_capture: sym(lib, b"cuStreamEndCapture\0")?,
+            // The flags-taking instantiate (CUDA 12 renamed _v2 -> WithFlags).
+            cu_graph_instantiate: sym_v2(
+                lib,
+                b"cuGraphInstantiateWithFlags\0",
+                b"cuGraphInstantiate_v2\0",
+            )?,
+            cu_graph_launch: sym(lib, b"cuGraphLaunch\0")?,
+            cu_graph_exec_destroy: sym(lib, b"cuGraphExecDestroy\0")?,
+            cu_graph_destroy: sym(lib, b"cuGraphDestroy\0")?,
+
             cu_get_error_name: sym(lib, b"cuGetErrorName\0")?,
             _lib: Lib(lib),
         })
