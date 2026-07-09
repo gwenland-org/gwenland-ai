@@ -149,8 +149,11 @@ fn gemv_q8_0_matches_dequantized_reference() {
     let dw = buf.alloc(padded.len() as u64).unwrap().dptr;
     cuda.htod(dw, &padded).unwrap();
     let dx = upload(&cuda, &mut buf, &x);
+    let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+    let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
     let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q8_0(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32).unwrap();
+    k.gemv_q8_0(&cuda, dw, d_qs, d_scales, dy, out_dim as u32, in_dim as u32).unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();

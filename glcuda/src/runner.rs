@@ -40,17 +40,20 @@ pub struct GenTiming {
     pub decode: std::time::Duration,
 }
 
-/// GEMV over either weight representation.
 fn gemv_w(
     cuda: &Cuda,
     k: &KernelSet,
+    ws: &crate::model::Workspace,
     m: &GpuMat,
     x: CUdeviceptr,
     y: CUdeviceptr,
 ) -> Result<(), GlError> {
     match &m.w {
         GpuWeight::F32(s) => k.gemv(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
-        GpuWeight::Q8_0(s) => k.gemv_q8_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
+        GpuWeight::Q8_0(s) => {
+            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
+            k.gemv_q8_0(cuda, s.dptr, ws.q8_qs.dptr, ws.q8_scales.dptr, y, m.out_dim, m.in_dim)
+        }
         GpuWeight::Q4_0(s) => k.gemv_q4_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
     }
 }
@@ -108,9 +111,9 @@ impl GpuModel {
         for (l, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
             k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
-            gemv_w(cuda, k, &layer.wq, xn, q_ptr)?;
-            gemv_w(cuda, k, &layer.wk, xn, k_ptr)?;
-            gemv_w(cuda, k, &layer.wv, xn, v_ptr)?;
+            gemv_w(cuda, k, ws, &layer.wq, xn, q_ptr)?;
+            gemv_w(cuda, k, ws, &layer.wk, xn, k_ptr)?;
+            gemv_w(cuda, k, ws, &layer.wv, xn, v_ptr)?;
 
             if let Some(b) = &layer.bq {
                 k.add(cuda, q_ptr, b.dptr, q_dim as u32)?;
@@ -163,7 +166,7 @@ impl GpuModel {
                 scale,
             )?;
 
-            gemv_w(cuda, k, &layer.wo, ws.attn_out.dptr, ws.proj.dptr)?;
+            gemv_w(cuda, k, ws, &layer.wo, ws.attn_out.dptr, ws.proj.dptr)?;
             k.add(cuda, x, ws.proj.dptr, dim)?;
 
             // --- SwiGLU feed-forward block ---
@@ -172,15 +175,15 @@ impl GpuModel {
             k.rms_norm(cuda, x, layer.ffn_norm.dptr, xn, dim, c.rms_eps)?;
             let gate = ws.gate_up.dptr;
             let up = at(ws.gate_up.dptr, c.hidden_dim);
-            gemv_w(cuda, k, &layer.w_gate_up, xn, gate)?;
+            gemv_w(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
             k.silu_mul(cuda, gate, up, c.hidden_dim as u32)?;
-            gemv_w(cuda, k, &layer.w_down, gate, ws.proj.dptr)?;
+            gemv_w(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
             k.add(cuda, x, ws.proj.dptr, dim)?;
         }
 
         if want_logits {
             k.rms_norm(cuda, x, self.output_norm.dptr, xn, dim, c.rms_eps)?;
-            gemv_w(cuda, k, &self.output, xn, ws.logits.dptr)?;
+            gemv_w(cuda, k, ws, &self.output, xn, ws.logits.dptr)?;
         }
         Ok(())
     }

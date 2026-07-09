@@ -275,6 +275,10 @@ pub(crate) struct Workspace {
     pub logits_host: Vec<f32>,
     /// Host staging for the embedding row uploaded per token.
     pub embed_host: Vec<f32>,
+    /// Q8_0 decoupled quantizer output (INT8 weights), `[hidden_dim]` max.
+    pub q8_qs: DevSlice,
+    /// Q8_0 decoupled quantizer output (FP32 block scales), `[hidden_dim / 32]` max.
+    pub q8_scales: DevSlice,
 }
 
 /// A model resident in VRAM: weights, KV cache and workspace, all carved
@@ -332,6 +336,8 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += f32s(c.vocab_size); // logits
     total += f32s(kv_capacity * (c.head_dim / 2)) * 2; // rope tables
     total += align_up(2 * 4); // token_params [pos, cached_len]
+    total += align_up(c.hidden_dim as u64); // q8_qs
+    total += f32s(c.hidden_dim / 32); // q8_scales
     total
 }
 
@@ -440,6 +446,8 @@ impl GpuModel {
             token_params: buf.alloc(2 * 4)?, // [pos, cached_len] as u32
             logits_host: vec![0.0; c.vocab_size],
             embed_host: vec![0.0; c.dim],
+            q8_qs: buf.alloc(c.hidden_dim as u64)?,
+            q8_scales: buf.alloc_f32(c.hidden_dim / 32)?,
         };
 
         Ok(GpuModel {
