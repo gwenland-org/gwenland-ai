@@ -41,8 +41,7 @@
     .reg .b64 %rd<8>;
 
     ld.param.u64 %rd1, [p_y];
-    ld.param.u64 %rd2, [p_x_qs];
-    ld.param.u64 %rd_x_scales, [p_x_scales];
+    ld.param.u64 %rd2, [p_x];
     ld.param.u32 %r1, [p_n];
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %ntid.x;
@@ -213,8 +212,7 @@ ROPE_DONE:
     .reg .b64 %rd<16>;
 
     ld.param.u64 %rd1, [p_w];
-    ld.param.u64 %rd2, [p_x_qs];
-    ld.param.u64 %rd_x_scales, [p_x_scales];
+    ld.param.u64 %rd2, [p_x];
     ld.param.u64 %rd3, [p_y];
     ld.param.u32 %r1, [p_out];
     ld.param.u32 %r2, [p_in];
@@ -482,7 +480,7 @@ GEMVQ8_LOOP4:
     
     ld.global.u32 %xq32_0, [%rd21];
     ld.global.f32 %f_x_scale, [%rd23];
-
+    
     // ROW 0
     ld.global.u16 %h1_0, [%rd17_0];
     cvt.f32.f16 %f2_0, %h1_0;
@@ -490,7 +488,7 @@ GEMVQ8_LOOP4:
     dp4a.s32.s32 %r30, %q32_0, %xq32_0, 0;
     cvt.rn.f32.s32 %f14, %r30;
     mul.rn.f32 %f18, %f2_0, %f_x_scale;
-    fma.rn.f32 %f1_0, %f14, %f18, %f1_0;
+    fma.rn.f32 %f1_0, %f18, %f14, %f1_0;
 
     // ROW 1
     ld.global.u16 %h1_1, [%rd17_1];
@@ -499,7 +497,7 @@ GEMVQ8_LOOP4:
     dp4a.s32.s32 %r30, %q32_1, %xq32_0, 0;
     cvt.rn.f32.s32 %f14, %r30;
     mul.rn.f32 %f18, %f2_1, %f_x_scale;
-    fma.rn.f32 %f1_1, %f14, %f18, %f1_1;
+    fma.rn.f32 %f1_1, %f18, %f14, %f1_1;
 
     // ROW 2
     ld.global.u16 %h1_2, [%rd17_2];
@@ -508,7 +506,7 @@ GEMVQ8_LOOP4:
     dp4a.s32.s32 %r30, %q32_2, %xq32_0, 0;
     cvt.rn.f32.s32 %f14, %r30;
     mul.rn.f32 %f18, %f2_2, %f_x_scale;
-    fma.rn.f32 %f1_2, %f14, %f18, %f1_2;
+    fma.rn.f32 %f1_2, %f18, %f14, %f1_2;
 
     // ROW 3
     ld.global.u16 %h1_3, [%rd17_3];
@@ -517,7 +515,7 @@ GEMVQ8_LOOP4:
     dp4a.s32.s32 %r30, %q32_3, %xq32_0, 0;
     cvt.rn.f32.s32 %f14, %r30;
     mul.rn.f32 %f18, %f2_3, %f_x_scale;
-    fma.rn.f32 %f1_3, %f14, %f18, %f1_3;
+    fma.rn.f32 %f1_3, %f18, %f14, %f1_3;
     
     add.s64 %rd17_0, %rd17_0, 144;
     add.s64 %rd17_1, %rd17_1, 144;
@@ -700,8 +698,7 @@ GEMVQ8_DONE:
     .reg .b64 %rd<16>;
 
     ld.param.u64 %rd1, [p_a];
-    ld.param.u64 %rd2, [p_x_qs];
-    ld.param.u64 %rd_x_scales, [p_x_scales];
+    ld.param.u64 %rd2, [p_x];
     ld.param.u64 %rd3, [p_y];
     ld.param.u32 %r1, [p_rows];
     ld.param.u32 %r2, [p_cols];
@@ -1420,8 +1417,7 @@ KVW_DONE:
     .reg .b64 %rd<20>;
 
     ld.param.u64 %rd1, [p_w];
-    ld.param.u64 %rd2, [p_x_qs];
-    ld.param.u64 %rd_x_scales, [p_x_scales];
+    ld.param.u64 %rd2, [p_x];
     ld.param.u64 %rd3, [p_y];
     ld.param.u32 %r1, [p_out];
     ld.param.u32 %r2, [p_in];
