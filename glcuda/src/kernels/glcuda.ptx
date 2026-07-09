@@ -1366,9 +1366,9 @@ ATTN_OUT_DONE:
 KVW_DONE:
     ret;
 }
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------// ---------------------------------------------------------------------------
 // gl_gemv_q4_0: y = W @ x with W in GGML Q4_0 blocks (18 B: f16 scale d +
-// 16 bytes of nibbles; weight = d * (q - 8)). 
+// 16 bytes of nibbles; weight = d * (q - 8)).
 // Launch: grid (out_dim) x 32 threads.
 // ---------------------------------------------------------------------------
 .visible .entry gl_gemv_q4_0(
@@ -1379,180 +1379,96 @@ KVW_DONE:
     .param .u32 p_in
 )
 {
-    .reg .pred %p<7>;
+    .reg .pred %p<6>;
     .reg .b16 %h<2>;
-    .reg .b16 %q16_<5>;
-    .reg .b32 %r<45>;
-    .reg .b32 %q32_<5>;
-    .reg .f32 %f<20>;
-    .reg .b64 %rd<30>;
+    .reg .b32 %r<30>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<20>;
 
     ld.param.u64 %rd1, [p_w];
     ld.param.u64 %rd2, [p_x];
     ld.param.u64 %rd3, [p_y];
     ld.param.u32 %r1, [p_out];
     ld.param.u32 %r2, [p_in];
+    
     mov.u32 %r3, %ctaid.x;              // row
     setp.ge.u32 %p1, %r3, %r1;
     @%p1 bra GEMVQ4_DONE;
+    
     mov.u32 %r4, %tid.x;                // lane
     cvta.to.global.u64 %rd4, %rd1;
     cvta.to.global.u64 %rd5, %rd2;
     cvta.to.global.u64 %rd6, %rd3;
+    
     shr.u32 %r5, %r2, 5;                // n_blocks = in_dim / 32
-    shr.u32 %r20, %r5, 2;               // n_blocks_4
-
-    shr.u32 %r21, %r4, 3;               // g = lane / 8
-    and.b32 %r22, %r4, 7;               // l = lane % 8
-
-    mul.lo.s32 %r6, %r5, 18;            // row bytes
+    
+    mul.lo.s32 %r6, %r5, 18;            // row_bytes = n_blocks * 18
     mul.wide.u32 %rd7, %r3, %r6;
-    add.s64 %rd15, %rd4, %rd7;          // row base
-    
-    mul.lo.s32 %r23, %r21, 18;
-    cvt.u64.u32 %rd16, %r23;
-    add.s64 %rd17, %rd15, %rd16;        // scale ptr
-    
-    mul.lo.s32 %r24, %r22, 2;
-    add.s32 %r25, %r23, %r24;
-    add.s32 %r25, %r25, 2;
-    cvt.u64.u32 %rd18, %r25;
-    add.s64 %rd19, %rd15, %rd18;        // qs ptr
-    
-    shl.b32 %r26, %r21, 7;
-    shl.b32 %r27, %r22, 4;
-    add.s32 %r28, %r26, %r27;
-    cvt.u64.u32 %rd20, %r28;
-    add.s64 %rd21, %rd5, %rd20;         // x4 ptr
+    add.s64 %rd8, %rd4, %rd7;           // row_base = W + row * row_bytes
 
-    mov.f32 %f1, 0f00000000;            // FP32 accumulator
-    mov.u32 %r7, 0;                     // block index
-
-GEMVQ4_LOOP4:
-    setp.ge.u32 %p2, %r7, %r20;
-    @%p2 bra GEMVQ4_TAIL_INIT;
+    // d_ptr = row_base + b*18
+    mov.u64 %rd9, %rd8;
     
-    ld.global.b16 %h1, [%rd17];
+    // qs_ptr = row_base + b*18 + 2 + (lane % 16)
+    and.b32 %r7, %r4, 15;               // lane % 16
+    add.s32 %r8, %r7, 2;
+    cvt.u64.u32 %rd10, %r8;
+    add.s64 %rd11, %rd8, %rd10;         // qs_ptr
+
+    // x_ptr = X + b*128 + lane*4
+    mul.wide.u32 %rd12, %r4, 4;
+    add.s64 %rd13, %rd5, %rd12;         // x_ptr
+
+    setp.lt.u32 %p2, %r4, 16;           // is_lower_nibble = lane < 16
+
+    mov.f32 %f1, 0f00000000;            // acc = 0.0
+    mov.u32 %r9, 0;                     // b = 0
+
+GEMVQ4_LOOP:
+    setp.ge.u32 %p3, %r9, %r5;
+    @%p3 bra GEMVQ4_REDUCE;
+    
+    ld.global.b16 %h1, [%rd9];          // load scale d
     cvt.f32.f16 %f2, %h1;
     
-    ld.global.v4.f32 {%f10, %f11, %f12, %f13}, [%rd21];
+    ld.global.u8 %r10, [%rd11];         // load byte
+    @%p2 and.b32 %r10, %r10, 0x0F;
+    @!%p2 shr.u32 %r10, %r10, 4;
+    @!%p2 and.b32 %r10, %r10, 0x0F;
+    sub.s32 %r10, %r10, 8;              // q - 8
+    cvt.rn.f32.s32 %f3, %r10;
     
-    ld.global.u16 %q16_0, [%rd19];
+    mul.rn.f32 %f4, %f2, %f3;           // weight = d * (q - 8)
     
-    and.b16 %q16_1, %q16_0, 0x000F;
-    cvt.u32.u16 %q32_1, %q16_1;
-    sub.s32 %q32_1, %q32_1, 8;
-    cvt.rn.f32.s32 %f14, %q32_1;
+    ld.global.f32 %f5, [%rd13];         // load x
+    fma.rn.f32 %f1, %f4, %f5, %f1;      // acc += weight * x
     
-    shr.u16 %q16_2, %q16_0, 4;
-    and.b16 %q16_2, %q16_2, 0x000F;
-    cvt.u32.u16 %q32_2, %q16_2;
-    sub.s32 %q32_2, %q32_2, 8;
-    cvt.rn.f32.s32 %f15, %q32_2;
-    
-    shr.u16 %q16_3, %q16_0, 8;
-    and.b16 %q16_3, %q16_3, 0x000F;
-    cvt.u32.u16 %q32_3, %q16_3;
-    sub.s32 %q32_3, %q32_3, 8;
-    cvt.rn.f32.s32 %f16, %q32_3;
-    
-    shr.u16 %q16_4, %q16_0, 12;
-    and.b16 %q16_4, %q16_4, 0x000F;
-    cvt.u32.u16 %q32_4, %q16_4;
-    sub.s32 %q32_4, %q32_4, 8;
-    cvt.rn.f32.s32 %f17, %q32_4;
-    
-    mul.rn.f32 %f18, %f2, %f14;
-    fma.rn.f32 %f1, %f18, %f10, %f1;
-    
-    mul.rn.f32 %f18, %f2, %f15;
-    fma.rn.f32 %f1, %f18, %f11, %f1;
-    
-    mul.rn.f32 %f18, %f2, %f16;
-    fma.rn.f32 %f1, %f18, %f12, %f1;
-    
-    mul.rn.f32 %f18, %f2, %f17;
-    fma.rn.f32 %f1, %f18, %f13, %f1;
-    
-    add.s64 %rd17, %rd17, 72;
-    add.s64 %rd19, %rd19, 72;
-    add.s64 %rd21, %rd21, 512;
-    add.s32 %r7, %r7, 1;
-    bra GEMVQ4_LOOP4;
-
-GEMVQ4_TAIL_INIT:
-    and.b32 %r37, %r5, 3;
-    setp.eq.u32 %p4, %r37, 0;
-    @%p4 bra GEMVQ4_REDUCE;
-    
-    shl.b32 %r7, %r20, 2;
-    
-    mul.lo.s32 %r38, %r7, 18;
-    cvt.u64.u32 %rd22, %r38;
-    add.s64 %rd8, %rd15, %rd22;
-    
-    shr.u32 %r39, %r4, 1;
-    cvt.u64.u32 %rd23, %r39;
-    add.s64 %rd12, %rd8, %rd23;
-    add.s64 %rd12, %rd12, 2;
-    
-    and.b32 %r40, %r4, 1;
-    
-    shl.b32 %r41, %r7, 5;
-    add.s32 %r41, %r41, %r4;
-    cvt.u64.u32 %rd24, %r41;
-    shl.b64 %rd25, %rd24, 2;
-    add.s64 %rd10, %rd5, %rd25;
-
-GEMVQ4_TAIL_LOOP:
-    setp.ge.u32 %p5, %r7, %r5;
-    @%p5 bra GEMVQ4_REDUCE;
-    ld.global.b16 %h1, [%rd8];
-    cvt.f32.f16 %f2, %h1;
-    
-    ld.global.u8 %r8, [%rd12];
-    setp.eq.u32 %p6, %r40, 0;
-    @%p6 and.b32 %r8, %r8, 0x0F;
-    @!%p6 shr.u32 %r8, %r8, 4;
-    @!%p6 and.b32 %r8, %r8, 0x0F;
-    sub.s32 %r8, %r8, 8;
-    cvt.rn.f32.s32 %f3, %r8;
-    
-    ld.global.f32 %f4, [%rd10];
-    mul.rn.f32 %f5, %f2, %f3;
-    fma.rn.f32 %f1, %f5, %f4, %f1;
-    add.s32 %r7, %r7, 1;
-    add.s64 %rd8, %rd8, 18;
-    add.s64 %rd12, %rd12, 18;
-    add.s64 %rd10, %rd10, 128;
-    bra GEMVQ4_TAIL_LOOP;
+    add.s64 %rd9, %rd9, 18;             // d_ptr += 18
+    add.s64 %rd11, %rd11, 18;           // qs_ptr += 18
+    add.s64 %rd13, %rd13, 128;          // x_ptr += 128 (32 floats)
+    add.s32 %r9, %r9, 1;
+    bra GEMVQ4_LOOP;
 
 GEMVQ4_REDUCE:
-    mov.b32 %r9, %f1;
-    shfl.sync.down.b32 %r10, %r9, 16, 31, 0xffffffff;
-    mov.b32 %f6, %r10;
-    add.f32 %f1, %f1, %f6;
-    mov.b32 %r9, %f1;
-    shfl.sync.down.b32 %r10, %r9, 8, 31, 0xffffffff;
-    mov.b32 %f6, %r10;
-    add.f32 %f1, %f1, %f6;
-    mov.b32 %r9, %f1;
-    shfl.sync.down.b32 %r10, %r9, 4, 31, 0xffffffff;
-    mov.b32 %f6, %r10;
-    add.f32 %f1, %f1, %f6;
-    mov.b32 %r9, %f1;
-    shfl.sync.down.b32 %r10, %r9, 2, 31, 0xffffffff;
-    mov.b32 %f6, %r10;
-    add.f32 %f1, %f1, %f6;
-    mov.b32 %r9, %f1;
-    shfl.sync.down.b32 %r10, %r9, 1, 31, 0xffffffff;
-    mov.b32 %f6, %r10;
-    add.f32 %f1, %f1, %f6;
-    setp.ne.u32 %p3, %r4, 0;
-    @%p3 bra GEMVQ4_DONE;
-    mul.wide.u32 %rd13, %r3, 4;
-    add.s64 %rd14, %rd6, %rd13;
-    st.global.f32 [%rd14], %f1;
+    mov.b32 %r11, %f1;
+    shfl.sync.down.b32 %r12, %r11, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r12; add.f32 %f1, %f1, %f6; mov.b32 %r11, %f1;
+    shfl.sync.down.b32 %r12, %r11, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r12; add.f32 %f1, %f1, %f6; mov.b32 %r11, %f1;
+    shfl.sync.down.b32 %r12, %r11, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r12; add.f32 %f1, %f1, %f6; mov.b32 %r11, %f1;
+    shfl.sync.down.b32 %r12, %r11, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r12; add.f32 %f1, %f1, %f6; mov.b32 %r11, %f1;
+    shfl.sync.down.b32 %r12, %r11, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r12; add.f32 %f1, %f1, %f6;
+    
+    setp.ne.u32 %p4, %r4, 0;
+    @%p4 bra GEMVQ4_DONE;
+    
+    mul.wide.u32 %rd14, %r3, 4;
+    add.s64 %rd15, %rd6, %rd14;
+    st.global.f32 [%rd15], %f1;
+
 GEMVQ4_DONE:
     ret;
 }

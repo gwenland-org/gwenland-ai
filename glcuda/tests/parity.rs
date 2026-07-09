@@ -137,10 +137,17 @@ fn gemv_q8_0_matches_dequantized_reference() {
     let mut want = vec![0f32; out_dim];
     glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x, &mut want, out_dim, in_dim);
 
+    let mut padded = Vec::with_capacity((blocks.len() / 34) * 36);
+    for block in blocks.chunks_exact(34) {
+        padded.extend_from_slice(&block[0..2]);
+        padded.extend_from_slice(&[0, 0]);
+        padded.extend_from_slice(&block[2..34]);
+    }
+
     let mut buf =
-        BackendBuffer::new(&cuda, (blocks.len() + (in_dim + out_dim) * 4 + 4096) as u64).unwrap();
-    let dw = buf.alloc(blocks.len() as u64).unwrap().dptr;
-    cuda.htod(dw, &blocks).unwrap();
+        BackendBuffer::new(&cuda, (padded.len() + (in_dim + out_dim) * 4 + 4096) as u64).unwrap();
+    let dw = buf.alloc(padded.len() as u64).unwrap().dptr;
+    cuda.htod(dw, &padded).unwrap();
     let dx = upload(&cuda, &mut buf, &x);
     let dy = buf.alloc_f32(out_dim).unwrap().dptr;
     k.gemv_q8_0(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32).unwrap();
