@@ -254,19 +254,48 @@ impl Cuda {
 
     /// JIT-load a PTX image. The driver compiles it for the actual device
     /// architecture (ADR-004: ahead-of-time PTX, no runtime codegen of ours).
+    ///
+    /// Uses `cuModuleLoadDataEx` with a JIT error-log buffer so a rejected
+    /// image reports the assembler's own diagnostic (line + reason), not a
+    /// bare `CUDA_ERROR_INVALID_PTX`.
     pub fn load_module(&self, ptx: &str) -> Result<Module, GlError> {
-        // cuModuleLoadData requires a NUL-terminated image for PTX text.
+        use crate::ffi::{JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+
+        // cuModuleLoadData* requires a NUL-terminated image for PTX text.
         let image = std::ffi::CString::new(ptx)
             .map_err(|_| GlError::Engine("PTX image contains interior NUL".into()))?;
+
+        let mut err_log = vec![0u8; 16 * 1024];
+        let mut err_size: usize = err_log.len();
+        let mut options = [JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
+        // The size option's value is passed by value in the pointer slot
+        // (CUDA's documented convention for scalar JIT options).
+        let mut values: [*mut std::ffi::c_void; 2] =
+            [err_log.as_mut_ptr().cast(), err_size as *mut std::ffi::c_void];
+
         let mut raw: CUmodule = std::ptr::null_mut();
-        // SAFETY: image outlives the call; out pointer is valid.
-        unsafe {
-            check(
-                &self.api,
-                (self.api.cu_module_load_data)(&mut raw, image.as_ptr().cast()),
-                "cuModuleLoadData(PTX JIT)",
-            )?
+        // SAFETY: image and buffers outlive the call; out pointer is valid;
+        // option/value arrays are length 2 as declared to numOptions.
+        let res = unsafe {
+            (self.api.cu_module_load_data_ex)(
+                &mut raw,
+                image.as_ptr().cast(),
+                options.len() as u32,
+                options.as_mut_ptr(),
+                values.as_mut_ptr(),
+            )
         };
+        if res != crate::ffi::CUDA_SUCCESS {
+            // The driver wrote the used length back into the value slot.
+            err_size = values[1] as usize;
+            let log = String::from_utf8_lossy(&err_log[..err_size.min(err_log.len())]);
+            let log = log.trim_end_matches('\0').trim();
+            return Err(GlError::Engine(if log.is_empty() {
+                "cuModuleLoadDataEx(PTX JIT) failed with no log".into()
+            } else {
+                format!("cuModuleLoadDataEx(PTX JIT) failed:\n{log}")
+            }));
+        }
         Ok(Module { api: self.api.clone(), raw })
     }
 

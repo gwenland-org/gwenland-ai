@@ -227,15 +227,27 @@ GEMV_LOOP:
     add.s64 %rd12, %rd12, 128;
     bra GEMV_LOOP;
 GEMV_REDUCE:
-    shfl.sync.down.b32 %f4, %f1, 16, 31, 0xffffffff;
+    // Warp-shuffle tree. shfl.sync.*.b32 moves *bit* registers, so the f32
+    // accumulator is reinterpreted through a .b32 temp (%r6) each step.
+    mov.b32 %r6, %f1;
+    shfl.sync.down.b32 %r7, %r6, 16, 31, 0xffffffff;
+    mov.b32 %f4, %r7;
     add.f32 %f1, %f1, %f4;
-    shfl.sync.down.b32 %f4, %f1, 8, 31, 0xffffffff;
+    mov.b32 %r6, %f1;
+    shfl.sync.down.b32 %r7, %r6, 8, 31, 0xffffffff;
+    mov.b32 %f4, %r7;
     add.f32 %f1, %f1, %f4;
-    shfl.sync.down.b32 %f4, %f1, 4, 31, 0xffffffff;
+    mov.b32 %r6, %f1;
+    shfl.sync.down.b32 %r7, %r6, 4, 31, 0xffffffff;
+    mov.b32 %f4, %r7;
     add.f32 %f1, %f1, %f4;
-    shfl.sync.down.b32 %f4, %f1, 2, 31, 0xffffffff;
+    mov.b32 %r6, %f1;
+    shfl.sync.down.b32 %r7, %r6, 2, 31, 0xffffffff;
+    mov.b32 %f4, %r7;
     add.f32 %f1, %f1, %f4;
-    shfl.sync.down.b32 %f4, %f1, 1, 31, 0xffffffff;
+    mov.b32 %r6, %f1;
+    shfl.sync.down.b32 %r7, %r6, 1, 31, 0xffffffff;
+    mov.b32 %f4, %r7;
     add.f32 %f1, %f1, %f4;
     setp.ne.u32 %p3, %r4, 0;
     @%p3 bra GEMV_DONE;
@@ -308,15 +320,26 @@ GEMVQ8_LOOP:
     add.s64 %rd10, %rd10, 128;
     bra GEMVQ8_LOOP;
 GEMVQ8_REDUCE:
-    shfl.sync.down.b32 %f6, %f1, 16, 31, 0xffffffff;
+    // Reinterpret f32 → .b32 for shfl, back to f32 for the add (%r9/%r10).
+    mov.b32 %r9, %f1;
+    shfl.sync.down.b32 %r10, %r9, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r10;
     add.f32 %f1, %f1, %f6;
-    shfl.sync.down.b32 %f6, %f1, 8, 31, 0xffffffff;
+    mov.b32 %r9, %f1;
+    shfl.sync.down.b32 %r10, %r9, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r10;
     add.f32 %f1, %f1, %f6;
-    shfl.sync.down.b32 %f6, %f1, 4, 31, 0xffffffff;
+    mov.b32 %r9, %f1;
+    shfl.sync.down.b32 %r10, %r9, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r10;
     add.f32 %f1, %f1, %f6;
-    shfl.sync.down.b32 %f6, %f1, 2, 31, 0xffffffff;
+    mov.b32 %r9, %f1;
+    shfl.sync.down.b32 %r10, %r9, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r10;
     add.f32 %f1, %f1, %f6;
-    shfl.sync.down.b32 %f6, %f1, 1, 31, 0xffffffff;
+    mov.b32 %r9, %f1;
+    shfl.sync.down.b32 %r10, %r9, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r10;
     add.f32 %f1, %f1, %f6;
     setp.ne.u32 %p3, %r4, 0;
     @%p3 bra GEMVQ8_DONE;
@@ -441,15 +464,26 @@ RMS_ACC:
     add.s64 %rd8, %rd8, %rd9;
     bra RMS_ACC;
 RMS_WARP_RED:
-    shfl.sync.down.b32 %f4, %f2, 16, 31, 0xffffffff;
+    // f32 → .b32 for shfl, back to f32 for the add (%r16/%r17).
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 16, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
     add.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 8, 31, 0xffffffff;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 8, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
     add.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 4, 31, 0xffffffff;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 4, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
     add.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 2, 31, 0xffffffff;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 2, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
     add.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 1, 31, 0xffffffff;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 1, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
     add.f32 %f2, %f2, %f4;
     setp.ne.u32 %p2, %r5, 0;
     @%p2 bra RMS_BARRIER1;
@@ -554,15 +588,26 @@ SF_MAX_LOOP:
     add.s64 %rd6, %rd6, %rd3;
     bra SF_MAX_LOOP;
 SF_MAX_RED:
-    shfl.sync.down.b32 %f4, %f2, 16, 31, 0xffffffff;
+    // f32 → .b32 for shfl, back to f32 for the max (%r18/%r19).
+    mov.b32 %r18, %f2;
+    shfl.sync.down.b32 %r19, %r18, 16, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     max.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 8, 31, 0xffffffff;
+    mov.b32 %r18, %f2;
+    shfl.sync.down.b32 %r19, %r18, 8, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     max.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 4, 31, 0xffffffff;
+    mov.b32 %r18, %f2;
+    shfl.sync.down.b32 %r19, %r18, 4, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     max.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 2, 31, 0xffffffff;
+    mov.b32 %r18, %f2;
+    shfl.sync.down.b32 %r19, %r18, 2, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     max.f32 %f2, %f2, %f4;
-    shfl.sync.down.b32 %f4, %f2, 1, 31, 0xffffffff;
+    mov.b32 %r18, %f2;
+    shfl.sync.down.b32 %r19, %r18, 1, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     max.f32 %f2, %f2, %f4;
     setp.ne.u32 %p2, %r4, 0;
     @%p2 bra SF_MAX_BARRIER;
@@ -623,15 +668,26 @@ SF_EXP_LOOP:
     add.s64 %rd8, %rd8, %rd3;
     bra SF_EXP_LOOP;
 SF_SUM_RED:
-    shfl.sync.down.b32 %f4, %f10, 16, 31, 0xffffffff;
+    // f32 → .b32 for shfl, back to f32 for the add (%r18/%r19).
+    mov.b32 %r18, %f10;
+    shfl.sync.down.b32 %r19, %r18, 16, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     add.f32 %f10, %f10, %f4;
-    shfl.sync.down.b32 %f4, %f10, 8, 31, 0xffffffff;
+    mov.b32 %r18, %f10;
+    shfl.sync.down.b32 %r19, %r18, 8, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     add.f32 %f10, %f10, %f4;
-    shfl.sync.down.b32 %f4, %f10, 4, 31, 0xffffffff;
+    mov.b32 %r18, %f10;
+    shfl.sync.down.b32 %r19, %r18, 4, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     add.f32 %f10, %f10, %f4;
-    shfl.sync.down.b32 %f4, %f10, 2, 31, 0xffffffff;
+    mov.b32 %r18, %f10;
+    shfl.sync.down.b32 %r19, %r18, 2, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     add.f32 %f10, %f10, %f4;
-    shfl.sync.down.b32 %f4, %f10, 1, 31, 0xffffffff;
+    mov.b32 %r18, %f10;
+    shfl.sync.down.b32 %r19, %r18, 1, 31, 0xffffffff;
+    mov.b32 %f4, %r19;
     add.f32 %f10, %f10, %f4;
     setp.ne.u32 %p2, %r4, 0;
     @%p2 bra SF_SUM_BARRIER;

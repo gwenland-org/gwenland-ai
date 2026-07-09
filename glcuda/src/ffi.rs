@@ -32,6 +32,12 @@ pub const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
 pub const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 pub const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
+// CUjit_option selectors (for cuModuleLoadDataEx JIT log capture).
+pub const JIT_INFO_LOG_BUFFER: i32 = 3;
+pub const JIT_INFO_LOG_BUFFER_SIZE_BYTES: i32 = 4;
+pub const JIT_ERROR_LOG_BUFFER: i32 = 5;
+pub const JIT_ERROR_LOG_BUFFER_SIZE_BYTES: i32 = 6;
+
 /// Owned handle to the dynamically loaded driver library. Never unloaded —
 /// the driver stays resident for the life of the process, matching the
 /// lifetime of the function pointers handed out below. The handle is held
@@ -109,6 +115,13 @@ pub struct DriverApi {
     pub cu_ctx_set_current: unsafe extern "system" fn(CUcontext) -> CUresult,
     pub cu_ctx_synchronize: unsafe extern "system" fn() -> CUresult,
     pub cu_module_load_data: unsafe extern "system" fn(*mut CUmodule, *const c_void) -> CUresult,
+    pub cu_module_load_data_ex: unsafe extern "system" fn(
+        *mut CUmodule,
+        *const c_void,
+        u32,             // numOptions
+        *mut i32,        // options (CUjit_option[])
+        *mut *mut c_void, // optionValues
+    ) -> CUresult,
     pub cu_module_unload: unsafe extern "system" fn(CUmodule) -> CUresult,
     pub cu_module_get_function:
         unsafe extern "system" fn(*mut CUfunction, CUmodule, *const u8) -> CUresult,
@@ -184,6 +197,7 @@ impl DriverApi {
             cu_ctx_set_current: sym(lib, b"cuCtxSetCurrent\0")?,
             cu_ctx_synchronize: sym(lib, b"cuCtxSynchronize\0")?,
             cu_module_load_data: sym(lib, b"cuModuleLoadData\0")?,
+            cu_module_load_data_ex: sym(lib, b"cuModuleLoadDataEx\0")?,
             cu_module_unload: sym(lib, b"cuModuleUnload\0")?,
             cu_module_get_function: sym(lib, b"cuModuleGetFunction\0")?,
             cu_mem_alloc: sym_v2(lib, b"cuMemAlloc_v2\0", b"cuMemAlloc\0")?,
