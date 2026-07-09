@@ -103,13 +103,14 @@ llama.cpp — fully optimized, and using CUDA Graphs on this path — decodes at
 
 | Engine | decode tok/s | vs theoretical |
 |---|---|---|
-| glcuda (pre-graph) | 155 | 24% |
+| glcuda (with graphs) | 155 | 24% |
 | **llama.cpp (optimized)** | **228** | 36% |
 | T4 peak-BW (theoretical) | 640 | 100% |
 
 So the concrete goal is **155 → ~228 (+47%)** to reach parity with the best
-production engine. That gap is almost exactly the inter-kernel serialization the
-bench identified — and CUDA Graphs is how llama.cpp closes it too.
+production engine. Note llama.cpp **disables** CUDA graphs on this GPU
+(architecture-gated) and still hits 228 — so the gap is *not* graph scheduling.
+It is per-matvec kernel efficiency; see [Next](#next-what-moves-the-needle).
 
 ---
 
@@ -182,28 +183,49 @@ because of the serial gaps, not because any kernel is slow.
 
 ## Next: what moves the needle
 
-In expected order of payoff:
+**Three pipeline theories, three flat results.** In order, the attempts and what
+the T4 actually said:
 
-In expected order of payoff. **Target: llama.cpp parity (~228 tok/s), a +47%
-gain over the pre-graph 155.**
+| Attempt | Hypothesis | Result |
+|---|---|---|
+| Fuse attention over all heads | launch overhead | **no change** (155) — overhead wasn't it |
+| CUDA Graphs (stage 1+2, full) | inter-kernel serialization | **no change** (155) — serialization wasn't it |
+| — | — | llama.cpp **disables** CUDA graphs on the T4 (`ggml_cuda_graph_set_enabled: disabling ... due to GPU architecture`) yet still hits 228 |
+
+The bench over-predicted the token cost (summed batched matvecs = 8.6 ms) vs the
+measured 6.45 ms — the real loop is *faster* than isolated kernels, so there were
+never meaningful gaps for graphs to remove. All three attempts targeted the
+*pipeline*; the pipeline was never the problem.
+
+### Where the gap really is: per-matvec efficiency
+
+Both engines are far below the ~505 tok/s bandwidth floor — us at **31%** (155),
+llama.cpp at **45%** (228). The gap is the efficiency of the kernels that
+dominate a token, not how they are scheduled:
+
+| Work | share of token | our GB/s | achievable |
+|---|---|---|---|
+| FFN (gate + up + down) | **61%** | 226–242 | 266 |
+| LM head | 24% | 264 | 266 |
+| attention matvecs | 15% | — | — |
+
+The FFN is 61% of every token and our gate/down GEMVs run at 85–91% of
+bandwidth. Closing 155→228 means making those dominant matvecs tighter — the
+lever is **kernel efficiency, not pipeline structure.**
 
 | Step | Expected | Status |
 |---|---|---|
-| Fuse attention over all heads | (prerequisite for graphs) | **done** — no direct gain |
-| Microbenchmark to locate the wall | (diagnosis) | **done** — it is serialization, not the kernels |
-| CUDA Graphs stage 1: capture/replay mechanism | (derisk the API) | **done** — self-test on T4 |
-| **CUDA Graphs stage 2: one graph per token** | 155 -> ~228 (llama.cpp) | **in progress** |
-| Native q4_0 / q4_k GEMV kernels | smaller stream/token | later |
-| KV-cache f16 | 2x less KV traffic | later |
+| Fuse attention (M2.1) | — | done, no gain, kept (correct + cleaner) |
+| CUDA Graphs (M2.2) | — | done, no gain, kept (correct; may help elsewhere) |
+| **Fuse gate+up into one matmul** | FFN is 61% of token | **next — highest value** |
+| Tighter Q8_0 GEMV (vectorized loads, better tiling) | dominant kernels | next |
+| Native q4_0 / q4_k GEMV | smaller stream/token | later |
+| KV-cache f16 | less KV traffic | later |
 
-The bench redirected the roadmap: since every kernel already runs near
-bandwidth and the loss is inter-kernel serialization, **CUDA Graphs is the
-correct lever** — collapsing the per-token launch sequence into a single graph
-replay removes the gaps that keep the GPU ~78% idle. This is also exactly how
-llama.cpp reaches 228 on this path, so parity is the concrete goal. The
-attention fusion done earlier is a prerequisite (fewer, more uniform nodes to
-capture). Stage 2 makes the graph static across tokens by moving `pos` /
-`cached_len` into device memory the kernels read.
+llama.cpp fuses gate+up into a single weight stream and one launch; we run them
+as two GEMVs over the same input. That is the clearest, best-understood win in
+the 61%-of-token FFN, and unlike the last three attempts it attacks the measured
+bottleneck (kernel efficiency) rather than the pipeline.
 
 ---
 
