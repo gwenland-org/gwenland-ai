@@ -59,7 +59,16 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
     }
     let w = match info.dtype {
         GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
-            HostWeight::Q8_0(gguf.tensor_data(info)?.to_vec())
+            let data = gguf.tensor_data(info)?;
+            // Pad 34-byte blocks to 36 bytes so every block starts on a 4-byte boundary,
+            // and the 32-byte weight payload sits perfectly aligned at offset 4.
+            let mut padded = Vec::with_capacity((data.len() / 34) * 36);
+            for block in data.chunks_exact(34) {
+                padded.extend_from_slice(&block[0..2]); // f16 scale
+                padded.extend_from_slice(&[0, 0]);      // 2 bytes padding
+                padded.extend_from_slice(&block[2..34]); // 32 quantized weights
+            }
+            HostWeight::Q8_0(padded)
         }
         GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
             HostWeight::Q4_0(gguf.tensor_data(info)?.to_vec())
@@ -151,7 +160,14 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
     }
     let token_embd = match embd_info.dtype {
         GgufDType::Q8_0 if dim.is_multiple_of(32) => {
-            HostWeight::Q8_0(gguf.tensor_data(embd_info)?.to_vec())
+            let data = gguf.tensor_data(embd_info)?;
+            let mut padded = Vec::with_capacity((data.len() / 34) * 36);
+            for block in data.chunks_exact(34) {
+                padded.extend_from_slice(&block[0..2]);
+                padded.extend_from_slice(&[0, 0]);
+                padded.extend_from_slice(&block[2..34]);
+            }
+            HostWeight::Q8_0(padded)
         }
         GgufDType::Q4_0 if dim.is_multiple_of(32) => {
             HostWeight::Q4_0(gguf.tensor_data(embd_info)?.to_vec())

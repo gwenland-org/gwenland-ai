@@ -10,7 +10,7 @@
 use glcore::GlError;
 
 use crate::buffer::{BackendBuffer, DevSlice, ALIGN};
-use crate::dequant::{q8_0_row_into, Q8_0_BLOCK_BYTES};
+use crate::dequant::q8_0_row_into;
 use crate::driver::Cuda;
 use crate::kernels;
 use crate::kv_cache::KvCacheDev;

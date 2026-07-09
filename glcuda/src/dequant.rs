@@ -18,8 +18,8 @@ const Q4_K_BLOCK_BYTES: usize = 144;
 const Q5_0_BLOCK_BYTES: usize = 22;
 /// Bytes per Q6_K super-block.
 const Q6_K_BLOCK_BYTES: usize = 210;
-/// Bytes per Q8_0 block (32 weights): f16 scale + 32 i8.
-pub const Q8_0_BLOCK_BYTES: usize = 34;
+/// Bytes per Q8_0 block (32 weights): f16 scale + 2 bytes padding + 32 i8.
+pub const Q8_0_BLOCK_BYTES: usize = 36;
 /// Bytes per Q4_0 block (32 weights): f16 scale + 16 bytes of nibbles.
 pub const Q4_0_BLOCK_BYTES: usize = 18;
 
@@ -153,7 +153,7 @@ pub fn q8_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
     let r = &blocks[row * row_bytes..(row + 1) * row_bytes];
     for (j, block) in r.chunks_exact(Q8_0_BLOCK_BYTES).enumerate() {
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
-        for (i, &q) in block[2..34].iter().enumerate() {
+        for (i, &q) in block[4..36].iter().enumerate() {
             out[j * 32 + i] = d * (q as i8) as f32;
         }
     }
@@ -235,9 +235,17 @@ mod tests {
         let mut data = rand_bytes(rows * dim / 32 * 34, 4);
         set_scales(&mut data, 34, 0);
         let full = glproc::kernels::dequant::q8_0::scalar::run(&data);
+        
+        let mut padded = Vec::with_capacity((data.len() / 34) * 36);
+        for block in data.chunks_exact(34) {
+            padded.extend_from_slice(&block[0..2]);
+            padded.extend_from_slice(&[0, 0]);
+            padded.extend_from_slice(&block[2..34]);
+        }
+        
         for row in 0..rows {
             let mut out = vec![0f32; dim];
-            q8_0_row_into(&data, row, dim, &mut out);
+            q8_0_row_into(&padded, row, dim, &mut out);
             assert_eq!(out, full[row * dim..(row + 1) * dim].to_vec());
         }
     }
