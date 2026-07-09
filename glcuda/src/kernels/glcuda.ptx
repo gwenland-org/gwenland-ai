@@ -380,7 +380,7 @@ QUANT_DONE:
     .reg .b64 %rd<40>;
 
     .reg .b32 %r3_0, %r3_1, %r3_2, %r3_3;
-    .reg .b64 %rd_x_scales, %rd23;
+    .reg .b64 %rd_x_scales;
     .reg .b64 %rd7_0, %rd7_1, %rd7_2, %rd7_3;
     .reg .b64 %rd15_0, %rd15_1, %rd15_2, %rd15_3;
     .reg .b64 %rd17_0, %rd17_1, %rd17_2, %rd17_3;
