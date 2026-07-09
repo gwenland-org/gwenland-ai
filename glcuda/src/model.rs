@@ -66,8 +66,13 @@ pub struct GpuModelConfig {
 pub enum HostWeight {
     /// Dense f32, row-major `[out_features, in_features]`.
     F32(Vec<f32>),
-    /// Raw GGML Q8_0 blocks, rows contiguous, `in_features % 32 == 0`.
+    /// Raw padded Q8_0 blocks (36 B), rows contiguous. Used for the host-side
+    /// embedding table (`q8_0_row_into`); matmul weights use `Q8_0Soa`.
     Q8_0(Vec<u8>),
+    /// Structure-of-Arrays Q8_0 for matmul weights: contiguous int8 `qs`
+    /// `[out, in]` + contiguous f16 block `scales` `[out, in/32]`. Enables the
+    /// coalesced `gl_gemv_q8_0_soa` kernel (no interleaved-scale/padding BW loss).
+    Q8_0Soa { qs: Vec<u8>, scales: Vec<u8> },
     /// Raw GGML Q4_0 blocks, rows contiguous, `in_features % 32 == 0`.
     Q4_0(Vec<u8>),
 }
@@ -78,6 +83,7 @@ impl HostWeight {
         match self {
             HostWeight::F32(v) => (v.len() * 4) as u64,
             HostWeight::Q8_0(b) => b.len() as u64,
+            HostWeight::Q8_0Soa { qs, scales } => (qs.len() + scales.len()) as u64,
             HostWeight::Q4_0(b) => b.len() as u64,
         }
     }
@@ -111,6 +117,16 @@ impl HostMat {
                 a.extend_from_slice(&b);
                 HostWeight::Q8_0(a)
             }
+            (
+                HostWeight::Q8_0Soa { qs: mut aq, scales: mut asc },
+                HostWeight::Q8_0Soa { qs: bq, scales: bsc },
+            ) => {
+                // qs and scales are both row-major [out, ..]; concatenating
+                // each stacks the rows (gate rows then up rows).
+                aq.extend_from_slice(&bq);
+                asc.extend_from_slice(&bsc);
+                HostWeight::Q8_0Soa { qs: aq, scales: asc }
+            }
             (HostWeight::Q4_0(mut a), HostWeight::Q4_0(b)) => {
                 // Rows are whole Q4_0 blocks; concatenation stacks them.
                 a.extend_from_slice(&b);
@@ -131,6 +147,7 @@ impl HostMat {
                 (&self.w, &other.w),
                 (HostWeight::F32(_), HostWeight::F32(_))
                     | (HostWeight::Q8_0(_), HostWeight::Q8_0(_))
+                    | (HostWeight::Q8_0Soa { .. }, HostWeight::Q8_0Soa { .. })
                     | (HostWeight::Q4_0(_), HostWeight::Q4_0(_))
             )
     }
@@ -197,6 +214,9 @@ impl HostModel {
         match &self.token_embd {
             HostWeight::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
             HostWeight::Q8_0(b) => q8_0_row_into(b, row, dim, out),
+            HostWeight::Q8_0Soa { .. } => {
+                unreachable!("embedding table is AoS Q8_0, never SoA")
+            }
             HostWeight::Q4_0(b) => crate::dequant::q4_0_row_into(b, row, dim, out),
         }
         Ok(())
@@ -207,8 +227,10 @@ impl HostModel {
 pub enum GpuWeight {
     /// Dense f32.
     F32(DevSlice),
-    /// Q8_0 blocks.
+    /// Q8_0 blocks (AoS, padded 36 B).
     Q8_0(DevSlice),
+    /// SoA Q8_0: contiguous int8 `qs` + separate f16 `scales`.
+    Q8_0Soa { qs: DevSlice, scales: DevSlice },
     /// Q4_0 blocks.
     Q4_0(DevSlice),
 }
@@ -364,6 +386,13 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
             let s = buf.alloc(b.len() as u64)?;
             cuda.htod(s.dptr, b)?;
             GpuWeight::Q8_0(s)
+        }
+        HostWeight::Q8_0Soa { qs, scales } => {
+            let dq = buf.alloc(qs.len() as u64)?;
+            cuda.htod(dq.dptr, qs)?;
+            let ds = buf.alloc(scales.len() as u64)?;
+            cuda.htod(ds.dptr, scales)?;
+            GpuWeight::Q8_0Soa { qs: dq, scales: ds }
         }
         HostWeight::Q4_0(b) => {
             let s = buf.alloc(b.len() as u64)?;

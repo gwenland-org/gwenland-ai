@@ -60,15 +60,17 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
     let w = match info.dtype {
         GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
             let data = gguf.tensor_data(info)?;
-            // Pad 34-byte blocks to 36 bytes so every block starts on a 4-byte boundary,
-            // and the 32-byte weight payload sits perfectly aligned at offset 4.
-            let mut padded = Vec::with_capacity((data.len() / 34) * 36);
+            // Structure-of-Arrays: split the 34-byte blocks into a contiguous
+            // int8 qs stream + a contiguous f16 scale stream (both row-major),
+            // so the GEMV reads qs as one coalesced transaction with no padding.
+            let n_blocks = data.len() / 34;
+            let mut qs = Vec::with_capacity(n_blocks * 32);
+            let mut scales = Vec::with_capacity(n_blocks * 2);
             for block in data.chunks_exact(34) {
-                padded.extend_from_slice(&block[0..2]); // f16 scale
-                padded.extend_from_slice(&[0, 0]);      // 2 bytes padding
-                padded.extend_from_slice(&block[2..34]); // 32 quantized weights
+                scales.extend_from_slice(&block[0..2]);  // f16 scale
+                qs.extend_from_slice(&block[2..34]);     // 32 quantized weights
             }
-            HostWeight::Q8_0(padded)
+            HostWeight::Q8_0Soa { qs, scales }
         }
         GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
             HostWeight::Q4_0(gguf.tensor_data(info)?.to_vec())

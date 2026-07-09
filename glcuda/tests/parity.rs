@@ -162,6 +162,52 @@ fn gemv_q8_0_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_MATMUL, "gemv_q8_0");
 }
 
+/// The SoA Q8_0 GEMV (contiguous qs + separate f16 scales) must match the same
+/// dequantized reference as the AoS kernel — same math, different layout.
+#[test]
+fn gemv_q8_0_soa_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (out_dim, in_dim) = (48usize, 128usize);
+    let w_f32 = randv(out_dim * in_dim, 40, 0.1);
+    let blocks = glproc::kernels::dequant::q8_0::scalar::quantize(&w_f32);
+    let w_deq = glproc::kernels::dequant::q8_0::scalar::run(&blocks);
+    let x = randv(in_dim, 41, 1.0);
+    let mut want = vec![0f32; out_dim];
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x, &mut want, out_dim, in_dim);
+
+    // Split the 34-byte blocks into contiguous qs + f16 scales (as the loader does).
+    let n_blocks = blocks.len() / 34;
+    let mut qs = Vec::with_capacity(n_blocks * 32);
+    let mut scales = Vec::with_capacity(n_blocks * 2);
+    for block in blocks.chunks_exact(34) {
+        scales.extend_from_slice(&block[0..2]);
+        qs.extend_from_slice(&block[2..34]);
+    }
+
+    let mut buf = BackendBuffer::new(
+        &cuda,
+        (qs.len() + scales.len() + (in_dim + out_dim) * 4 + 4096) as u64,
+    )
+    .unwrap();
+    let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &qs).unwrap();
+    let dwsc = buf.alloc(scales.len() as u64).unwrap().dptr;
+    cuda.htod(dwsc, &scales).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+    let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q8_0_soa(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+        .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_MATMUL, "gemv_q8_0_soa");
+}
+
 #[test]
 fn gemv_q4_0_matches_dequantized_reference() {
     let Some((cuda, k)) = gpu() else { return };

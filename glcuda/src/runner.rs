@@ -54,6 +54,19 @@ fn gemv_w(
             k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q8_0(cuda, s.dptr, ws.q8_qs.dptr, ws.q8_scales.dptr, y, m.out_dim, m.in_dim)
         }
+        GpuWeight::Q8_0Soa { qs, scales } => {
+            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
+            k.gemv_q8_0_soa(
+                cuda,
+                qs.dptr,
+                scales.dptr,
+                ws.q8_qs.dptr,
+                ws.q8_scales.dptr,
+                y,
+                m.out_dim,
+                m.in_dim,
+            )
+        }
         GpuWeight::Q4_0(s) => k.gemv_q4_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
     }
 }
@@ -269,6 +282,9 @@ impl GpuModel {
                 out.copy_from_slice(&v[row * dim..(row + 1) * dim])
             }
             crate::model::HostWeight::Q8_0(b) => crate::dequant::q8_0_row_into(b, row, dim, out),
+            crate::model::HostWeight::Q8_0Soa { .. } => {
+                unreachable!("embedding table is AoS Q8_0, never SoA")
+            }
             crate::model::HostWeight::Q4_0(b) => crate::dequant::q4_0_row_into(b, row, dim, out),
         }
         Ok(())
