@@ -18,6 +18,12 @@ use glcuda::kernels::{rope_tables, KernelSet};
 // is ~1 ULP looser for the ops that do arithmetic on the payload. These are
 // combined absolute-or-relative (see `assert_close`).
 const EPS_MATMUL: f32 = 1e-5;
+// Q8_0 GEMV quantizes BOTH operands to int8. The host reference dequantizes
+// with div+round-half-away while the device uses rcp.rn+round-to-even, so a
+// rare single-quantum flip can leave a ~1e-3 residual on the accumulated dot.
+// 1e-3 is the honest bound for a fully-quantized matvec (a real kernel bug is
+// orders of magnitude larger); f32/Q4 GEMVs keep the tight EPS_MATMUL.
+const EPS_Q8_GEMV: f32 = 1e-3;
 const EPS_RMSNORM: f32 = 1e-6;
 const EPS_SOFTMAX: f32 = 1e-5;
 // RoPE: doc says 1e-7 ("element-wise, no reduction"), but the device fuses
@@ -67,6 +73,24 @@ fn randv_bytes(n: usize, seed: u64) -> Vec<u8> {
             (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8
         })
         .collect()
+}
+
+/// Mirror glcuda's `quantize_q8` (per-32-block amax/127 scale, round-to-
+/// nearest, clamp) then dequantize. The Q8_0 GEMV quantizes its activation to
+/// int8 on-device, so a faithful reference must dot the DEQUANTIZED activation
+/// — not the full-precision one — or it disagrees by the ~1/127 activation
+/// quantization error (which is what tripped both q8 GEMV tests otherwise).
+fn q8_round_trip(x: &[f32]) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    for (blk_in, blk_out) in x.chunks(32).zip(out.chunks_mut(32)) {
+        let amax = blk_in.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let scale = amax / 127.0;
+        for (o, &v) in blk_out.iter_mut().zip(blk_in) {
+            let q = if scale != 0.0 { (v / scale).round().clamp(-128.0, 127.0) } else { 0.0 };
+            *o = q * scale;
+        }
+    }
+    out
 }
 
 /// Mixed absolute-or-relative closeness. `eps` is the per-operation
@@ -134,8 +158,10 @@ fn gemv_q8_0_matches_dequantized_reference() {
     // lossy) through the scalar matvec.
     let w_deq = glproc::kernels::dequant::q8_0::scalar::run(&blocks);
     let x = randv(in_dim, 41, 1.0);
+    // The GEMV quantizes x to int8 on-device; feed the reference the same.
+    let x_dq = q8_round_trip(&x);
     let mut want = vec![0f32; out_dim];
-    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x, &mut want, out_dim, in_dim);
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_dq, &mut want, out_dim, in_dim);
 
     let mut padded = Vec::with_capacity((blocks.len() / 34) * 36);
     for block in blocks.chunks_exact(34) {
@@ -159,7 +185,7 @@ fn gemv_q8_0_matches_dequantized_reference() {
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(&cuda).unwrap();
 
-    assert_close(&got, &want, EPS_MATMUL, "gemv_q8_0");
+    assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0");
 }
 
 /// The SoA Q8_0 GEMV (contiguous qs + separate f16 scales) must match the same
@@ -172,8 +198,9 @@ fn gemv_q8_0_soa_matches_dequantized_reference() {
     let blocks = glproc::kernels::dequant::q8_0::scalar::quantize(&w_f32);
     let w_deq = glproc::kernels::dequant::q8_0::scalar::run(&blocks);
     let x = randv(in_dim, 41, 1.0);
+    let x_dq = q8_round_trip(&x);
     let mut want = vec![0f32; out_dim];
-    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x, &mut want, out_dim, in_dim);
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_dq, &mut want, out_dim, in_dim);
 
     // Split the 34-byte blocks into contiguous qs + f16 scales (as the loader does).
     let n_blocks = blocks.len() / 34;
@@ -205,7 +232,7 @@ fn gemv_q8_0_soa_matches_dequantized_reference() {
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(&cuda).unwrap();
 
-    assert_close(&got, &want, EPS_MATMUL, "gemv_q8_0_soa");
+    assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0_soa");
 }
 
 #[test]
