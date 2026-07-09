@@ -61,6 +61,9 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
         GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
             HostWeight::Q8_0(gguf.tensor_data(info)?.to_vec())
         }
+        GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
+            HostWeight::Q4_0(gguf.tensor_data(info)?.to_vec())
+        }
         _ => HostWeight::F32(dequant_any(gguf, info)?),
     };
     Ok(HostMat { w, out_dim, in_dim })
@@ -149,6 +152,9 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
     let token_embd = match embd_info.dtype {
         GgufDType::Q8_0 if dim.is_multiple_of(32) => {
             HostWeight::Q8_0(gguf.tensor_data(embd_info)?.to_vec())
+        }
+        GgufDType::Q4_0 if dim.is_multiple_of(32) => {
+            HostWeight::Q4_0(gguf.tensor_data(embd_info)?.to_vec())
         }
         _ => HostWeight::F32(dequant_any(gguf, embd_info)?),
     };

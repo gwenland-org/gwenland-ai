@@ -56,6 +56,19 @@ fn randv(n: usize, seed: u64, scale: f32) -> Vec<f32> {
         .collect()
 }
 
+/// Deterministic pseudo-random bytes.
+fn randv_bytes(n: usize, seed: u64) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..n)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8
+        })
+        .collect()
+}
+
 /// Mixed absolute-or-relative closeness. `eps` is the per-operation
 /// tolerance from ArchGLML_X2 §8; it is honored as an *absolute* bound near
 /// zero and as a *relative* bound for larger magnitudes. A fixed absolute
@@ -137,6 +150,36 @@ fn gemv_q8_0_matches_dequantized_reference() {
     buf.free(&cuda).unwrap();
 
     assert_close(&got, &want, EPS_MATMUL, "gemv_q8_0");
+}
+
+#[test]
+fn gemv_q4_0_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (out_dim, in_dim) = (48usize, 128usize); // whole Q4_0 blocks per row
+    let blocks_len = (in_dim / 32 * 18) * out_dim;
+    let mut blocks = randv_bytes(blocks_len, 40);
+    // ensure scale (d) is not NaN/Inf for exact comparison
+    for block in blocks.chunks_exact_mut(18) {
+        block[0..2].copy_from_slice(&0x2e66u16.to_le_bytes()); // ~0.1
+    }
+    let w_deq = glproc::kernels::dequant::q4_0::scalar::run(&blocks);
+    let x = randv(in_dim, 41, 1.0);
+    let mut want = vec![0f32; out_dim];
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x, &mut want, out_dim, in_dim);
+
+    let mut buf =
+        BackendBuffer::new(&cuda, (blocks.len() + (in_dim + out_dim) * 4 + 4096) as u64).unwrap();
+    let dw = buf.alloc(blocks.len() as u64).unwrap().dptr;
+    cuda.htod(dw, &blocks).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q4_0(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32).unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_MATMUL, "gemv_q4_0");
 }
 
 #[test]

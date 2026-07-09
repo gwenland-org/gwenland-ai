@@ -34,6 +34,7 @@ pub struct KernelSet {
     f_rope: Kernel,
     f_gemv: Kernel,
     f_gemv_q8_0: Kernel,
+    f_gemv_q4_0: Kernel,
     f_gemv_t: Kernel,
     f_rms_norm: Kernel,
     f_softmax_scale: Kernel,
@@ -51,6 +52,7 @@ impl KernelSet {
             f_rope: module.get_function("gl_rope_f32")?,
             f_gemv: module.get_function("gl_gemv_f32")?,
             f_gemv_q8_0: module.get_function("gl_gemv_q8_0")?,
+            f_gemv_q4_0: module.get_function("gl_gemv_q4_0")?,
             f_gemv_t: module.get_function("gl_gemv_t_f32")?,
             f_rms_norm: module.get_function("gl_rms_norm_f32")?,
             f_softmax_scale: module.get_function("gl_softmax_scale_f32")?,
@@ -175,8 +177,9 @@ impl KernelSet {
         cuda.launch(self.f_gemv, (out_dim, 1, 1), (WARP, 1, 1), 0, &mut params)
     }
 
-    /// Quantized decode GEMV: `y = W @ x` with `W` in GGML Q8_0 blocks,
-    /// dequantized in registers (FP32 accumulation). `in_dim % 32 == 0`.
+    /// `y = x * w^T` for Q8_0 weights (row-major). `w` is `[out_dim, in_dim]`.
+    /// `in_dim` must be a multiple of 32 (Q8_0 block size).
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_q8_0(
         &self,
         cuda: &Cuda,
@@ -197,6 +200,31 @@ impl KernelSet {
             &mut i as *mut _ as *mut c_void,
         ];
         cuda.launch(self.f_gemv_q8_0, (out_dim, 1, 1), (WARP, 1, 1), 0, &mut params)
+    }
+
+    /// `y = x * w^T` for Q4_0 weights (row-major). `w` is `[out_dim, in_dim]`.
+    /// `in_dim` must be a multiple of 32 (Q4_0 block size).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4_0(
+        &self,
+        cuda: &Cuda,
+        w: CUdeviceptr,
+        x: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(in_dim % 32, 0, "Q4_0 rows are whole blocks");
+        let (mut w, mut x, mut y) = (w, x, y);
+        let (mut o, mut i) = (out_dim, in_dim);
+        let mut params = [
+            &mut w as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_gemv_q4_0, (out_dim, 1, 1), (WARP, 1, 1), 0, &mut params)
     }
 
     /// Transposed-access GEMV: `y[c] = Σ_r x[r] * a[r*cols + c]` — the

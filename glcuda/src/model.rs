@@ -68,6 +68,8 @@ pub enum HostWeight {
     F32(Vec<f32>),
     /// Raw GGML Q8_0 blocks, rows contiguous, `in_features % 32 == 0`.
     Q8_0(Vec<u8>),
+    /// Raw GGML Q4_0 blocks, rows contiguous, `in_features % 32 == 0`.
+    Q4_0(Vec<u8>),
 }
 
 impl HostWeight {
@@ -76,6 +78,7 @@ impl HostWeight {
         match self {
             HostWeight::F32(v) => (v.len() * 4) as u64,
             HostWeight::Q8_0(b) => b.len() as u64,
+            HostWeight::Q4_0(b) => b.len() as u64,
         }
     }
 }
@@ -108,6 +111,11 @@ impl HostMat {
                 a.extend_from_slice(&b);
                 HostWeight::Q8_0(a)
             }
+            (HostWeight::Q4_0(mut a), HostWeight::Q4_0(b)) => {
+                // Rows are whole Q4_0 blocks; concatenation stacks them.
+                a.extend_from_slice(&b);
+                HostWeight::Q4_0(a)
+            }
             // Mixed representations shouldn't happen for a matched gate/up
             // pair, but if they do, the caller must keep them separate.
             _ => panic!("stack_rows: mismatched weight representations"),
@@ -123,6 +131,7 @@ impl HostMat {
                 (&self.w, &other.w),
                 (HostWeight::F32(_), HostWeight::F32(_))
                     | (HostWeight::Q8_0(_), HostWeight::Q8_0(_))
+                    | (HostWeight::Q4_0(_), HostWeight::Q4_0(_))
             )
     }
 }
@@ -188,6 +197,7 @@ impl HostModel {
         match &self.token_embd {
             HostWeight::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
             HostWeight::Q8_0(b) => q8_0_row_into(b, row, dim, out),
+            HostWeight::Q4_0(b) => crate::dequant::q4_0_row_into(b, row, dim, out),
         }
         Ok(())
     }
@@ -197,8 +207,10 @@ impl HostModel {
 pub enum GpuWeight {
     /// Dense f32.
     F32(DevSlice),
-    /// Raw GGML Q8_0 blocks (gl_gemv_q8_0 consumes them directly).
+    /// Q8_0 blocks.
     Q8_0(DevSlice),
+    /// Q4_0 blocks.
+    Q4_0(DevSlice),
 }
 
 /// A VRAM weight matrix with launch dimensions.
@@ -343,10 +355,14 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
     let w = match &m.w {
         HostWeight::F32(v) => GpuWeight::F32(up_f32(cuda, buf, v)?),
         HostWeight::Q8_0(b) => {
-            debug_assert_eq!(b.len(), m.out_dim * m.in_dim / 32 * Q8_0_BLOCK_BYTES);
             let s = buf.alloc(b.len() as u64)?;
             cuda.htod(s.dptr, b)?;
             GpuWeight::Q8_0(s)
+        }
+        HostWeight::Q4_0(b) => {
+            let s = buf.alloc(b.len() as u64)?;
+            cuda.htod(s.dptr, b)?;
+            GpuWeight::Q4_0(s)
         }
     };
     Ok(GpuMat { w, out_dim: m.out_dim as u32, in_dim: m.in_dim as u32 })

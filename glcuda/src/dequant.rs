@@ -20,6 +20,8 @@ const Q5_0_BLOCK_BYTES: usize = 22;
 const Q6_K_BLOCK_BYTES: usize = 210;
 /// Bytes per Q8_0 block (32 weights): f16 scale + 32 i8.
 pub const Q8_0_BLOCK_BYTES: usize = 34;
+/// Bytes per Q4_0 block (32 weights): f16 scale + 16 bytes of nibbles.
+pub const Q4_0_BLOCK_BYTES: usize = 18;
 
 /// Unpack the 6-bit (scale, min) pair for Q4_K sub-block `j` (0..8) from
 /// the 12-byte packed scales field. Mirrors ggml's `get_scale_min_k4`.
@@ -153,6 +155,23 @@ pub fn q8_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
         let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
         for (i, &q) in block[2..34].iter().enumerate() {
             out[j * 32 + i] = d * (q as i8) as f32;
+        }
+    }
+}
+
+/// Dequantize one row of a Q4_0 matrix (`dim % 32 == 0`) — the host-side
+/// embedding lookup.
+pub fn q4_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), dim);
+    let row_bytes = dim / 32 * Q4_0_BLOCK_BYTES;
+    let r = &blocks[row * row_bytes..(row + 1) * row_bytes];
+    for (j, block) in r.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        for (i, &byte) in block[2..18].iter().enumerate() {
+            let l = byte & 0x0F;
+            let h = byte >> 4;
+            out[j * 32 + i] = d * ((l as i8) - 8) as f32;
+            out[j * 32 + i + 16] = d * ((h as i8) - 8) as f32;
         }
     }
 }
