@@ -349,6 +349,73 @@ fn attention_decode_composition_matches_reference() {
     assert_close(&got, &want, EPS_MATMUL, "attention_decode");
 }
 
+/// The fused all-heads decode-attention kernel (`gl_attn_decode_f32`, M2.1)
+/// must match the per-head reference for every head, including GQA where
+/// several query heads share one KV head. K/V are laid out exactly as the
+/// device KV cache does: `[kv_head][seq][dim]` with a `head_stride` of
+/// `max_context * head_dim` elements between KV heads.
+#[test]
+fn fused_attn_decode_matches_per_head_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (head_dim, n_heads, n_kv, cached_len, max_ctx) = (64usize, 8usize, 2usize, 100usize, 128usize);
+    let heads_per_kv = n_heads / n_kv;
+    let head_stride = max_ctx * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Queries for all heads.
+    let q = randv(n_heads * head_dim, 50, 1.0);
+    // K and V regions sized to the full cache stride per KV head (only the
+    // first `cached_len` rows of each are populated / read).
+    let mut kc = vec![0f32; n_kv * head_stride];
+    let mut vc = vec![0f32; n_kv * head_stride];
+    for kvh in 0..n_kv {
+        let src_k = randv(cached_len * head_dim, 60 + kvh as u64, 1.0);
+        let src_v = randv(cached_len * head_dim, 70 + kvh as u64, 1.0);
+        kc[kvh * head_stride..kvh * head_stride + src_k.len()].copy_from_slice(&src_k);
+        vc[kvh * head_stride..kvh * head_stride + src_v.len()].copy_from_slice(&src_v);
+    }
+
+    // Reference: run the per-head attention for each query head against its
+    // own KV head's first `cached_len` rows.
+    let mut want = vec![0f32; n_heads * head_dim];
+    for h in 0..n_heads {
+        let kvh = h / heads_per_kv;
+        let krows = &kc[kvh * head_stride..kvh * head_stride + cached_len * head_dim];
+        let vrows = &vc[kvh * head_stride..kvh * head_stride + cached_len * head_dim];
+        let out = attention_ref(&q[h * head_dim..(h + 1) * head_dim], krows, vrows, head_dim);
+        want[h * head_dim..(h + 1) * head_dim].copy_from_slice(&out);
+    }
+
+    let bytes = ((q.len() + kc.len() + vc.len() + n_heads * head_dim) * 4 + 8192) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dq = upload(&cuda, &mut buf, &q);
+    let dk = upload(&cuda, &mut buf, &kc);
+    let dv = upload(&cuda, &mut buf, &vc);
+    let dout = buf.alloc_f32(n_heads * head_dim).unwrap().dptr;
+
+    k.attn_decode(
+        &cuda,
+        dq,
+        dk,
+        dv,
+        dout,
+        n_heads as u32,
+        head_dim as u32,
+        cached_len as u32,
+        heads_per_kv as u32,
+        head_stride as u32,
+        scale,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+
+    let mut got = vec![0f32; n_heads * head_dim];
+    cuda.dtoh_f32(&mut got, dout).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_MATMUL, "fused_attn_decode");
+}
+
 /// ADR-005 / M2 definition of done: the backend buffer must give VRAM back
 /// exactly — free VRAM identical before and after a full alloc/use/free
 /// cycle. Requires `--test-threads=1` to be meaningful (see module doc).

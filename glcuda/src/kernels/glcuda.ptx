@@ -16,6 +16,11 @@
 //   gl_silu_mul_f32      <-> glproc ops::silu::scalar::run
 //   gl_rope_f32          <-> glproc runner::rope (host supplies cos/sin)
 //   gl_add_f32           <-> residual add in glproc runner::step
+//   gl_attn_decode_f32   <-> the whole per-head decode-attention loop, fused:
+//                            one block per query head does q.k, softmax and the
+//                            weighted-V sum in shared memory. Replaces the
+//                            gemv+softmax+gemv_t triple launched once per head
+//                            (M2.1 fusion: ~3*n_heads launches -> 1 per layer).
 //
 .version 7.0
 .target sm_70
@@ -728,5 +733,280 @@ SF_DIV_LOOP:
     add.s64 %rd9, %rd9, %rd3;
     bra SF_DIV_LOOP;
 SF_END:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_attn_decode_f32: fused single-query decode attention for ALL heads.
+//   grid.x = n_heads (one block per query head), blockDim.x = 128.
+//
+// Per block (head h):
+//   kv_head = h / heads_per_kv
+//   k_base  = p_k + kv_head * head_stride   (this head's [seq][dim] K region)
+//   v_base  = p_v + kv_head * head_stride
+//   q       = p_q + h * head_dim            (this head's query vector)
+//   out     = p_out + h * head_dim
+// Pass 1: threads stride over t in [0,cached_len): scores[t] = (q . k[t]) * scale
+//         held in shared memory (sm_sc). Dot is sequential over head_dim, one
+//         thread per t -> same accumulation order as glproc dot_f32.
+// Pass 2: block softmax over sm_sc[0..cached_len] (max, exp, sum, normalize),
+//         same numerically-stable two-pass form and degenerate handling as
+//         gl_softmax_scale_f32.
+// Pass 3: threads stride over d in [0,head_dim): out[d] = sum_t sm_sc[t]*v[t][d]
+//         sequential over t -> matches glproc's `out[d] += w * v_row[d]`.
+// Shared: sm_sc[4096 f32] scores + sm_red[36] reduction/broadcast scratch.
+// cached_len is bounded by MAX_KV_CONTEXT (4096); one block's scores fit.
+// ---------------------------------------------------------------------------
+.visible .entry gl_attn_decode_f32(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u32 p_head_dim,
+    .param .u32 p_cached_len,
+    .param .u32 p_heads_per_kv,
+    .param .u32 p_head_stride,
+    .param .f32 p_scale
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<40>;
+    .reg .f32 %f<32>;
+    .reg .b64 %rd<40>;
+    .shared .align 4 .b8 sm_sc[16384];   // scores[0..4096]
+    .shared .align 4 .b8 sm_red[36];     // warp partials + broadcast
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_v];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u32 %r2, [p_cached_len];
+    ld.param.u32 %r3, [p_heads_per_kv];
+    ld.param.u32 %r4, [p_head_stride];
+    ld.param.f32 %f1, [p_scale];
+
+    mov.u32 %r5, %ctaid.x;               // h (query head)
+    mov.u32 %r6, %tid.x;                 // thread id
+    mov.u32 %r7, %ntid.x;                // block size
+    and.b32 %r8, %r6, 31;                // lane
+    shr.u32 %r9, %r6, 5;                 // warp id
+    add.s32 %r10, %r7, 31;
+    shr.u32 %r11, %r10, 5;               // n_warps
+    mov.u32 %r12, sm_sc;                 // scores base (shared)
+    mov.u32 %r13, sm_red;                // reduction base (shared)
+
+    cvta.to.global.u64 %rd5, %rd1;       // q global
+    cvta.to.global.u64 %rd6, %rd2;       // k global
+    cvta.to.global.u64 %rd7, %rd3;       // v global
+    cvta.to.global.u64 %rd8, %rd4;       // out global
+
+    // kv_head = h / heads_per_kv ; kv offset in elements = kv_head*head_stride
+    div.u32 %r14, %r5, %r3;              // kv_head
+    mul.lo.s32 %r15, %r14, %r4;          // kv_head * head_stride (elems)
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd6, %rd9;           // k_base for this head
+    add.s64 %rd11, %rd7, %rd9;           // v_base for this head
+    // q vector base = q + h*head_dim
+    mul.lo.s32 %r16, %r5, %r1;
+    mul.wide.u32 %rd12, %r16, 4;
+    add.s64 %rd13, %rd5, %rd12;          // q_base
+    add.s64 %rd14, %rd8, %rd12;          // out_base
+
+    // ---- Pass 1: scores[t] = (q . k[t]) * scale, one thread per t ----
+    mov.u32 %r17, %r6;                   // t = tid
+ATTN_SCORE:
+    setp.ge.u32 %p1, %r17, %r2;
+    @%p1 bra ATTN_SCORE_DONE;
+    // k row t base = k_base + t*head_dim
+    mul.lo.s32 %r18, %r17, %r1;
+    mul.wide.u32 %rd15, %r18, 4;
+    add.s64 %rd16, %rd10, %rd15;         // &k[t][0]
+    mov.u64 %rd17, %rd13;                // &q[0]
+    mov.f32 %f2, 0f00000000;             // dot acc (FP32)
+    mov.u32 %r19, 0;                     // d
+ATTN_DOT:
+    setp.ge.u32 %p2, %r19, %r1;
+    @%p2 bra ATTN_DOT_DONE;
+    ld.global.f32 %f3, [%rd17];
+    ld.global.f32 %f4, [%rd16];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.s64 %rd17, %rd17, 4;
+    add.s64 %rd16, %rd16, 4;
+    add.s32 %r19, %r19, 1;
+    bra ATTN_DOT;
+ATTN_DOT_DONE:
+    mul.rn.f32 %f2, %f2, %f1;            // * scale
+    // store into shared scores[t]
+    shl.b32 %r20, %r17, 2;
+    add.s32 %r21, %r12, %r20;
+    st.shared.f32 [%r21], %f2;
+    add.s32 %r17, %r17, %r7;             // t += blockDim
+    bra ATTN_SCORE;
+ATTN_SCORE_DONE:
+    bar.sync 0;
+
+    // ---- Pass 2: softmax over sm_sc[0..cached_len] ----
+    // max reduction (strided per thread over shared scores)
+    mov.f32 %f5, 0fFF800000;             // -inf
+    mov.u32 %r22, %r6;
+ATTN_MAX:
+    setp.ge.u32 %p3, %r22, %r2;
+    @%p3 bra ATTN_MAX_RED;
+    shl.b32 %r23, %r22, 2;
+    add.s32 %r24, %r12, %r23;
+    ld.shared.f32 %f6, [%r24];
+    max.f32 %f5, %f5, %f6;
+    add.s32 %r22, %r22, %r7;
+    bra ATTN_MAX;
+ATTN_MAX_RED:
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTN_MAX_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f5;
+ATTN_MAX_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTN_MAX_BC;
+    mov.f32 %f7, 0fFF800000;
+    mov.u32 %r29, 0;
+ATTN_MAX_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTN_MAX_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f8, [%r31];
+    max.f32 %f7, %f7, %f8;
+    add.s32 %r29, %r29, 1;
+    bra ATTN_MAX_W;
+ATTN_MAX_ST:
+    st.shared.f32 [%r13+32], %f7;
+ATTN_MAX_BC:
+    bar.sync 0;
+    ld.shared.f32 %f9, [%r13+32];        // m (block max), uniform
+
+    // exp(score - m) written back to shared, plus per-thread sum
+    mov.f32 %f10, 0f00000000;            // sum acc
+    mov.u32 %r32, %r6;
+ATTN_EXP:
+    setp.ge.u32 %p3, %r32, %r2;
+    @%p3 bra ATTN_SUM_RED;
+    shl.b32 %r33, %r32, 2;
+    add.s32 %r34, %r12, %r33;
+    ld.shared.f32 %f11, [%r34];
+    sub.f32 %f12, %f11, %f9;             // score - m
+    mul.f32 %f13, %f12, 0f3FB8AA3B;      // * log2(e)
+    ex2.approx.f32 %f14, %f13;           // exp(score - m)
+    st.shared.f32 [%r34], %f14;
+    add.f32 %f10, %f10, %f14;
+    add.s32 %r32, %r32, %r7;
+    bra ATTN_EXP;
+ATTN_SUM_RED:
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTN_SUM_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f10;
+ATTN_SUM_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTN_SUM_BC;
+    mov.f32 %f15, 0f00000000;
+    mov.u32 %r29, 0;
+ATTN_SUM_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTN_SUM_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f16, [%r31];
+    add.f32 %f15, %f15, %f16;
+    add.s32 %r29, %r29, 1;
+    bra ATTN_SUM_W;
+ATTN_SUM_ST:
+    st.shared.f32 [%r13+32], %f15;
+ATTN_SUM_BC:
+    bar.sync 0;
+    ld.shared.f32 %f17, [%r13+32];       // sum, uniform
+    // reciprocal of sum (guard sum>0, else leave weights = exp values)
+    setp.gt.f32 %p7, %f17, 0f00000000;
+    mov.f32 %f18, 0f3F800000;            // 1.0 default (no-op divide)
+    @!%p7 bra ATTN_RCP_DONE;
+    rcp.rn.f32 %f18, %f17;               // 1/sum
+ATTN_RCP_DONE:
+    bar.sync 0;
+
+    // ---- Pass 3: out[d] = sum_t (scores[t]*inv_sum) * v[t][d] ----
+    // one thread per d, sequential over t (matches glproc weighted-V order).
+    mov.u32 %r35, %r6;                   // d = tid
+ATTN_OUT:
+    setp.ge.u32 %p1, %r35, %r1;
+    @%p1 bra ATTN_OUT_DONE;
+    mov.f32 %f19, 0f00000000;            // out acc
+    mov.u32 %r36, 0;                     // t
+    // &v[0][d] = v_base + d*4 ; stride between t rows = head_dim*4 bytes
+    mul.wide.u32 %rd18, %r35, 4;
+    add.s64 %rd19, %rd11, %rd18;         // &v[0][d]
+    mul.lo.s32 %r37, %r1, 4;             // row stride bytes
+    cvt.u64.u32 %rd20, %r37;
+ATTN_OUT_LOOP:
+    setp.ge.u32 %p2, %r36, %r2;
+    @%p2 bra ATTN_OUT_STORE;
+    shl.b32 %r38, %r36, 2;
+    add.s32 %r39, %r12, %r38;
+    ld.shared.f32 %f20, [%r39];          // exp weight (un-normalized)
+    mul.rn.f32 %f21, %f20, %f18;         // * inv_sum -> normalized weight
+    ld.global.f32 %f22, [%rd19];         // v[t][d]
+    fma.rn.f32 %f19, %f21, %f22, %f19;
+    add.s64 %rd19, %rd19, %rd20;
+    add.s32 %r36, %r36, 1;
+    bra ATTN_OUT_LOOP;
+ATTN_OUT_STORE:
+    // out[d] at out_base + d*4
+    add.s64 %rd21, %rd14, %rd18;
+    st.global.f32 [%rd21], %f19;
+    add.s32 %r35, %r35, %r7;
+    bra ATTN_OUT;
+ATTN_OUT_DONE:
     ret;
 }

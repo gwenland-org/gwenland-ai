@@ -37,6 +37,7 @@ pub struct KernelSet {
     f_gemv_t: Kernel,
     f_rms_norm: Kernel,
     f_softmax_scale: Kernel,
+    f_attn_decode: Kernel,
 }
 
 impl KernelSet {
@@ -52,6 +53,7 @@ impl KernelSet {
             f_gemv_t: module.get_function("gl_gemv_t_f32")?,
             f_rms_norm: module.get_function("gl_rms_norm_f32")?,
             f_softmax_scale: module.get_function("gl_softmax_scale_f32")?,
+            f_attn_decode: module.get_function("gl_attn_decode_f32")?,
             _module: module,
         })
     }
@@ -223,6 +225,53 @@ impl KernelSet {
         ];
         cuda.launch(self.f_softmax_scale, (1, 1, 1), (BLOCK, 1, 1), 0, &mut params)
     }
+
+    /// Fused decode attention over ALL query heads in one launch (M2.1).
+    /// One block per query head does Q·K, scaled softmax and the weighted-V
+    /// sum in shared memory — replacing the per-head gemv+softmax+gemv_t
+    /// triple (from `3 * n_heads` launches to 1).
+    ///
+    /// * `q` — all heads' query vectors, `[n_heads * head_dim]`
+    /// * `k_base`/`v_base` — this layer's K/V region start (head 0); the
+    ///   kernel offsets by `kv_head * head_stride` internally
+    /// * `out` — all heads' attention output, `[n_heads * head_dim]`
+    /// * `head_stride` — elements between consecutive KV heads' `[seq][dim]`
+    ///   regions (`max_context * head_dim`)
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode(
+        &self,
+        cuda: &Cuda,
+        q: CUdeviceptr,
+        k_base: CUdeviceptr,
+        v_base: CUdeviceptr,
+        out: CUdeviceptr,
+        n_heads: u32,
+        head_dim: u32,
+        cached_len: u32,
+        heads_per_kv: u32,
+        head_stride: u32,
+        scale: f32,
+    ) -> Result<(), GlError> {
+        // Scores live in a fixed 16 KiB shared array (max_context 4096).
+        debug_assert!(cached_len <= 4096, "cached_len exceeds fused-attn shared scores");
+        let (mut q, mut k, mut v, mut o) = (q, k_base, v_base, out);
+        let (mut hd, mut cl, mut hpk, mut hs, mut sc) =
+            (head_dim, cached_len, heads_per_kv, head_stride, scale);
+        let mut params = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut cl as *mut _ as *mut c_void,
+            &mut hpk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // One block per head, 128 threads (4 warps). Shared scores are
+        // declared statically in the kernel, so shared_bytes here is 0.
+        cuda.launch(self.f_attn_decode, (n_heads, 1, 1), (128, 1, 1), 0, &mut params)
+    }
 }
 
 /// Host-side cos/sin tables for [`KernelSet::rope`] at one position —
@@ -260,6 +309,7 @@ mod tests {
             "gl_gemv_t_f32",
             "gl_rms_norm_f32",
             "gl_softmax_scale_f32",
+            "gl_attn_decode_f32",
         ] {
             assert!(
                 PTX.contains(&format!(".visible .entry {entry}(")),

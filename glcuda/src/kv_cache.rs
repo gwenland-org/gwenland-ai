@@ -105,6 +105,13 @@ impl KvCacheDev {
         self.addr(self.region(layer, 1, head))
     }
 
+    /// Elements between consecutive KV heads' `[seq][dim]` regions within a
+    /// layer — the stride the fused attention kernel adds per `kv_head`.
+    /// `read_k(l, 0)` + `n * head_stride()` == `read_k(l, n)` (in elements).
+    pub fn head_stride(&self) -> usize {
+        self.max_context * self.head_dim
+    }
+
     /// Advance the cursor after every layer/head committed the current
     /// token. Call exactly once per token.
     pub fn advance(&mut self) {

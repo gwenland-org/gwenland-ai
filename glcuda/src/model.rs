@@ -210,8 +210,6 @@ pub(crate) struct Workspace {
     pub gate: DevSlice,
     /// SwiGLU up, `[hidden_dim]`.
     pub up: DevSlice,
-    /// Attention score scratch, `[kv capacity]`.
-    pub scores: DevSlice,
     /// Output logits, `[vocab_size]`.
     pub logits: DevSlice,
     /// Host-precomputed RoPE cos table for every position,
@@ -273,7 +271,6 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += f32s(q_dim + 2 * kv_dim); // qkv
     total += f32s(q_dim); // attn_out
     total += f32s(c.hidden_dim) * 2; // gate, up
-    total += f32s(kv_capacity); // scores
     total += f32s(c.vocab_size); // logits
     total += f32s(kv_capacity * (c.head_dim / 2)) * 2; // rope tables
     total
@@ -376,7 +373,6 @@ impl GpuModel {
             proj: buf.alloc_f32(c.dim)?,
             gate: buf.alloc_f32(c.hidden_dim)?,
             up: buf.alloc_f32(c.hidden_dim)?,
-            scores: buf.alloc_f32(kv_capacity)?,
             logits: buf.alloc_f32(c.vocab_size)?,
             rope_cos: up_f32(cuda, &mut buf, &cos_all)?,
             rope_sin: up_f32(cuda, &mut buf, &sin_all)?,

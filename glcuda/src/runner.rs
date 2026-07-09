@@ -152,18 +152,25 @@ impl GpuModel {
                 kv.write_v(cuda, l, h, at(v_ptr, h * head_dim))?;
             }
 
-            // Single-query attention per head: Q·K over the cache rows
-            // (gemv), scaled softmax, weighted V sum (gemv_t). The scores
-            // scratch is reused across heads — stream ordering serializes.
+            // Fused decode attention over ALL heads in one launch (M2.1):
+            // one block per head does Q·K, scaled softmax and the weighted-V
+            // sum in shared memory. Replaces the per-head triple of
+            // gemv+softmax+gemv_t (3*n_heads launches -> 1), which was ~2/3
+            // of the per-token launch count and the decode bottleneck.
             let cached_len = (kv.current_pos() + 1) as u32;
-            for h in 0..c.n_heads {
-                let kv_head = h / heads_per_kv.max(1);
-                let q_seg = at(q_ptr, h * head_dim);
-                let out_seg = at(ws.attn_out.dptr, h * head_dim);
-                k.gemv(cuda, kv.read_k(l, kv_head), q_seg, ws.scores.dptr, cached_len, head_dim as u32)?;
-                k.softmax_scale(cuda, ws.scores.dptr, cached_len, scale)?;
-                k.gemv_t(cuda, kv.read_v(l, kv_head), ws.scores.dptr, out_seg, cached_len, head_dim as u32)?;
-            }
+            k.attn_decode(
+                cuda,
+                q_ptr,
+                kv.read_k(l, 0),
+                kv.read_v(l, 0),
+                ws.attn_out.dptr,
+                c.n_heads as u32,
+                head_dim as u32,
+                cached_len,
+                heads_per_kv.max(1) as u32,
+                kv.head_stride() as u32,
+                scale,
+            )?;
 
             gemv_w(cuda, k, &layer.wo, ws.attn_out.dptr, ws.proj.dptr)?;
             k.add(cuda, x, ws.proj.dptr, dim)?;
