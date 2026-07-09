@@ -110,6 +110,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2b. Q8_0 GEMV — the kernel the MODEL actually runs (gemv_q8_0), at the
+    //     same decode sizes. This is the real decode path; the f32 gemv above
+    //     is not. Q8_0 streams ~1.06 B/weight vs 4 B, so compare its GB/s to
+    //     the 265 achievable to see if the quantized kernel is the bottleneck.
+    // ============================================================
+    for (label, out_dim, in_dim) in
+        [("gate  ", 2 * hidden, dim), ("down  ", dim, hidden), ("lmhead", vocab, dim)]
+    {
+        let mark = buf.mark();
+        // Q8_0: 34 bytes per 32-weight block.
+        let row_blocks = in_dim / 32;
+        let wbytes = out_dim * row_blocks * 34;
+        let w = buf.alloc(wbytes as u64)?.dptr;
+        let x = buf.alloc_f32(in_dim)?.dptr;
+        let y = buf.alloc_f32(out_dim)?.dptr;
+        k.gemv_q8_0(&cuda, w, x, y, out_dim as u32, in_dim as u32)?;
+        cuda.synchronize()?;
+        let iters = 200;
+        let t = Instant::now();
+        for _ in 0..iters {
+            k.gemv_q8_0(&cuda, w, x, y, out_dim as u32, in_dim as u32)?;
+        }
+        cuda.synchronize()?;
+        let batched = t.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "[q8_0 {label}] {out_dim:>6}x{in_dim:<5}  batched {:>6.1} us ({:>5.0} GB/s of {wbytes} B)",
+            batched * 1e6,
+            wbytes as f64 / batched / 1e9,
+        );
+        buf.reset_to(mark);
+    }
+
+    // ============================================================
     // 3. Synchronous DtoD at KV-write granularity (head_dim=64 f32 = 256 B),
     //    96 copies per token — is the per-copy latency the stall?
     // ============================================================
