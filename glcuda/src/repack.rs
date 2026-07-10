@@ -15,9 +15,10 @@
 //!     aligned u32 of int8 activations. 128 B per super-block.
 //!   - `scales`: per-sub-block f16 of the PRE-MULTIPLIED scale `d * sc`
 //!     (8 per super-block). Pre-multiplying at load removes ggml's branchy
-//!     6-bit scale unpack from the hot loop entirely; the f16 rounding of
-//!     the product adds at most 2^-12 relative error — two orders below the
-//!     1e-2 Q4_K parity epsilon. 16 B per super-block.
+//!     6-bit scale unpack from the hot loop entirely; the f16 storage
+//!     rounds to nearest-even, adding at most 2^-11 relative error with a
+//!     symmetric (cancelling) sign — well below the 1e-2 Q4_K parity
+//!     epsilon. 16 B per super-block.
 //!   - `mins`: f16 of `dmin * m`, same shape as `scales`. 16 B.
 //!
 //!   Total: 160 B per 256 weights = 5.0 bpw, vs 4.5 native (the +11% buys
@@ -46,8 +47,46 @@ pub const Q4_K_BLOCK_BYTES: usize = 144;
 /// Sub-blocks per super-block (32 weights each — the activation block size).
 pub const Q4_K_SUB_BLOCKS: usize = 8;
 
+/// f32 -> f16 bit pattern, ROUND-TO-NEAREST-EVEN. Used for the Q4_K
+/// pre-multiplied scale/min pairs, where rounding mode is load-bearing:
+/// truncation's error is one-sided (every stored scale slightly LOW), so
+/// across the 8-16 sub-blocks of a dot product the errors accumulate
+/// coherently instead of cancelling — the first T4 parity run failed by
+/// exactly that margin (|diff| 1.024e-2 vs the 1e-2 epsilon). RNE is
+/// symmetric and half the max error (2^-11 relative).
+pub fn f32_to_f16_bits_rne(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let man = bits & 0x7F_FFFF;
+    if exp == 0xFF {
+        // inf/NaN (quietened): propagate rather than round.
+        return sign | 0x7C00 | (((man != 0) as u16) << 9);
+    }
+    let e = exp - 127 + 15;
+    if e >= 31 {
+        return sign | 0x7C00; // overflow -> inf
+    }
+    if e <= 0 {
+        return sign; // < 6.1e-5 flushes to zero (far below any real scale)
+    }
+    // Truncate 23 -> 10 mantissa bits, then round on the 13 dropped bits.
+    // A mantissa carry deliberately overflows into the exponent field —
+    // f16's encoding is monotonic, so +1 at the binade boundary is exact.
+    let h = ((e as u32) << 10) | (man >> 13);
+    let dropped = man & 0x1FFF;
+    let round_up = dropped > 0x1000 || (dropped == 0x1000 && (h & 1) == 1);
+    let h = h + round_up as u32;
+    if h >= 0x7C00 {
+        return sign | 0x7C00;
+    }
+    sign | h as u16
+}
+
 /// f32 -> f16 bit pattern, truncating the mantissa (glproc's converter,
-/// ADR-001 duplication). Sub-ulp rounding is far below quantization noise.
+/// ADR-001 duplication). Used for the Q8_0 requant scales, where staying
+/// byte-for-byte identical to glproc's quantizer matters more than the
+/// sub-quantization-noise rounding difference.
 pub fn f32_to_f16_bits(v: f32) -> u16 {
     let bits = v.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
@@ -103,8 +142,9 @@ pub fn q4_k_to_soa(data: &[u8]) -> Result<Q4KSoaStreams, GlError> {
 
         for j in 0..Q4_K_SUB_BLOCKS {
             let (sc, m) = scale_min(j, scales);
-            sc_out.extend_from_slice(&f32_to_f16_bits(d * sc as f32).to_le_bytes());
-            mn_out.extend_from_slice(&f32_to_f16_bits(dmin * m as f32).to_le_bytes());
+            // RNE, not the truncating converter — see f32_to_f16_bits_rne.
+            sc_out.extend_from_slice(&f32_to_f16_bits_rne(d * sc as f32).to_le_bytes());
+            mn_out.extend_from_slice(&f32_to_f16_bits_rne(dmin * m as f32).to_le_bytes());
         }
 
         // Linearize the ggml nibble order (per 32-byte chunk: low nibbles are
@@ -218,13 +258,13 @@ mod tests {
             for i in 0..Q4_K_NUMEL {
                 let got = soa_weight(&qs, &sc, &mn, bi, i);
                 let w = want[bi * Q4_K_NUMEL + i];
-                // f32_to_f16_bits truncates: each pre-multiplied pair is low
-                // by at most 2^-10 relative, so the elementwise bound is on
-                // the GROSS magnitudes |d*sc*q| + |dmin*m| (their difference
-                // — the weight — can be much smaller through cancellation).
+                // RNE premul: each pair is within 2^-11 relative, so the
+                // elementwise bound is on the GROSS magnitudes
+                // |d*sc*q| + |dmin*m| (their difference — the weight — can
+                // be much smaller through cancellation).
                 let (s6, m6) = scale_min(i / 32, &block[4..16]);
                 let gross = d * s6 as f32 * 15.0 + dmin * m6 as f32;
-                let tol = gross * 2f32.powi(-10) + 1e-6;
+                let tol = gross * 2f32.powi(-11) + 1e-6;
                 assert!(
                     (got - w).abs() <= tol,
                     "block {bi} weight {i}: soa {got} vs glproc {w} (tol {tol})"
@@ -281,6 +321,32 @@ mod tests {
         let (qs, sc) = f32_to_q8_0_soa(&values);
         assert_eq!(qs, want_qs);
         assert_eq!(sc, want_sc);
+    }
+
+    /// RNE converter: exact values survive, ties round to even, the
+    /// mantissa carry at a binade boundary lands on the next exponent.
+    #[test]
+    fn f16_bits_rne_rounds_to_nearest_even() {
+        for v in [0.0f32, 1.0, -2.0, 0.5, 65504.0] {
+            assert_eq!(f16_to_f32(f32_to_f16_bits_rne(v)), v);
+        }
+        // 1.0 + 2^-11 is exactly halfway between 1.0 and the next f16
+        // (1.0 + 2^-10): ties-to-even keeps the even mantissa (1.0).
+        assert_eq!(f16_to_f32(f32_to_f16_bits_rne(1.0 + 2f32.powi(-11))), 1.0);
+        // Just above halfway rounds up.
+        assert_eq!(
+            f16_to_f32(f32_to_f16_bits_rne(1.0 + 2f32.powi(-11) + 2f32.powi(-16))),
+            1.0 + 2f32.powi(-10)
+        );
+        // Largest f16 mantissa rounding up must carry into the exponent.
+        assert_eq!(f16_to_f32(f32_to_f16_bits_rne(1.9999999f32)), 2.0);
+        // Above f16 max -> inf; RNE error bound holds everywhere else.
+        assert_eq!(f16_to_f32(f32_to_f16_bits_rne(1e9)), f32::INFINITY);
+        for i in 0..1000 {
+            let v = 0.003 + i as f32 * 0.37;
+            let rt = f16_to_f32(f32_to_f16_bits_rne(v));
+            assert!((rt - v).abs() <= v.abs() * 2f32.powi(-11), "{v} -> {rt}");
+        }
     }
 
     #[test]
