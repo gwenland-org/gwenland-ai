@@ -4,6 +4,27 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.2 Task C-1, native Q6_K SoA decode path:
+
+- New PTX kernel `gl_gemv_q6_k_soa`: four SoA streams (packed low nibbles,
+  2-bit highs, verbatim i8 sub-block scales, verbatim f16 super-block `d`)
+  at the exact native 6.5625 bpw. q6 values are assembled in registers
+  (`ql | qh<<4`, masked shifts into int8x4 lanes) and the −32 centering
+  folds into the integer domain: `d·sc·xs·(dot(q6,xq) − 32·Σxq)` per
+  16-value sub-block. Zero added quantization error — every stream is
+  verbatim or losslessly relocated.
+- Replaces the M2.1 Q6_K→Q8_0 requant detour (8.5 bpw) for the ~1.6 GB of
+  Q6_K tensors a Q4_K_M 7B streams per token: expected ~+3 tok/s decode
+  (38.8 → ~42). Q6_K embedding tables stay quantized host-side
+  (`q6_k_row_into`). Disk cache bumped (`GLCACHE5`).
+- Repack linearizes ggml's half/quarter interleave (its 16 i8 scales turn
+  out to already be in linear sub-block order — verbatim copy); host test
+  pins the reconstruction bit-exact vs glproc. Note: the real GGML
+  `block_q6_K` is 210 B (qh is 64 B, not 32) — the task brief's 178 B
+  sketch was corrected against `dequant.rs`/glproc.
+- Parity `gemv_q6_k_soa` ε 2e-3 (5× under the task bound); bench `[q6k]`
+  section at 7B shapes.
+
 glcuda — M2.2 Task C-2, native Q4_0 SoA decode path:
 
 - New PTX kernel `gl_gemv_q4_0_soa`: the Q4_K kernel's structure minus the

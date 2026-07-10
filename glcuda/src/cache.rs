@@ -21,10 +21,11 @@ use glcore::GlError;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
 
 // Version history: GLCACHE3 = M2.1 (Q4_K native + requant-to-Q8_0 staging);
-// GLCACHE4 = M2.2 Task C-2 (Q4_0 matmuls repack to SoA instead of AoS). A
-// bump forces a restage so pre-existing caches pick up the new layouts —
-// old caches would read back fine but keep the old kernels' cost.
-const MAGIC: &[u8; 8] = b"GLCACHE4";
+// GLCACHE4 = M2.2 Task C-2 (Q4_0 matmuls repack to SoA); GLCACHE5 = M2.2
+// Task C-1 (Q6_K matmuls go native SoA instead of requant-to-Q8_0). A bump
+// forces a restage so pre-existing caches pick up the new layouts — old
+// caches would read back fine but keep the old kernels' cost.
+const MAGIC: &[u8; 8] = b"GLCACHE5";
 
 /// Path of the cache file for a GGUF at `gguf_path`.
 fn cache_path(gguf_path: &str) -> PathBuf {
@@ -146,6 +147,13 @@ fn rd_weight<R: Read>(r: &mut R) -> io::Result<HostWeight> {
         4 => HostWeight::Q4K(rd_bytes(r)?),
         5 => HostWeight::Q4KSoa { qs: rd_bytes(r)?, scales: rd_bytes(r)?, mins: rd_bytes(r)? },
         6 => HostWeight::Q4_0Soa { qs: rd_bytes(r)?, scales: rd_bytes(r)? },
+        7 => HostWeight::Q6K(rd_bytes(r)?),
+        8 => HostWeight::Q6KSoa {
+            ql: rd_bytes(r)?,
+            qh: rd_bytes(r)?,
+            scales: rd_bytes(r)?,
+            d: rd_bytes(r)?,
+        },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad weight tag")),
     })
 }
@@ -278,6 +286,17 @@ fn wr_weight<W: Write>(w: &mut W, weight: &HostWeight) -> io::Result<()> {
             wr_bytes(w, qs)?;
             wr_bytes(w, scales)
         }
+        HostWeight::Q6K(b) => {
+            w.write_all(&[7u8])?;
+            wr_bytes(w, b)
+        }
+        HostWeight::Q6KSoa { ql, qh, scales, d } => {
+            w.write_all(&[8u8])?;
+            wr_bytes(w, ql)?;
+            wr_bytes(w, qh)?;
+            wr_bytes(w, scales)?;
+            wr_bytes(w, d)
+        }
     }
 }
 
@@ -345,7 +364,11 @@ mod tests {
         let layer = HostLayer {
             attn_norm: vec![1.0, 2.0, 3.0, 4.0],
             wq: mat(4, 4, HostWeight::Q8_0Soa { qs: vec![1, 2, 3, 4], scales: vec![9, 8] }),
-            wk: mat(2, 4, HostWeight::F32(vec![0.5; 8])),
+            wk: mat(
+                2,
+                4,
+                HostWeight::Q6KSoa { ql: vec![1; 4], qh: vec![2; 2], scales: vec![3, 4], d: vec![5, 6] },
+            ),
             wv: mat(
                 2,
                 4,
@@ -388,6 +411,10 @@ mod tests {
                 HostWeight::Q4_0Soa { qs: xq, scales: xs },
                 HostWeight::Q4_0Soa { qs: yq, scales: ys },
             ) => xq == yq && xs == ys,
+            (
+                HostWeight::Q6KSoa { ql: xl, qh: xh, scales: xs, d: xd },
+                HostWeight::Q6KSoa { ql: yl, qh: yh, scales: ys, d: yd },
+            ) => xl == yl && xh == yh && xs == ys && xd == yd,
             _ => false,
         }
     }
@@ -409,6 +436,7 @@ mod tests {
         let (lb, lm) = (&back.layers[0], &m.layers[0]);
         assert_eq!(lb.attn_norm, lm.attn_norm);
         assert!(weight_eq(&lb.wq.w, &lm.wq.w));
+        assert!(weight_eq(&lb.wk.w, &lm.wk.w)); // Q6KSoa
         assert!(weight_eq(&lb.wv.w, &lm.wv.w)); // Q4KSoa
         assert!(weight_eq(&lb.wo.w, &lm.wo.w)); // Q4_0Soa
         assert_eq!(lb.wq.out_dim, lm.wq.out_dim);

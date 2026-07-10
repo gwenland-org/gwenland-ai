@@ -408,6 +408,99 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2i. Q6_K SoA GEMV (gl_gemv_q6_k_soa, M2.2 Task C-1) — the native
+    //     6.5625 bpw kernel replacing the Q6_K->Q8_0 requant stream. Same
+    //     method: CPU-validated on synthetic SoA streams, GB/s of real
+    //     bytes (ql + qh + i8 scales + f16 d) vs the achievable ceiling.
+    // ============================================================
+    {
+        let d_bits: [u16; 4] = [0x3C00, 0x3800, 0x3E00, 0x3400]; // 1.0 0.5 1.5 0.25
+        let d_vals: [f32; 4] = [1.0, 0.5, 1.5, 0.25];
+        let qb = |i: usize| -> u8 { ((i * 131 + 7) % 251) as u8 };
+
+        let (dim7, hidden7) = (3584usize, 18944usize);
+        for (label, out_dim, in_dim) in [("gate7b", 2 * hidden7, dim7), ("down7b", dim7, hidden7)] {
+            let mark = buf.mark();
+            let nsb = in_dim / 256; // super-blocks per row
+            let nsub = in_dim / 16; // i8 scales per row
+
+            let wql: Vec<u8> = (0..out_dim * in_dim / 2).map(qb).collect();
+            let wqh: Vec<u8> = (0..out_dim * in_dim / 4).map(|i| qb(i * 3 + 1)).collect();
+            let wsc: Vec<i8> = (0..out_dim * nsub).map(|i| ((i * 5) % 23) as i8 - 11).collect();
+            let wd_bits: Vec<u16> = (0..out_dim * nsb).map(|i| d_bits[i % 4]).collect();
+            let xqs: Vec<i8> = (0..in_dim).map(|i| (qb(i * 7 + 3) as i32 - 125) as i8).collect();
+            let xsc: Vec<f32> = (0..in_dim / 32).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
+
+            let d_wql = buf.alloc(wql.len() as u64)?.dptr;
+            let d_wqh = buf.alloc(wqh.len() as u64)?.dptr;
+            let d_wsc = buf.alloc(wsc.len() as u64)?.dptr;
+            let d_wd = buf.alloc((wd_bits.len() * 2) as u64)?.dptr;
+            let d_xqs = buf.alloc(in_dim as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(in_dim / 32)?.dptr;
+            let d_y = buf.alloc_f32(out_dim)?.dptr;
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let u16_u8 = |v: &[u16]| unsafe {
+                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
+            };
+            cuda.htod(d_wql, &wql)?;
+            cuda.htod(d_wqh, &wqh)?;
+            cuda.htod(d_wsc, as_u8(&wsc))?;
+            cuda.htod(d_wd, u16_u8(&wd_bits))?;
+            cuda.htod(d_xqs, as_u8(&xqs))?;
+            cuda.htod_f32(d_xsc, &xsc)?;
+
+            k.gemv_q6_k_soa(&cuda, d_wql, d_wqh, d_wsc, d_wd, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
+            cuda.synchronize()?;
+            let mut y_host = vec![0f32; out_dim];
+            cuda.dtoh_f32(&mut y_host, d_y)?;
+
+            // CPU reference off the SoA streams: per 16-value sub-block,
+            // acc += d*sc*xs*(dot(q6,xq) - 32*sum(xq)), kernel bit layout
+            // (low4 from ql lo/hi nibble, high2 from qh byte i/4).
+            let mut max_rel = 0f32;
+            for r in 0..out_dim {
+                let mut acc = 0f32;
+                for s in 0..nsub {
+                    let d = d_vals[(r * nsb + s / 16) % 4];
+                    let sc = wsc[r * nsub + s] as f32;
+                    let xs = xsc[s / 2];
+                    let (mut dot, mut sum) = (0i32, 0i32);
+                    for i in 0..16 {
+                        let v = s * 16 + i;
+                        let (g, rr) = (v / 8, v % 8);
+                        let lbyte = wql[r * in_dim / 2 + g * 4 + (rr % 4)];
+                        let low4 = if rr < 4 { lbyte & 0x0F } else { lbyte >> 4 };
+                        let high2 = (wqh[r * in_dim / 4 + v / 4] >> (2 * (v % 4))) & 0x03;
+                        let q6 = ((high2 << 4) | low4) as i32;
+                        let xv = xqs[v] as i32;
+                        dot += q6 * xv;
+                        sum += xv;
+                    }
+                    acc += d * sc * xs * (dot - 32 * sum) as f32;
+                }
+                let dl = (acc - y_host[r]).abs() / acc.abs().max(1.0);
+                max_rel = max_rel.max(dl);
+            }
+
+            let iters = 100;
+            let t = Instant::now();
+            for _ in 0..iters {
+                k.gemv_q6_k_soa(&cuda, d_wql, d_wqh, d_wsc, d_wd, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
+            }
+            cuda.synchronize()?;
+            let each = t.elapsed().as_secs_f64() / iters as f64;
+            let sbytes = wql.len() + wqh.len() + wsc.len() + wd_bits.len() * 2;
+            println!(
+                "[q6k  {label}] {out_dim:>6}x{in_dim:<5}  batched {:>6.1} us ({:>5.0} GB/s of {sbytes} B) | max_rel_err {:.1e}",
+                each * 1e6,
+                sbytes as f64 / each / 1e9,
+                max_rel,
+            );
+            buf.reset_to(mark);
+        }
+    }
+
+    // ============================================================
     // 2e. Batched GEMM (gl_gemm_q8_0_soa) — the prefill path. Validates vs a
     //     CPU reference and times it against looping the SoA GEMV once per
     //     token (what sequential prefill does today). The GEMM streams each

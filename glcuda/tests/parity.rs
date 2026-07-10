@@ -292,6 +292,55 @@ fn gemv_q4_k_soa_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_Q4K_GEMV, "gemv_q4_k_soa");
 }
 
+/// M2.2 Task C-1: the SoA Q6_K GEMV vs the glproc scalar ground truth.
+/// All four weight streams are lossless (verbatim i8/f16 scales, relocated
+/// quants — no premultiply), so the error structure is the Q8_0 test's:
+/// activation quantization (mirrored in the reference via q8_round_trip)
+/// plus accumulation order. 2e-3 doubles the Q8 epsilon for the 4x larger
+/// integer dots over the 512-wide rows — still 5x under the task's 1e-2.
+#[test]
+fn gemv_q6_k_soa_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (out_dim, in_dim) = (48usize, 512usize); // 2 super-blocks per row
+    let blocks_len = (in_dim / 256 * 210) * out_dim;
+    let mut blocks = randv_bytes(blocks_len, 70);
+    for block in blocks.chunks_exact_mut(210) {
+        block[208..210].copy_from_slice(&0x1e66u16.to_le_bytes()); // sane d
+    }
+    let w_deq = glproc::kernels::dequant::q6_k::scalar::run(&blocks).unwrap();
+    let x = randv(in_dim, 71, 1.0);
+    let x_dq = q8_round_trip(&x);
+    let mut want = vec![0f32; out_dim];
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_dq, &mut want, out_dim, in_dim);
+
+    let (wql, wqh, wsc, wd) = glcuda::repack::q6_k_to_soa(&blocks).unwrap();
+
+    let bytes = (wql.len() + wqh.len() + wsc.len() + wd.len() + (in_dim + out_dim) * 4 + 8192) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dql = buf.alloc(wql.len() as u64).unwrap().dptr;
+    cuda.htod(dql, &wql).unwrap();
+    let dqh = buf.alloc(wqh.len() as u64).unwrap().dptr;
+    cuda.htod(dqh, &wqh).unwrap();
+    let dsc = buf.alloc(wsc.len() as u64).unwrap().dptr;
+    cuda.htod(dsc, &wsc).unwrap();
+    let dd = buf.alloc(wd.len() as u64).unwrap().dptr;
+    cuda.htod(dd, &wd).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+    let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q6_k_soa(&cuda, dql, dqh, dsc, dd, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+        .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    // 2e-3: Q8-like error structure, doubled for the larger q6 dot range.
+    assert_close(&got, &want, 2e-3, "gemv_q6_k_soa");
+}
+
 /// M2.2 Task C-2: the SoA Q4_0 GEMV vs the glproc scalar ground truth.
 /// (48, 384) exercises one full 256-value group + a 4-block tail; (20, 160)
 /// is tail-only (dim-896-class models never hit the grouped path evenly).

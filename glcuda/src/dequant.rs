@@ -190,6 +190,37 @@ pub fn q4_k_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
     }
 }
 
+/// Dequantize one row of a Q6_K matrix (`dim % 256 == 0`) — the host-side
+/// embedding lookup for Q6_K-quantized tables. Zero allocation per call;
+/// math identical to `dequant_q6_k`.
+pub fn q6_k_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), dim);
+    debug_assert!(dim.is_multiple_of(K_BLOCK_NUMEL));
+    let row_bytes = dim / K_BLOCK_NUMEL * Q6_K_BLOCK_BYTES;
+    let r = &blocks[row * row_bytes..(row + 1) * row_bytes];
+    for (bi, block) in r.chunks_exact(Q6_K_BLOCK_BYTES).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[208], block[209]]));
+        let o = &mut out[bi * K_BLOCK_NUMEL..(bi + 1) * K_BLOCK_NUMEL];
+        for half in 0..2 {
+            let ql = &block[half * 64..half * 64 + 64];
+            let qh = &block[128 + half * 32..128 + half * 32 + 32];
+            let sc = &block[192 + half * 8..192 + half * 8 + 8];
+            let oh = &mut o[half * 128..half * 128 + 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i32 - 32;
+                oh[l] = d * (sc[is] as i8 as f32) * q1 as f32;
+                oh[l + 32] = d * (sc[is + 2] as i8 as f32) * q2 as f32;
+                oh[l + 64] = d * (sc[is + 4] as i8 as f32) * q3 as f32;
+                oh[l + 96] = d * (sc[is + 6] as i8 as f32) * q4 as f32;
+            }
+        }
+    }
+}
+
 /// Dequantize one row of a Q4_0 matrix (`dim % 32 == 0`) — the host-side
 /// embedding lookup.
 pub fn q4_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
@@ -291,6 +322,19 @@ mod tests {
         for row in 0..rows {
             let mut out = vec![0f32; dim];
             q4_k_row_into(&data, row, dim, &mut out);
+            assert_eq!(out, full[row * dim..(row + 1) * dim].to_vec());
+        }
+    }
+
+    #[test]
+    fn q6_k_row_matches_full_dequant() {
+        let (rows, dim) = (3usize, 512usize);
+        let mut data = rand_bytes(rows * dim / 256 * 210, 6);
+        set_scales(&mut data, 210, 208);
+        let full = dequant_q6_k(&data).unwrap();
+        for row in 0..rows {
+            let mut out = vec![0f32; dim];
+            q6_k_row_into(&data, row, dim, &mut out);
             assert_eq!(out, full[row * dim..(row + 1) * dim].to_vec());
         }
     }

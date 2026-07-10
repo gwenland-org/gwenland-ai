@@ -13,7 +13,7 @@ use glcore::GlError;
 
 use crate::dequant::dequant_any;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
-use crate::repack::{f32_to_q8_0_soa, q4_0_to_soa, q4_k_to_soa};
+use crate::repack::{f32_to_q8_0_soa, q4_0_to_soa, q4_k_to_soa, q6_k_to_soa};
 
 /// Read `{arch}.{suffix}` from metadata as u64.
 fn meta_u64(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<u64> {
@@ -86,13 +86,21 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
             let (qs, scales) = q4_0_to_soa(gguf.tensor_data(info)?)?;
             HostWeight::Q4_0Soa { qs, scales }
         }
-        // Quantized dtypes with no native kernel (Q6_K, Q5_0 — Q4_K_M files
-        // carry Q6_K ffn_down/attn_v/output tensors): requantize to Q8_0 SoA
-        // instead of dense f32. Same policy glproc documents for its repack:
-        // Q8_0 adds ~2^-8 relative error on top of an already-lossy format
-        // (an order below that format's own loss), where dense f32 would
-        // multiply the tensor's VRAM and per-token DRAM traffic by 4-6x —
-        // enough on the big Q4_K_M tensors to sink the 7B decode budget.
+        // Native Q6_K path (M2.2 Task C-1): four SoA streams at the exact
+        // native 6.5625 bpw — replaces the M2.1 requant-to-Q8_0 detour that
+        // streamed these tensors (half of Q4_K_M's ffn_down/attn_v, plus
+        // output.weight) at 8.5 bpw. Zero added quantization error: every
+        // stream is verbatim or losslessly relocated.
+        GgufDType::Q6_K if in_dim.is_multiple_of(256) => {
+            let (ql, qh, scales, d) = q6_k_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q6KSoa { ql, qh, scales, d }
+        }
+        // Quantized dtypes with no native kernel (Q5_0, plus ragged-row
+        // k-quants, which the format itself cannot normally produce):
+        // requantize to Q8_0 SoA instead of dense f32. Same policy glproc
+        // documents for its repack: Q8_0 adds ~2^-8 relative error on top
+        // of an already-lossy format, where dense f32 would multiply the
+        // tensor's VRAM and per-token DRAM traffic by 4-6x.
         GgufDType::Q5_0 | GgufDType::Q6_K | GgufDType::Q4_K
             if in_dim.is_multiple_of(32) =>
         {
@@ -227,6 +235,10 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         // instead of a dense-f32 table (~2 GB for a 152k x 3584 vocab).
         GgufDType::Q4_K if dim.is_multiple_of(256) => {
             HostWeight::Q4K(gguf.tensor_data(embd_info)?.to_vec())
+        }
+        // Q6_K embedding: raw super-blocks + per-row dequant, like Q4_K.
+        GgufDType::Q6_K if dim.is_multiple_of(256) => {
+            HostWeight::Q6K(gguf.tensor_data(embd_info)?.to_vec())
         }
         _ => HostWeight::F32(dequant_any(gguf, embd_info)?),
     };

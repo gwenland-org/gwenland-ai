@@ -206,6 +206,81 @@ pub fn q4_0_to_soa(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), GlError> {
     Ok((qs_out, sc_out))
 }
 
+/// Bytes per AoS Q6_K super-block: ql 128 + qh 64 + scales 16 + d 2.
+/// (NOTE: the M2.2 brief listed 178 B with a 32-byte qh — the real GGML
+/// `block_q6_K` is 210 B with qh at 2 bits x 256 = 64 B; `dequant_q6_k`
+/// and glproc pin this bit-exactly and are the ground truth followed here.)
+pub const Q6_K_BLOCK_BYTES: usize = 210;
+
+/// The Q6_K SoA streams: `(ql, qh, scales_i8, d_f16)`.
+pub type Q6KSoaStreams = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
+
+/// Repack raw AoS Q6_K super-blocks into four contiguous SoA streams for
+/// `gl_gemv_q6_k_soa` (M2.2 Task C-1), 6.5625 bpw — exactly the native
+/// rate, nothing is inflated or premultiplied:
+///
+/// * `ql`: low 4 bits of each value, LINEARIZED out of ggml's two-half /
+///   four-quarter interleave and packed in the shared kernel order
+///   (`byte j = v[8g+j] | v[8g+4+j] << 4`). 128 B per super-block.
+/// * `qh`: upper 2 bits, byte k = values 4k..4k+4 at bit positions 0/2/4/6
+///   — one u16 load gives a lane its 8 values' high bits. 64 B.
+/// * `scales`: verbatim i8 per 16-value sub-block. ggml's scale array is
+///   already in linear sub-block order (index h*8 + qtr*2 + is == i/16),
+///   so this is a straight copy. 16 B.
+/// * `d`: verbatim f16 super-block scale. 2 B.
+///
+/// Dequant identity per value: `w = d * sc[i/16] * ((ql | qh<<4) - 32)`,
+/// which the kernel evaluates as `d*sc*xs*(dot(q6,xq) - 32*sum(xq))` per
+/// sub-block — the same integer-centering trick as Q4_0.
+pub fn q6_k_to_soa(data: &[u8]) -> Result<Q6KSoaStreams, GlError> {
+    if !data.len().is_multiple_of(Q6_K_BLOCK_BYTES) {
+        return Err(GlError::Parse(format!(
+            "Q6_K data length {} is not a multiple of {Q6_K_BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+    let n_blocks = data.len() / Q6_K_BLOCK_BYTES;
+    let mut ql_out = Vec::with_capacity(n_blocks * 128);
+    let mut qh_out = Vec::with_capacity(n_blocks * 64);
+    let mut sc_out = Vec::with_capacity(n_blocks * 16);
+    let mut d_out = Vec::with_capacity(n_blocks * 2);
+
+    for block in data.chunks_exact(Q6_K_BLOCK_BYTES) {
+        sc_out.extend_from_slice(&block[192..208]); // i8 scales, verbatim
+        d_out.extend_from_slice(&block[208..210]); // f16 d, verbatim
+
+        // Linearize the UNSIGNED 6-bit values (0..63) out of the ggml
+        // half/quarter interleave (mirrors dequant_q6_k exactly).
+        let mut v = [0u8; 256];
+        for half in 0..2 {
+            let ql = &block[half * 64..half * 64 + 64];
+            let qh = &block[128 + half * 32..128 + half * 32 + 32];
+            for l in 0..32 {
+                let o = half * 128 + l;
+                v[o] = (ql[l] & 0x0F) | ((qh[l] & 0x03) << 4);
+                v[o + 32] = (ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4);
+                v[o + 64] = (ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4);
+                v[o + 96] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4);
+            }
+        }
+        // Low nibbles in the kernel order; high 2 bits four-per-byte.
+        for g in 0..32 {
+            for j in 0..4 {
+                ql_out.push((v[g * 8 + j] & 0x0F) | ((v[g * 8 + 4 + j] & 0x0F) << 4));
+            }
+        }
+        for k in 0..64 {
+            qh_out.push(
+                (v[k * 4] >> 4)
+                    | ((v[k * 4 + 1] >> 4) << 2)
+                    | ((v[k * 4 + 2] >> 4) << 4)
+                    | ((v[k * 4 + 3] >> 4) << 6),
+            );
+        }
+    }
+    Ok((ql_out, qh_out, sc_out, d_out))
+}
+
 /// Quantize dense f32 weights (`len % 32 == 0`) straight into the Q8_0 SoA
 /// pair `(qs, scales_f16)` the `gl_gemv_q8_0_soa` / `gl_gemm_q8_0_soa`
 /// kernels read. Per 32-group: `d = max|v| / 127` (round-tripped through
@@ -373,6 +448,43 @@ mod tests {
     #[test]
     fn q4_0_soa_rejects_ragged_input() {
         assert!(q4_0_to_soa(&[0u8; Q4_0_BLOCK_BYTES - 1]).is_err());
+    }
+
+    /// Q6_K SoA repack must reconstruct BIT-EXACTLY the glproc scalar
+    /// dequant: all four streams are lossless (verbatim i8 scales, verbatim
+    /// f16 d, relocated-not-rounded quants), so exact equality is the bar.
+    #[test]
+    fn q6_k_soa_reconstructs_glproc_dequant_exactly() {
+        let mut data = rand_bytes(Q6_K_BLOCK_BYTES * 3, 31);
+        for block in data.chunks_exact_mut(Q6_K_BLOCK_BYTES) {
+            block[208..210].copy_from_slice(&0x2e66u16.to_le_bytes()); // sane d
+        }
+        let want = glproc::kernels::dequant::q6_k::scalar::run(&data).unwrap();
+        let (ql, qh, sc, d) = q6_k_to_soa(&data).unwrap();
+        assert_eq!(ql.len(), 128 * 3);
+        assert_eq!(qh.len(), 64 * 3);
+        assert_eq!(sc.len(), 16 * 3);
+        assert_eq!(d.len(), 2 * 3);
+        for bi in 0..3 {
+            let dv = f16_to_f32(u16::from_le_bytes([d[bi * 2], d[bi * 2 + 1]]));
+            for i in 0..256 {
+                // Kernel-order extraction: low4 from ql (group i/8, lo/hi
+                // nibble), high2 from qh byte i/4 at bit 2*(i%4).
+                let (g, r) = (i / 8, i % 8);
+                let lbyte = ql[bi * 128 + g * 4 + (r % 4)];
+                let low4 = if r < 4 { lbyte & 0x0F } else { lbyte >> 4 };
+                let high2 = (qh[bi * 64 + i / 4] >> (2 * (i % 4))) & 0x03;
+                let q6 = ((high2 << 4) | low4) as i32 - 32;
+                let s = sc[bi * 16 + i / 16] as i8;
+                let got = dv * s as f32 * q6 as f32;
+                assert_eq!(got, want[bi * 256 + i], "block {bi} value {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn q6_k_soa_rejects_ragged_input() {
+        assert!(q6_k_to_soa(&[0u8; Q6_K_BLOCK_BYTES - 1]).is_err());
     }
 
     /// The f32 -> Q8_0 SoA requant must be glproc's quantizer followed by
