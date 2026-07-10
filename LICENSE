@@ -2,11 +2,12 @@ GwenLand
 Copyright (c) 2026 JinXSuper
 
 This software is provided under the MIT License, subject to the
-"Commons Clause" License Condition v1.0 stated below.
+"Commons Clause" License Condition v1.0 stated below. The combined terms
+are commonly referred to as "MIT + Commons Clause".
 
 
 ================================================================================
-COMMONS CLAUSE LICENSE CONDITION v1.0
+"Commons Clause" License Condition v1.0
 ================================================================================
 
 The Software is provided to you by the Licensor under the License, as defined
@@ -24,14 +25,16 @@ derives, entirely or substantially, from the functionality of the Software. Any
 license notice or attribution required by the License must also include this
 Commons Clause License Condition notice.
 
-Software:  GwenLand
-License:   MIT License (below)
-Licensor:  JinXSuper
+Software: GwenLand
+License:  MIT
+Licensor: JinXSuper
 
 
 ================================================================================
-MIT LICENSE
+MIT License
 ================================================================================
+
+Copyright (c) 2026 JinXSuper
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -53,7 +56,7 @@ SOFTWARE.
 
 
 ================================================================================
-SUMMARY (not legally binding)
+Summary (not legally binding)
 ================================================================================
 
 - Personal use .......................................... Allowed

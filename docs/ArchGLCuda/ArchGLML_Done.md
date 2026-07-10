@@ -159,27 +159,43 @@ The AoS kernel is retained only for the host-side embedding row lookup.
 
 ---
 
-## 6 · Deferred to M2.1 (not required for M2)
+## 6 · M2.1 progress: batched prefill (landed)
 
-Per the spec these are throughput enhancements, explicitly outside M2's scope:
+Prefill was sequential — one full forward pass per prompt token, re-streaming the
+whole weight set once per token. `gl_gemm_q8_0_soa` batches the five weight
+matmuls over a tile of tokens (each weight row streamed once per 4-token tile),
+and `Runner::prefill_batched` processes the prompt in batched passes while the
+weight-free per-token work (RoPE, KV write, attention) stays a loop using the same
+kernels as the decode path — so semantics are identical.
 
-- **Batched prefill.** Prefill is currently sequential — one full forward pass
-  per prompt token — which re-streams the full weight set once per token. A
-  batched GEMM (`gl_gemm_q8_0_soa`) streams each weight row once per token tile.
-  This is where the int8 dp4a path pays off, since batched GEMM is
-  arithmetic-bound rather than bandwidth-bound. **The kernel is written and
-  validated** (bit-exact vs CPU reference, `max_rel_err` = 0) — at a 4-token tile
-  it is already **3.25× faster** than looping the GEMV per token; wiring it into
-  the runner's prefill path is the next step.
+- kernel bit-exact vs CPU reference (`max_rel_err` = 0), **3.25× faster** than
+  looping the GEMV per token
+- end-to-end on 7B: **prefill 32.9 → 73.0 tok/s (2.2×)**, output coherent, decode
+  unchanged (the blend is < 3.25× because the per-token attention/norm loop is not
+  batched)
 
-  ![Batched GEMM vs sequential per-token GEMV](done_prefill.png)
+![Batched GEMM vs sequential per-token GEMV](done_prefill.png)
+
+Still deferred (throughput enhancements, outside M2's scope):
+
 - **Tensor Cores (WMMA/MMA)** — the headline M2.1 deliverable.
 - **Q4_K native GEMV** — halves decode bytes (the only lever past the Q8_0
   bandwidth ceiling), for larger models on the same card.
+- **Larger GEMM tile (T > 4)** — pushes prefill further toward the compute bound.
+
+## 7 · Note on load time
+
+On the validation runs the ~33s model "stage" (repack Q8_0 → SoA + dequant) was
+found to be **I/O-bound on the Colab disk**, not CPU: parallelizing the repack
+across cores gave 0 % improvement and `madvise(SEQUENTIAL)` didn't move it —
+staging is dominated by reading the 8 GB GGUF at the shared disk's ~250 MB/s. On
+local NVMe (2–3 GB/s) this is ~3–5s. It is an infrastructure limit, not an engine
+cost; the VRAM upload itself runs at PCIe speed (~3.5 GB/s). An opt-in on-disk
+cache of the repacked weights exists (`GLCUDA_CACHE=1`) for fast local disks.
 
 ---
 
-## 7 · Reproduction
+## 8 · Reproduction
 
 The full validation is driven by [`glcuda_t4_validation.ipynb`](../../glcuda_t4_validation.ipynb)
 (Colab, T4 runtime). It installs Rust, clones the repo, builds `glcuda` (no CUDA

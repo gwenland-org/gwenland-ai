@@ -1,129 +1,133 @@
 # GwenLand
 
-GwenLand is a local-first AI toolkit. One Rust binary, under 50 MB, that takes you through the whole loop: fetch a model, fine-tune it, serve it, and chat with it. Inference runs on your machine and nothing leaves it.
+**Local-first LLM inference in pure Rust.** No Python, no CUDA toolkit, no
+`nvcc`, no vendor SDKs at build time — one Cargo workspace that loads GGUF /
+safetensors models and runs them on your CPU or GPU. The GPU backends ship
+hand-written kernels (PTX for CUDA) and load the driver at runtime, so the same
+tree builds on a machine with no GPU at all.
 
-It's still pre-release, so expect flags and file formats to move around. The native `gwen train` backend especially is experimental: the layer-streaming LoRA objective converges, but it's still an approximation (mean-pool forward, capped vocab, one projection per layer), so the adapters it makes aren't ready for inference yet. Fine for experimenting, not for real training runs. The `changelog/` folder tracks what's landed.
+GwenLand targets modest hardware — the reference CPU box is an 11th-gen i3 with
+8 GB of RAM — with an mmap-based loader that streams model weights without
+blowing the RAM budget. A GPU is optional.
 
-GwenLand is built for modest hardware. The machine we target is an 11th-gen i3 with 8 GB of RAM and no GPU, running Linux, backed by an mmap-based loader that streams one model layer into memory at a time so it doesn't blow the RAM budget. A GPU is optional, not required.
+> Status: pre-1.0. The CPU engine (`glproc`) runs models end-to-end today. The
+> CUDA engine (`glcuda`) has **passed its M2 milestone** — validated on real
+> hardware (see below). Vulkan and Metal backends are scaffolded but not yet
+> implemented.
 
-## Installing
+---
 
-You'll need a recent Rust toolchain (edition 2024, so Rust 1.85 or newer). From the workspace root:
+## Architecture: the "gl-stack"
 
-```bash
-cargo build --release -p gltui
+Every backend is an independent engine implementing one shared trait
+(`glcore::engine_trait`). A thin runtime selects an engine and routes requests —
+it owns no compute logic — so engines never depend on each other and can be added
+without touching the runtime.
+
+```mermaid
+graph TD
+    cli["glcli · gwen run / info / tui"] --> rt["runtime<br/>(select + route, no compute)"]
+    rt --> glproc["glproc · CPU<br/>✅ M1 (SIMD + threads)"]
+    rt --> glcuda["glcuda · CUDA / NVIDIA<br/>✅ M2 (hand-written PTX)"]
+    rt --> glvulkan["glvulkan · Vulkan<br/>◻ planned"]
+    rt --> glmetal["glmetal · Metal / Apple<br/>◻ planned"]
+    core["glcore · shared: GGUF & safetensors parsers,<br/>BPE tokenizer, tensor types, engine trait, runtime"]
+    glproc -.uses.-> core
+    glcuda -.uses.-> core
+    style glproc fill:#1baf7a,color:#fff,stroke:#178a61
+    style glcuda fill:#2a78d6,color:#fff,stroke:#1c5aa8
 ```
 
-The stripped binary lands at `target/release/gwenland`. It's named `gwenland`, but its command name is `gwen`, which is how this README refers to it. Alias it so the examples work as written:
+| Crate | Role | Status |
+|-------|------|--------|
+| `glcore` | Shared: GGUF/safetensors parsers (from scratch, mmap zero-copy), BPE tokenizer, `Tensor` types, the engine trait, the runtime | ✅ |
+| `glproc` | CPU engine — scalar → SIMD + threaded matmul, attention, KV cache, sampler | ✅ M1 |
+| `glcuda` | CUDA engine — CUDA Driver FFI, hand-written PTX kernels (SIMT), VRAM bump allocator, CUDA-graph decode | ✅ **M2** |
+| `glvulkan` | Vulkan compute backend (cross-vendor) | ◻ planned |
+| `glmetal` | Metal backend (Apple Silicon) | ◻ planned |
+| `glcli` | The `gwen` command-line interface | ✅ |
+
+---
+
+## Building
+
+Needs a recent Rust toolchain. From the workspace root:
 
 ```bash
-alias gwen="$PWD/target/release/gwenland"
+cargo build --release -p glcli      # builds the `gwen` binary
 ```
 
-Or just run it through cargo while you're hacking on it:
+The binary lands at `target/release/gwen`. No CUDA toolkit is required to build —
+`glcuda` loads `libcuda.so.1` at runtime and ships its kernels as PTX.
+
+## Running
 
 ```bash
-cargo run -p gltui -- doctor
+# one-shot inference on a local GGUF
+gwen run model.gguf --prompt "Explain what a GPU is in one sentence."
+
+# interactive REPL (omit --prompt)
+gwen run model.gguf
+
+# model metadata
+gwen info model.gguf
 ```
 
-### Using a GPU
+`gwen run` flags: `--prompt`, `--max-tokens` (256), `--temperature` (0.8),
+`--top-k` (40), `--top-p` (0.95), `--repeat-penalty` (1.1), `--raw` (skip the chat
+template). The CLI currently runs on the CPU engine; the CUDA engine is validated
+standalone (see the notebook below) and is being wired into the runtime's
+fallback chain.
 
-The default build is CPU-only and compiles anywhere without a CUDA toolkit or the macOS SDK. To use a GPU you don't rebuild anything — set an environment variable and Candle picks it up at runtime:
+---
+
+## glcuda — the CUDA backend (M2 ✅)
+
+`glcuda` is a from-scratch CUDA SIMT inference engine with **hand-authored PTX
+kernels** — no `nvcc`, no cuBLAS. It has passed every criterion of its M2
+Definition of Done on a **Tesla T4** (sm_75): full forward pass with coherent
+output, tensor-by-tensor numerical parity against the CPU engine (14/14 tests),
+backend-buffer reuse (zero `cudaMalloc` after init), mmap loading, no VRAM leaks.
+
+Measured on the T4 (Qwen2.5-7B-Q8_0):
+
+- **decode 29.2 tok/s** — 88 % of the card's memory bandwidth (bandwidth-bound,
+  as expected for weight-streaming decode)
+- **prefill 73 tok/s** via batched GEMM
+- coherent output, parity with the CPU reference within spec ε
+
+Full write-up, charts, and the Definition-of-Done table:
+[`docs/ArchGLCuda/ArchGLML_Done.md`](docs/ArchGLCuda/ArchGLML_Done.md).
+Benchmark methodology: [`docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md`](docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md).
+The whole validation is reproducible on a free Colab T4 via
+[`glcuda_t4_validation.ipynb`](glcuda_t4_validation.ipynb).
+
+---
+
+## Development
 
 ```bash
-CANDLE_CUDA=1  gwen serve qwen3-8b-q4_0    # NVIDIA
-CANDLE_METAL=1 gwen serve qwen3-8b-q4_0    # Apple Silicon
+cargo build --workspace
+cargo test  -p glcore --lib
+cargo test  -p glproc --lib
+
+# glcuda's host tests run without a GPU; its parity/forward tests skip cleanly
+# when no CUDA device is present, and are meaningful on GPU hardware:
+cargo test  -p glcuda --lib
+cargo test  -p glcuda --test parity  -- --test-threads=1
 ```
 
-## A quick run-through
-
-The whole pipeline, start to finish:
-
-```bash
-gwen doctor                                   # check your environment first
-gwen fetch -m tinyllama/TinyLlama-1.1B -q q4_k_m
-gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --epochs 3   # experimental
-gwen serve tinyllama-1.1b-q4_k_m              # serves SSE on port 1136
-gwen chat                                     # chat with it in the terminal
-```
-
-## Commands
-
-- `gwen fetch` — download a model from HuggingFace. Resumes interrupted downloads and checks the SHA-256.
-- `gwen train` — fine-tune a LoRA adapter on the native Candle backend.
-- `gwen serve` — start the local inference server (SSE, served by candle-transformers, no subprocess).
-- `gwen chat` — a streaming terminal chat with history.
-- `gwen run` — one-shot inference on a local GGUF file.
-- `gwen eval` — score a model on a validation set.
-- `gwen benchmark` — cold start, inference, layer load, and memory numbers.
-- `gwen hub` — list, pull, push, info, and prune on HuggingFace.
-- `gwen dataset` — validate, convert, and split JSONL datasets.
-- `gwen scan` — flag PII, toxicity, and prompt injection in models and datasets.
-- `gwen convert` — GGUF to SafeTensors.
-- `gwen config` — read and write your settings.
-- `gwen doctor` — check the storage layout, runtime, and dependencies.
-- `gwen update` — update to the latest release.
-
-Every command also takes a few global flags: `--json` for machine-readable output (NDJSON with `--non-interactive`), `--non-interactive` for scripts and agents (no TUI or prompts, and it turns on automatically when stdout isn't a terminal), `--dry-run` to validate without doing anything, and `--yes` to auto-confirm prompts.
-
-A few examples:
-
-```bash
-gwen fetch -m mistralai/Mistral-7B-v0.1 -q q5_k_m
-gwen fetch --from https://example.com/model.gguf --to /data/models
-
-gwen train -m tinyllama/TinyLlama-1.1B -d ./data.jsonl --dry-run     # estimate cost first
-gwen train --auto-merge --base-model ./qwen3.gguf --dataset ./data.jsonl
-
-gwen serve qwen3-8b-q4_0 --port 8080
-gwen serve qwen3-8b-q4_0 --dry-run
-
-gwen dataset validate ./data.jsonl
-gwen scan ./model.gguf
-```
-
-## Where your files go
-
-Everything lives under one folder in your home directory, `~/.gwenland/`. Set `GWEN_HOME` if you want it somewhere else. The folders are created as needed:
-
-- `config/` — your `config.json`
-- `models/` — downloaded models and the `models.json` registry
-- `crash-logs/` — readable crash reports
-- `cache/` — internal cache and a `tmp/` for partial downloads and updates
-- `eval_results/` — output from `gwen eval`
-
-This replaced the old `~/.config/gwen/` layout, and there's no automatic migration. If you used a pre-1.0 build, just re-run `gwen fetch <model>` to repopulate; your old data is left alone.
-
-If `gwen` ever crashes — a panic, or a lower-level fault like a segfault — it writes a readable report to `~/.gwenland/crash-logs/`. Set `RUST_BACKTRACE=1` for a full trace, and run `gwen doctor` to confirm the storage folders exist and are writable.
-
-## Project structure
-
-The repo is a Cargo workspace (resolver 2, edition 2024):
-
-- `packages/core` — `gwenland-core`, where the real work happens: inference, training, benchmarks, storage, diagnostics. It's a library crate.
-- `packages/gltui` — `gltui`, the `gwenland` CLI and its ratatui TUI. This is the binary.
-- `changelog/` — per-session notes.
-
-The release profile is tuned for size: `opt-level = "z"`, fat LTO, one codegen unit, `panic = "abort"`, symbols stripped. That's how the binary stays under 50 MB.
-
-## Working on it
-
-```bash
-cargo check --workspace
-
-# Core tests run single-threaded on purpose: a few of them touch process-global
-# state (the panic hook, the GWEN_HOME test env) and would race otherwise.
-cargo test -p gwenland-core --lib -- --test-threads=1
-
-cargo bench -p gwenland-core
-```
-
-Each change gets a note under `changelog/`, and new ideas for the CPU training path get triaged in [NewExperiment.md](NewExperiment.md) before they turn into a tracked issue and a spec. See [CONTRIBUTING.md](CONTRIBUTING.md) for the rest.
+The architecture specs live in [`architecture/`](architecture/) (e.g.
+`ArchGLML_X2.md` is the glcuda M2 ground truth) and the roadmap in
+[`ROADMAP.md`](ROADMAP.md).
 
 ## Privacy
 
-Training and inference run on your machine. The only network calls are the model and dataset downloads and pushes you ask for with `gwen fetch` and `gwen hub`. [PRIVACY.md](PRIVACY.md) has the details.
+Inference runs entirely on your machine. The engines make no network calls.
 
 ## License
 
-MIT with the Commons Clause — see [LICENSE](LICENSE). Free for personal and research use; commercial use needs a separate agreement.
+**MIT + Commons Clause** — see [LICENSE](LICENSE). Free for personal, research,
+and internal use; modification and forking allowed. Selling GwenLand as a product
+or a substantially-unchanged hosted service requires a separate commercial
+agreement. Enquiries: jinxsuperdev@gmail.com
