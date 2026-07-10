@@ -4,6 +4,27 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.1 Task B, INT8 tensor-core prefill GEMM:
+
+- New hand-authored `gl_gemm_mma_q8` in a separate `.target sm_75` PTX
+  module (`glcuda_sm75.ptx`), loaded only on sm_75+ devices; the sm_70 dp4a
+  `gl_gemm_q8_0_soa` stays as the runtime fallback (and `GLCUDA_NO_MMA=1`
+  forces it, as the A/B benchmark switch).
+- Shape correction vs the task brief: integer `mma.m16n8k16` is sm_80+ per
+  the PTX ISA — Turing's INT8 tensor-core shape is `m8n8k16`, which is what
+  the kernel uses (one warp per 8×8 output tile, 8-token tiles vs the dp4a
+  GEMM's 4, so weight streams halve on top of the tensor-core dot).
+- No new weight layout: the row-major Q8_0 SoA qs stream *is* the col-major
+  B fragment `mma.row.col` expects (W row-major = Bᵀ col-major), so both
+  GEMMs share one weight image.
+- Dequant epilogue fused per 32-K block in registers (Q8_0 scales are
+  per-32 but one MMA covers K=16, so int32 accumulation is only
+  scale-uniform across two chained MMAs); FP32 accumulation across blocks.
+- Parity: `gemm_mma_q8` vs the dequantized scalar reference (ε 1e-3,
+  ragged token count exercising the guarded writes); bench gains an MMA
+  section reporting kernel time/TOPS next to the dp4a GEMM on identical
+  data.
+
 glcuda — M2.1 Task A, native Q4_K decode path:
 
 - New hand-authored PTX kernel `gl_gemv_q4_k_soa`: one warp per output row,

@@ -115,7 +115,17 @@ fn gemm_rows(
         GpuWeight::Q8_0Soa { qs, scales } => {
             let wqs = qs.dptr + (row0 * inb) as u64; // int8, 1 B/elem
             let wsc = scales.dptr + (row0 * (inb / 32) * 2) as u64; // f16, 2 B/block
-            k.gemm_q8_0_soa(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
+            // Runtime kernel selection (M2.1 Task B): the tensor-core GEMM
+            // on sm_75+, the dp4a GEMM as the sm_70 fallback. Same weight
+            // bytes either way; the MMA path needs whole 8-row output tiles
+            // (every real model dim satisfies this — the guard is for odd
+            // test shapes). The prefill scratch is PREFILL_BATCH rows, so
+            // the MMA's read-padding to 8 token rows is always in bounds.
+            if k.has_mma() && rows.is_multiple_of(8) {
+                k.gemm_mma_q8(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
+            } else {
+                k.gemm_q8_0_soa(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
+            }
         }
         GpuWeight::F32(s) => {
             let w = s.dptr + (row0 * inb) as u64 * 4;

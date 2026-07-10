@@ -16,6 +16,11 @@ use crate::ffi::CUdeviceptr;
 /// driver compiles this for the actual device at module load).
 pub const PTX: &str = include_str!("glcuda.ptx");
 
+/// Turing tensor-core kernels (M2.1 Task B). A separate module because the
+/// main image targets sm_70 and ptxas rejects instructions above a module's
+/// `.target` — loaded only when the device reports sm_75+.
+pub const PTX_SM75: &str = include_str!("glcuda_sm75.ptx");
+
 /// Threads per block for element-wise and one-block-reduction kernels.
 const BLOCK: u32 = 256;
 /// Warp size — grid geometry for the one-warp-per-row GEMV.
@@ -29,6 +34,11 @@ fn ceil_div(n: u32, d: u32) -> u32 {
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
     _module: Module,
+    /// The sm_75+ tensor-core module and its GEMM entry, present only on
+    /// capable devices (and absent under `GLCUDA_NO_MMA=1`, the benchmark
+    /// A/B switch). The `Option` IS the runtime kernel selection: callers
+    /// ask [`KernelSet::has_mma`] and fall back to `gl_gemm_q8_0_soa`.
+    mma: Option<(Module, Kernel)>,
     f_add: Kernel,
     f_silu_mul: Kernel,
     f_rope: Kernel,
@@ -47,10 +57,28 @@ pub struct KernelSet {
 }
 
 impl KernelSet {
-    /// JIT the embedded PTX and resolve every entry point.
+    /// JIT the embedded PTX and resolve every entry point. On sm_75+ the
+    /// tensor-core module is loaded too (`GLCUDA_NO_MMA=1` opts out, for
+    /// A/B benchmarking against the sm_70 dp4a GEMM).
     pub fn load(cuda: &Cuda) -> Result<KernelSet, GlError> {
         let module = cuda.load_module(PTX)?;
+        let sm = (cuda.info.sm_major, cuda.info.sm_minor);
+        let mma = if sm >= (7, 5) && std::env::var_os("GLCUDA_NO_MMA").is_none() {
+            let m75 = cuda.load_module(PTX_SM75)?;
+            let f = m75.get_function("gl_gemm_mma_q8")?;
+            eprintln!(
+                "[glcuda] tensor-core MMA GEMM enabled (sm_{}{})",
+                cuda.info.sm_major, cuda.info.sm_minor
+            );
+            Some((m75, f))
+        } else {
+            if sm >= (7, 5) {
+                eprintln!("[glcuda] GLCUDA_NO_MMA set: prefill GEMM on the sm_70 dp4a path");
+            }
+            None
+        };
         Ok(KernelSet {
+            mma,
             f_add: module.get_function("gl_add_f32")?,
             f_silu_mul: module.get_function("gl_silu_mul_f32")?,
             f_rope: module.get_function("gl_rope_f32")?,
@@ -279,6 +307,60 @@ impl KernelSet {
             &mut n as *mut _ as *mut c_void,
         ];
         cuda.launch(self.f_gemm_q8_0_soa, (ceil_div(out_dim, 8), 1, 1), (256, 1, 1), 0, &mut params)
+    }
+
+    /// True when the tensor-core GEMM is available (device is sm_75+ and
+    /// `GLCUDA_NO_MMA` is unset) — the runtime kernel selection callers use
+    /// before [`Self::gemm_mma_q8`].
+    pub fn has_mma(&self) -> bool {
+        self.mma.is_some()
+    }
+
+    /// Batched GEMM `Y[ntok, out] = X[ntok, in] @ W[out, in]^T` on the INT8
+    /// tensor cores (M2.1 Task B, sm_75+). Same operands as
+    /// [`Self::gemm_q8_0_soa`] — the row-major Q8_0 SoA qs stream is already
+    /// the col-major B fragment layout `mma.row.col` wants (W row-major ==
+    /// B^T col-major), so the two kernels share one weight image. One warp
+    /// per 8x8 output tile, 8-token tiles (vs the fallback's 4), fused
+    /// per-32-K dequant epilogue in registers.
+    ///
+    /// Requires `out_dim % 8 == 0`, `in_dim % 32 == 0`, and `x_qs`/`x_scales`
+    /// allocated for `ntok` rounded up to a multiple of 8 (extra rows are
+    /// read, never written). Errors if the module is not loaded — gate on
+    /// [`Self::has_mma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8(
+        &self,
+        cuda: &Cuda,
+        w_qs: CUdeviceptr,
+        w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(out_dim % 8, 0, "gemm_mma_q8 requires out_dim % 8 == 0");
+        debug_assert_eq!(in_dim % 32, 0, "gemm_mma_q8 requires whole 32-K scale blocks");
+        let (_, f) = self
+            .mma
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("gemm_mma_q8 called without sm_75 module".into()))?;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) = (w_qs, w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        // 256 threads = 8 warps = 8 output tiles of 8 rows per block.
+        cuda.launch(*f, (ceil_div(out_dim, 64), 1, 1), (256, 1, 1), 0, &mut params)
     }
 
     /// `y = W @ x` for Q4_K weights in Structure-of-Arrays layout (M2.1
@@ -541,6 +623,24 @@ mod tests {
         // in a comment kills the whole module. Catch it here, not on the GPU.
         if let Some(line) = PTX.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
             panic!("PTX line {} contains non-ASCII: {:?}", line.0 + 1, line.1);
+        }
+    }
+
+    /// Same structural gate for the sm_75 tensor-core module — it JITs on
+    /// far fewer machines, so catching a stray byte here matters more.
+    #[test]
+    fn sm75_ptx_is_structurally_sound() {
+        assert!(
+            PTX_SM75.contains(".visible .entry gl_gemm_mma_q8("),
+            "sm_75 PTX is missing gl_gemm_mma_q8"
+        );
+        assert_eq!(PTX_SM75.matches('{').count(), PTX_SM75.matches('}').count());
+        assert!(PTX_SM75.contains(".target sm_75"));
+        assert!(PTX_SM75.contains("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32"));
+        assert!(!PTX_SM75.contains('\0'));
+        assert!(!PTX_SM75.contains('\r'), "CRLF would be rejected by ptxas");
+        if let Some(line) = PTX_SM75.lines().enumerate().find(|(_, l)| !l.is_ascii()) {
+            panic!("sm_75 PTX line {} contains non-ASCII: {:?}", line.0 + 1, line.1);
         }
     }
 

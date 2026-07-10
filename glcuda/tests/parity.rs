@@ -322,6 +322,66 @@ fn gemv_q4_0_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_MATMUL, "gemv_q4_0");
 }
 
+/// M2.1 Task B: the tensor-core batched GEMM against the same dequantized
+/// reference as the dp4a GEMM. Runs only on sm_75+ (the module is not even
+/// loaded below that). Ragged token count (5) exercises the padded-row read
+/// / guarded-write contract; out=16 is two 8-row warp tiles.
+#[test]
+fn gemm_mma_q8_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 — no tensor-core module");
+        return;
+    }
+    let (out_dim, in_dim, ntok) = (16usize, 64usize, 5usize);
+    let ntok_pad = ntok.div_ceil(8) * 8;
+
+    let w_f32 = randv(out_dim * in_dim, 50, 0.1);
+    let blocks = glproc::kernels::dequant::q8_0::scalar::quantize(&w_f32);
+    let w_deq = glproc::kernels::dequant::q8_0::scalar::run(&blocks);
+    let x = randv(ntok_pad * in_dim, 51, 1.0);
+    let x_dq = q8_round_trip(&x);
+    let mut want = vec![0f32; ntok * out_dim];
+    for t in 0..ntok {
+        glproc::kernels::matmul::scalar::run_matvec(
+            &w_deq,
+            &x_dq[t * in_dim..(t + 1) * in_dim],
+            &mut want[t * out_dim..(t + 1) * out_dim],
+            out_dim,
+            in_dim,
+        );
+    }
+
+    let n_blocks = blocks.len() / 34;
+    let mut qs = Vec::with_capacity(n_blocks * 32);
+    let mut scales = Vec::with_capacity(n_blocks * 2);
+    for block in blocks.chunks_exact(34) {
+        scales.extend_from_slice(&block[0..2]);
+        qs.extend_from_slice(&block[2..34]);
+    }
+
+    let bytes = (qs.len() + scales.len() + (ntok_pad * in_dim) * 5 + ntok * out_dim * 4 + 8192) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &qs).unwrap();
+    let dwsc = buf.alloc(scales.len() as u64).unwrap().dptr;
+    cuda.htod(dwsc, &scales).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    // Quantize all padded rows in one pass, exactly as prefill does.
+    let d_qs = buf.alloc((ntok_pad * in_dim) as u64).unwrap().dptr;
+    let d_scales = buf.alloc_f32(ntok_pad * in_dim / 32).unwrap().dptr;
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32).unwrap();
+    let dy = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
+    k.gemm_mma_q8(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
+        .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; ntok * out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_Q8_GEMV, "gemm_mma_q8");
+}
+
 #[test]
 fn rms_norm_matches_glproc_scalar() {
     let Some((cuda, k)) = gpu() else { return };

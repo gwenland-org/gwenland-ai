@@ -1,0 +1,199 @@
+//
+// glcuda_sm75.ptx - Turing tensor-core kernels (M2.1 Task B).
+//
+// Lives in its own module because the main suite targets sm_70 and ptxas
+// rejects any instruction above a module's .target - the driver JIT-compiles
+// each module independently, so KernelSet loads this one only when the
+// device reports sm_75+. gl_gemm_q8_0_soa remains the sm_70 fallback.
+//
+// NOTE on the MMA shape: integer mma.m16n8k16 (the shape in the task brief)
+// requires sm_80 per the PTX ISA target notes - ptxas refuses it for sm_75.
+// Turing's INT8 tensor-core shape is m8n8k16 (A 8x16 s8 row, B 16x8 s8 col,
+// C/D 8x8 s32), one .b32 register for A, one for B, two for C/D. That is
+// what T4 hardware executes; this kernel uses it.
+//
+.version 7.0
+.target sm_75
+.address_size 64
+
+// ---------------------------------------------------------------------------
+// gl_gemm_mma_q8: batched GEMM Y[ntok, out] = X[ntok, in] @ W[out, in]^T on
+// the INT8 tensor cores, Q8_0 SoA weights + int8 activations (prefill path).
+//
+// Mapping to mma.m8n8k16.row.col:
+//   A (8x16, row-major)  = 8 activation token rows x 16 K values.
+//   B (16x8, col-major)  = 16 K values x 8 weight rows. A col-major B column
+//     is 16 CONSECUTIVE K bytes of one weight row - which is exactly the
+//     row-major [out, in] Q8_0 SoA qs stream. W row-major IS B^T col-major,
+//     so the existing SoA layout feeds the MMA directly; no new weight
+//     layout is needed (the "design the B layout" decision resolves to the
+//     identity, and the same bytes serve both this kernel and the fallback).
+//   D (8x8, s32)         = 8 tokens x 8 weight rows.
+//
+// Per-thread fragments (groupID = lane/4, tig = lane%4):
+//   a0 = X[t0 + groupID][kb*32 + half*16 + tig*4 ..+4]   (one u32)
+//   b0 = W[n0 + groupID][same k range]                    (one u32)
+//   d0, d1 = Y-tile row (t0+groupID), cols 2*tig, 2*tig+1 (two s32)
+//
+// Scale handling: Q8_0 scales are per 32 K values, but one MMA covers K=16,
+// so the int32 accumulator only stays scale-uniform for one 32-block = two
+// chained MMAs. The epilogue is therefore FUSED PER K-BLOCK (not a separate
+// pass - a second kernel would round-trip the 8x8 int tiles through global
+// memory every 32 K): zero the C fragment, run the two MMAs, then
+//   facc_j += f32(d_j) * wsc[col_j, kb] * xsc[row, kb]
+// in registers. FP32 accumulation across blocks, like every other kernel.
+//
+// One warp per 8x8 output tile: warp = 8 weight rows, looping over all
+// 8-token tiles (vs the fallback's 4-token coarsening, halving weight
+// streams) with the dot itself on the tensor cores.
+//
+// Requirements: out % 8 == 0, in % 32 == 0 (caller falls back otherwise);
+// x_qs/x_scales rows must be ALLOCATED up to ntok rounded up to 8 (extra
+// rows are read, never written - same contract as the fallback's 4).
+// Launch: grid ceil(out / (8 * ntid/32)) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemm_mma_q8(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in,
+    .param .u32 p_ntok
+)
+{
+    .reg .pred %p<5>;
+    .reg .b16 %h<4>;
+    .reg .b32 %r<40>;
+    .reg .f32 %f<14>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    ld.param.u32 %r3, [p_ntok];
+
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;                 // warp_id
+    and.b32 %r6, %r4, 31;                // lane
+    mov.u32 %r7, %ntid.x;
+    shr.u32 %r8, %r7, 5;                 // warps per block
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.s32 %r10, %r9, %r8, %r5;      // global warp = output tile index
+    shl.b32 %r11, %r10, 3;               // n0 = first weight row of the tile
+    setp.ge.u32 %p1, %r11, %r1;
+    @%p1 bra MMA_DONE;
+
+    shr.u32 %r12, %r6, 2;                // groupID = lane / 4
+    and.b32 %r13, %r6, 3;                // tig = lane % 4
+    shr.u32 %r14, %r2, 5;                // nb = in / 32 (K blocks)
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+
+    // B fragment base: weight row (n0 + groupID), k byte offset tig*4.
+    add.s32 %r15, %r11, %r12;            // n0 + groupID
+    mul.wide.u32 %rd11, %r15, %r2;
+    add.s64 %rd11, %rd6, %rd11;
+    shl.b32 %r16, %r13, 2;               // tig * 4
+    cvt.u64.u32 %rd12, %r16;
+    add.s64 %rd11, %rd11, %rd12;         // wqs fragment base
+
+    // Epilogue scale columns: nc0 = n0 + 2*tig (this thread's D cols).
+    shl.b32 %r17, %r13, 1;
+    add.s32 %r18, %r11, %r17;            // nc0
+    mul.wide.u32 %rd13, %r18, %r14;      // nc0 * nb
+    shl.b64 %rd13, %rd13, 1;             // f16 bytes
+    add.s64 %rd13, %rd7, %rd13;          // wsc row nc0 base
+    add.s32 %r19, %r18, 1;               // nc1 = nc0 + 1
+    mul.wide.u32 %rd14, %r19, %r14;
+    shl.b64 %rd14, %rd14, 1;
+    add.s64 %rd14, %rd7, %rd14;          // wsc row nc1 base
+
+    mov.u32 %r20, 0;                     // t0 (token tile base)
+
+MMA_TILE:
+    setp.ge.u32 %p2, %r20, %r3;
+    @%p2 bra MMA_DONE;
+
+    // A fragment base: token row (t0 + groupID), k byte offset tig*4.
+    add.s32 %r21, %r20, %r12;            // t = t0 + groupID
+    mul.wide.u32 %rd20, %r21, %r2;
+    add.s64 %rd20, %rd8, %rd20;
+    add.s64 %rd20, %rd20, %rd12;         // xqs fragment ptr
+    mul.wide.u32 %rd21, %r21, %r14;      // t * nb
+    shl.b64 %rd21, %rd21, 2;             // f32 bytes
+    add.s64 %rd21, %rd9, %rd21;          // xsc ptr
+
+    mov.u64 %rd22, %rd11;                // wqs walker (reset per tile)
+    mov.u64 %rd23, %rd13;                // wsc nc0 walker
+    mov.u64 %rd24, %rd14;                // wsc nc1 walker
+
+    mov.f32 %f1, 0f00000000;             // facc0 (D col nc0)
+    mov.f32 %f2, 0f00000000;             // facc1 (D col nc1)
+    mov.u32 %r22, 0;                     // kb (K block index)
+
+MMA_KLOOP:
+    setp.ge.u32 %p3, %r22, %r14;
+    @%p3 bra MMA_WRITE;
+
+    ld.global.u32 %r24, [%rd20];         // A half 0 (k 0..15 of block)
+    ld.global.u32 %r25, [%rd20+16];      // A half 1 (k 16..31)
+    ld.global.u32 %r26, [%rd22];         // B half 0
+    ld.global.u32 %r27, [%rd22+16];      // B half 1
+
+    // One 32-K scale block = two chained k16 MMAs on a zeroed accumulator.
+    mov.u32 %r28, 0;
+    mov.u32 %r29, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r28, %r29}, {%r24}, {%r26}, {%r28, %r29};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r28, %r29}, {%r25}, {%r27}, {%r28, %r29};
+
+    // Fused dequant epilogue for this block.
+    ld.global.f32 %f3, [%rd21];          // xsc[t][kb]
+    ld.global.u16 %h1, [%rd23];
+    cvt.f32.f16 %f4, %h1;                // wsc[nc0][kb]
+    ld.global.u16 %h2, [%rd24];
+    cvt.f32.f16 %f5, %h2;                // wsc[nc1][kb]
+    cvt.rn.f32.s32 %f6, %r28;
+    cvt.rn.f32.s32 %f7, %r29;
+    mul.rn.f32 %f8, %f4, %f3;
+    fma.rn.f32 %f1, %f6, %f8, %f1;
+    mul.rn.f32 %f9, %f5, %f3;
+    fma.rn.f32 %f2, %f7, %f9, %f2;
+
+    add.s64 %rd20, %rd20, 32;            // next K block
+    add.s64 %rd22, %rd22, 32;
+    add.s64 %rd21, %rd21, 4;
+    add.s64 %rd23, %rd23, 2;
+    add.s64 %rd24, %rd24, 2;
+    add.s32 %r22, %r22, 1;
+    bra MMA_KLOOP;
+
+MMA_WRITE:
+    // Thread owns Y[t][nc0] and Y[t][nc1] (adjacent). Guard the padded
+    // token rows (read above, never written).
+    setp.ge.u32 %p4, %r21, %r3;
+    @%p4 bra MMA_ADV;
+    mad.lo.s32 %r30, %r21, %r1, %r18;    // t * out + nc0
+    mul.wide.u32 %rd30, %r30, 4;
+    add.s64 %rd30, %rd10, %rd30;
+    st.global.f32 [%rd30], %f1;
+    st.global.f32 [%rd30+4], %f2;
+
+MMA_ADV:
+    add.s32 %r20, %r20, 8;
+    bra MMA_TILE;
+
+MMA_DONE:
+    ret;
+}
