@@ -325,6 +325,13 @@ impl GgufFile {
         // truncates the file concurrently, reads could fault — an accepted
         // (and conventional) risk for mmap-based model loading.
         let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        // Staging reads essentially the whole file once, region by region. Hint
+        // the kernel to read ahead aggressively instead of faulting in 4 KB
+        // pages on demand — on slow/virtualized disks this turns many small
+        // random reads into large sequential ones. Best-effort; unix-only
+        // (madvise has no Windows equivalent here).
+        #[cfg(unix)]
+        let _ = mmap.advise(memmap2::Advice::Sequential);
         let mut r = Reader::new(&mmap);
 
         let magic = r.u32()?;

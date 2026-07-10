@@ -209,6 +209,7 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         .map(|n| n.get())
         .unwrap_or(1)
         .min(n_layers.max(1));
+    eprintln!("[glcuda] stage: repacking {n_layers} layers across {n_threads} threads");
     let mut built: Vec<Option<HostLayer>> = (0..n_layers).map(|_| None).collect();
     std::thread::scope(|s| -> Result<(), GlError> {
         let handles: Vec<_> = (0..n_threads)
