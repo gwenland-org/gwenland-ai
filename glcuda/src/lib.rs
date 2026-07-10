@@ -20,6 +20,7 @@
 //! * [`sampler`] — engine-owned sampler (ADR-001 duplication of glproc's)
 
 pub mod buffer;
+pub mod cache;
 pub mod dequant;
 pub mod driver;
 pub mod ffi;
@@ -215,7 +216,9 @@ impl GlEngine for GlcudaEngine {
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         let t_stage = Instant::now();
-        let host = loader::load_host(&gguf)?;
+        // Cache the staged (repacked) model next to the GGUF so subsequent
+        // loads skip the ~30s repack. A cache miss just rebuilds it.
+        let host = cache::load_host_cached(path, || loader::load_host(&gguf))?;
         let stage_s = t_stage.elapsed().as_secs_f64();
 
         let t_upload = Instant::now();
