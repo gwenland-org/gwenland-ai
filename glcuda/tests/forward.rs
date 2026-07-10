@@ -225,6 +225,41 @@ fn forward_logits_match_glproc() {
     );
 }
 
+/// Batched prefill must produce the same final-token logits as the sequential
+/// CPU reference. The 35-token prompt crosses the PREFILL_BATCH (32) boundary,
+/// so chunking is exercised too.
+#[test]
+fn batched_prefill_matches_glproc() {
+    let Some((cuda, k)) = gpu() else { return };
+    let cpu = cpu_model();
+    let mut cpu_run = Runner::new(&cpu);
+    let mut gpu_model = GpuModel::upload(&cuda, host_model()).unwrap();
+
+    let prompt: Vec<u32> = (0..35).map(|i| (i % 5 + 1) as u32).collect();
+    for (pos, &tok) in prompt.iter().enumerate() {
+        cpu_run.forward_into(tok, pos).unwrap();
+    }
+    gpu_model.prefill_batched(&cuda, &k, &prompt).unwrap();
+
+    let want = cpu_run.logits().to_vec();
+    let got = gpu_model.logits_host(&cuda).unwrap().to_vec();
+    gpu_model.free(&cuda).unwrap();
+
+    assert_eq!(got.len(), VOCAB);
+    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+        assert!(
+            (g - w).abs() <= LOGIT_EPS,
+            "batched logit {i}: gpu {g} vs cpu {w} (|diff| {})",
+            (g - w).abs()
+        );
+    }
+    assert_eq!(
+        Sampler::greedy(&got),
+        glproc::sampler::Sampler::greedy(&want),
+        "batched prefill argmax diverged from CPU reference"
+    );
+}
+
 #[test]
 fn greedy_generation_matches_glproc() {
     let Some((cuda, k)) = gpu() else { return };

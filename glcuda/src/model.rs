@@ -301,7 +301,27 @@ pub(crate) struct Workspace {
     pub q8_qs: DevSlice,
     /// Q8_0 decoupled quantizer output (FP32 block scales), `[hidden_dim / 32]` max.
     pub q8_scales: DevSlice,
+    /// Batched prefill scratch, all `[PREFILL_BATCH, width]` row-major. Used only
+    /// by `prefill_batched`, which processes up to `PREFILL_BATCH` prompt tokens
+    /// per pass so the weight GEMMs stream weights once per tile instead of once
+    /// per token. `pf_qs`/`pf_scales` are sized to the widest matmul input
+    /// (`hidden_dim`) and reused for every quantize in the batched pass.
+    pub pf_x: DevSlice,
+    pub pf_xn: DevSlice,
+    pub pf_q: DevSlice,
+    pub pf_k: DevSlice,
+    pub pf_v: DevSlice,
+    pub pf_attn: DevSlice,
+    pub pf_proj: DevSlice,
+    pub pf_gate: DevSlice,
+    pub pf_up: DevSlice,
+    pub pf_qs: DevSlice,
+    pub pf_scales: DevSlice,
 }
+
+/// Prompt tokens processed per batched-prefill pass. Bounds the batched
+/// workspace VRAM; longer prompts are processed in consecutive chunks.
+pub(crate) const PREFILL_BATCH: usize = 32;
 
 /// A model resident in VRAM: weights, KV cache and workspace, all carved
 /// from one backend buffer.
@@ -360,6 +380,14 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += align_up(2 * 4); // token_params [pos, cached_len]
     total += align_up(c.hidden_dim as u64); // q8_qs
     total += f32s(c.hidden_dim / 32); // q8_scales
+    // Batched prefill scratch (PREFILL_BATCH rows each).
+    let b = PREFILL_BATCH;
+    total += f32s(b * c.dim) * 3; // pf_x, pf_xn, pf_proj
+    total += f32s(b * q_dim) * 2; // pf_q, pf_attn
+    total += f32s(b * kv_dim) * 2; // pf_k, pf_v
+    total += f32s(b * c.hidden_dim) * 2; // pf_gate, pf_up
+    total += align_up((b * c.hidden_dim) as u64); // pf_qs
+    total += f32s(b * c.hidden_dim / 32); // pf_scales
     total
 }
 
@@ -477,6 +505,17 @@ impl GpuModel {
             embed_host: vec![0.0; c.dim],
             q8_qs: buf.alloc(c.hidden_dim as u64)?,
             q8_scales: buf.alloc_f32(c.hidden_dim / 32)?,
+            pf_x: buf.alloc_f32(PREFILL_BATCH * c.dim)?,
+            pf_xn: buf.alloc_f32(PREFILL_BATCH * c.dim)?,
+            pf_q: buf.alloc_f32(PREFILL_BATCH * q_dim)?,
+            pf_k: buf.alloc_f32(PREFILL_BATCH * kv_dim)?,
+            pf_v: buf.alloc_f32(PREFILL_BATCH * kv_dim)?,
+            pf_attn: buf.alloc_f32(PREFILL_BATCH * q_dim)?,
+            pf_proj: buf.alloc_f32(PREFILL_BATCH * c.dim)?,
+            pf_gate: buf.alloc_f32(PREFILL_BATCH * c.hidden_dim)?,
+            pf_up: buf.alloc_f32(PREFILL_BATCH * c.hidden_dim)?,
+            pf_qs: buf.alloc((PREFILL_BATCH * c.hidden_dim) as u64)?,
+            pf_scales: buf.alloc_f32(PREFILL_BATCH * c.hidden_dim / 32)?,
         };
 
         Ok(GpuModel {
