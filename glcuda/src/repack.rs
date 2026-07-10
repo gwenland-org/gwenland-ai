@@ -168,6 +168,44 @@ pub fn q4_k_to_soa(data: &[u8]) -> Result<Q4KSoaStreams, GlError> {
     Ok((qs_out, sc_out, mn_out))
 }
 
+/// Bytes per AoS Q4_0 block (f16 scale + 16 nibble bytes, 32 weights).
+pub const Q4_0_BLOCK_BYTES: usize = 18;
+
+/// Repack raw AoS Q4_0 blocks into the SoA pair `(qs, scales_f16)` for
+/// `gl_gemv_q4_0_soa` (M2.2 Task C-2). The nibble stream uses the same
+/// kernel order as Q4_K (`byte j = v[8g+j] | v[8g+4+j] << 4`, so a u32
+/// load splits into two dp4a operands with two masks); the f16 block
+/// scales are copied VERBATIM — Q4_0's `d` is already the final per-32
+/// scale, so unlike Q4_K there is no pre-multiply and no rounding loss.
+/// 4.5 bpw streamed, byte-exact dequant vs the AoS ground truth.
+pub fn q4_0_to_soa(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), GlError> {
+    if !data.len().is_multiple_of(Q4_0_BLOCK_BYTES) {
+        return Err(GlError::Parse(format!(
+            "Q4_0 data length {} is not a multiple of {Q4_0_BLOCK_BYTES}",
+            data.len()
+        )));
+    }
+    let n_blocks = data.len() / Q4_0_BLOCK_BYTES;
+    let mut qs_out = Vec::with_capacity(n_blocks * 16);
+    let mut sc_out = Vec::with_capacity(n_blocks * 2);
+    for block in data.chunks_exact(Q4_0_BLOCK_BYTES) {
+        sc_out.extend_from_slice(&block[0..2]); // f16 d, verbatim
+        // GGML order: byte i holds value i (low nibble) and value i+16
+        // (high nibble). Linearize, then repack in the kernel order.
+        let mut v = [0u8; 32];
+        for (i, &byte) in block[2..18].iter().enumerate() {
+            v[i] = byte & 0x0F;
+            v[i + 16] = byte >> 4;
+        }
+        for g in 0..4 {
+            for j in 0..4 {
+                qs_out.push(v[g * 8 + j] | (v[g * 8 + 4 + j] << 4));
+            }
+        }
+    }
+    Ok((qs_out, sc_out))
+}
+
 /// Quantize dense f32 weights (`len % 32 == 0`) straight into the Q8_0 SoA
 /// pair `(qs, scales_f16)` the `gl_gemv_q8_0_soa` / `gl_gemm_q8_0_soa`
 /// kernels read. Per 32-group: `d = max|v| / 127` (round-tripped through
@@ -304,6 +342,37 @@ mod tests {
     #[test]
     fn q4_k_soa_rejects_ragged_input() {
         assert!(q4_k_to_soa(&[0u8; Q4_K_BLOCK_BYTES - 1]).is_err());
+    }
+
+    /// Q4_0 SoA repack must reconstruct, bit-exactly, the same weights as
+    /// the glproc scalar dequant — the scales are verbatim f16 and the
+    /// nibbles are lossless, so unlike Q4_K there is no tolerance at all.
+    #[test]
+    fn q4_0_soa_reconstructs_glproc_dequant_exactly() {
+        let mut data = rand_bytes(Q4_0_BLOCK_BYTES * 7, 21);
+        for block in data.chunks_exact_mut(Q4_0_BLOCK_BYTES) {
+            block[0..2].copy_from_slice(&0x2e66u16.to_le_bytes()); // sane d
+        }
+        let want = glproc::kernels::dequant::q4_0::scalar::run(&data);
+        let (qs, sc) = q4_0_to_soa(&data).unwrap();
+        assert_eq!(qs.len(), 16 * 7);
+        assert_eq!(sc.len(), 2 * 7);
+        for (bi, _) in data.chunks_exact(Q4_0_BLOCK_BYTES).enumerate() {
+            let d = f16_to_f32(u16::from_le_bytes([sc[bi * 2], sc[bi * 2 + 1]]));
+            for i in 0..32 {
+                // Kernel order: value i -> group i/8, byte (i%8)%4, lo/hi.
+                let (g, r) = (i / 8, i % 8);
+                let byte = qs[bi * 16 + g * 4 + (r % 4)];
+                let q = if r < 4 { byte & 0x0F } else { byte >> 4 };
+                let got = d * (q as i8 - 8) as f32;
+                assert_eq!(got, want[bi * 32 + i], "block {bi} value {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn q4_0_soa_rejects_ragged_input() {
+        assert!(q4_0_to_soa(&[0u8; Q4_0_BLOCK_BYTES - 1]).is_err());
     }
 
     /// The f32 -> Q8_0 SoA requant must be glproc's quantizer followed by

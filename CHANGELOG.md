@@ -4,6 +4,22 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.2 Task C-2, native Q4_0 SoA decode path:
+
+- New PTX kernel `gl_gemv_q4_0_soa`: the Q4_K kernel's structure minus the
+  mins stream, with the −8 centering folded into the integer domain
+  (`d·xs·(dot(q,xq) − 8·Σxq)`, both dp4a chains, one f32 mul + one fma per
+  32-value block). Verbatim f16 block scales — no pre-multiply, zero
+  rounding loss. Guarded tail iteration keeps the requirement at
+  `in % 32 == 0`, so dim-896-class Q4_0 models work.
+- Loader: Q4_0 matmul tensors repack to SoA (4.5 bpw streamed); the AoS
+  path and legacy `gl_gemv_q4_0` kernel remain for the embedding table
+  only. Disk cache bumped (`GLCACHE4`).
+- Parity: two shapes covering the grouped path and the tail (ε 1e-3 — the
+  error structure is Q8_0 SoA's, stricter than the task's 1e-2 bound);
+  bench gains a `[q4_0]` section at 7B shapes.
+- Expected on a Q4_0 7B file: ~3.9 GB/token stream → ≥50 tok/s decode DoD.
+
 glcuda — M2.1 Task B, INT8 tensor-core prefill GEMM:
 
 - New hand-authored `gl_gemm_mma_q8` in a separate `.target sm_75` PTX

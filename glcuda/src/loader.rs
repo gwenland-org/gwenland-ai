@@ -13,7 +13,7 @@ use glcore::GlError;
 
 use crate::dequant::dequant_any;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
-use crate::repack::{f32_to_q8_0_soa, q4_k_to_soa};
+use crate::repack::{f32_to_q8_0_soa, q4_0_to_soa, q4_k_to_soa};
 
 /// Read `{arch}.{suffix}` from metadata as u64.
 fn meta_u64(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<u64> {
@@ -79,8 +79,12 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
             let (qs, scales, mins) = q4_k_to_soa(gguf.tensor_data(info)?)?;
             HostWeight::Q4KSoa { qs, scales, mins }
         }
+        // Native Q4_0 path (M2.2 Task C-2): SoA nibbles + verbatim f16
+        // scales for gl_gemv_q4_0_soa. The kernel has a block tail, so
+        // in % 32 (the format's own invariant) is the only requirement.
         GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
-            HostWeight::Q4_0(gguf.tensor_data(info)?.to_vec())
+            let (qs, scales) = q4_0_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q4_0Soa { qs, scales }
         }
         // Quantized dtypes with no native kernel (Q6_K, Q5_0 — Q4_K_M files
         // carry Q6_K ffn_down/attn_v/output tensors): requantize to Q8_0 SoA

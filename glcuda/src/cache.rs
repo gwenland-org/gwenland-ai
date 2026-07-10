@@ -20,10 +20,11 @@ use glcore::GlError;
 
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
 
-// Version-bumped for M2.1 Task A: caches written before the Q4_K-native /
-// requant-to-Q8_0 staging policy hold dense-f32 k-quant tensors and must be
-// restaged, not reused (they'd read back fine but keep the old VRAM/BW cost).
-const MAGIC: &[u8; 8] = b"GLCACHE3";
+// Version history: GLCACHE3 = M2.1 (Q4_K native + requant-to-Q8_0 staging);
+// GLCACHE4 = M2.2 Task C-2 (Q4_0 matmuls repack to SoA instead of AoS). A
+// bump forces a restage so pre-existing caches pick up the new layouts —
+// old caches would read back fine but keep the old kernels' cost.
+const MAGIC: &[u8; 8] = b"GLCACHE4";
 
 /// Path of the cache file for a GGUF at `gguf_path`.
 fn cache_path(gguf_path: &str) -> PathBuf {
@@ -144,6 +145,7 @@ fn rd_weight<R: Read>(r: &mut R) -> io::Result<HostWeight> {
         3 => HostWeight::Q4_0(rd_bytes(r)?),
         4 => HostWeight::Q4K(rd_bytes(r)?),
         5 => HostWeight::Q4KSoa { qs: rd_bytes(r)?, scales: rd_bytes(r)?, mins: rd_bytes(r)? },
+        6 => HostWeight::Q4_0Soa { qs: rd_bytes(r)?, scales: rd_bytes(r)? },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad weight tag")),
     })
 }
@@ -271,6 +273,11 @@ fn wr_weight<W: Write>(w: &mut W, weight: &HostWeight) -> io::Result<()> {
             wr_bytes(w, scales)?;
             wr_bytes(w, mins)
         }
+        HostWeight::Q4_0Soa { qs, scales } => {
+            w.write_all(&[6u8])?;
+            wr_bytes(w, qs)?;
+            wr_bytes(w, scales)
+        }
     }
 }
 
@@ -344,7 +351,7 @@ mod tests {
                 4,
                 HostWeight::Q4KSoa { qs: vec![7; 8], scales: vec![1, 2, 3, 4], mins: vec![5, 6, 7, 8] },
             ),
-            wo: mat(4, 4, HostWeight::F32(vec![-1.0; 16])),
+            wo: mat(4, 4, HostWeight::Q4_0Soa { qs: vec![9; 8], scales: vec![2, 4] }),
             bq: Some(vec![0.1, 0.2, 0.3, 0.4]),
             bk: None,
             bv: Some(vec![9.9]),
@@ -377,6 +384,10 @@ mod tests {
                 HostWeight::Q4KSoa { qs: xq, scales: xs, mins: xm },
                 HostWeight::Q4KSoa { qs: yq, scales: ys, mins: ym },
             ) => xq == yq && xs == ys && xm == ym,
+            (
+                HostWeight::Q4_0Soa { qs: xq, scales: xs },
+                HostWeight::Q4_0Soa { qs: yq, scales: ys },
+            ) => xq == yq && xs == ys,
             _ => false,
         }
     }
@@ -398,7 +409,8 @@ mod tests {
         let (lb, lm) = (&back.layers[0], &m.layers[0]);
         assert_eq!(lb.attn_norm, lm.attn_norm);
         assert!(weight_eq(&lb.wq.w, &lm.wq.w));
-        assert!(weight_eq(&lb.wv.w, &lm.wv.w)); // Q4_0
+        assert!(weight_eq(&lb.wv.w, &lm.wv.w)); // Q4KSoa
+        assert!(weight_eq(&lb.wo.w, &lm.wo.w)); // Q4_0Soa
         assert_eq!(lb.wq.out_dim, lm.wq.out_dim);
         assert_eq!(lb.bq, lm.bq);
         assert_eq!(lb.bk, lm.bk); // None

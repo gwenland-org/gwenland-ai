@@ -292,6 +292,55 @@ fn gemv_q4_k_soa_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_Q4K_GEMV, "gemv_q4_k_soa");
 }
 
+/// M2.2 Task C-2: the SoA Q4_0 GEMV vs the glproc scalar ground truth.
+/// (48, 384) exercises one full 256-value group + a 4-block tail; (20, 160)
+/// is tail-only (dim-896-class models never hit the grouped path evenly).
+/// Scales are verbatim f16 (no premul), so the only error sources are the
+/// int8 activation quantization (in the reference via q8_round_trip) and
+/// accumulation order — the same structure as the Q8_0 SoA test, hence the
+/// same 1e-3 epsilon (stricter than the task's 1e-2 bound).
+#[test]
+fn gemv_q4_0_soa_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    for (out_dim, in_dim, seed) in [(48usize, 384usize, 60u64), (20, 160, 61)] {
+        let blocks_len = (in_dim / 32 * 18) * out_dim;
+        let mut blocks = randv_bytes(blocks_len, seed);
+        for block in blocks.chunks_exact_mut(18) {
+            block[0..2].copy_from_slice(&0x2e66u16.to_le_bytes()); // ~0.1
+        }
+        let w_deq = glproc::kernels::dequant::q4_0::scalar::run(&blocks);
+        let x = randv(in_dim, seed + 1, 1.0);
+        let x_dq = q8_round_trip(&x);
+        let mut want = vec![0f32; out_dim];
+        glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_dq, &mut want, out_dim, in_dim);
+
+        let (wqs, wsc) = glcuda::repack::q4_0_to_soa(&blocks).unwrap();
+
+        let mut buf = BackendBuffer::new(
+            &cuda,
+            (wqs.len() + wsc.len() + (in_dim + out_dim) * 4 + 8192) as u64,
+        )
+        .unwrap();
+        let dwqs = buf.alloc(wqs.len() as u64).unwrap().dptr;
+        cuda.htod(dwqs, &wqs).unwrap();
+        let dwsc = buf.alloc(wsc.len() as u64).unwrap().dptr;
+        cuda.htod(dwsc, &wsc).unwrap();
+        let dx = upload(&cuda, &mut buf, &x);
+        let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+        let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+        k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
+        let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+        k.gemv_q4_0_soa(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+            .unwrap();
+        cuda.synchronize().unwrap();
+        let mut got = vec![0f32; out_dim];
+        cuda.dtoh_f32(&mut got, dy).unwrap();
+        buf.free(&cuda).unwrap();
+
+        assert_close(&got, &want, EPS_Q8_GEMV, &format!("gemv_q4_0_soa({out_dim}x{in_dim})"));
+    }
+}
+
 #[test]
 fn gemv_q4_0_matches_dequantized_reference() {
     let Some((cuda, k)) = gpu() else { return };
