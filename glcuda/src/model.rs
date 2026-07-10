@@ -75,16 +75,32 @@ pub enum HostWeight {
     Q8_0Soa { qs: Vec<u8>, scales: Vec<u8> },
     /// Raw GGML Q4_0 blocks, rows contiguous, `in_features % 32 == 0`.
     Q4_0(Vec<u8>),
+    /// Raw GGML Q4_K super-blocks (144 B / 256 weights), rows contiguous.
+    /// Embedding-table only (host-side row dequant, `q4_k_row_into`);
+    /// matmul weights use `Q4KSoa`.
+    Q4K(Vec<u8>),
+    /// Structure-of-Arrays Q4_K for matmul weights (M2.1 Task A): contiguous
+    /// packed nibbles `qs` `[out, in/2]` + f16 PRE-MULTIPLIED sub-block
+    /// `scales` (`d*sc`) and `mins` (`dmin*m`), each `[out, in/32]` f16.
+    /// 5.0 bpw streamed per decode token vs 8.5 for Q8_0 SoA — the layout
+    /// `gl_gemv_q4_k_soa` reads (see `repack::q4_k_to_soa`).
+    Q4KSoa { qs: Vec<u8>, scales: Vec<u8>, mins: Vec<u8> },
 }
 
 impl HostWeight {
-    /// Bytes this weight occupies in VRAM.
-    pub fn vram_bytes(&self) -> u64 {
+    /// VRAM this weight reserves, per backend-buffer region: every separately
+    /// uploaded stream starts on an ALIGN boundary, so multi-stream (SoA)
+    /// representations must round each stream up individually — summing raw
+    /// lengths under-counts by up to `(n_streams - 1) * ALIGN` per matrix.
+    pub fn vram_reserved(&self) -> u64 {
+        let a = |n: usize| (n as u64).div_ceil(ALIGN) * ALIGN;
         match self {
-            HostWeight::F32(v) => (v.len() * 4) as u64,
-            HostWeight::Q8_0(b) => b.len() as u64,
-            HostWeight::Q8_0Soa { qs, scales } => (qs.len() + scales.len()) as u64,
-            HostWeight::Q4_0(b) => b.len() as u64,
+            HostWeight::F32(v) => a(v.len() * 4),
+            HostWeight::Q8_0(b) => a(b.len()),
+            HostWeight::Q8_0Soa { qs, scales } => a(qs.len()) + a(scales.len()),
+            HostWeight::Q4_0(b) => a(b.len()),
+            HostWeight::Q4K(b) => a(b.len()),
+            HostWeight::Q4KSoa { qs, scales, mins } => a(qs.len()) + a(scales.len()) + a(mins.len()),
         }
     }
 }
@@ -132,6 +148,17 @@ impl HostMat {
                 a.extend_from_slice(&b);
                 HostWeight::Q4_0(a)
             }
+            (
+                HostWeight::Q4KSoa { qs: mut aq, scales: mut asc, mins: mut amn },
+                HostWeight::Q4KSoa { qs: bq, scales: bsc, mins: bmn },
+            ) => {
+                // All three streams are row-major [out, ..]; concatenating
+                // each stacks the rows (gate rows then up rows).
+                aq.extend_from_slice(&bq);
+                asc.extend_from_slice(&bsc);
+                amn.extend_from_slice(&bmn);
+                HostWeight::Q4KSoa { qs: aq, scales: asc, mins: amn }
+            }
             // Mixed representations shouldn't happen for a matched gate/up
             // pair, but if they do, the caller must keep them separate.
             _ => panic!("stack_rows: mismatched weight representations"),
@@ -149,6 +176,7 @@ impl HostMat {
                     | (HostWeight::Q8_0(_), HostWeight::Q8_0(_))
                     | (HostWeight::Q8_0Soa { .. }, HostWeight::Q8_0Soa { .. })
                     | (HostWeight::Q4_0(_), HostWeight::Q4_0(_))
+                    | (HostWeight::Q4KSoa { .. }, HostWeight::Q4KSoa { .. })
             )
     }
 }
@@ -214,10 +242,11 @@ impl HostModel {
         match &self.token_embd {
             HostWeight::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
             HostWeight::Q8_0(b) => q8_0_row_into(b, row, dim, out),
-            HostWeight::Q8_0Soa { .. } => {
-                unreachable!("embedding table is AoS Q8_0, never SoA")
+            HostWeight::Q8_0Soa { .. } | HostWeight::Q4KSoa { .. } => {
+                unreachable!("embedding table is AoS, never SoA")
             }
             HostWeight::Q4_0(b) => crate::dequant::q4_0_row_into(b, row, dim, out),
+            HostWeight::Q4K(b) => crate::dequant::q4_k_row_into(b, row, dim, out),
         }
         Ok(())
     }
@@ -233,6 +262,8 @@ pub enum GpuWeight {
     Q8_0Soa { qs: DevSlice, scales: DevSlice },
     /// Q4_0 blocks.
     Q4_0(DevSlice),
+    /// SoA Q4_K: packed nibbles + pre-multiplied f16 sub-block scales/mins.
+    Q4KSoa { qs: DevSlice, scales: DevSlice, mins: DevSlice },
 }
 
 /// A VRAM weight matrix with launch dimensions.
@@ -356,7 +387,8 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     let q_dim = c.n_heads * c.head_dim;
     let kv_dim = c.n_kv_heads * c.head_dim;
     let f32s = |n: usize| align_up((n * 4) as u64);
-    let mat = |m: &HostMat| align_up(m.w.vram_bytes());
+    // vram_reserved already rounds every upload stream to ALIGN individually.
+    let mat = |m: &HostMat| m.w.vram_reserved();
 
     let mut total = 0u64;
     for l in &host.layers {
@@ -426,6 +458,18 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
             let s = buf.alloc(b.len() as u64)?;
             cuda.htod(s.dptr, b)?;
             GpuWeight::Q4_0(s)
+        }
+        HostWeight::Q4K(_) => {
+            unreachable!("raw Q4_K is embedding-only; matmul weights are repacked to Q4KSoa")
+        }
+        HostWeight::Q4KSoa { qs, scales, mins } => {
+            let dq = buf.alloc(qs.len() as u64)?;
+            cuda.htod(dq.dptr, qs)?;
+            let ds = buf.alloc(scales.len() as u64)?;
+            cuda.htod(ds.dptr, scales)?;
+            let dm = buf.alloc(mins.len() as u64)?;
+            cuda.htod(dm.dptr, mins)?;
+            GpuWeight::Q4KSoa { qs: dq, scales: ds, mins: dm }
         }
     };
     Ok(GpuMat { w, out_dim: m.out_dim as u32, in_dim: m.in_dim as u32 })

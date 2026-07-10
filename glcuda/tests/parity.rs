@@ -24,6 +24,12 @@ const EPS_MATMUL: f32 = 1e-5;
 // 1e-3 is the honest bound for a fully-quantized matvec (a real kernel bug is
 // orders of magnitude larger); f32/Q4 GEMVs keep the tight EPS_MATMUL.
 const EPS_Q8_GEMV: f32 = 1e-3;
+// Q4_K GEMV: both operands quantized (4-bit weights + int8 activations) AND
+// the sub-block scales/mins are pre-multiplied into f16 at repack (~2^-12
+// relative each). Q4_K is the lossiest format in the suite; 1e-2 is the
+// architecture's stated tolerance for it (a real kernel/layout bug shows up
+// orders of magnitude larger).
+const EPS_Q4K_GEMV: f32 = 1e-2;
 const EPS_RMSNORM: f32 = 1e-6;
 const EPS_SOFTMAX: f32 = 1e-5;
 // RoPE: doc says 1e-7 ("element-wise, no reduction"), but the device fuses
@@ -233,6 +239,57 @@ fn gemv_q8_0_soa_matches_dequantized_reference() {
     buf.free(&cuda).unwrap();
 
     assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0_soa");
+}
+
+/// M2.1 Task A: the native Q4_K SoA GEMV against the glproc scalar ground
+/// truth. Weights are synthetic Q4_K super-blocks (random nibbles + packed
+/// 6-bit scales, sane f16 d/dmin), dequantized by glproc for the reference;
+/// the device gets the `repack::q4_k_to_soa` streams and the activation
+/// int8-quantized on device, exactly as the forward pass runs it.
+#[test]
+fn gemv_q4_k_soa_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (out_dim, in_dim) = (48usize, 512usize); // 2 super-blocks per row
+    let blocks_len = (in_dim / 256 * 144) * out_dim;
+    let mut blocks = randv_bytes(blocks_len, 45);
+    for block in blocks.chunks_exact_mut(144) {
+        block[0..2].copy_from_slice(&0x1e66u16.to_le_bytes()); // d ~ 0.0016
+        block[2..4].copy_from_slice(&0x1a66u16.to_le_bytes()); // dmin ~ 0.0008
+    }
+    // CPU ground truth: glproc's Q4_K dequant through the scalar matvec,
+    // against the round-tripped (int8-quantized) activation the kernel sees.
+    let w_deq = glproc::kernels::dequant::q4_k::scalar::run(&blocks).unwrap();
+    let x = randv(in_dim, 46, 1.0);
+    let x_dq = q8_round_trip(&x);
+    let mut want = vec![0f32; out_dim];
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_dq, &mut want, out_dim, in_dim);
+
+    let (wqs, wsc, wmn) = glcuda::repack::q4_k_to_soa(&blocks).unwrap();
+
+    let mut buf = BackendBuffer::new(
+        &cuda,
+        (wqs.len() + wsc.len() + wmn.len() + (in_dim + out_dim) * 4 + 8192) as u64,
+    )
+    .unwrap();
+    let dwqs = buf.alloc(wqs.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &wqs).unwrap();
+    let dwsc = buf.alloc(wsc.len() as u64).unwrap().dptr;
+    cuda.htod(dwsc, &wsc).unwrap();
+    let dwmn = buf.alloc(wmn.len() as u64).unwrap().dptr;
+    cuda.htod(dwmn, &wmn).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+    let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q4_k_soa(&cuda, dwqs, dwsc, dwmn, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+        .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_Q4K_GEMV, "gemv_q4_k_soa");
 }
 
 #[test]

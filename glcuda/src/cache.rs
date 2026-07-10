@@ -20,7 +20,10 @@ use glcore::GlError;
 
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
 
-const MAGIC: &[u8; 8] = b"GLCACHE2";
+// Version-bumped for M2.1 Task A: caches written before the Q4_K-native /
+// requant-to-Q8_0 staging policy hold dense-f32 k-quant tensors and must be
+// restaged, not reused (they'd read back fine but keep the old VRAM/BW cost).
+const MAGIC: &[u8; 8] = b"GLCACHE3";
 
 /// Path of the cache file for a GGUF at `gguf_path`.
 fn cache_path(gguf_path: &str) -> PathBuf {
@@ -139,6 +142,8 @@ fn rd_weight<R: Read>(r: &mut R) -> io::Result<HostWeight> {
         1 => HostWeight::Q8_0(rd_bytes(r)?),
         2 => HostWeight::Q8_0Soa { qs: rd_bytes(r)?, scales: rd_bytes(r)? },
         3 => HostWeight::Q4_0(rd_bytes(r)?),
+        4 => HostWeight::Q4K(rd_bytes(r)?),
+        5 => HostWeight::Q4KSoa { qs: rd_bytes(r)?, scales: rd_bytes(r)?, mins: rd_bytes(r)? },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad weight tag")),
     })
 }
@@ -256,6 +261,16 @@ fn wr_weight<W: Write>(w: &mut W, weight: &HostWeight) -> io::Result<()> {
             w.write_all(&[3u8])?;
             wr_bytes(w, b)
         }
+        HostWeight::Q4K(b) => {
+            w.write_all(&[4u8])?;
+            wr_bytes(w, b)
+        }
+        HostWeight::Q4KSoa { qs, scales, mins } => {
+            w.write_all(&[5u8])?;
+            wr_bytes(w, qs)?;
+            wr_bytes(w, scales)?;
+            wr_bytes(w, mins)
+        }
     }
 }
 
@@ -324,7 +339,11 @@ mod tests {
             attn_norm: vec![1.0, 2.0, 3.0, 4.0],
             wq: mat(4, 4, HostWeight::Q8_0Soa { qs: vec![1, 2, 3, 4], scales: vec![9, 8] }),
             wk: mat(2, 4, HostWeight::F32(vec![0.5; 8])),
-            wv: mat(2, 4, HostWeight::Q4_0(vec![7; 18])),
+            wv: mat(
+                2,
+                4,
+                HostWeight::Q4KSoa { qs: vec![7; 8], scales: vec![1, 2, 3, 4], mins: vec![5, 6, 7, 8] },
+            ),
             wo: mat(4, 4, HostWeight::F32(vec![-1.0; 16])),
             bq: Some(vec![0.1, 0.2, 0.3, 0.4]),
             bk: None,
@@ -349,10 +368,15 @@ mod tests {
             (HostWeight::F32(x), HostWeight::F32(y)) => x == y,
             (HostWeight::Q8_0(x), HostWeight::Q8_0(y)) => x == y,
             (HostWeight::Q4_0(x), HostWeight::Q4_0(y)) => x == y,
+            (HostWeight::Q4K(x), HostWeight::Q4K(y)) => x == y,
             (
                 HostWeight::Q8_0Soa { qs: xq, scales: xs },
                 HostWeight::Q8_0Soa { qs: yq, scales: ys },
             ) => xq == yq && xs == ys,
+            (
+                HostWeight::Q4KSoa { qs: xq, scales: xs, mins: xm },
+                HostWeight::Q4KSoa { qs: yq, scales: ys, mins: ym },
+            ) => xq == yq && xs == ys && xm == ym,
             _ => false,
         }
     }

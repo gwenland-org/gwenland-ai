@@ -1883,3 +1883,172 @@ GEMVQ4_REDUCE:
 GEMVQ4_DONE:
     ret;
 }
+
+// ---------------------------------------------------------------------------
+// gl_gemv_q4_k_soa: y = W @ x, Q4_K weights in STRUCTURE-OF-ARRAYS layout
+// (M2.1 Task A - the decode-bandwidth kernel: 5.0 bpw streamed vs 8.5 for
+// Q8_0 SoA).
+//
+//   p_wqs : contiguous 4-bit quants [out_dim * in_dim / 2] (u8). Packed at
+//           repack time so one u32 holds 8 CONSECUTIVE values:
+//             byte j = v[8g+j] | v[8g+4+j] << 4     (j = 0..4, group g)
+//           so   w & 0x0F0F0F0F  = values 8g..8g+4   (one int8 x4 lane set)
+//                (w>>4) & 0x0F.. = values 8g+4..8g+8 (the next one)
+//           and each half lines up with one aligned u32 of int8 activations.
+//   p_wsc : f16 PRE-MULTIPLIED sub-block scales d*sc [out_dim * in_dim/32].
+//           Pre-multiplying at repack removes ggml's 6-bit scale unpack
+//           (branchy, j<4 / j>=4 asymmetric) from the hot loop.
+//   p_wmn : f16 pre-multiplied sub-block mins dmin*m, same shape.
+//   p_xqs : int8 quantized activation [in_dim] (gl_quantize_q8 output).
+//   p_xsc : f32 activation block scales [in_dim/32].
+//   p_y   : f32 output [out_dim].
+//
+// Math per 32-weight sub-block (matches the activation quantizer's block):
+//   w_i = (d*sc)*q_i - (dmin*m),  x_i = xs*xq_i
+//   sum w_i*x_i = (d*sc)*xs * dot(q, xq) - (dmin*m)*xs * sum(xq)
+// Both integer terms come from dp4a chains (q nibbles are 0..15, safely
+// inside the positive s8 range; sum(xq) is dp4a against 0x01010101).
+//
+// One warp per output row, one ITERATION per 256-weight super-block: the 32
+// lanes read 128 contiguous qs bytes (one coalesced transaction) and 256
+// activation bytes; lane l owns values 8l..8l+8, i.e. sub-block l/4, whose
+// scale/min/xscale it reads directly. FP32 accumulation, 32-lane shuffle
+// reduction, lane 0 writes.
+//
+// in_dim must be a multiple of 256 (guaranteed: ggml cannot produce a Q4_K
+// tensor whose row length is not - QK_K divisibility is a format invariant).
+// Launch: grid ceil(out_dim / (ntid/32)) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_q4_k_soa(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_wmn,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<5>;
+    .reg .b16 %h<4>;
+    .reg .b32 %r<32>;
+    .reg .f32 %f<14>;
+    .reg .b64 %rd<40>;
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_wmn];
+    ld.param.u64 %rd4, [p_xqs];
+    ld.param.u64 %rd5, [p_xsc];
+    ld.param.u64 %rd6, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+
+    mov.u32 %r3, %tid.x;
+    shr.u32 %r4, %r3, 5;                 // warp_id
+    and.b32 %r5, %r3, 31;                // lane
+    mov.u32 %r6, %ntid.x;
+    shr.u32 %r7, %r6, 5;                 // warps per block
+    mov.u32 %r8, %ctaid.x;
+    mad.lo.s32 %r9, %r8, %r7, %r4;       // output row
+    setp.ge.u32 %p1, %r9, %r1;
+    @%p1 bra Q4K_DONE;
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+
+    shr.u32 %r10, %r2, 8;                // n_sb = in_dim / 256 super-blocks
+    shr.u32 %r11, %r2, 1;                // qs row bytes = in_dim / 2
+
+    // Row bases.
+    mul.wide.u32 %rd12, %r9, %r11;       // row * in/2
+    add.s64 %rd13, %rd7, %rd12;          // wqs row base
+    mul.wide.u32 %rd14, %r9, %r10;       // row * n_sb
+    shl.b64 %rd14, %rd14, 4;             // * 16 B (8 f16 scales / super-block)
+    add.s64 %rd15, %rd8, %rd14;          // wsc row base
+    add.s64 %rd16, %rd9, %rd14;          // wmn row base
+
+    // Lane offsets. Lane l: qs u32 at l*4; activations at l*8; its
+    // sub-block index within the super-block is l/4.
+    shl.b32 %r12, %r5, 2;                // lane * 4
+    cvt.u64.u32 %rd17, %r12;
+    add.s64 %rd18, %rd13, %rd17;         // wqs lane ptr
+    shl.b32 %r13, %r5, 3;                // lane * 8
+    cvt.u64.u32 %rd19, %r13;
+    add.s64 %rd20, %rd10, %rd19;         // xqs lane ptr
+    shr.u32 %r14, %r5, 2;                // sub-block = lane / 4 (0..7)
+    cvt.u64.u32 %rd21, %r14;
+    shl.b64 %rd22, %rd21, 1;
+    add.s64 %rd23, %rd15, %rd22;         // wsc lane ptr (f16)
+    add.s64 %rd24, %rd16, %rd22;         // wmn lane ptr (f16)
+    shl.b64 %rd25, %rd21, 2;
+    add.s64 %rd26, %rd11, %rd25;         // xsc lane ptr (f32)
+
+    mov.f32 %f1, 0f00000000;             // FP32 accumulator
+    mov.u32 %r15, 0x01010101;            // dp4a "ones" for sum(xq)
+    mov.u32 %r16, 0;                     // super-block index
+
+Q4K_LOOP:
+    setp.ge.u32 %p2, %r16, %r10;
+    @%p2 bra Q4K_REDUCE;
+
+    ld.global.u32 %r17, [%rd18];         // 8 packed weight nibbles
+    and.b32 %r18, %r17, 0x0F0F0F0F;      // values 8g..8g+4
+    shr.u32 %r19, %r17, 4;
+    and.b32 %r19, %r19, 0x0F0F0F0F;      // values 8g+4..8g+8
+    ld.global.u32 %r20, [%rd20];         // xq bytes 0..3
+    ld.global.u32 %r21, [%rd20+4];       // xq bytes 4..7
+    dp4a.s32.s32 %r22, %r18, %r20, 0;
+    dp4a.s32.s32 %r22, %r19, %r21, %r22; // idot = dot(q, xq)
+    dp4a.s32.s32 %r23, %r20, %r15, 0;
+    dp4a.s32.s32 %r23, %r21, %r15, %r23; // isum = sum(xq)
+
+    ld.global.u16 %h1, [%rd23];
+    cvt.f32.f16 %f2, %h1;                // sc = f16(d * sc_j)
+    ld.global.u16 %h2, [%rd24];
+    cvt.f32.f16 %f3, %h2;                // mn = f16(dmin * m_j)
+    ld.global.f32 %f4, [%rd26];          // xs (activation block scale)
+
+    cvt.rn.f32.s32 %f5, %r22;
+    cvt.rn.f32.s32 %f6, %r23;
+    mul.rn.f32 %f7, %f2, %f4;            // sc * xs
+    fma.rn.f32 %f1, %f5, %f7, %f1;       // acc += idot * sc*xs
+    mul.rn.f32 %f8, %f3, %f4;            // mn * xs
+    neg.f32 %f8, %f8;
+    fma.rn.f32 %f1, %f6, %f8, %f1;       // acc -= isum * mn*xs
+
+    add.s64 %rd18, %rd18, 128;           // qs: 128 B / super-block
+    add.s64 %rd20, %rd20, 256;           // xq: 256 B
+    add.s64 %rd23, %rd23, 16;            // scales: 8 f16
+    add.s64 %rd24, %rd24, 16;            // mins: 8 f16
+    add.s64 %rd26, %rd26, 32;            // xsc: 8 f32
+    add.s32 %r16, %r16, 1;
+    bra Q4K_LOOP;
+
+Q4K_REDUCE:
+    mov.b32 %r24, %f1;
+    shfl.sync.down.b32 %r25, %r24, 16, 31, 0xffffffff;
+    mov.b32 %f9, %r25; add.f32 %f1, %f1, %f9; mov.b32 %r24, %f1;
+    shfl.sync.down.b32 %r25, %r24, 8, 31, 0xffffffff;
+    mov.b32 %f9, %r25; add.f32 %f1, %f1, %f9; mov.b32 %r24, %f1;
+    shfl.sync.down.b32 %r25, %r24, 4, 31, 0xffffffff;
+    mov.b32 %f9, %r25; add.f32 %f1, %f1, %f9; mov.b32 %r24, %f1;
+    shfl.sync.down.b32 %r25, %r24, 2, 31, 0xffffffff;
+    mov.b32 %f9, %r25; add.f32 %f1, %f1, %f9; mov.b32 %r24, %f1;
+    shfl.sync.down.b32 %r25, %r24, 1, 31, 0xffffffff;
+    mov.b32 %f9, %r25; add.f32 %f1, %f1, %f9;
+
+    setp.ne.u32 %p3, %r5, 0;             // only lane 0 writes
+    @%p3 bra Q4K_DONE;
+    mul.wide.u32 %rd27, %r9, 4;
+    add.s64 %rd28, %rd6, %rd27;
+    cvta.to.global.u64 %rd28, %rd28;
+    st.global.f32 [%rd28], %f1;
+
+Q4K_DONE:
+    ret;
+}

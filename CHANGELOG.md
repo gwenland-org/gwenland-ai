@@ -4,6 +4,27 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.1 Task A, native Q4_K decode path:
+
+- New hand-authored PTX kernel `gl_gemv_q4_k_soa`: one warp per output row,
+  one loop iteration per 256-weight super-block (128 coalesced qs bytes),
+  dp4a integer dots against the int8-quantized activation. Streams 5.0 bpw
+  per decode token vs 8.5 for Q8_0 SoA — the lever past the 7B Q8_0
+  bandwidth ceiling (29.7 tok/s ≈ 88% of achievable on a T4).
+- New `repack` module: Q4_K super-blocks → SoA streams (nibbles repacked
+  for u32/dp4a consumption; sub-block scales and mins pre-multiplied to f16
+  `d*sc` / `dmin*m`, buying ggml's 6-bit scale unpack out of the hot loop),
+  plus an f32 → Q8_0-SoA requantizer.
+- Loader policy for Q4_K_M files: Q4_K matmul tensors go native SoA; the
+  Q6_K/Q5_0 tensors those files carry are requantized to Q8_0 SoA (glproc's
+  repack policy) instead of dense f32; Q4_K embedding tables stay 4.5 bpw on
+  the host with per-row dequant; tied LM heads are staged through the same
+  repack as any matmul weight. Staged-model disk cache format bumped
+  (`GLCACHE3`) so pre-Q4_K caches restage.
+- Parity: `gemv_q4_k_soa` vs glproc scalar Q4_K dequant + matvec (ε 1e-2);
+  host-side repack round-trip tests; the existing GPU parity suite is
+  untouched.
+
 ## 0.1.48-alpha — 2026-07-08
 
 First tagged alpha release. Bundles the M1.5–M1.7 GL engine wave with a full

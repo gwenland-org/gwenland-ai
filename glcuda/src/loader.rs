@@ -2,19 +2,18 @@
 //!
 //! The config parse mirrors glproc's loader key-for-key (same metadata
 //! keys, same defaults, same RoPE-style table) so both engines read one
-//! file identically. Weight policy differs by design: Q8_0 tensors stay
-//! quantized (native gl_gemv_q8_0 path); every other dtype is dequantized
-//! to f32 on the host and uploaded dense. glproc's Q4_K/Q5_0/Q6_K → Q8_0
-//! *repacking* is a CPU-throughput trade (integer-dot kernels) that the
-//! GPU does not need — dense f32 is the more accurate representation, at
-//! the cost of VRAM (Q8_0 GGUFs are the recommended M2 format for large
-//! models).
+//! file identically. Weight policy (M2.1 Task A): Q8_0 and Q4_K matmul
+//! tensors stay quantized in their native SoA layouts (gl_gemv_q8_0_soa /
+//! gl_gemv_q4_k_soa read them directly — quantized VRAM *is* the decode
+//! bandwidth budget); other quantized dtypes (Q6_K, Q5_0) are requantized
+//! to Q8_0 SoA (see `repack`); f16/f32 tensors upload dense f32.
 
 use glcore::format::gguf::{GgufDType, GgufFile, GgufValue};
 use glcore::GlError;
 
 use crate::dequant::dequant_any;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
+use crate::repack::{f32_to_q8_0_soa, q4_k_to_soa};
 
 /// Read `{arch}.{suffix}` from metadata as u64.
 fn meta_u64(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<u64> {
@@ -72,8 +71,29 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
             }
             HostWeight::Q8_0Soa { qs, scales }
         }
+        // Native Q4_K path (M2.1 Task A): repack the 144-byte super-blocks
+        // into the SoA triple gl_gemv_q4_k_soa streams at 5.0 bpw. The
+        // in_dim % 256 guard is belt-and-braces — ggml cannot emit a Q4_K
+        // tensor with a ragged row (QK_K divisibility is a format invariant).
+        GgufDType::Q4_K if in_dim.is_multiple_of(256) => {
+            let (qs, scales, mins) = q4_k_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q4KSoa { qs, scales, mins }
+        }
         GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
             HostWeight::Q4_0(gguf.tensor_data(info)?.to_vec())
+        }
+        // Quantized dtypes with no native kernel (Q6_K, Q5_0 — Q4_K_M files
+        // carry Q6_K ffn_down/attn_v/output tensors): requantize to Q8_0 SoA
+        // instead of dense f32. Same policy glproc documents for its repack:
+        // Q8_0 adds ~2^-8 relative error on top of an already-lossy format
+        // (an order below that format's own loss), where dense f32 would
+        // multiply the tensor's VRAM and per-token DRAM traffic by 4-6x —
+        // enough on the big Q4_K_M tensors to sink the 7B decode budget.
+        GgufDType::Q5_0 | GgufDType::Q6_K | GgufDType::Q4_K
+            if in_dim.is_multiple_of(32) =>
+        {
+            let (qs, scales) = f32_to_q8_0_soa(&dequant_any(gguf, info)?);
+            HostWeight::Q8_0Soa { qs, scales }
         }
         _ => HostWeight::F32(dequant_any(gguf, info)?),
     };
@@ -198,6 +218,12 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         GgufDType::Q4_0 if dim.is_multiple_of(32) => {
             HostWeight::Q4_0(gguf.tensor_data(embd_info)?.to_vec())
         }
+        // Q4_K embedding (Q4_K_M files): keep the raw super-blocks and
+        // dequantize one row per token (q4_k_row_into) — 4.5 bpw host RAM
+        // instead of a dense-f32 table (~2 GB for a 152k x 3584 vocab).
+        GgufDType::Q4_K if dim.is_multiple_of(256) => {
+            HostWeight::Q4K(gguf.tensor_data(embd_info)?.to_vec())
+        }
         _ => HostWeight::F32(dequant_any(gguf, embd_info)?),
     };
 
@@ -235,10 +261,12 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
     let layers: Vec<HostLayer> = built.into_iter().map(|o| o.expect("every layer built")).collect();
 
     let output_norm = tensor(gguf, "output_norm.weight")?;
-    // Tied embeddings: reuse the embedding table as LM head.
+    // Tied embeddings: reuse the embedding tensor as LM head — staged
+    // through `weight` (not a clone of `token_embd`) so the matmul gets the
+    // SoA repack the embedding table's AoS row-lookup layout doesn't have.
     let output = match gguf.find_tensor("output.weight") {
         Some(_) => weight(gguf, "output.weight")?,
-        None => HostMat { w: token_embd.clone(), out_dim: vocab_size, in_dim: dim },
+        None => weight(gguf, "token_embd.weight")?,
     };
 
     Ok(HostModel {

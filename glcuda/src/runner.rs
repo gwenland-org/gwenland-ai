@@ -68,6 +68,20 @@ fn gemv_w(
             )
         }
         GpuWeight::Q4_0(s) => k.gemv_q4_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
+        GpuWeight::Q4KSoa { qs, scales, mins } => {
+            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
+            k.gemv_q4_k_soa(
+                cuda,
+                qs.dptr,
+                scales.dptr,
+                mins.dptr,
+                ws.q8_qs.dptr,
+                ws.q8_scales.dptr,
+                y,
+                m.out_dim,
+                m.in_dim,
+            )
+        }
     }
 }
 
@@ -118,6 +132,22 @@ fn gemm_rows(
                 let xt = x_f32 + (t * inb) as u64 * 4;
                 let yt = y + (t * rows) as u64 * 4;
                 k.gemv_q4_0(cuda, s.dptr, xt, yt, rows, inb)?;
+            }
+            Ok(())
+        }
+        // Q4_K SoA prefill: per-token GEMV over the already-quantized rows of
+        // x_qs/x_scales. Streams the weight once per token (no 4-token tile
+        // yet) — Task A ships the decode kernel; a batched Q4_K GEMM is the
+        // Task B / M2.1 follow-up if Q4_K prefill throughput matters.
+        GpuWeight::Q4KSoa { qs, scales, mins } => {
+            let wqs = qs.dptr + (row0 * (inb / 2)) as u64; // nibbles, 0.5 B/elem
+            let wsub = scales.dptr + (row0 * (inb / 32) * 2) as u64; // f16/sub-block
+            let wmin = mins.dptr + (row0 * (inb / 32) * 2) as u64;
+            for t in 0..n {
+                let xq = x_qs + (t * inb) as u64; // int8, 1 B/elem
+                let xs = x_scales + (t * (inb / 32)) as u64 * 4; // f32/block
+                let yt = y + (t * rows) as u64 * 4;
+                k.gemv_q4_k_soa(cuda, wqs, wsub, wmin, xq, xs, yt, rows, inb)?;
             }
             Ok(())
         }
@@ -472,10 +502,11 @@ impl GpuModel {
                 out.copy_from_slice(&v[row * dim..(row + 1) * dim])
             }
             crate::model::HostWeight::Q8_0(b) => crate::dequant::q8_0_row_into(b, row, dim, out),
-            crate::model::HostWeight::Q8_0Soa { .. } => {
-                unreachable!("embedding table is AoS Q8_0, never SoA")
+            crate::model::HostWeight::Q8_0Soa { .. } | crate::model::HostWeight::Q4KSoa { .. } => {
+                unreachable!("embedding table is AoS, never SoA")
             }
             crate::model::HostWeight::Q4_0(b) => crate::dequant::q4_0_row_into(b, row, dim, out),
+            crate::model::HostWeight::Q4K(b) => crate::dequant::q4_k_row_into(b, row, dim, out),
         }
         Ok(())
     }

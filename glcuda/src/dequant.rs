@@ -159,6 +159,37 @@ pub fn q8_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
     }
 }
 
+/// Dequantize one row of a Q4_K matrix (`dim % 256 == 0`) — the host-side
+/// embedding lookup for Q4_K_M models (keeps the ~150k-row table at 4.5
+/// bpw in host RAM instead of dense f32). Zero allocation per call; math
+/// identical to `dequant_q4_k`.
+pub fn q4_k_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
+    debug_assert_eq!(out.len(), dim);
+    debug_assert!(dim.is_multiple_of(K_BLOCK_NUMEL));
+    let row_bytes = dim / K_BLOCK_NUMEL * Q4_K_BLOCK_BYTES;
+    let r = &blocks[row * row_bytes..(row + 1) * row_bytes];
+    for (bi, block) in r.chunks_exact(Q4_K_BLOCK_BYTES).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        let o = &mut out[bi * K_BLOCK_NUMEL..(bi + 1) * K_BLOCK_NUMEL];
+        for chunk in 0..4 {
+            let (sc1, m1) = q4_k_scale_min(2 * chunk, scales);
+            let (sc2, m2) = q4_k_scale_min(2 * chunk + 1, scales);
+            let d1 = d * sc1 as f32;
+            let min1 = dmin * m1 as f32;
+            let d2 = d * sc2 as f32;
+            let min2 = dmin * m2 as f32;
+            let q = &qs[chunk * 32..chunk * 32 + 32];
+            for (l, &byte) in q.iter().enumerate() {
+                o[chunk * 64 + l] = d1 * (byte & 0x0F) as f32 - min1;
+                o[chunk * 64 + 32 + l] = d2 * (byte >> 4) as f32 - min2;
+            }
+        }
+    }
+}
+
 /// Dequantize one row of a Q4_0 matrix (`dim % 32 == 0`) — the host-side
 /// embedding lookup.
 pub fn q4_0_row_into(blocks: &[u8], row: usize, dim: usize, out: &mut [f32]) {
@@ -246,6 +277,20 @@ mod tests {
         for row in 0..rows {
             let mut out = vec![0f32; dim];
             q8_0_row_into(&padded, row, dim, &mut out);
+            assert_eq!(out, full[row * dim..(row + 1) * dim].to_vec());
+        }
+    }
+
+    #[test]
+    fn q4_k_row_matches_full_dequant() {
+        let (rows, dim) = (3usize, 512usize); // 2 super-blocks per row
+        let mut data = rand_bytes(rows * dim / 256 * 144, 5);
+        set_scales(&mut data, 144, 0);
+        set_scales(&mut data, 144, 2);
+        let full = dequant_q4_k(&data).unwrap();
+        for row in 0..rows {
+            let mut out = vec![0f32; dim];
+            q4_k_row_into(&data, row, dim, &mut out);
             assert_eq!(out, full[row * dim..(row + 1) * dim].to_vec());
         }
     }

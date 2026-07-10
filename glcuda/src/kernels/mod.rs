@@ -37,6 +37,7 @@ pub struct KernelSet {
     f_gemv_q8_0: Kernel,
     f_gemv_q8_0_soa: Kernel,
     f_gemm_q8_0_soa: Kernel,
+    f_gemv_q4_k_soa: Kernel,
     f_gemv_q4_0: Kernel,
     f_gemv_t: Kernel,
     f_rms_norm: Kernel,
@@ -58,6 +59,7 @@ impl KernelSet {
             f_gemv_q8_0: module.get_function("gl_gemv_q8_0")?,
             f_gemv_q8_0_soa: module.get_function("gl_gemv_q8_0_soa")?,
             f_gemm_q8_0_soa: module.get_function("gl_gemm_q8_0_soa")?,
+            f_gemv_q4_k_soa: module.get_function("gl_gemv_q4_k_soa")?,
             f_gemv_q4_0: module.get_function("gl_gemv_q4_0")?,
             f_gemv_t: module.get_function("gl_gemv_t_f32")?,
             f_rms_norm: module.get_function("gl_rms_norm_f32")?,
@@ -279,6 +281,46 @@ impl KernelSet {
         cuda.launch(self.f_gemm_q8_0_soa, (ceil_div(out_dim, 8), 1, 1), (256, 1, 1), 0, &mut params)
     }
 
+    /// `y = W @ x` for Q4_K weights in Structure-of-Arrays layout (M2.1
+    /// Task A): `w_qs` packed nibbles `[out, in/2]`, `w_scales`/`w_mins`
+    /// pre-multiplied f16 sub-block pairs `[out, in/32]` (see
+    /// `repack::q4_k_to_soa` for the exact packing). `x` pre-quantized with
+    /// [`Self::quantize_q8`] — the 32-value activation block matches the
+    /// Q4_K sub-block, so the integer dot decomposes per sub-block as
+    /// `(d*sc)*xs*dot(q,xq) - (dmin*m)*xs*sum(xq)`, both dp4a chains.
+    /// One warp per row; one loop iteration streams one 256-weight
+    /// super-block (128 coalesced qs bytes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q4_k_soa(
+        &self,
+        cuda: &Cuda,
+        w_qs: CUdeviceptr,
+        w_scales: CUdeviceptr,
+        w_mins: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(in_dim % 256, 0, "Q4_K rows are whole super-blocks");
+        let (mut wqs, mut wsc, mut wmn) = (w_qs, w_scales, w_mins);
+        let (mut xqs, mut xsc, mut y) = (x_qs, x_scales, y);
+        let (mut o, mut i) = (out_dim, in_dim);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut wmn as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+        ];
+        // 256 threads = 8 warps = 8 rows/block, same geometry as the Q8_0 SoA GEMV.
+        cuda.launch(self.f_gemv_q4_k_soa, (ceil_div(out_dim, 8), 1, 1), (256, 1, 1), 0, &mut params)
+    }
+
     /// Dynamically quantize `x` into `qs` and `scales`.
     pub fn quantize_q8(
         &self,
@@ -471,6 +513,7 @@ mod tests {
             "gl_gemv_q8_0",
             "gl_gemv_q8_0_soa",
             "gl_gemm_q8_0_soa",
+            "gl_gemv_q4_k_soa",
             "gl_gemv_t_f32",
             "gl_rms_norm_f32",
             "gl_softmax_scale_f32",
