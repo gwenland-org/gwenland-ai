@@ -58,14 +58,21 @@ type TokenSink<'a> = Option<&'a mut dyn FnMut(u32, &str)>;
 /// VRAM-resident model after [`GlEngine::load_model`].
 #[derive(Default)]
 pub struct GlcudaEngine {
-    cuda: Option<Cuda>,
-    kernels: Option<KernelSet>,
+    // Field order is drop order: everything holding CUDA resources (the model's
+    // buffer + captured graph, and the kernel module) must drop BEFORE `cuda`
+    // releases the context, or their destructors run against a dead context and
+    // segfault. So `cuda` is declared LAST. (`shutdown()` also frees explicitly
+    // in this order; this protects the implicit-Drop path.)
     /// Mutex because `GlEngine::infer` takes `&self` while a forward pass
     /// mutates the KV cursor and host staging buffers. One inference at a
     /// time per engine — the single-GPU invariant, enforced.
     model: Option<Mutex<GpuModel>>,
+    kernels: Option<KernelSet>,
     tokenizer: Option<Tokenizer>,
     config: GlcudaConfig,
+    /// Owns the CUDA context; released on drop. Declared last so it drops after
+    /// everything above that holds CUDA resources.
+    cuda: Option<Cuda>,
 }
 
 impl GlcudaEngine {
@@ -216,9 +223,15 @@ impl GlEngine for GlcudaEngine {
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         let t_stage = Instant::now();
-        // Cache the staged (repacked) model next to the GGUF so subsequent
-        // loads skip the ~30s repack. A cache miss just rebuilds it.
-        let host = cache::load_host_cached(path, || loader::load_host(&gguf))?;
+        // Staging repacks Q8_0 -> SoA in parallel (see loader). The disk cache
+        // is OPT-IN via GLCUDA_CACHE=1: it only pays off on fast local disk —
+        // on slow/virtualized disk (e.g. Colab) writing the ~7.5 GB cache costs
+        // far more than the repack it saves, so it is off by default.
+        let host = if std::env::var_os("GLCUDA_CACHE").is_some() {
+            cache::load_host_cached(path, || loader::load_host(&gguf))?
+        } else {
+            loader::load_host(&gguf)?
+        };
         let stage_s = t_stage.elapsed().as_secs_f64();
 
         let t_upload = Instant::now();

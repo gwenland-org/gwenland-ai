@@ -114,6 +114,30 @@ fn fuse_gate_up(
 /// Parse config and stage every weight of a GGUF transformer for upload.
 /// Supports the same llama-family architectures as glproc (standard
 /// `blk.N.*` tensor naming).
+/// Stage one transformer block's weights (the parallel unit of `load_host`).
+fn build_layer(gguf: &GgufFile, i: usize) -> Result<HostLayer, GlError> {
+    Ok(HostLayer {
+        attn_norm: tensor(gguf, &format!("blk.{i}.attn_norm.weight"))?,
+        wq: weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
+        wk: weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
+        wv: weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
+        wo: weight(gguf, &format!("blk.{i}.attn_output.weight"))?,
+        bq: tensor_opt(gguf, &format!("blk.{i}.attn_q.bias"))?,
+        bk: tensor_opt(gguf, &format!("blk.{i}.attn_k.bias"))?,
+        bv: tensor_opt(gguf, &format!("blk.{i}.attn_v.bias"))?,
+        q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
+        k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
+        ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
+        w_gate_up: fuse_gate_up(
+            weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
+            weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
+            gguf,
+            i,
+        )?,
+        w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
+    })
+}
+
 pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
     let arch = gguf
         .get_meta("general.architecture")
@@ -177,29 +201,37 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         _ => HostWeight::F32(dequant_any(gguf, embd_info)?),
     };
 
-    let mut layers = Vec::with_capacity(n_layers);
-    for i in 0..n_layers {
-        layers.push(HostLayer {
-            attn_norm: tensor(gguf, &format!("blk.{i}.attn_norm.weight"))?,
-            wq: weight(gguf, &format!("blk.{i}.attn_q.weight"))?,
-            wk: weight(gguf, &format!("blk.{i}.attn_k.weight"))?,
-            wv: weight(gguf, &format!("blk.{i}.attn_v.weight"))?,
-            wo: weight(gguf, &format!("blk.{i}.attn_output.weight"))?,
-            bq: tensor_opt(gguf, &format!("blk.{i}.attn_q.bias"))?,
-            bk: tensor_opt(gguf, &format!("blk.{i}.attn_k.bias"))?,
-            bv: tensor_opt(gguf, &format!("blk.{i}.attn_v.bias"))?,
-            q_norm: tensor_opt(gguf, &format!("blk.{i}.attn_q_norm.weight"))?,
-            k_norm: tensor_opt(gguf, &format!("blk.{i}.attn_k_norm.weight"))?,
-            ffn_norm: tensor(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
-            w_gate_up: fuse_gate_up(
-                weight(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-                weight(gguf, &format!("blk.{i}.ffn_up.weight"))?,
-                gguf,
-                i,
-            )?,
-            w_down: weight(gguf, &format!("blk.{i}.ffn_down.weight"))?,
-        });
-    }
+    // Repacking the per-layer weights (Q8_0 -> SoA) is the bulk of staging and
+    // is embarrassingly parallel across layers — each reads a disjoint slice of
+    // the (Sync) mmap. Fan out over the available cores; a single core keeps the
+    // old sequential behavior.
+    let n_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(n_layers.max(1));
+    let mut built: Vec<Option<HostLayer>> = (0..n_layers).map(|_| None).collect();
+    std::thread::scope(|s| -> Result<(), GlError> {
+        let handles: Vec<_> = (0..n_threads)
+            .map(|t| {
+                s.spawn(move || -> Result<Vec<(usize, HostLayer)>, GlError> {
+                    let mut out = Vec::new();
+                    let mut i = t;
+                    while i < n_layers {
+                        out.push((i, build_layer(gguf, i)?));
+                        i += n_threads;
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        for h in handles {
+            for (i, layer) in h.join().expect("layer-staging thread panicked")? {
+                built[i] = Some(layer);
+            }
+        }
+        Ok(())
+    })?;
+    let layers: Vec<HostLayer> = built.into_iter().map(|o| o.expect("every layer built")).collect();
 
     let output_norm = tensor(gguf, "output_norm.weight")?;
     // Tied embeddings: reuse the embedding table as LM head.
