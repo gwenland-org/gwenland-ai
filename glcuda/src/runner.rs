@@ -390,6 +390,29 @@ impl GpuModel {
             )));
         }
 
+        // Opt-in per-phase GPU timing (GLCUDA_PROFILE_PREFILL=1). Each phase
+        // syncs and accumulates wall time into a bucket, so the split is
+        // exact at the cost of serializing the pipeline — diagnostic only,
+        // never on in production. Buckets: qkv (norm+quant+Q/K/V GEMMs),
+        // attn (bias/qk-norm/rope/kv-write/attention core), ffn (norm+quant+
+        // gate/up/down GEMMs+silu+residual).
+        let prof = std::env::var_os("GLCUDA_PROFILE_PREFILL").is_some();
+        let (mut t_qkv, mut t_attn, mut t_ffn) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        macro_rules! phase {
+            ($bucket:expr, $body:block) => {{
+                if prof {
+                    cuda.synchronize()?;
+                    let _t = Instant::now();
+                    $body
+                    cuda.synchronize()?;
+                    $bucket += _t.elapsed();
+                } else {
+                    $body
+                }
+            }};
+        }
+
         let mut base = 0usize;
         while base < p {
             let n = (p - base).min(PREFILL_BATCH);
@@ -416,55 +439,61 @@ impl GpuModel {
 
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
-                k.rms_norm_rows(cuda, pf_x, layer.attn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
-                k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
-                gemm_rows(cuda, k, &layer.wq, 0, q_dim as u32, pf_xn, pf_qs, pf_scales, pf_q, n as u32)?;
-                gemm_rows(cuda, k, &layer.wk, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_k, n as u32)?;
-                gemm_rows(cuda, k, &layer.wv, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_v, n as u32)?;
+                phase!(t_qkv, {
+                    k.rms_norm_rows(cuda, pf_x, layer.attn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
+                    k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
+                    gemm_rows(cuda, k, &layer.wq, 0, q_dim as u32, pf_xn, pf_qs, pf_scales, pf_q, n as u32)?;
+                    gemm_rows(cuda, k, &layer.wk, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_k, n as u32)?;
+                    gemm_rows(cuda, k, &layer.wv, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_v, n as u32)?;
+                });
 
-                if let Some(b) = &layer.bq {
-                    k.add_bias_rows(cuda, pf_q, b.dptr, q_dim as u32, (n * q_dim) as u32)?;
-                }
-                if let Some(b) = &layer.bk {
-                    k.add_bias_rows(cuda, pf_k, b.dptr, kv_dim as u32, (n * kv_dim) as u32)?;
-                }
-                if let Some(b) = &layer.bv {
-                    k.add_bias_rows(cuda, pf_v, b.dptr, kv_dim as u32, (n * kv_dim) as u32)?;
-                }
-                // Per-head q/k norms: a [n, heads*head_dim] block is exactly
-                // n*heads contiguous rows of head_dim.
-                if let Some(qn) = &layer.q_norm {
-                    k.rms_norm_rows(cuda, pf_q, qn.dptr, pf_q, head_dim as u32, rms_eps, (n * n_heads) as u32)?;
-                }
-                if let Some(kn) = &layer.k_norm {
-                    k.rms_norm_rows(cuda, pf_k, kn.dptr, pf_k, head_dim as u32, rms_eps, (n * n_kv_heads) as u32)?;
-                }
-                k.rope_rows(cuda, pf_q, rope_cos, rope_sin, n_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
-                k.rope_rows(cuda, pf_k, rope_cos, rope_sin, n_kv_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
-                k.kv_write_rows(cuda, self.kv.read_k(l, 0), pf_k, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
-                k.kv_write_rows(cuda, self.kv.read_v(l, 0), pf_v, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
-                // Causal by construction: row t reads cached_len = pos+1
-                // rows, so later rows (already written above) are never seen.
-                k.attn_decode_rows(
-                    cuda, pf_q, self.kv.read_k(l, 0), self.kv.read_v(l, 0), pf_attn,
-                    n_heads as u32, head_dim as u32, pos_base, heads_per_kv, head_stride, scale,
-                    n as u32,
-                )?;
+                phase!(t_attn, {
+                    if let Some(b) = &layer.bq {
+                        k.add_bias_rows(cuda, pf_q, b.dptr, q_dim as u32, (n * q_dim) as u32)?;
+                    }
+                    if let Some(b) = &layer.bk {
+                        k.add_bias_rows(cuda, pf_k, b.dptr, kv_dim as u32, (n * kv_dim) as u32)?;
+                    }
+                    if let Some(b) = &layer.bv {
+                        k.add_bias_rows(cuda, pf_v, b.dptr, kv_dim as u32, (n * kv_dim) as u32)?;
+                    }
+                    // Per-head q/k norms: a [n, heads*head_dim] block is exactly
+                    // n*heads contiguous rows of head_dim.
+                    if let Some(qn) = &layer.q_norm {
+                        k.rms_norm_rows(cuda, pf_q, qn.dptr, pf_q, head_dim as u32, rms_eps, (n * n_heads) as u32)?;
+                    }
+                    if let Some(kn) = &layer.k_norm {
+                        k.rms_norm_rows(cuda, pf_k, kn.dptr, pf_k, head_dim as u32, rms_eps, (n * n_kv_heads) as u32)?;
+                    }
+                    k.rope_rows(cuda, pf_q, rope_cos, rope_sin, n_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
+                    k.rope_rows(cuda, pf_k, rope_cos, rope_sin, n_kv_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
+                    k.kv_write_rows(cuda, self.kv.read_k(l, 0), pf_k, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
+                    k.kv_write_rows(cuda, self.kv.read_v(l, 0), pf_v, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
+                    // Causal by construction: row t reads cached_len = pos+1
+                    // rows, so later rows (already written above) are never seen.
+                    k.attn_decode_rows(
+                        cuda, pf_q, self.kv.read_k(l, 0), self.kv.read_v(l, 0), pf_attn,
+                        n_heads as u32, head_dim as u32, pos_base, heads_per_kv, head_stride, scale,
+                        n as u32,
+                    )?;
+                });
 
-                k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
-                gemm_rows(cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj, n as u32)?;
-                k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+                phase!(t_ffn, {
+                    k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
+                    gemm_rows(cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj, n as u32)?;
+                    k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
 
-                // --- SwiGLU feed-forward block ---
-                k.rms_norm_rows(cuda, pf_x, layer.ffn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
-                k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
-                // gate = fused rows [0, hidden); up = fused rows [hidden, 2*hidden).
-                gemm_rows(cuda, k, &layer.w_gate_up, 0, hidden as u32, pf_xn, pf_qs, pf_scales, pf_gate, n as u32)?;
-                gemm_rows(cuda, k, &layer.w_gate_up, hidden as u32, hidden as u32, pf_xn, pf_qs, pf_scales, pf_up, n as u32)?;
-                k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
-                k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
-                gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
-                k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+                    // --- SwiGLU feed-forward block ---
+                    k.rms_norm_rows(cuda, pf_x, layer.ffn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
+                    k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
+                    // gate = fused rows [0, hidden); up = fused rows [hidden, 2*hidden).
+                    gemm_rows(cuda, k, &layer.w_gate_up, 0, hidden as u32, pf_xn, pf_qs, pf_scales, pf_gate, n as u32)?;
+                    gemm_rows(cuda, k, &layer.w_gate_up, hidden as u32, hidden as u32, pf_xn, pf_qs, pf_scales, pf_up, n as u32)?;
+                    k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
+                    k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
+                    gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
+                    k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+                });
             }
 
             // Commit the chunk: ONE advance per token (the cursor contract).
@@ -483,6 +512,15 @@ impl GpuModel {
                 gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
             }
             base += n;
+        }
+        if prof {
+            let tot = (t_qkv + t_attn + t_ffn).as_secs_f64().max(1e-9);
+            eprintln!(
+                "[prefill split] {p} tok | qkv {:.1} ms ({:.0}%) | attn {:.1} ms ({:.0}%) | ffn {:.1} ms ({:.0}%)",
+                t_qkv.as_secs_f64() * 1e3, 100.0 * t_qkv.as_secs_f64() / tot,
+                t_attn.as_secs_f64() * 1e3, 100.0 * t_attn.as_secs_f64() / tot,
+                t_ffn.as_secs_f64() * 1e3, 100.0 * t_ffn.as_secs_f64() / tot,
+            );
         }
         Ok(())
     }
