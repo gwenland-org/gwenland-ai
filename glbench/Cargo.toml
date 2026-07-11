@@ -1,0 +1,30 @@
+[package]
+name = "glbench"
+version = "0.1.48"
+edition = "2021"
+description = "GwenLand AI benchmark framework (Mensura Veritatis) — measure truth about engine performance"
+license-file = "../LICENSE"
+
+# glbench observes performance; it never optimizes it. It runs inference through
+# the existing GlEngine contract in glcore and reports what the hardware did.
+#
+# Dependency rule (DESIGN.md): ZERO new external dependencies. Only the Rust
+# standard library and existing GwenLand workspace crates. No serde here — the
+# JSON/CSV/Markdown writers are hand-rolled in src/export so the data model
+# stays decoupled from any serialization framework.
+[dependencies]
+glcore = { path = "../glcore" }
+glproc = { path = "../glproc" }
+
+# The CUDA engine is a workspace crate, so depending on it adds no external
+# dependency. It self-probes for hardware at init() and reports availability via
+# capabilities().available, so linking it on a CPU-only machine is harmless —
+# the adapter simply reports the engine as unavailable.
+glcuda = { path = "../glcuda" }
+
+[[bin]]
+name = "glbench"
+path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

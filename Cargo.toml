@@ -5,6 +5,7 @@ members = [
     "glcuda",
     "glvulkan",
     "glmetal",
+    "glbench",
     "glcli",
     "packages/core",
     "packages/gltui",

@@ -2617,6 +2617,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "glbench"
+version = "0.1.48"
+dependencies = [
+ "glcore",
+ "glcuda",
+ "glproc",
+ "tempfile",
+]
+
+[[package]]
 name = "glcli"
 version = "0.1.48"
 dependencies = [
