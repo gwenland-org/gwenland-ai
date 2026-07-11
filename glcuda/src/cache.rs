@@ -21,11 +21,11 @@ use glcore::GlError;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
 
 // Version history: GLCACHE3 = M2.1 (Q4_K native + requant-to-Q8_0 staging);
-// GLCACHE4 = M2.2 Task C-2 (Q4_0 matmuls repack to SoA); GLCACHE5 = M2.2
-// Task C-1 (Q6_K matmuls go native SoA instead of requant-to-Q8_0). A bump
-// forces a restage so pre-existing caches pick up the new layouts — old
-// caches would read back fine but keep the old kernels' cost.
-const MAGIC: &[u8; 8] = b"GLCACHE5";
+// GLCACHE4 = M2.2 Task C-2 (Q4_0 SoA); GLCACHE5 = M2.2 Task C-1 (Q6_K
+// native SoA); GLCACHE6 = Q6_K qh WIDENED into the ql nibble layout — this
+// bump is CORRECTNESS, not just cost: a GLCACHE5 cache's 64-byte qh stream
+// read back into the widened kernel would dequantize garbage.
+const MAGIC: &[u8; 8] = b"GLCACHE6";
 
 /// Path of the cache file for a GGUF at `gguf_path`.
 fn cache_path(gguf_path: &str) -> PathBuf {
