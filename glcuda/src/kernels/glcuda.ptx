@@ -2414,3 +2414,607 @@ Q6K_REDUCE:
 Q6K_DONE:
     ret;
 }
+
+// ===========================================================================
+// M2.3 Stage 1b - batched-over-tokens ("rows") variants for prefill.
+//
+// The prefill chunk used to launch the per-token kernels in a serial loop
+// (~7000 launches per 32-token chunk, each a few us of latency on a chain
+// of dependencies). These variants add a token dimension (ctaid.y = row)
+// so one launch covers the whole chunk. They read positions from the
+// pos_seq identity array (pos_seq[p] == p, uploaded once at load):
+// row t uses pos = pos_seq[base + t], and cached_len = pos + 1.
+//
+// The single-token originals are kept untouched - the decode graph is
+// captured against them and their launch geometry is token-invariant.
+// Same math, same rounding, same order as the originals.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// gl_rms_norm_rows_f32: out[r][i] = x[r][i] * rsqrt(mean(x[r]^2)+eps) * w[i]
+// for rows r = 0..gridDim.x. Exactly gl_rms_norm_f32 per block, with the
+// block's row selected by ctaid.x. Launch: grid (rows) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_rms_norm_rows_f32(
+    .param .u64 p_x,
+    .param .u64 p_w,
+    .param .u64 p_out,
+    .param .u32 p_dim,
+    .param .f32 p_eps
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<24>;
+    .shared .align 4 .b8 sm_rmsr[36];
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_w];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_dim];
+    ld.param.f32 %f1, [p_eps];
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    // Row base: this block handles row ctaid.x of x/out (w is shared).
+    mov.u32 %r18, %ctaid.x;
+    mul.lo.s32 %r19, %r18, %r1;
+    mul.wide.u32 %rd14, %r19, 4;
+    add.s64 %rd4, %rd4, %rd14;
+    add.s64 %rd6, %rd6, %rd14;
+    mov.u32 %r2, %tid.x;
+    mov.u32 %r3, %ntid.x;
+    and.b32 %r5, %r2, 31;               // lane
+    shr.u32 %r6, %r2, 5;                // warp id
+    mov.u32 %r7, sm_rmsr;               // shared base
+    add.s32 %r10, %r3, 31;
+    shr.u32 %r11, %r10, 5;              // n_warps
+
+    // strided sum of squares
+    mov.f32 %f2, 0f00000000;
+    mov.u32 %r4, %r2;
+    mul.wide.u32 %rd7, %r2, 4;
+    add.s64 %rd8, %rd4, %rd7;           // x ptr
+    mul.wide.u32 %rd9, %r3, 4;          // stride bytes
+RMSR_ACC:
+    setp.ge.u32 %p1, %r4, %r1;
+    @%p1 bra RMSR_WARP_RED;
+    ld.global.f32 %f3, [%rd8];
+    fma.rn.f32 %f2, %f3, %f3, %f2;
+    add.s32 %r4, %r4, %r3;
+    add.s64 %rd8, %rd8, %rd9;
+    bra RMSR_ACC;
+RMSR_WARP_RED:
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 16, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
+    add.f32 %f2, %f2, %f4;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 8, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
+    add.f32 %f2, %f2, %f4;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 4, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
+    add.f32 %f2, %f2, %f4;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 2, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
+    add.f32 %f2, %f2, %f4;
+    mov.b32 %r16, %f2;
+    shfl.sync.down.b32 %r17, %r16, 1, 31, 0xffffffff;
+    mov.b32 %f4, %r17;
+    add.f32 %f2, %f2, %f4;
+    setp.ne.u32 %p2, %r5, 0;
+    @%p2 bra RMSR_BARRIER1;
+    shl.b32 %r8, %r6, 2;
+    add.s32 %r9, %r7, %r8;
+    st.shared.f32 [%r9], %f2;
+RMSR_BARRIER1:
+    bar.sync 0;
+    setp.ne.u32 %p3, %r2, 0;
+    @%p3 bra RMSR_BCAST;
+    mov.f32 %f5, 0f00000000;
+    mov.u32 %r12, 0;
+RMSR_SUM_WARPS:
+    setp.ge.u32 %p4, %r12, %r11;
+    @%p4 bra RMSR_FINISH;
+    shl.b32 %r13, %r12, 2;
+    add.s32 %r14, %r7, %r13;
+    ld.shared.f32 %f6, [%r14];
+    add.f32 %f5, %f5, %f6;
+    add.s32 %r12, %r12, 1;
+    bra RMSR_SUM_WARPS;
+RMSR_FINISH:
+    cvt.rn.f32.u32 %f7, %r1;
+    div.rn.f32 %f8, %f5, %f7;
+    add.f32 %f9, %f8, %f1;
+    sqrt.rn.f32 %f10, %f9;
+    rcp.rn.f32 %f11, %f10;
+    st.shared.f32 [%r7+32], %f11;
+RMSR_BCAST:
+    bar.sync 0;
+    ld.shared.f32 %f12, [%r7+32];
+    mov.u32 %r15, %r2;
+    mul.wide.u32 %rd10, %r2, 4;
+    add.s64 %rd11, %rd4, %rd10;
+    add.s64 %rd12, %rd5, %rd10;
+    add.s64 %rd13, %rd6, %rd10;
+RMSR_OUT:
+    setp.ge.u32 %p5, %r15, %r1;
+    @%p5 bra RMSR_DONE;
+    ld.global.f32 %f13, [%rd11];
+    ld.global.f32 %f14, [%rd12];
+    mul.rn.f32 %f15, %f13, %f12;
+    mul.rn.f32 %f16, %f15, %f14;
+    st.global.f32 [%rd13], %f16;
+    add.s32 %r15, %r15, %r3;
+    add.s64 %rd11, %rd11, %rd9;
+    add.s64 %rd12, %rd12, %rd9;
+    add.s64 %rd13, %rd13, %rd9;
+    bra RMSR_OUT;
+RMSR_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_add_bias_rows_f32: y[i] += b[i % dim] for i < total - the broadcast
+// bias add over a [rows, dim] activation block in one launch (the per-token
+// loop was up to 3 * n_layers * n launches per chunk on biased models).
+// Launch: grid ceil(total/256) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_add_bias_rows_f32(
+    .param .u64 p_y,
+    .param .u64 p_b,
+    .param .u32 p_dim,
+    .param .u32 p_total
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<10>;
+    .reg .f32 %f<4>;
+    .reg .b64 %rd<10>;
+
+    ld.param.u64 %rd1, [p_y];
+    ld.param.u64 %rd2, [p_b];
+    ld.param.u32 %r1, [p_dim];
+    ld.param.u32 %r2, [p_total];
+    mov.u32 %r3, %ctaid.x;
+    mov.u32 %r4, %ntid.x;
+    mov.u32 %r5, %tid.x;
+    mad.lo.s32 %r6, %r3, %r4, %r5;
+    setp.ge.u32 %p1, %r6, %r2;
+    @%p1 bra ABR_DONE;
+    cvta.to.global.u64 %rd3, %rd1;
+    cvta.to.global.u64 %rd4, %rd2;
+    rem.u32 %r7, %r6, %r1;              // bias index = i % dim
+    mul.wide.u32 %rd5, %r6, 4;
+    add.s64 %rd6, %rd3, %rd5;
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f1, [%rd6];
+    ld.global.f32 %f2, [%rd8];
+    add.f32 %f3, %f1, %f2;
+    st.global.f32 [%rd6], %f3;
+ABR_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_rope_rows_f32: gl_rope_f32 over ctaid.y token rows in one launch.
+// Row t rotates x + t*(n_heads*head_dim) at position pos_seq[t] (the caller
+// passes p_pos_seq already offset to the chunk base, so element t IS the
+// row's absolute position). Launch: grid (ceil(pairs/256), ntok) x 256.
+// ---------------------------------------------------------------------------
+.visible .entry gl_rope_rows_f32(
+    .param .u64 p_x,
+    .param .u64 p_cos,
+    .param .u64 p_sin,
+    .param .u32 p_heads,
+    .param .u32 p_head_dim,
+    .param .u32 p_neox,
+    .param .u64 p_pos_seq
+)
+{
+    .reg .pred %p<3>;
+    .reg .b32 %r<26>;
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_cos];
+    ld.param.u64 %rd3, [p_sin];
+    ld.param.u32 %r1, [p_heads];
+    ld.param.u32 %r2, [p_head_dim];
+    ld.param.u32 %r3, [p_neox];
+    ld.param.u64 %rd14, [p_pos_seq];
+    shr.u32 %r4, %r2, 1;                // half = head_dim / 2
+    mov.u32 %r5, %ctaid.x;
+    mov.u32 %r6, %ntid.x;
+    mov.u32 %r7, %tid.x;
+    mad.lo.s32 %r8, %r5, %r6, %r7;      // pair index
+    mul.lo.s32 %r9, %r1, %r4;           // total pairs
+    setp.ge.u32 %p1, %r8, %r9;
+    @%p1 bra ROPER_DONE;
+    div.u32 %r10, %r8, %r4;             // h
+    rem.u32 %r11, %r8, %r4;             // i
+    mul.lo.s32 %r12, %r10, %r2;         // base = h * head_dim
+    setp.ne.u32 %p2, %r3, 0;
+    @%p2 bra ROPER_NEOX;
+    shl.b32 %r13, %r11, 1;
+    add.s32 %r14, %r12, %r13;           // a = base + 2i
+    add.s32 %r15, %r14, 1;              // b = a + 1
+    bra ROPER_IDX_DONE;
+ROPER_NEOX:
+    add.s32 %r14, %r12, %r11;           // a = base + i
+    add.s32 %r15, %r14, %r4;            // b = a + half
+ROPER_IDX_DONE:
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    // Row t: x base += t * heads*head_dim; pos = pos_seq[t].
+    mov.u32 %r20, %ctaid.y;
+    mul.lo.s32 %r21, %r1, %r2;          // heads * head_dim
+    mul.lo.s32 %r22, %r21, %r20;        // row element offset
+    mul.wide.u32 %rd16, %r22, 4;
+    add.s64 %rd4, %rd4, %rd16;
+    cvta.to.global.u64 %rd15, %rd14;
+    mul.wide.u32 %rd17, %r20, 4;
+    add.s64 %rd15, %rd15, %rd17;
+    ld.global.u32 %r16, [%rd15];        // pos = pos_seq[t]
+    mul.lo.s32 %r17, %r16, %r4;         // pos * half
+    add.s32 %r18, %r17, %r11;           // pos*half + i
+    mul.wide.u32 %rd7, %r18, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    add.s64 %rd9, %rd6, %rd7;
+    ld.global.f32 %f1, [%rd8];          // cos
+    ld.global.f32 %f2, [%rd9];          // sin
+    mul.wide.u32 %rd10, %r14, 4;
+    add.s64 %rd11, %rd4, %rd10;
+    mul.wide.u32 %rd12, %r15, 4;
+    add.s64 %rd13, %rd4, %rd12;
+    ld.global.f32 %f3, [%rd11];         // x0
+    ld.global.f32 %f4, [%rd13];         // x1
+    mul.f32 %f5, %f3, %f1;
+    mul.f32 %f6, %f4, %f2;
+    sub.f32 %f7, %f5, %f6;              // x0*cos - x1*sin
+    mul.f32 %f8, %f3, %f2;
+    mul.f32 %f9, %f4, %f1;
+    add.f32 %f10, %f8, %f9;             // x0*sin + x1*cos
+    st.global.f32 [%rd11], %f7;
+    st.global.f32 [%rd13], %f10;
+ROPER_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_kv_write_rows: gl_kv_write over ctaid.y token rows in one launch. Row t
+// copies src + t*(n_kv*head_dim) into cache position pos_seq[t].
+// Launch: grid (ceil(n_kv*head_dim/256), ntok) x 256 threads.
+// ---------------------------------------------------------------------------
+.visible .entry gl_kv_write_rows(
+    .param .u64 p_dst,
+    .param .u64 p_src,
+    .param .u64 p_pos_seq,
+    .param .u32 p_head_dim,
+    .param .u32 p_n_kv,
+    .param .u32 p_head_stride
+)
+{
+    .reg .pred %p<2>;
+    .reg .b32 %r<20>;
+    .reg .f32 %f<2>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [p_dst];
+    ld.param.u64 %rd2, [p_src];
+    ld.param.u64 %rd3, [p_pos_seq];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u32 %r2, [p_n_kv];
+    ld.param.u32 %r3, [p_head_stride];
+    mov.u32 %r4, %ctaid.x;
+    mov.u32 %r5, %ntid.x;
+    mov.u32 %r6, %tid.x;
+    mad.lo.s32 %r7, %r4, %r5, %r6;       // e = element index within a row
+    mul.lo.s32 %r8, %r2, %r1;            // n_kv * head_dim
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra KVWR_DONE;
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    // Row t: src base += t * n_kv*head_dim; pos = pos_seq[t].
+    mov.u32 %r16, %ctaid.y;
+    mul.lo.s32 %r17, %r8, %r16;
+    mul.wide.u32 %rd11, %r17, 4;
+    add.s64 %rd5, %rd5, %rd11;
+    mul.wide.u32 %rd12, %r16, 4;
+    add.s64 %rd6, %rd6, %rd12;
+    ld.global.u32 %r9, [%rd6];           // pos
+    div.u32 %r10, %r7, %r1;              // kv_head
+    rem.u32 %r11, %r7, %r1;              // d
+    mul.lo.s32 %r12, %r10, %r3;          // kv_head * head_stride
+    mul.lo.s32 %r13, %r9, %r1;           // pos * head_dim
+    add.s32 %r14, %r12, %r13;
+    add.s32 %r15, %r14, %r11;            // dst element index
+    mul.wide.u32 %rd7, %r7, 4;
+    add.s64 %rd8, %rd5, %rd7;
+    ld.global.f32 %f1, [%rd8];
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd4, %rd9;
+    st.global.f32 [%rd10], %f1;
+KVWR_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_attn_decode_rows_f32: gl_attn_decode_f32 over ctaid.y token rows in one
+// launch - the whole chunk's causal attention per layer. Block (h, t) runs
+// query head h of token row t: q/out at + t*(n_heads*head_dim), and
+// cached_len = pos_seq[t] + 1, so row t attends to exactly the first
+// pos_seq[t]+1 cache rows (its own KV row was written by the preceding
+// gl_kv_write_rows launch; later rows exist but are never read - causal).
+// Launch: grid (n_heads, ntok) x 128 threads. Same shared plan as the
+// original (16 KiB scores + 36 B reduction scratch).
+// ---------------------------------------------------------------------------
+.visible .entry gl_attn_decode_rows_f32(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u32 p_head_dim,
+    .param .u64 p_pos_seq,
+    .param .u32 p_heads_per_kv,
+    .param .u32 p_head_stride,
+    .param .f32 p_scale
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<48>;
+    .reg .f32 %f<32>;
+    .reg .b64 %rd<44>;
+    .shared .align 4 .b8 sm_scr[16384];  // scores[0..4096]
+    .shared .align 4 .b8 sm_redr[36];    // warp partials + broadcast
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_v];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u64 %rd30, [p_pos_seq];
+    ld.param.u32 %r3, [p_heads_per_kv];
+    ld.param.u32 %r4, [p_head_stride];
+    ld.param.f32 %f1, [p_scale];
+
+    // Token row t and its causal length: cached_len = pos_seq[t] + 1.
+    mov.u32 %r42, %ctaid.y;
+    cvta.to.global.u64 %rd31, %rd30;
+    mul.wide.u32 %rd32, %r42, 4;
+    add.s64 %rd31, %rd31, %rd32;
+    ld.global.u32 %r2, [%rd31];          // pos
+    add.s32 %r2, %r2, 1;                 // cached_len
+
+    mov.u32 %r5, %ctaid.x;               // h (query head)
+    mov.u32 %r6, %tid.x;                 // thread id
+    mov.u32 %r7, %ntid.x;                // block size
+    and.b32 %r8, %r6, 31;                // lane
+    shr.u32 %r9, %r6, 5;                 // warp id
+    add.s32 %r10, %r7, 31;
+    shr.u32 %r11, %r10, 5;               // n_warps
+    mov.u32 %r12, sm_scr;                // scores base (shared)
+    mov.u32 %r13, sm_redr;               // reduction base (shared)
+
+    cvta.to.global.u64 %rd5, %rd1;       // q global
+    cvta.to.global.u64 %rd6, %rd2;       // k global
+    cvta.to.global.u64 %rd7, %rd3;       // v global
+    cvta.to.global.u64 %rd8, %rd4;       // out global
+
+    // Row bases: q/out += t * n_heads*head_dim (n_heads = gridDim.x).
+    mov.u32 %r43, %nctaid.x;
+    mul.lo.s32 %r44, %r43, %r1;
+    mul.lo.s32 %r45, %r44, %r42;
+    mul.wide.u32 %rd33, %r45, 4;
+    add.s64 %rd5, %rd5, %rd33;
+    add.s64 %rd8, %rd8, %rd33;
+
+    // kv_head = h / heads_per_kv ; kv offset in elements = kv_head*head_stride
+    div.u32 %r14, %r5, %r3;              // kv_head
+    mul.lo.s32 %r15, %r14, %r4;          // kv_head * head_stride (elems)
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd6, %rd9;           // k_base for this head
+    add.s64 %rd11, %rd7, %rd9;           // v_base for this head
+    // q vector base = q + h*head_dim
+    mul.lo.s32 %r16, %r5, %r1;
+    mul.wide.u32 %rd12, %r16, 4;
+    add.s64 %rd13, %rd5, %rd12;          // q_base
+    add.s64 %rd14, %rd8, %rd12;          // out_base
+
+    // ---- Pass 1: scores[t] = (q . k[t]) * scale, one thread per t ----
+    mov.u32 %r17, %r6;                   // t = tid
+ATTNR_SCORE:
+    setp.ge.u32 %p1, %r17, %r2;
+    @%p1 bra ATTNR_SCORE_DONE;
+    mul.lo.s32 %r18, %r17, %r1;
+    mul.wide.u32 %rd15, %r18, 4;
+    add.s64 %rd16, %rd10, %rd15;         // &k[t][0]
+    mov.u64 %rd17, %rd13;                // &q[0]
+    mov.f32 %f2, 0f00000000;             // dot acc (FP32)
+    mov.u32 %r19, 0;                     // d
+ATTNR_DOT:
+    setp.ge.u32 %p2, %r19, %r1;
+    @%p2 bra ATTNR_DOT_DONE;
+    ld.global.f32 %f3, [%rd17];
+    ld.global.f32 %f4, [%rd16];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.s64 %rd17, %rd17, 4;
+    add.s64 %rd16, %rd16, 4;
+    add.s32 %r19, %r19, 1;
+    bra ATTNR_DOT;
+ATTNR_DOT_DONE:
+    mul.rn.f32 %f2, %f2, %f1;            // * scale
+    shl.b32 %r20, %r17, 2;
+    add.s32 %r21, %r12, %r20;
+    st.shared.f32 [%r21], %f2;
+    add.s32 %r17, %r17, %r7;             // t += blockDim
+    bra ATTNR_SCORE;
+ATTNR_SCORE_DONE:
+    bar.sync 0;
+
+    // ---- Pass 2: softmax over sm_scr[0..cached_len] ----
+    mov.f32 %f5, 0fFF800000;             // -inf
+    mov.u32 %r22, %r6;
+ATTNR_MAX:
+    setp.ge.u32 %p3, %r22, %r2;
+    @%p3 bra ATTNR_MAX_RED;
+    shl.b32 %r23, %r22, 2;
+    add.s32 %r24, %r12, %r23;
+    ld.shared.f32 %f6, [%r24];
+    max.f32 %f5, %f5, %f6;
+    add.s32 %r22, %r22, %r7;
+    bra ATTNR_MAX;
+ATTNR_MAX_RED:
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTNR_MAX_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f5;
+ATTNR_MAX_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTNR_MAX_BC;
+    mov.f32 %f7, 0fFF800000;
+    mov.u32 %r29, 0;
+ATTNR_MAX_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTNR_MAX_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f8, [%r31];
+    max.f32 %f7, %f7, %f8;
+    add.s32 %r29, %r29, 1;
+    bra ATTNR_MAX_W;
+ATTNR_MAX_ST:
+    st.shared.f32 [%r13+32], %f7;
+ATTNR_MAX_BC:
+    bar.sync 0;
+    ld.shared.f32 %f9, [%r13+32];        // m (block max), uniform
+
+    mov.f32 %f10, 0f00000000;            // sum acc
+    mov.u32 %r32, %r6;
+ATTNR_EXP:
+    setp.ge.u32 %p3, %r32, %r2;
+    @%p3 bra ATTNR_SUM_RED;
+    shl.b32 %r33, %r32, 2;
+    add.s32 %r34, %r12, %r33;
+    ld.shared.f32 %f11, [%r34];
+    sub.f32 %f12, %f11, %f9;             // score - m
+    mul.f32 %f13, %f12, 0f3FB8AA3B;      // * log2(e)
+    ex2.approx.f32 %f14, %f13;           // exp(score - m)
+    st.shared.f32 [%r34], %f14;
+    add.f32 %f10, %f10, %f14;
+    add.s32 %r32, %r32, %r7;
+    bra ATTNR_EXP;
+ATTNR_SUM_RED:
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTNR_SUM_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f10;
+ATTNR_SUM_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTNR_SUM_BC;
+    mov.f32 %f15, 0f00000000;
+    mov.u32 %r29, 0;
+ATTNR_SUM_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTNR_SUM_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f16, [%r31];
+    add.f32 %f15, %f15, %f16;
+    add.s32 %r29, %r29, 1;
+    bra ATTNR_SUM_W;
+ATTNR_SUM_ST:
+    st.shared.f32 [%r13+32], %f15;
+ATTNR_SUM_BC:
+    bar.sync 0;
+    ld.shared.f32 %f17, [%r13+32];       // sum, uniform
+    setp.gt.f32 %p7, %f17, 0f00000000;
+    mov.f32 %f18, 0f3F800000;            // 1.0 default (no-op divide)
+    @!%p7 bra ATTNR_RCP_DONE;
+    rcp.rn.f32 %f18, %f17;               // 1/sum
+ATTNR_RCP_DONE:
+    bar.sync 0;
+
+    // ---- Pass 3: out[d] = sum_t (scores[t]*inv_sum) * v[t][d] ----
+    mov.u32 %r35, %r6;                   // d = tid
+ATTNR_OUT:
+    setp.ge.u32 %p1, %r35, %r1;
+    @%p1 bra ATTNR_OUT_DONE;
+    mov.f32 %f19, 0f00000000;            // out acc
+    mov.u32 %r36, 0;                     // t
+    mul.wide.u32 %rd18, %r35, 4;
+    add.s64 %rd19, %rd11, %rd18;         // &v[0][d]
+    mul.lo.s32 %r37, %r1, 4;             // row stride bytes
+    cvt.u64.u32 %rd20, %r37;
+ATTNR_OUT_LOOP:
+    setp.ge.u32 %p2, %r36, %r2;
+    @%p2 bra ATTNR_OUT_STORE;
+    shl.b32 %r38, %r36, 2;
+    add.s32 %r39, %r12, %r38;
+    ld.shared.f32 %f20, [%r39];          // exp weight (un-normalized)
+    mul.rn.f32 %f21, %f20, %f18;         // * inv_sum -> normalized weight
+    ld.global.f32 %f22, [%rd19];         // v[t][d]
+    fma.rn.f32 %f19, %f21, %f22, %f19;
+    add.s64 %rd19, %rd19, %rd20;
+    add.s32 %r36, %r36, 1;
+    bra ATTNR_OUT_LOOP;
+ATTNR_OUT_STORE:
+    add.s64 %rd21, %rd14, %rd18;
+    st.global.f32 [%rd21], %f19;
+    add.s32 %r35, %r35, %r7;
+    bra ATTNR_OUT;
+ATTNR_OUT_DONE:
+    ret;
+}

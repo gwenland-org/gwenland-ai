@@ -765,6 +765,84 @@ fn fused_attn_decode_matches_per_head_reference() {
     assert_close(&got, &want, EPS_MATMUL, "fused_attn_decode");
 }
 
+/// M2.3 Stage 1b: the batched-over-tokens attention (`gl_attn_decode_rows`)
+/// must equal the per-token reference for EVERY row, with row t attending to
+/// exactly its own causal prefix (cached_len = pos_seq[base+t] + 1) — the
+/// kernel that lets one launch replace prefill's serial per-token loop.
+#[test]
+fn attn_decode_rows_matches_per_token_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (head_dim, n_heads, n_kv, max_ctx) = (64usize, 4usize, 2usize, 64usize);
+    let (base, ntok) = (5usize, 3usize); // chunk starts mid-sequence
+    let heads_per_kv = n_heads / n_kv;
+    let head_stride = max_ctx * head_dim;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // KV cache with rows 0..base+ntok populated per KV head.
+    let filled = base + ntok;
+    let mut kc = vec![0f32; n_kv * head_stride];
+    let mut vc = vec![0f32; n_kv * head_stride];
+    for kvh in 0..n_kv {
+        let sk = randv(filled * head_dim, 80 + kvh as u64, 1.0);
+        let sv = randv(filled * head_dim, 85 + kvh as u64, 1.0);
+        kc[kvh * head_stride..kvh * head_stride + sk.len()].copy_from_slice(&sk);
+        vc[kvh * head_stride..kvh * head_stride + sv.len()].copy_from_slice(&sv);
+    }
+    // Queries for every token row.
+    let q = randv(ntok * n_heads * head_dim, 90, 1.0);
+
+    // Reference: row t, head h attends to the first base+t+1 rows only.
+    let mut want = vec![0f32; ntok * n_heads * head_dim];
+    for t in 0..ntok {
+        for h in 0..n_heads {
+            let kvh = h / heads_per_kv;
+            let len = (base + t + 1) * head_dim;
+            let krows = &kc[kvh * head_stride..kvh * head_stride + len];
+            let vrows = &vc[kvh * head_stride..kvh * head_stride + len];
+            let qoff = t * n_heads * head_dim + h * head_dim;
+            let out = attention_ref(&q[qoff..qoff + head_dim], krows, vrows, head_dim);
+            want[qoff..qoff + head_dim].copy_from_slice(&out);
+        }
+    }
+
+    let bytes = ((q.len() + kc.len() + vc.len() + q.len()) * 4 + 8192) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dq = upload(&cuda, &mut buf, &q);
+    let dk = upload(&cuda, &mut buf, &kc);
+    let dv = upload(&cuda, &mut buf, &vc);
+    let dout = buf.alloc_f32(q.len()).unwrap().dptr;
+    // pos_seq identity array, as the model uploads at load.
+    let pos_vals: Vec<u32> = (0..=(max_ctx as u32)).collect();
+    let dpos = buf.alloc(((max_ctx + 1) * 4) as u64).unwrap().dptr;
+    let pos_bytes = unsafe {
+        std::slice::from_raw_parts(pos_vals.as_ptr().cast::<u8>(), pos_vals.len() * 4)
+    };
+    cuda.htod(dpos, pos_bytes).unwrap();
+
+    k.attn_decode_rows(
+        &cuda,
+        dq,
+        dk,
+        dv,
+        dout,
+        n_heads as u32,
+        head_dim as u32,
+        dpos + (base * 4) as u64,
+        heads_per_kv as u32,
+        head_stride as u32,
+        scale,
+        ntok as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+
+    let mut got = vec![0f32; q.len()];
+    cuda.dtoh_f32(&mut got, dout).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_MATMUL, "attn_decode_rows");
+}
+
 /// M2.2: gl_kv_write must place each KV head's row at the device-`pos`
 /// slot of its cache region — the graph-static replacement for the per-head
 /// cuMemcpyDtoD. Write two heads' rows at pos=3, read them back from the

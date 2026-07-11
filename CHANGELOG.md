@@ -4,6 +4,28 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.3 Stage 1, prefill de-serialization (post head-to-head):
+
+- First llama.cpp head-to-head (CUDA build, same T4/models): **decode at
+  parity** — 0.95× (Q8_0), 1.03× (Q4_K_M, glcuda ahead), 0.97× (Q4_0) —
+  but prefill 17–30× behind (45–78 vs 1340–1470 tok/s).
+- Stage 1a: token positions are consecutive integers, so a `pos_seq`
+  identity array uploaded once at load replaces prefill's per-token
+  `token_params` HtoD (~896 synchronous, pipeline-draining copies per
+  32-token chunk). Zero PTX changes — the kernels already read pos by
+  pointer. Also fixes a latent cursor bug (advance ran per layer,
+  overcounting 28×; prompts >146 tokens on 7B would falsely hit "KV
+  cache full").
+- Stage 1b: five batched-over-tokens kernel variants (`gl_rms_norm_rows`,
+  `gl_add_bias_rows`, `gl_rope_rows`, `gl_kv_write_rows`,
+  `gl_attn_decode_rows` — causal via `cached_len = pos_seq[t]+1`) collapse
+  prefill's serial per-token loop (~7000 launches/chunk) into ~15 launches
+  per layer. Single-token originals untouched (the decode graph is
+  captured against them). New parity test pins batched attention's
+  causality row-by-row.
+- Remaining prefill gap (Stage 2): Q4_K/Q4_0/Q6_K still fall back to
+  per-token GEMV — batched tile GEMMs for the quant formats are next.
+
 glcuda — M2.2 Q6_K kernel tuning (post-T4):
 
 - First T4 run showed `gl_gemv_q6_k_soa` correct (parity green) but

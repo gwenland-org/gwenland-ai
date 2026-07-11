@@ -56,6 +56,14 @@ pub struct KernelSet {
     f_softmax_scale: Kernel,
     f_attn_decode: Kernel,
     f_kv_write: Kernel,
+    // Batched-over-tokens prefill variants (M2.3 Stage 1b). The single-token
+    // originals above stay untouched — the decode graph is captured against
+    // them; these exist so one launch covers a whole prefill chunk.
+    f_rms_norm_rows: Kernel,
+    f_add_bias_rows: Kernel,
+    f_rope_rows: Kernel,
+    f_kv_write_rows: Kernel,
+    f_attn_decode_rows: Kernel,
 }
 
 impl KernelSet {
@@ -98,6 +106,11 @@ impl KernelSet {
             f_softmax_scale: module.get_function("gl_softmax_scale_f32")?,
             f_attn_decode: module.get_function("gl_attn_decode_f32")?,
             f_kv_write: module.get_function("gl_kv_write")?,
+            f_rms_norm_rows: module.get_function("gl_rms_norm_rows_f32")?,
+            f_add_bias_rows: module.get_function("gl_add_bias_rows_f32")?,
+            f_rope_rows: module.get_function("gl_rope_rows_f32")?,
+            f_kv_write_rows: module.get_function("gl_kv_write_rows")?,
+            f_attn_decode_rows: module.get_function("gl_attn_decode_rows_f32")?,
             _module: module,
         })
     }
@@ -192,6 +205,153 @@ impl KernelSet {
         ];
         let n = n_kv * head_dim;
         cuda.launch(self.f_kv_write, (ceil_div(n, BLOCK), 1, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Batched RMSNorm over `rows` contiguous rows of `dim` (M2.3 prefill):
+    /// one launch replaces the per-token loop. Also serves the per-head
+    /// q/k-norms — a `[n, heads*head_dim]` block is `n*heads` contiguous
+    /// rows of `head_dim`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_norm_rows(
+        &self,
+        cuda: &Cuda,
+        x: CUdeviceptr,
+        w: CUdeviceptr,
+        out: CUdeviceptr,
+        dim: u32,
+        eps: f32,
+        rows: u32,
+    ) -> Result<(), GlError> {
+        let (mut x, mut w, mut out) = (x, w, out);
+        let (mut d, mut e) = (dim, eps);
+        let mut params = [
+            &mut x as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut e as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_rms_norm_rows, (rows, 1, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Broadcast bias add over a `[rows, dim]` activation block in one
+    /// launch: `y[i] += b[i % dim]` for `i < total` (M2.3 prefill).
+    pub fn add_bias_rows(
+        &self,
+        cuda: &Cuda,
+        y: CUdeviceptr,
+        b: CUdeviceptr,
+        dim: u32,
+        total: u32,
+    ) -> Result<(), GlError> {
+        let (mut y, mut b) = (y, b);
+        let (mut d, mut t) = (dim, total);
+        let mut params = [
+            &mut y as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+            &mut t as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_add_bias_rows, (ceil_div(total, BLOCK), 1, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Batched RoPE over `ntok` token rows in one launch (M2.3 prefill).
+    /// Row `t` rotates `x + t*heads*head_dim` at position `pos_seq[t]` —
+    /// pass `pos_seq` already offset to the chunk's base position.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_rows(
+        &self,
+        cuda: &Cuda,
+        x: CUdeviceptr,
+        cos: CUdeviceptr,
+        sin: CUdeviceptr,
+        n_heads: u32,
+        head_dim: u32,
+        neox: bool,
+        pos_seq: CUdeviceptr,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        let (mut x, mut cos, mut sin) = (x, cos, sin);
+        let (mut h, mut hd, mut nx, mut p) = (n_heads, head_dim, neox as u32, pos_seq);
+        let mut params = [
+            &mut x as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nx as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+        ];
+        let pairs = n_heads * (head_dim / 2);
+        cuda.launch(self.f_rope_rows, (ceil_div(pairs, BLOCK), ntok, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Batched KV write over `ntok` token rows in one launch (M2.3
+    /// prefill): row `t` (at `src + t*n_kv*head_dim`) lands at cache
+    /// position `pos_seq[t]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_write_rows(
+        &self,
+        cuda: &Cuda,
+        dst_base: CUdeviceptr,
+        src: CUdeviceptr,
+        pos_seq: CUdeviceptr,
+        head_dim: u32,
+        n_kv: u32,
+        head_stride: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        let (mut d, mut s, mut p) = (dst_base, src, pos_seq);
+        let (mut hd, mut nk, mut hs) = (head_dim, n_kv, head_stride);
+        let mut params = [
+            &mut d as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+        ];
+        let n = n_kv * head_dim;
+        cuda.launch(self.f_kv_write_rows, (ceil_div(n, BLOCK), ntok, 1), (BLOCK, 1, 1), 0, &mut params)
+    }
+
+    /// Batched causal decode-attention over `ntok` token rows in one launch
+    /// (M2.3 prefill): block (h, t) runs head h of row t with
+    /// `cached_len = pos_seq[t] + 1`, so each row attends to exactly its
+    /// own prefix (rows after it exist in the cache but are never read).
+    /// Requires the chunk's KV rows to be written first (kv_write_rows on
+    /// the same stream).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_decode_rows(
+        &self,
+        cuda: &Cuda,
+        q: CUdeviceptr,
+        k_base: CUdeviceptr,
+        v_base: CUdeviceptr,
+        out: CUdeviceptr,
+        n_heads: u32,
+        head_dim: u32,
+        pos_seq: CUdeviceptr,
+        heads_per_kv: u32,
+        head_stride: u32,
+        scale: f32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        let (mut q, mut k, mut v, mut o) = (q, k_base, v_base, out);
+        let (mut hd, mut ps, mut hpk, mut hs, mut sc) =
+            (head_dim, pos_seq, heads_per_kv, head_stride, scale);
+        let mut params = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut hpk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_attn_decode_rows, (n_heads, ntok, 1), (128, 1, 1), 0, &mut params)
     }
 
     /// Decode GEMV: `y = W @ x`, `W` row-major `[out_dim, in_dim]`.
@@ -685,6 +845,11 @@ mod tests {
             "gl_softmax_scale_f32",
             "gl_attn_decode_f32",
             "gl_kv_write",
+            "gl_rms_norm_rows_f32",
+            "gl_add_bias_rows_f32",
+            "gl_rope_rows_f32",
+            "gl_kv_write_rows",
+            "gl_attn_decode_rows_f32",
         ] {
             assert!(
                 PTX.contains(&format!(".visible .entry {entry}(")),
