@@ -399,6 +399,11 @@ impl GpuModel {
         let prof = std::env::var_os("GLCUDA_PROFILE_PREFILL").is_some();
         let (mut t_qkv, mut t_attn, mut t_ffn) =
             (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Fine-grained FFN sub-buckets (only meaningful with the profiler on):
+        // gate+up GEMMs, down GEMM, and the elementwise glue (quant/silu/
+        // norm/add) — to localize the 51-67% FFN cost the coarse split shows.
+        let (mut t_gu, mut t_dn, mut t_elt) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
         macro_rules! phase {
             ($bucket:expr, $body:block) => {{
                 if prof {
@@ -478,20 +483,33 @@ impl GpuModel {
                     )?;
                 });
 
-                phase!(t_ffn, {
+                // FFN, split into GEMM sub-buckets (t_gu / t_dn) vs the
+                // elementwise glue (t_elt). t_ffn is their sum, reported
+                // below — no outer phase! wrapper, so the inner syncs don't
+                // double-count. wo (o-proj) GEMM is grouped into t_dn.
+                phase!(t_elt, {
                     k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
+                });
+                phase!(t_dn, {
                     gemm_rows(cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj, n as u32)?;
+                });
+                phase!(t_elt, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
-
-                    // --- SwiGLU feed-forward block ---
                     k.rms_norm_rows(cuda, pf_x, layer.ffn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
                     k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
-                    // gate = fused rows [0, hidden); up = fused rows [hidden, 2*hidden).
+                });
+                phase!(t_gu, {
                     gemm_rows(cuda, k, &layer.w_gate_up, 0, hidden as u32, pf_xn, pf_qs, pf_scales, pf_gate, n as u32)?;
                     gemm_rows(cuda, k, &layer.w_gate_up, hidden as u32, hidden as u32, pf_xn, pf_qs, pf_scales, pf_up, n as u32)?;
+                });
+                phase!(t_elt, {
                     k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
                     k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
+                });
+                phase!(t_dn, {
                     gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
+                });
+                phase!(t_elt, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
                 });
             }
@@ -514,12 +532,18 @@ impl GpuModel {
             base += n;
         }
         if prof {
+            let _ = t_ffn; // superseded by the t_gu/t_dn/t_elt sub-buckets
+            let t_ffn = t_gu + t_dn + t_elt;
             let tot = (t_qkv + t_attn + t_ffn).as_secs_f64().max(1e-9);
+            let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+            let pc = |d: std::time::Duration| 100.0 * d.as_secs_f64() / tot;
             eprintln!(
-                "[prefill split] {p} tok | qkv {:.1} ms ({:.0}%) | attn {:.1} ms ({:.0}%) | ffn {:.1} ms ({:.0}%)",
-                t_qkv.as_secs_f64() * 1e3, 100.0 * t_qkv.as_secs_f64() / tot,
-                t_attn.as_secs_f64() * 1e3, 100.0 * t_attn.as_secs_f64() / tot,
-                t_ffn.as_secs_f64() * 1e3, 100.0 * t_ffn.as_secs_f64() / tot,
+                "[prefill split] {p} tok | qkv {:.0}ms ({:.0}%) | attn {:.0}ms ({:.0}%) | ffn {:.0}ms ({:.0}%)",
+                ms(t_qkv), pc(t_qkv), ms(t_attn), pc(t_attn), ms(t_ffn), pc(t_ffn),
+            );
+            eprintln!(
+                "[ffn detail]   gate+up GEMM {:.0}ms ({:.0}%) | down+o GEMM {:.0}ms ({:.0}%) | elementwise {:.0}ms ({:.0}%)",
+                ms(t_gu), pc(t_gu), ms(t_dn), pc(t_dn), ms(t_elt), pc(t_elt),
             );
         }
         Ok(())
