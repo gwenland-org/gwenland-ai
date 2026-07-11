@@ -466,23 +466,23 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
     }
 
     let bytes = (qs.len() + scales.len() + (ntok_pad * in_dim) * 5 + ntok * out_dim * 4 + 8192) as u64;
-    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
     let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
     cuda.htod(dwqs, &qs).unwrap();
     let dwsc = buf.alloc(scales.len() as u64).unwrap().dptr;
     cuda.htod(dwsc, &scales).unwrap();
-    let dx = upload(&cuda, &mut buf, &x);
+    let dx = upload(cuda, &mut buf, &x);
     // Quantize all padded rows in one pass, exactly as prefill does.
     let d_qs = buf.alloc((ntok_pad * in_dim) as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(ntok_pad * in_dim / 32).unwrap().dptr;
-    k.quantize_q8(&cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32).unwrap();
+    k.quantize_q8(cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32).unwrap();
     let dy = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
-    k.gemm_mma_q8(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
+    k.gemm_mma_q8(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
         .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; ntok * out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
-    buf.free(&cuda).unwrap();
+    buf.free(cuda).unwrap();
 
     assert_close(&got, &want, EPS_Q8_GEMV, &format!("gemm_mma_q8(ntok={ntok})"));
 }
