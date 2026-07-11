@@ -4,6 +4,23 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.3 Stage 2b, MMA GEMM shared-memory activation staging:
+
+- The prefill phase profiler answered the question Stage 2a raised: with a
+  596-token prompt, **ffn 67% / attn 24% / qkv 8%**. Root cause found by
+  byte math: in v2 every warp re-read the ENTIRE activation slab from L2 on
+  its own — the gate GEMM alone moved ~540 MB of L2 traffic for a 229 KB
+  matrix (2368 warps × 229 KB). FFN has three such GEMMs per layer; qkv's
+  are small. That, not quantize or weight bytes, was the 67%.
+- v3: all 8 warps of a block share the same tokens, so each k-block's
+  activation slice (64×32 B = 2 KB) + its 64 activation scales are staged
+  in shared memory once per block and consumed by all warps — A traffic
+  drops 8×. `bar.sync` brackets the staging, so out-of-range warps no
+  longer early-exit: they stage + synchronize and skip only their own
+  compute (warp-uniform predicate; exercised by the out=16 parity cases).
+- Q8_0 prefill measured trajectory: 78 → 91.5 (Stage 1) → 131.8/201
+  (Stage 2a) → this stage targets the FFN bucket directly.
+
 glcuda — M2.3 Stage 2a, MMA GEMM arithmetic intensity:
 
 - Stage 1 measured: Q8_0 prefill 78 → 91.5 tok/s — launch overhead is dead,
