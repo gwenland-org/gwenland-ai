@@ -414,7 +414,10 @@ pub(crate) struct Workspace {
 
 /// Prompt tokens processed per batched-prefill pass. Bounds the batched
 /// workspace VRAM; longer prompts are processed in consecutive chunks.
-pub(crate) const PREFILL_BATCH: usize = 32;
+/// 64 = the MMA GEMM's full m-tile span (M2.3 Stage 2a): one weight stream
+/// covers the whole chunk. Scratch cost is linear in this (~15 MiB at 64
+/// for 7B shapes).
+pub(crate) const PREFILL_BATCH: usize = 64;
 
 /// A model resident in VRAM: weights, KV cache and workspace, all carved
 /// from one backend buffer.

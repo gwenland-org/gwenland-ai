@@ -488,9 +488,15 @@ impl KernelSet {
     /// per 8x8 output tile, 8-token tiles (vs the fallback's 4), fused
     /// per-32-K dequant epilogue in registers.
     ///
-    /// Requires `out_dim % 8 == 0`, `in_dim % 32 == 0`, and `x_qs`/`x_scales`
-    /// allocated for `ntok` rounded up to a multiple of 8 (extra rows are
-    /// read, never written). Errors if the module is not loaded — gate on
+    /// M2.3 Stage 2a: the k-loop is outer and each weight fragment feeds up
+    /// to eight 8-token m-tiles from registers — weights stream once per 64
+    /// tokens instead of once per 8 (the llama.cpp head-to-head showed
+    /// weight re-streaming was the prefill ceiling).
+    ///
+    /// Requires `out_dim % 8 == 0`, `in_dim % 32 == 0`, `ntok <= 64` (the
+    /// runner chunks at `PREFILL_BATCH`), and `x_qs`/`x_scales` allocated
+    /// for `ntok` rounded up to a multiple of 8 (extra rows are read, never
+    /// written). Errors if the module is not loaded — gate on
     /// [`Self::has_mma`].
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mma_q8(
@@ -507,6 +513,7 @@ impl KernelSet {
     ) -> Result<(), GlError> {
         debug_assert_eq!(out_dim % 8, 0, "gemm_mma_q8 requires out_dim % 8 == 0");
         debug_assert_eq!(in_dim % 32, 0, "gemm_mma_q8 requires whole 32-K scale blocks");
+        debug_assert!(ntok <= 64, "gemm_mma_q8 covers at most 8 m-tiles (64 token rows)");
         let (_, f) = self
             .mma
             .as_ref()

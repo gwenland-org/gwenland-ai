@@ -420,10 +420,12 @@ fn gemv_q4_0_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_MATMUL, "gemv_q4_0");
 }
 
-/// M2.1 Task B: the tensor-core batched GEMM against the same dequantized
-/// reference as the dp4a GEMM. Runs only on sm_75+ (the module is not even
-/// loaded below that). Ragged token count (5) exercises the padded-row read
-/// / guarded-write contract; out=16 is two 8-row warp tiles.
+/// M2.1 Task B / M2.3 Stage 2a: the tensor-core batched GEMM against the
+/// same dequantized reference as the dp4a GEMM. Runs only on sm_75+ (the
+/// module is not even loaded below that). Ragged token counts exercise the
+/// padded-row read / guarded-write contract; 5 stays inside m-tile 0, 20
+/// spans three m-tiles of the Stage 2a k-outer loop (weight fragment reused
+/// from registers across tiles), 64 fills all eight.
 #[test]
 fn gemm_mma_q8_matches_dequantized_reference() {
     let Some((cuda, k)) = gpu() else { return };
@@ -431,7 +433,12 @@ fn gemm_mma_q8_matches_dequantized_reference() {
         eprintln!("SKIP: device below sm_75 — no tensor-core module");
         return;
     }
-    let (out_dim, in_dim, ntok) = (16usize, 64usize, 5usize);
+    for (out_dim, in_dim, ntok) in [(16usize, 64usize, 5usize), (16, 64, 20), (16, 64, 64)] {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok);
+    }
+}
+
+fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize) {
     let ntok_pad = ntok.div_ceil(8) * 8;
 
     let w_f32 = randv(out_dim * in_dim, 50, 0.1);
@@ -477,7 +484,7 @@ fn gemm_mma_q8_matches_dequantized_reference() {
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(&cuda).unwrap();
 
-    assert_close(&got, &want, EPS_Q8_GEMV, "gemm_mma_q8");
+    assert_close(&got, &want, EPS_Q8_GEMV, &format!("gemm_mma_q8(ntok={ntok})"));
 }
 
 #[test]

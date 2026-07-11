@@ -4,6 +4,23 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.3 Stage 2a, MMA GEMM arithmetic intensity:
+
+- Stage 1 measured: Q8_0 prefill 78 → 91.5 tok/s — launch overhead is dead,
+  so the remaining ceiling is weight re-streaming: the MMA GEMM read the
+  full weight once per 8-token tile (llama.cpp: ~once per 512).
+- `gl_gemm_mma_q8` v2: the k-loop is outer and each weight fragment, once
+  in registers, feeds up to EIGHT 8-token m-tiles (64 rows) — weight DRAM
+  traffic drops 8× per chunk. Skipped m-tiles branch warp-uniformly, so
+  short chunks read nothing beyond round8(ntok) rows. `PREFILL_BATCH`
+  32 → 64 so a chunk fills the m-tile span (~15 MiB scratch at 7B shapes).
+- Bench notebook: glcuda prefill now measured on a ~500-token prompt like
+  llama-bench's pp512 (22 tokens was dominated by fixed costs) — only
+  possible now that the Stage 1a cursor fix lifted the latent 146-token
+  prompt cap.
+- Decode head-to-head after Stage 1: 0.96× (Q8_0), **1.17×** (Q4_K_M),
+  **1.11×** (Q4_0) — glcuda ahead of llama.cpp on both quant formats.
+
 glcuda — M2.3 Stage 1, prefill de-serialization (post head-to-head):
 
 - First llama.cpp head-to-head (CUDA build, same T4/models): **decode at
