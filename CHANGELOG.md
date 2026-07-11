@@ -4,22 +4,30 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+The M2.1–M2.3 arc (native Q4_K/Q4_0/Q6_K kernels, INT8 Tensor Cores, prefill
+de-serialization, and the first llama.cpp head-to-head) is written up in
+[`changelog/Gwen-Changes-2026-07-11_M2.3.md`](changelog/Gwen-Changes-2026-07-11_M2.3.md);
+the architecture + benchmark record is
+[`docs/ArchGLCuda/ArchGLML_M2.1-M2.3.md`](docs/ArchGLCuda/ArchGLML_M2.1-M2.3.md).
+
 glcuda — M2.3 Stage 2b, MMA GEMM shared-memory activation staging:
 
-- The prefill phase profiler answered the question Stage 2a raised: with a
-  596-token prompt, **ffn 67% / attn 24% / qkv 8%**. Root cause found by
-  byte math: in v2 every warp re-read the ENTIRE activation slab from L2 on
-  its own — the gate GEMM alone moved ~540 MB of L2 traffic for a 229 KB
-  matrix (2368 warps × 229 KB). FFN has three such GEMMs per layer; qkv's
-  are small. That, not quantize or weight bytes, was the 67%.
+- The prefill phase profiler showed **ffn 67% / attn 24% / qkv 8%** on a
+  596-token prompt. Hypothesis (from byte math): in v2 every warp re-read
+  the whole activation slab from L2 on its own — the gate GEMM alone ~540 MB
+  of L2 traffic for a 229 KB matrix.
 - v3: all 8 warps of a block share the same tokens, so each k-block's
-  activation slice (64×32 B = 2 KB) + its 64 activation scales are staged
-  in shared memory once per block and consumed by all warps — A traffic
-  drops 8×. `bar.sync` brackets the staging, so out-of-range warps no
-  longer early-exit: they stage + synchronize and skip only their own
-  compute (warp-uniform predicate; exercised by the out=16 parity cases).
-- Q8_0 prefill measured trajectory: 78 → 91.5 (Stage 1) → 131.8/201
-  (Stage 2a) → this stage targets the FFN bucket directly.
+  activation slice (64×32 B = 2 KB) + its 64 scales are staged in shared
+  memory once per block and consumed by all warps. `bar.sync` brackets the
+  staging, so out-of-range warps stage + synchronize rather than early-exit
+  (exercised by the out=16 parity cases).
+- **Result: FFN unchanged (2218 vs 2210 ms) — the theory was wrong.**
+  Follow-up byte math: the FFN weight stream is only ~60 GB ≈ 300 ms at
+  200 GB/s, yet FFN measures 2218 ms — a 5× residual that is neither
+  A-traffic nor weight bandwidth. A per-op FFN profiler
+  (`GLCUDA_PROFILE_PREFILL=1`, second line) now splits gate+up / down+o /
+  elementwise to localize it before any further kernel work. Prefill
+  trajectory across M2.3: 78 → 91.5 (Stage 1) → ~132 (Stage 2a) → ~200.
 
 glcuda — M2.3 Stage 2a, MMA GEMM arithmetic intensity:
 
