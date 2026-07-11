@@ -376,8 +376,7 @@ impl GpuModel {
         let (pf_attn, pf_proj) = (ws.pf_attn.dptr, ws.pf_proj.dptr);
         let (pf_gate, pf_up) = (ws.pf_gate.dptr, ws.pf_up.dptr);
         let (pf_qs, pf_scales) = (ws.pf_qs.dptr, ws.pf_scales.dptr);
-        let tp = ws.token_params.dptr;
-        let (pos_ptr, clen_ptr) = (tp, tp + 4);
+        let pos_seq = ws.pos_seq.dptr;
         let (rope_cos, rope_sin) = (ws.rope_cos.dptr, ws.rope_sin.dptr);
         let single_xn = ws.xn.dptr;
         let logits = ws.logits.dptr;
@@ -417,12 +416,13 @@ impl GpuModel {
                 gemm_rows(cuda, k, &layer.wv, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_v, n as u32)?;
 
                 for i in 0..n {
-                    let pos = (base + i) as u32;
-                    let params = [pos, pos + 1];
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(params.as_ptr().cast::<u8>(), 8)
-                    };
-                    cuda.htod(tp, bytes)?;
+                    // Positions are consecutive integers, so pos and
+                    // cached_len (= pos+1) are adjacent elements of the
+                    // pos_seq identity array — no HtoD, no pipeline drain
+                    // (the old per-token token_params copy here was ~896
+                    // synchronous copies per chunk and the top prefill cost).
+                    let pos_ptr = pos_seq + ((base + i) * 4) as u64;
+                    let clen_ptr = pos_ptr + 4;
                     let (qi, ki, vi) = (fq(pf_q, i * q_dim), fq(pf_k, i * kv_dim), fq(pf_v, i * kv_dim));
 
                     if let Some(b) = &layer.bq {
@@ -454,7 +454,6 @@ impl GpuModel {
                         cuda, qi, self.kv.read_k(l, 0), self.kv.read_v(l, 0), fq(pf_attn, i * q_dim),
                         n_heads as u32, head_dim as u32, clen_ptr, heads_per_kv, head_stride, scale,
                     )?;
-                    self.kv.advance();
                 }
 
                 k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
@@ -473,6 +472,15 @@ impl GpuModel {
                 k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
                 gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
                 k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+            }
+
+            // Commit the chunk: ONE advance per token (the cursor contract).
+            // The old code advanced inside the layer loop — n * n_layers per
+            // chunk — which overcounted current_pos 28x and would falsely
+            // report "KV cache full" on any prompt longer than
+            // max_context / n_layers (146 tokens on the 7B).
+            for _ in 0..n {
+                self.kv.advance();
             }
 
             // Logits only for the final prompt token (last row of the last chunk).

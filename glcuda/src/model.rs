@@ -378,6 +378,14 @@ pub(crate) struct Workspace {
     /// before each graph replay so the captured graph stays valid across
     /// tokens without re-capture (M2.2).
     pub token_params: DevSlice,
+    /// The identity sequence `0..=kv_capacity` as device u32s, uploaded once
+    /// (M2.3 prefill). Token positions are just consecutive integers, so a
+    /// prefill launch for position `p` passes `pos_seq + p*4` as its pos
+    /// pointer — and `pos_seq + (p+1)*4` as its cached-len pointer, since
+    /// `cached_len = pos + 1 = pos_seq[p+1]`. This replaces the per-token
+    /// `token_params` HtoD that prefill used to issue per layer per token
+    /// (~896 synchronous, pipeline-draining copies per 32-token chunk).
+    pub pos_seq: DevSlice,
     /// Host copy of the logits, filled once per sampled token.
     pub logits_host: Vec<f32>,
     /// Host staging for the embedding row uploaded per token.
@@ -464,6 +472,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += f32s(c.vocab_size); // logits
     total += f32s(kv_capacity * (c.head_dim / 2)) * 2; // rope tables
     total += align_up(2 * 4); // token_params [pos, cached_len]
+    total += align_up(((kv_capacity + 1) * 4) as u64); // pos_seq 0..=capacity
     total += align_up(c.hidden_dim as u64); // q8_qs
     total += f32s(c.hidden_dim / 32); // q8_scales
     // Batched prefill scratch (PREFILL_BATCH rows each).
@@ -617,6 +626,16 @@ impl GpuModel {
             rope_cos: up_f32(cuda, &mut buf, &cos_all)?,
             rope_sin: up_f32(cuda, &mut buf, &sin_all)?,
             token_params: buf.alloc(2 * 4)?, // [pos, cached_len] as u32
+            pos_seq: {
+                let vals: Vec<u32> = (0..=kv_capacity as u32).collect();
+                let s = buf.alloc(((kv_capacity + 1) * 4) as u64)?;
+                // SAFETY: u32s viewed as their little-endian bytes for HtoD.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(vals.as_ptr().cast::<u8>(), vals.len() * 4)
+                };
+                cuda.htod(s.dptr, bytes)?;
+                s
+            },
             logits_host: vec![0.0; c.vocab_size],
             embed_host: vec![0.0; c.dim],
             q8_qs: buf.alloc(c.hidden_dim as u64)?,
