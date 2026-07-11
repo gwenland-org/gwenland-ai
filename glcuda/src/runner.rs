@@ -188,8 +188,8 @@ fn gemm_rows(
         }
         // Q6_K SoA prefill: per-token GEMV fallback, same shape as Q4_K.
         GpuWeight::Q6KSoa { ql, qh, scales, d } => {
-            let wql = ql.dptr + (row0 * (inb / 2)) as u64; // nibbles
-            let wqh = qh.dptr + (row0 * (inb / 4)) as u64; // 2-bit highs
+            let wql = ql.dptr + (row0 * (inb / 2)) as u64; // low nibbles
+            let wqh = qh.dptr + (row0 * (inb / 2)) as u64; // 2-bit highs (widened)
             let wsc = scales.dptr + (row0 * (inb / 16)) as u64; // i8/sub-block
             let wd = d.dptr + (row0 * (inb / 256) * 2) as u64; // f16/super-block
             for t in 0..n {

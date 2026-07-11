@@ -216,14 +216,23 @@ pub const Q6_K_BLOCK_BYTES: usize = 210;
 pub type Q6KSoaStreams = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>);
 
 /// Repack raw AoS Q6_K super-blocks into four contiguous SoA streams for
-/// `gl_gemv_q6_k_soa` (M2.2 Task C-1), 6.5625 bpw — exactly the native
-/// rate, nothing is inflated or premultiplied:
+/// `gl_gemv_q6_k_soa` (M2.2 Task C-1). Both quant streams use the SAME
+/// u32-per-8-values layout (`byte j = field(v[8g+j]) | field(v[8g+4+j])
+/// << 4`), so a warp reads each as one coalesced 128-byte transaction and
+/// the kernel reconstructs `q6 = ql | (qh_field << 4)` with a single
+/// and/shl/or per int8x4 half — replacing the first version's 32-op
+/// per-byte 2-bit spread, which held it to 155-183 GB/s vs the Q4_K
+/// kernel's 242:
 ///
 /// * `ql`: low 4 bits of each value, LINEARIZED out of ggml's two-half /
-///   four-quarter interleave and packed in the shared kernel order
-///   (`byte j = v[8g+j] | v[8g+4+j] << 4`). 128 B per super-block.
-/// * `qh`: upper 2 bits, byte k = values 4k..4k+4 at bit positions 0/2/4/6
-///   — one u16 load gives a lane its 8 values' high bits. 64 B.
+///   four-quarter interleave, packed lo/hi nibble. 128 B.
+/// * `qh`: upper 2-bit field (0..3) in the identical nibble layout. This
+///   WIDENS qh from ggml's native 64 B to 128 B — the rate goes 6.5625 ->
+///   7.0625 bpw (+0.5). The trade is deliberate: the M2.2 kernel was
+///   compute-starved (155-183 GB/s, far under the 257 ceiling), so it has
+///   bandwidth headroom to spend, and spending half a bit to delete ~28
+///   ALU ops per iteration nets decode throughput. Still well under Q8_0's
+///   8.5 and the requant-to-Q8_0 path this replaces.
 /// * `scales`: verbatim i8 per 16-value sub-block. ggml's scale array is
 ///   already in linear sub-block order (index h*8 + qtr*2 + is == i/16),
 ///   so this is a straight copy. 16 B.
@@ -241,7 +250,7 @@ pub fn q6_k_to_soa(data: &[u8]) -> Result<Q6KSoaStreams, GlError> {
     }
     let n_blocks = data.len() / Q6_K_BLOCK_BYTES;
     let mut ql_out = Vec::with_capacity(n_blocks * 128);
-    let mut qh_out = Vec::with_capacity(n_blocks * 64);
+    let mut qh_out = Vec::with_capacity(n_blocks * 128); // widened nibble slots
     let mut sc_out = Vec::with_capacity(n_blocks * 16);
     let mut d_out = Vec::with_capacity(n_blocks * 2);
 
@@ -250,32 +259,45 @@ pub fn q6_k_to_soa(data: &[u8]) -> Result<Q6KSoaStreams, GlError> {
         d_out.extend_from_slice(&block[208..210]); // f16 d, verbatim
 
         // Linearize the UNSIGNED 6-bit values (0..63) out of the ggml
-        // half/quarter interleave (mirrors dequant_q6_k exactly).
-        let mut v = [0u8; 256];
+        // half/quarter interleave (mirrors dequant_q6_k exactly). Split each
+        // into its low nibble (lo[], 0..15) and its high 2-bit field, packed
+        // into qh's WIDENED nibble layout (see below).
+        let mut lo = [0u8; 256];
+        let mut hi = [0u8; 256];
         for half in 0..2 {
             let ql = &block[half * 64..half * 64 + 64];
             let qh = &block[128 + half * 32..128 + half * 32 + 32];
             for l in 0..32 {
                 let o = half * 128 + l;
-                v[o] = (ql[l] & 0x0F) | ((qh[l] & 0x03) << 4);
-                v[o + 32] = (ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4);
-                v[o + 64] = (ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4);
-                v[o + 96] = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4);
+                lo[o] = ql[l] & 0x0F;
+                hi[o] = qh[l] & 0x03;
+                lo[o + 32] = ql[l + 32] & 0x0F;
+                hi[o + 32] = (qh[l] >> 2) & 0x03;
+                lo[o + 64] = ql[l] >> 4;
+                hi[o + 64] = (qh[l] >> 4) & 0x03;
+                lo[o + 96] = ql[l + 32] >> 4;
+                hi[o + 96] = (qh[l] >> 6) & 0x03;
             }
         }
-        // Low nibbles in the kernel order; high 2 bits four-per-byte.
+        // Both streams in the IDENTICAL u32-per-8-values order (value 8g+j in
+        // the low nibble of byte j, value 8g+4+j in the high nibble): the
+        // kernel loads each as one coalesced u32 and rebuilds q6 with a
+        // single `(qh_field << 4) | ql` per int8x4 half. qh's 2-bit fields
+        // sit in nibble slots (0..3) — this WIDENS qh from ggml's 64 B to
+        // 128 B (6.5625 -> 7.0625 bpw, +0.5), which is the tuning trade:
+        // the M2.2 kernel was compute-starved at 155-183 GB/s (well under
+        // the 257 ceiling), so spending half a bit to delete the 32-op
+        // per-byte 2-bit spread nets decode throughput. Still below Q8_0's
+        // 8.5 and Q4_K_M's requant-to-Q8_0 path.
         for g in 0..32 {
             for j in 0..4 {
-                ql_out.push((v[g * 8 + j] & 0x0F) | ((v[g * 8 + 4 + j] & 0x0F) << 4));
+                ql_out.push((lo[g * 8 + j] & 0x0F) | ((lo[g * 8 + 4 + j] & 0x0F) << 4));
             }
         }
-        for k in 0..64 {
-            qh_out.push(
-                (v[k * 4] >> 4)
-                    | ((v[k * 4 + 1] >> 4) << 2)
-                    | ((v[k * 4 + 2] >> 4) << 4)
-                    | ((v[k * 4 + 3] >> 4) << 6),
-            );
+        for g in 0..32 {
+            for j in 0..4 {
+                qh_out.push((hi[g * 8 + j] & 0x0F) | ((hi[g * 8 + 4 + j] & 0x0F) << 4));
+            }
         }
     }
     Ok((ql_out, qh_out, sc_out, d_out))
@@ -462,18 +484,20 @@ mod tests {
         let want = glproc::kernels::dequant::q6_k::scalar::run(&data).unwrap();
         let (ql, qh, sc, d) = q6_k_to_soa(&data).unwrap();
         assert_eq!(ql.len(), 128 * 3);
-        assert_eq!(qh.len(), 64 * 3);
+        assert_eq!(qh.len(), 128 * 3); // widened nibble slots
         assert_eq!(sc.len(), 16 * 3);
         assert_eq!(d.len(), 2 * 3);
         for bi in 0..3 {
             let dv = f16_to_f32(u16::from_le_bytes([d[bi * 2], d[bi * 2 + 1]]));
             for i in 0..256 {
-                // Kernel-order extraction: low4 from ql (group i/8, lo/hi
-                // nibble), high2 from qh byte i/4 at bit 2*(i%4).
+                // Kernel-order extraction: ql and qh share the same
+                // u32-per-8-values layout (group i/8, byte (i%8)%4, low
+                // nibble when i%8 < 4). low4 from ql, high2 from qh.
                 let (g, r) = (i / 8, i % 8);
                 let lbyte = ql[bi * 128 + g * 4 + (r % 4)];
+                let hbyte = qh[bi * 128 + g * 4 + (r % 4)];
                 let low4 = if r < 4 { lbyte & 0x0F } else { lbyte >> 4 };
-                let high2 = (qh[bi * 64 + i / 4] >> (2 * (i % 4))) & 0x03;
+                let high2 = if r < 4 { hbyte & 0x0F } else { hbyte >> 4 };
                 let q6 = ((high2 << 4) | low4) as i32 - 32;
                 let s = sc[bi * 16 + i / 16] as i8;
                 let got = dv * s as f32 * q6 as f32;

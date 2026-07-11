@@ -92,9 +92,11 @@ pub enum HostWeight {
     Q6K(Vec<u8>),
     /// Structure-of-Arrays Q6_K for matmul weights (M2.2 Task C-1): four
     /// contiguous streams — packed low nibbles `ql` `[out, in/2]`, 2-bit
-    /// highs `qh` `[out, in/4]`, verbatim i8 sub-block `scales`
-    /// `[out, in/16]`, verbatim f16 super-block `d` `[out, in/256]`.
-    /// Native 6.5625 bpw; the layout `gl_gemv_q6_k_soa` reads.
+    /// highs `qh` widened into the identical nibble layout `[out, in/2]`
+    /// (the bytes-for-ALU trade that lifted the kernel off its 155-183
+    /// GB/s compute stall — see `repack::q6_k_to_soa`), verbatim i8
+    /// sub-block `scales` `[out, in/16]`, verbatim f16 super-block `d`
+    /// `[out, in/256]`. 7.0625 bpw; the layout `gl_gemv_q6_k_soa` reads.
     Q6KSoa { ql: Vec<u8>, qh: Vec<u8>, scales: Vec<u8>, d: Vec<u8> },
     /// Structure-of-Arrays Q4_K for matmul weights (M2.1 Task A): contiguous
     /// packed nibbles `qs` `[out, in/2]` + f16 PRE-MULTIPLIED sub-block

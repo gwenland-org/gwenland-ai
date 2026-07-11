@@ -4,6 +4,22 @@ The notable changes, newest first. The blow-by-blow per-session notes live in [`
 
 ## Unreleased
 
+glcuda — M2.2 Q6_K kernel tuning (post-T4):
+
+- First T4 run showed `gl_gemv_q6_k_soa` correct (parity green) but
+  compute-stalled at 155–183 GB/s vs the Q4_K kernel's 242 — the in-kernel
+  32-op per-byte 2-bit spread starved the memory pipeline, so Q4_K_M decode
+  stayed flat (~36.5) instead of gaining.
+- Fix: qh is repacked into the identical u32-per-8-values nibble layout as
+  ql (each 2-bit field in a nibble slot), so the kernel rebuilds q6 with a
+  single and/shl/or per int8×4 half and both quant loads are coalesced
+  u32s. This widens qh 64→128 B/super-block (6.5625 → 7.0625 bpw, +0.5) —
+  a deliberate bytes-for-ALU trade: the kernel had bandwidth headroom and
+  no compute headroom, and 7.06 still beats the 8.5 requant path it
+  replaced. Notebook 14c now builds `llama-quantize` and converts the Q8_0
+  file to *pure* Q4_0 (`--pure --allow-requantize`) since public "Q4_0"
+  GGUFs are mixed quants (Q4_1 ffn_down = the Unknown(3) load error).
+
 glcuda — M2.2 Task C-1, native Q6_K SoA decode path:
 
 - New PTX kernel `gl_gemv_q6_k_soa`: four SoA streams (packed low nibbles,

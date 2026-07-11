@@ -2238,9 +2238,11 @@ Q40S_DONE:
 //   p_wql : low 4 bits [out_dim * in_dim / 2] (u8), repack-linearized out
 //           of ggml's half/quarter interleave, packed in the shared kernel
 //           order (u32 = 8 consecutive values as lo/hi nibble halves).
-//   p_wqh : upper 2 bits [out_dim * in_dim / 4] (u8): byte k = values
-//           4k..4k+4 at bit positions 0/2/4/6 - one u16 load covers a
-//           lane's 8 values.
+//   p_wqh : upper 2-bit fields [out_dim * in_dim / 2] (u8) in the IDENTICAL
+//           nibble layout as ql (WIDENED from ggml's 64 B/super-block to
+//           128 B - see repack::q6_k_to_soa for the bytes-vs-ALU trade):
+//           one coalesced u32 load per 8 values, reconstructed with a
+//           nibble mask + shl instead of a 32-op per-byte 2-bit spread.
 //   p_wsc : VERBATIM i8 sub-block scales [out_dim * in_dim/16].
 //   p_wd  : VERBATIM f16 super-block scales [out_dim * in_dim/256].
 //   p_xqs / p_xsc : int8 activation + f32 block scales (gl_quantize_q8).
@@ -2250,13 +2252,13 @@ Q40S_DONE:
 //   sum w_i*x_i = d*sc*xs * (dot(q6, xq) - 32*sum(xq))
 // A lane's 8 values sit inside ONE sub-block (lane l owns values 8l..8l+8,
 // sub-block l/2) and one activation block (xs at l/4), so the identity
-// holds per lane with scalar sc/xs. q6 = ql | qh<<4 is assembled in
-// registers into int8x4 lanes (0..63, safely positive s8) with masked
-// shifts; the -32 centering folds into the integer domain like Q4_0's -8.
+// holds per lane with scalar sc/xs. q6 = ql | (qh_field << 4) is assembled
+// in registers into int8x4 lanes (0..63, safely positive s8); the -32
+// centering folds into the integer domain like Q4_0's -8.
 //
 // One warp per output row, one iteration per 256-value super-block:
-// 128 B ql + 64 B qh + 16 B sc + 2 B d = 210 B of weight stream per
-// iteration (native rate). in_dim % 256 == 0 is a Q6_K format invariant.
+// 128 B ql + 128 B qh + 16 B sc + 2 B d = 274 B of weight stream per
+// iteration (7.0625 bpw). in_dim % 256 == 0 is a Q6_K format invariant.
 // Launch: grid ceil(out_dim / (ntid/32)) x 256 threads.
 // ---------------------------------------------------------------------------
 .visible .entry gl_gemv_q6_k_soa(
@@ -2305,15 +2307,13 @@ Q40S_DONE:
     cvta.to.global.u64 %rd13, %rd6;
 
     shr.u32 %r10, %r2, 8;                // n_sb = in / 256 super-blocks
-    shr.u32 %r11, %r2, 1;                // ql row bytes = in / 2
-    shr.u32 %r12, %r2, 2;                // qh row bytes = in / 4
+    shr.u32 %r11, %r2, 1;                // ql/qh row bytes = in / 2 (qh widened)
     shr.u32 %r13, %r2, 4;                // sc row bytes = in / 16
 
     // Row bases.
     mul.wide.u32 %rd14, %r9, %r11;
     add.s64 %rd15, %rd8, %rd14;          // ql row base
-    mul.wide.u32 %rd16, %r9, %r12;
-    add.s64 %rd17, %rd9, %rd16;          // qh row base
+    add.s64 %rd17, %rd9, %rd14;          // qh row base (same stride as ql)
     mul.wide.u32 %rd18, %r9, %r13;
     add.s64 %rd19, %rd10, %rd18;         // sc row base
     mul.wide.u32 %rd20, %r9, %r10;
@@ -2324,9 +2324,7 @@ Q40S_DONE:
     shl.b32 %r14, %r5, 2;                // lane * 4
     cvt.u64.u32 %rd22, %r14;
     add.s64 %rd23, %rd15, %rd22;         // ql lane ptr (u32)
-    shl.b32 %r15, %r5, 1;                // lane * 2
-    cvt.u64.u32 %rd24, %r15;
-    add.s64 %rd25, %rd17, %rd24;         // qh lane ptr (u16)
+    add.s64 %rd25, %rd17, %rd22;         // qh lane ptr (u32, same layout as ql)
     shr.u32 %r16, %r5, 1;                // sub-block = lane / 2 (0..15)
     cvt.u64.u32 %rd26, %r16;
     add.s64 %rd27, %rd19, %rd26;         // sc lane ptr (s8)
@@ -2346,40 +2344,24 @@ Q6K_LOOP:
     setp.ge.u32 %p2, %r20, %r10;
     @%p2 bra Q6K_REDUCE;
 
-    ld.global.u32 %r21, [%rd23];         // 8 low nibbles (packed)
+    // ql and qh share the same u32-per-8-values packing (repack tuning):
+    // a single coalesced u32 each, reconstructed with one and/shl/or per
+    // int8x4 half instead of the old 32-op per-byte 2-bit spread. qh holds
+    // the raw 2-bit fields in nibble slots (0..3), so (qh_field << 4) | ql
+    // is the assembled 6-bit value (0..63).
+    ld.global.u32 %r21, [%rd23];         // ql: 8 low nibbles
     and.b32 %r22, %r21, 0x0F0F0F0F;      // low4 of values 8g..8g+4
     shr.u32 %r23, %r21, 4;
     and.b32 %r23, %r23, 0x0F0F0F0F;      // low4 of values 8g+4..8g+8
-    ld.global.u16 %r24, [%rd25];         // 8 x 2 high bits (2 bytes)
+    ld.global.u32 %r24, [%rd25];         // qh: 8 high-2-bit fields (nibbles)
+    and.b32 %r25, %r24, 0x0F0F0F0F;      // 2-bit fields of 8g..8g+4
+    shl.b32 %r25, %r25, 4;               // -> bit 4 of each int8 lane
+    shr.u32 %r26, %r24, 4;
+    and.b32 %r26, %r26, 0x0F0F0F0F;
+    shl.b32 %r26, %r26, 4;               // 2-bit fields of 8g+4..8g+8
 
-    // Spread byte0's four 2-bit fields to bit 4 of each int8 lane.
-    and.b32 %r25, %r24, 0x03;
-    shl.b32 %r26, %r25, 4;
-    and.b32 %r25, %r24, 0x0C;
-    shl.b32 %r25, %r25, 10;
-    or.b32 %r26, %r26, %r25;
-    and.b32 %r25, %r24, 0x30;
-    shl.b32 %r25, %r25, 16;
-    or.b32 %r26, %r26, %r25;
-    and.b32 %r25, %r24, 0xC0;
-    shl.b32 %r25, %r25, 22;
-    or.b32 %r26, %r26, %r25;             // H0
-    // Same for byte1.
-    shr.u32 %r27, %r24, 8;
-    and.b32 %r25, %r27, 0x03;
-    shl.b32 %r28, %r25, 4;
-    and.b32 %r25, %r27, 0x0C;
-    shl.b32 %r25, %r25, 10;
-    or.b32 %r28, %r28, %r25;
-    and.b32 %r25, %r27, 0x30;
-    shl.b32 %r25, %r25, 16;
-    or.b32 %r28, %r28, %r25;
-    and.b32 %r25, %r27, 0xC0;
-    shl.b32 %r25, %r25, 22;
-    or.b32 %r28, %r28, %r25;             // H1
-
-    or.b32 %r29, %r22, %r26;             // q6 values 8g..8g+4 (0..63)
-    or.b32 %r30, %r23, %r28;             // q6 values 8g+4..8g+8
+    or.b32 %r29, %r22, %r25;             // q6 values 8g..8g+4 (0..63)
+    or.b32 %r30, %r23, %r26;             // q6 values 8g+4..8g+8
 
     ld.global.u32 %r31, [%rd29];         // xq bytes 0..3
     ld.global.u32 %r32, [%rd29+4];       // xq bytes 4..7
@@ -2401,7 +2383,7 @@ Q6K_LOOP:
     fma.rn.f32 %f1, %f5, %f7, %f1;
 
     add.s64 %rd23, %rd23, 128;           // ql: 128 B / super-block
-    add.s64 %rd25, %rd25, 64;            // qh: 64 B
+    add.s64 %rd25, %rd25, 128;           // qh: 128 B (widened nibble slots)
     add.s64 %rd27, %rd27, 16;            // sc: 16 B
     add.s64 %rd21, %rd21, 2;             // d: 2 B
     add.s64 %rd29, %rd29, 256;           // xq: 256 B

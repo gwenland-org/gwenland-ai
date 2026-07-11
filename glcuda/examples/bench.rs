@@ -408,10 +408,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
-    // 2i. Q6_K SoA GEMV (gl_gemv_q6_k_soa, M2.2 Task C-1) — the native
-    //     6.5625 bpw kernel replacing the Q6_K->Q8_0 requant stream. Same
-    //     method: CPU-validated on synthetic SoA streams, GB/s of real
-    //     bytes (ql + qh + i8 scales + f16 d) vs the achievable ceiling.
+    // 2i. Q6_K SoA GEMV (gl_gemv_q6_k_soa, M2.2 Task C-1) — 7.0625 bpw
+    //     (qh widened for ALU, see repack) replacing the Q6_K->Q8_0 requant
+    //     stream at 8.5. Same method: CPU-validated on synthetic SoA
+    //     streams, GB/s of real bytes vs the achievable ceiling.
     // ============================================================
     {
         let d_bits: [u16; 4] = [0x3C00, 0x3800, 0x3E00, 0x3400]; // 1.0 0.5 1.5 0.25
@@ -425,7 +425,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let nsub = in_dim / 16; // i8 scales per row
 
             let wql: Vec<u8> = (0..out_dim * in_dim / 2).map(qb).collect();
-            let wqh: Vec<u8> = (0..out_dim * in_dim / 4).map(|i| qb(i * 3 + 1)).collect();
+            // qh: widened nibble layout, each nibble a 2-bit field (0..3).
+            let wqh: Vec<u8> = (0..out_dim * in_dim / 2).map(|i| qb(i * 3 + 1) & 0x33).collect();
             let wsc: Vec<i8> = (0..out_dim * nsub).map(|i| ((i * 5) % 23) as i8 - 11).collect();
             let wd_bits: Vec<u16> = (0..out_dim * nsb).map(|i| d_bits[i % 4]).collect();
             let xqs: Vec<i8> = (0..in_dim).map(|i| (qb(i * 7 + 3) as i32 - 125) as i8).collect();
@@ -469,8 +470,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let v = s * 16 + i;
                         let (g, rr) = (v / 8, v % 8);
                         let lbyte = wql[r * in_dim / 2 + g * 4 + (rr % 4)];
+                        let hbyte = wqh[r * in_dim / 2 + g * 4 + (rr % 4)];
                         let low4 = if rr < 4 { lbyte & 0x0F } else { lbyte >> 4 };
-                        let high2 = (wqh[r * in_dim / 4 + v / 4] >> (2 * (v % 4))) & 0x03;
+                        let high2 = if rr < 4 { hbyte & 0x0F } else { hbyte >> 4 };
                         let q6 = ((high2 << 4) | low4) as i32;
                         let xv = xqs[v] as i32;
                         dot += q6 * xv;
