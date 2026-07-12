@@ -764,43 +764,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mark = buf.mark();
             let nb = in_dim / 32;
             let scale_bits = 0x3C00u16; // 1.0 in f16, so scales are exactly 1.
-            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
             let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
             let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
-            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
             let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
             let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
             let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
-            cuda.htod(d_wqs, as_u8(&wqs))?;
-            cuda.htod(d_wsc, &vec![scale_bits; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
             cuda.htod(d_xqs, as_u8(&xqs))?;
             cuda.htod_f32(d_xsc, &vec![1.0f32; ntok * nb])?;
 
-            // This launch is the suspect; the sync makes a fault visible here.
-            let launched = k.gemm_mma_q8_r256(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32);
-            let synced = cuda.synchronize();
-            match (launched, synced) {
-                (Ok(()), Ok(())) => {
-                    let mut y_host = vec![0f32; ntok * out_dim];
-                    cuda.dtoh_f32(&mut y_host, d_y)?;
-                    // Reference: scales all 1.0, so y[t][r] = sum_k wqs*xqs.
-                    let mut max_rel = 0f32;
-                    for t in 0..ntok {
-                        for r in 0..out_dim {
-                            let mut acc = 0i64;
-                            for kk in 0..in_dim {
-                                acc += wqs[r * in_dim + kk] as i64 * xqs[t * in_dim + kk] as i64;
+            // Launch at row0=0 AND row0=out_dim (the up-projection split case
+            // the engine hits at gemm_rows:565 with row0=hidden — a code path
+            // [gemm-phaseb] never exercised, and the leading crash suspect).
+            // For row0>0 we alloc DOUBLE the weight rows and point the kernel
+            // at the upper half, exactly as the fused gate|up weight does.
+            for row0 in [0u32, out_dim as u32] {
+                let need_rows = out_dim + row0 as usize; // full weight height
+                let d_w2 = buf.alloc((need_rows * in_dim) as u64)?.dptr;
+                let d_s2 = buf.alloc((need_rows * nb * 2) as u64)?.dptr;
+                cuda.htod(d_w2, as_u8(&(0..need_rows * in_dim).map(qb).collect::<Vec<i8>>()))?;
+                cuda.htod(d_s2, &vec![scale_bits; need_rows * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
+                let wqs_off = d_w2 + (row0 as u64 * in_dim as u64); // int8 1 B/elem
+                let wsc_off = d_s2 + (row0 as u64 * (in_dim / 32) as u64 * 2); // f16
+                let launched = k.gemm_mma_q8_r256(&cuda, wqs_off, wsc_off, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32);
+                let synced = cuda.synchronize();
+                match (launched, synced) {
+                    (Ok(()), Ok(())) => {
+                        let mut y_host = vec![0f32; ntok * out_dim];
+                        cuda.dtoh_f32(&mut y_host, d_y)?;
+                        let mut max_rel = 0f32;
+                        for t in 0..ntok {
+                            for r in 0..out_dim {
+                                let mut acc = 0i64;
+                                let wrow = (row0 as usize + r) * in_dim;
+                                for kk in 0..in_dim {
+                                    // weights for row0>0 were regenerated with qb over need_rows.
+                                    let w = (((wrow + kk) * 131 + 7) % 255) as i32 - 127;
+                                    acc += w as i64 * xqs[t * in_dim + kk] as i64;
+                                }
+                                let want = acc as f32;
+                                let got = y_host[t * out_dim + r];
+                                max_rel = max_rel.max((got - want).abs() / want.abs().max(1.0));
                             }
-                            let want = acc as f32;
-                            let got = y_host[t * out_dim + r];
-                            max_rel = max_rel.max((got - want).abs() / want.abs().max(1.0));
                         }
+                        println!("[r256-parity {label} row0={row0}] {out_dim}x{in_dim} ntok={ntok}: OK, max_rel_err {max_rel:.2e}");
                     }
-                    println!("[r256-parity {label}] {out_dim}x{in_dim} ntok={ntok}: OK, max_rel_err {max_rel:.2e}");
-                }
-                (l, s) => {
-                    println!("[r256-parity {label}] FAULT: launch={l:?} sync={s:?}");
+                    (l, s) => {
+                        println!("[r256-parity {label} row0={row0}] FAULT: launch={l:?} sync={s:?}");
+                    }
                 }
             }
             buf.reset_to(mark);
