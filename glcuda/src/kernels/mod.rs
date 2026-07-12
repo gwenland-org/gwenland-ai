@@ -34,11 +34,14 @@ fn ceil_div(n: u32, d: u32) -> u32 {
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
     _module: Module,
-    /// The sm_75+ tensor-core module and its GEMM entry, present only on
+    /// The sm_75+ tensor-core module and its two GEMM entries, present only on
     /// capable devices (and absent under `GLCUDA_NO_MMA=1`, the benchmark
     /// A/B switch). The `Option` IS the runtime kernel selection: callers
     /// ask [`KernelSet::has_mma`] and fall back to `gl_gemm_q8_0_soa`.
-    mma: Option<(Module, Kernel)>,
+    /// Tuple: (module, 8-m-tile GEMM, 32-m-tile r256 GEMM). The r256 entry is
+    /// the Phase B weight-reuse kernel (256 rows/weight-read); the bench A/B
+    /// picks which m-tile count net-wins on the BW-bound FFN GEMMs.
+    mma: Option<(Module, Kernel, Kernel)>,
     f_add: Kernel,
     f_silu_mul: Kernel,
     f_rope: Kernel,
@@ -79,11 +82,12 @@ impl KernelSet {
         let mma = if sm >= (7, 5) && std::env::var_os("GLCUDA_NO_MMA").is_none() {
             let m75 = cuda.load_module(PTX_SM75)?;
             let f = m75.get_function("gl_gemm_mma_q8")?;
+            let f256 = m75.get_function("gl_gemm_mma_q8_r256")?;
             eprintln!(
                 "[glcuda] tensor-core MMA GEMM enabled (sm_{}{})",
                 cuda.info.sm_major, cuda.info.sm_minor
             );
-            Some((m75, f))
+            Some((m75, f, f256))
         } else {
             if sm >= (7, 5) {
                 eprintln!("[glcuda] GLCUDA_NO_MMA set: prefill GEMM on the sm_70 dp4a path");
@@ -560,7 +564,7 @@ impl KernelSet {
         debug_assert_eq!(out_dim % 8, 0, "gemm_mma_q8 requires out_dim % 8 == 0");
         debug_assert_eq!(in_dim % 32, 0, "gemm_mma_q8 requires whole 32-K scale blocks");
         debug_assert!(ntok <= 64, "gemm_mma_q8 covers at most 8 m-tiles (64 token rows)");
-        let (_, f) = self
+        let (_, f, _) = self
             .mma
             .as_ref()
             .ok_or_else(|| GlError::Engine("gemm_mma_q8 called without sm_75 module".into()))?;
@@ -578,6 +582,46 @@ impl KernelSet {
         ];
         // 256 threads = 8 warps = 8 output tiles of 8 rows per block.
         cuda.launch(*f, (ceil_div(out_dim, 64), 1, 1), (256, 1, 1), 0, &mut params)
+    }
+
+    /// Phase B weight-reuse GEMM: identical contract to [`Self::gemm_mma_q8`]
+    /// but 32 m-tiles (up to 256 token rows per weight-fragment read) instead
+    /// of 8. Requires `ntok <= 256` and x rows allocated to `round8(ntok)`.
+    /// The weight walker/grid are the same; only the per-block row span grows,
+    /// so the launch geometry is unchanged. Gate on [`Self::has_mma`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8_r256(
+        &self,
+        cuda: &Cuda,
+        w_qs: CUdeviceptr,
+        w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(out_dim % 8, 0, "gemm_mma_q8_r256 requires out_dim % 8 == 0");
+        debug_assert_eq!(in_dim % 32, 0, "gemm_mma_q8_r256 requires whole 32-K scale blocks");
+        debug_assert!(ntok <= 256, "gemm_mma_q8_r256 covers at most 32 m-tiles (256 rows)");
+        let (_, _, f256) = self
+            .mma
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("gemm_mma_q8_r256 called without sm_75 module".into()))?;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) = (w_qs, w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(*f256, (ceil_div(out_dim, 64), 1, 1), (256, 1, 1), 0, &mut params)
     }
 
     /// `y = W @ x` for Q4_K weights in Structure-of-Arrays layout (M2.1
@@ -936,6 +980,16 @@ mod tests {
         assert!(
             PTX_SM75.contains(".visible .entry gl_gemm_mma_q8("),
             "sm_75 PTX is missing gl_gemm_mma_q8"
+        );
+        assert!(
+            PTX_SM75.contains(".visible .entry gl_gemm_mma_q8_r256("),
+            "sm_75 PTX is missing gl_gemm_mma_q8_r256 (Phase B weight-reuse GEMM)"
+        );
+        // r256 unrolls 32 m-tiles = 64 mma.sync ops; the base kernel has 16.
+        // A regenerated body with the wrong tile count trips this.
+        assert!(
+            PTX_SM75.matches("mma.sync.aligned.m8n8k16").count() >= 64 + 16,
+            "sm_75 PTX mma.sync count too low — r256 unroll incomplete?"
         );
         assert_eq!(PTX_SM75.matches('{').count(), PTX_SM75.matches('}').count());
         assert!(PTX_SM75.contains(".target sm_75"));

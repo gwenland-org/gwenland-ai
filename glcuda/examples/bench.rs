@@ -745,6 +745,74 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2e. [gemm-phaseb] The A/B that decides Phase B's m-tile count. The
+    //     [gemm-reuse] trend says weight-BW-bound (reuse pays), but the
+    //     register model warns 32 m-tiles (256 rows) drops occupancy to ~50%,
+    //     which may cost achieved bandwidth on a BW-bound kernel. So process a
+    //     FIXED 512-row chunk of gate_up and down THREE ways and time the
+    //     whole chunk: 8 calls x 64 (the current 8-tile kernel), 4 calls x 128
+    //     and 2 calls x 256 (the r256 kernel, fewer weight re-streams, lower
+    //     occupancy). Winner = lowest total us for the full 512-row chunk.
+    //     This pits reuse against occupancy at the real work size — the number
+    //     the register model cannot predict.
+    if k.has_mma() {
+        let d7 = 3584usize;
+        let h7 = 18944usize;
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let chunk = 512usize; // one layer-first ubatch
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        for (label, out_dim, in_dim) in [("gate_up", 2 * h7, d7), ("down   ", d7, h7)] {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            cuda.htod(d_wqs, as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()))?;
+            cuda.htod(d_wsc, &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
+            let d_xqs = buf.alloc((chunk * in_dim) as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(chunk * nb)?.dptr;
+            let d_y = buf.alloc_f32(chunk * out_dim)?.dptr;
+            cuda.htod(d_xqs, as_u8(&(0..chunk * in_dim).map(|i| qb(i * 7 + 3)).collect::<Vec<i8>>()))?;
+            cuda.htod_f32(d_xsc, &vec![0.5f32; chunk * nb])?;
+
+            // Process the full `chunk` rows as ceil(chunk/tile) calls of `tile`
+            // rows each, using the 8-tile kernel for tile<=64 and r256 above.
+            let run_chunk = |tile: usize| -> Result<f64, glcore::GlError> {
+                let iters = 30;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    let mut base = 0usize;
+                    while base < chunk {
+                        let n = (chunk - base).min(tile) as u32;
+                        let xqs = d_xqs + (base * in_dim) as u64;
+                        let xsc = d_xsc + (base * nb) as u64 * 4;
+                        let y = d_y + (base * out_dim) as u64 * 4;
+                        if tile <= 64 {
+                            k.gemm_mma_q8(&cuda, d_wqs, d_wsc, xqs, xsc, y, out_dim as u32, in_dim as u32, n)?;
+                        } else {
+                            k.gemm_mma_q8_r256(&cuda, d_wqs, d_wsc, xqs, xsc, y, out_dim as u32, in_dim as u32, n)?;
+                        }
+                        base += tile;
+                    }
+                }
+                cuda.synchronize()?;
+                Ok(t.elapsed().as_secs_f64() * 1e6 / iters as f64) // us per full chunk
+            };
+            // Warm all three.
+            for &tile in &[64usize, 128, 256] { run_chunk(tile)?; }
+            let (t64, t128, t256) = (run_chunk(64)?, run_chunk(128)?, run_chunk(256)?);
+            let best = if t256 <= t128 && t256 <= t64 { "256" } else if t128 <= t64 { "128" } else { "64" };
+            println!(
+                "[gemm-phaseb {label}] 512-row chunk: 8x64 {:.0}us | 4x128 {:.0}us ({:+.0}%) | 2x256 {:.0}us ({:+.0}%) => best tile {best}",
+                t64,
+                t128, 100.0 * (t128 - t64) / t64,
+                t256, 100.0 * (t256 - t64) / t64,
+            );
+            buf.reset_to(mark);
+        }
+        println!("[gemm-phaseb] best tile = the m-tile count to wire into gemm_rows. 128 winning = reuse helps, occupancy holds; 64 winning = occupancy loss ate the reuse; 256 winning = max reuse wins outright.");
+    }
+
+    // ============================================================
     // 2c. The dp4a QUANTIZE TAX. Every Q8_0 matmul first quantizes its input
     //     activation (quantize_q8) — an extra kernel the dp4a path added that
     //     did not exist before. Per decode token there are ~4/layer (qkv,

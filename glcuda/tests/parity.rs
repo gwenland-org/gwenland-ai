@@ -434,11 +434,28 @@ fn gemm_mma_q8_matches_dequantized_reference() {
         return;
     }
     for (out_dim, in_dim, ntok) in [(16usize, 64usize, 5usize), (16, 64, 20), (16, 64, 64)] {
-        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok);
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, false);
     }
 }
 
-fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize) {
+/// Phase B r256 kernel: same math as the 8-tile GEMM but 32 m-tiles (256
+/// rows/read). ntok cases span the guard boundaries — 5 (tile 0 only), 128
+/// (16 tiles, the A/B's low point), 256 (all 32 tiles, the cap).
+#[test]
+fn gemm_mma_q8_r256_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 — no tensor-core module");
+        return;
+    }
+    for (out_dim, in_dim, ntok) in
+        [(16usize, 64usize, 5usize), (16, 64, 128), (16, 64, 200), (16, 64, 256)]
+    {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, true);
+    }
+}
+
+fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize, r256: bool) {
     let ntok_pad = ntok.div_ceil(8) * 8;
 
     let w_f32 = randv(out_dim * in_dim, 50, 0.1);
@@ -477,14 +494,20 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
     let d_scales = buf.alloc_f32(ntok_pad * in_dim / 32).unwrap().dptr;
     k.quantize_q8(cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32).unwrap();
     let dy = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
-    k.gemm_mma_q8(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
-        .unwrap();
+    if r256 {
+        k.gemm_mma_q8_r256(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
+            .unwrap();
+    } else {
+        k.gemm_mma_q8(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
+            .unwrap();
+    }
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; ntok * out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(cuda).unwrap();
 
-    assert_close(&got, &want, EPS_Q8_GEMV, &format!("gemm_mma_q8(ntok={ntok})"));
+    let name = if r256 { "gemm_mma_q8_r256" } else { "gemm_mma_q8" };
+    assert_close(&got, &want, EPS_Q8_GEMV, &format!("{name}(ntok={ntok})"));
 }
 
 #[test]
