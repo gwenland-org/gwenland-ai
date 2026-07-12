@@ -3018,3 +3018,305 @@ ATTNR_OUT_STORE:
 ATTNR_OUT_DONE:
     ret;
 }
+
+// ---------------------------------------------------------------------------
+// gl_attn_rows_probe: DIAGNOSTIC copy of gl_attn_decode_rows_f32 with a
+// uniform early-exit knob, for the bench [attn] pass-split only - the engine
+// never launches it. p_stop = 0 runs the full kernel (identical work to the
+// real one); 1 returns after Pass 1 (QK scores); 2 returns after Pass 2
+// (softmax). The passes are separated by bar.sync inside one launch, so no
+// host-side timing can split them - this kernel is the instrumentation.
+// p_stop is a kernel param (warp-uniform), so the early ret is uniform and
+// cannot deadlock a barrier. Each exit stores one score to out[0] first:
+// an observable global write so ptxas cannot dead-code-eliminate the very
+// pass being timed. Same launch shape and shared plan as the original.
+// ---------------------------------------------------------------------------
+.visible .entry gl_attn_rows_probe(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u32 p_head_dim,
+    .param .u64 p_pos_seq,
+    .param .u32 p_heads_per_kv,
+    .param .u32 p_head_stride,
+    .param .f32 p_scale,
+    .param .u32 p_stop
+)
+{
+    .reg .pred %p<9>;
+    .reg .b32 %r<49>;
+    .reg .f32 %f<32>;
+    .reg .b64 %rd<44>;
+    .shared .align 4 .b8 sm_scp[16384];  // scores[0..4096]
+    .shared .align 4 .b8 sm_redp[36];    // warp partials + broadcast
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_v];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u64 %rd30, [p_pos_seq];
+    ld.param.u32 %r3, [p_heads_per_kv];
+    ld.param.u32 %r4, [p_head_stride];
+    ld.param.f32 %f1, [p_scale];
+    ld.param.u32 %r48, [p_stop];
+
+    // Token row t and its causal length: cached_len = pos_seq[t] + 1.
+    mov.u32 %r42, %ctaid.y;
+    cvta.to.global.u64 %rd31, %rd30;
+    mul.wide.u32 %rd32, %r42, 4;
+    add.s64 %rd31, %rd31, %rd32;
+    ld.global.u32 %r2, [%rd31];          // pos
+    add.s32 %r2, %r2, 1;                 // cached_len
+
+    mov.u32 %r5, %ctaid.x;               // h (query head)
+    mov.u32 %r6, %tid.x;                 // thread id
+    mov.u32 %r7, %ntid.x;                // block size
+    and.b32 %r8, %r6, 31;                // lane
+    shr.u32 %r9, %r6, 5;                 // warp id
+    add.s32 %r10, %r7, 31;
+    shr.u32 %r11, %r10, 5;               // n_warps
+    mov.u32 %r12, sm_scp;                // scores base (shared)
+    mov.u32 %r13, sm_redp;               // reduction base (shared)
+
+    cvta.to.global.u64 %rd5, %rd1;       // q global
+    cvta.to.global.u64 %rd6, %rd2;       // k global
+    cvta.to.global.u64 %rd7, %rd3;       // v global
+    cvta.to.global.u64 %rd8, %rd4;       // out global
+
+    // Row bases: q/out += t * n_heads*head_dim (n_heads = gridDim.x).
+    mov.u32 %r43, %nctaid.x;
+    mul.lo.s32 %r44, %r43, %r1;
+    mul.lo.s32 %r45, %r44, %r42;
+    mul.wide.u32 %rd33, %r45, 4;
+    add.s64 %rd5, %rd5, %rd33;
+    add.s64 %rd8, %rd8, %rd33;
+
+    // kv_head = h / heads_per_kv ; kv offset in elements = kv_head*head_stride
+    div.u32 %r14, %r5, %r3;              // kv_head
+    mul.lo.s32 %r15, %r14, %r4;          // kv_head * head_stride (elems)
+    mul.wide.u32 %rd9, %r15, 4;
+    add.s64 %rd10, %rd6, %rd9;           // k_base for this head
+    add.s64 %rd11, %rd7, %rd9;           // v_base for this head
+
+    // q vector base = q + h*head_dim
+    mul.lo.s32 %r16, %r5, %r1;
+    mul.wide.u32 %rd12, %r16, 4;
+    add.s64 %rd13, %rd5, %rd12;          // q_base
+    add.s64 %rd14, %rd8, %rd12;          // out_base
+
+    // ---- Pass 1: scores[t] = (q . k[t]) * scale, one thread per t ----
+    mov.u32 %r17, %r6;                   // t = tid
+ATTNP_SCORE:
+    setp.ge.u32 %p1, %r17, %r2;
+    @%p1 bra ATTNP_SCORE_DONE;
+    mul.lo.s32 %r18, %r17, %r1;
+    mul.wide.u32 %rd15, %r18, 4;
+    add.s64 %rd16, %rd10, %rd15;         // &k[t][0]
+    mov.u64 %rd17, %rd13;                // &q[0]
+    mov.f32 %f2, 0f00000000;             // dot acc (FP32)
+    mov.u32 %r19, 0;                     // d
+ATTNP_DOT:
+    setp.ge.u32 %p2, %r19, %r1;
+    @%p2 bra ATTNP_DOT_DONE;
+    ld.global.f32 %f3, [%rd17];
+    ld.global.f32 %f4, [%rd16];
+    fma.rn.f32 %f2, %f3, %f4, %f2;
+    add.s64 %rd17, %rd17, 4;
+    add.s64 %rd16, %rd16, 4;
+    add.s32 %r19, %r19, 1;
+    bra ATTNP_DOT;
+ATTNP_DOT_DONE:
+    mul.rn.f32 %f2, %f2, %f1;            // * scale
+    shl.b32 %r20, %r17, 2;
+    add.s32 %r21, %r12, %r20;
+    st.shared.f32 [%r21], %f2;
+    add.s32 %r17, %r17, %r7;             // t += blockDim
+    bra ATTNP_SCORE;
+ATTNP_SCORE_DONE:
+    bar.sync 0;
+
+    // stop == 1: return after the score pass. Thread 0 publishes scores[0]
+    // to out[0] so Pass 1 stays observable; the exit is uniform (param).
+    setp.ne.u32 %p8, %r48, 1;
+    @%p8 bra ATTNP_S1_SKIP;
+    setp.ne.u32 %p0, %r6, 0;
+    @%p0 bra ATTNP_S1_RET;
+    ld.shared.f32 %f30, [%r12];
+    st.global.f32 [%rd14], %f30;
+ATTNP_S1_RET:
+    ret;
+ATTNP_S1_SKIP:
+
+    // ---- Pass 2: softmax over sm_scp[0..cached_len] ----
+    mov.f32 %f5, 0fFF800000;             // -inf
+    mov.u32 %r22, %r6;
+ATTNP_MAX:
+    setp.ge.u32 %p3, %r22, %r2;
+    @%p3 bra ATTNP_MAX_RED;
+    shl.b32 %r23, %r22, 2;
+    add.s32 %r24, %r12, %r23;
+    ld.shared.f32 %f6, [%r24];
+    max.f32 %f5, %f5, %f6;
+    add.s32 %r22, %r22, %r7;
+    bra ATTNP_MAX;
+ATTNP_MAX_RED:
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    mov.b32 %r25, %f5;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r26;
+    max.f32 %f5, %f5, %f6;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTNP_MAX_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f5;
+ATTNP_MAX_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTNP_MAX_BC;
+    mov.f32 %f7, 0fFF800000;
+    mov.u32 %r29, 0;
+ATTNP_MAX_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTNP_MAX_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f8, [%r31];
+    max.f32 %f7, %f7, %f8;
+    add.s32 %r29, %r29, 1;
+    bra ATTNP_MAX_W;
+ATTNP_MAX_ST:
+    st.shared.f32 [%r13+32], %f7;
+ATTNP_MAX_BC:
+    bar.sync 0;
+    ld.shared.f32 %f9, [%r13+32];        // m (block max), uniform
+
+    mov.f32 %f10, 0f00000000;            // sum acc
+    mov.u32 %r32, %r6;
+ATTNP_EXP:
+    setp.ge.u32 %p3, %r32, %r2;
+    @%p3 bra ATTNP_SUM_RED;
+    shl.b32 %r33, %r32, 2;
+    add.s32 %r34, %r12, %r33;
+    ld.shared.f32 %f11, [%r34];
+    sub.f32 %f12, %f11, %f9;             // score - m
+    mul.f32 %f13, %f12, 0f3FB8AA3B;      // * log2(e)
+    ex2.approx.f32 %f14, %f13;           // exp(score - m)
+    st.shared.f32 [%r34], %f14;
+    add.f32 %f10, %f10, %f14;
+    add.s32 %r32, %r32, %r7;
+    bra ATTNP_EXP;
+ATTNP_SUM_RED:
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    mov.b32 %r25, %f10;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f11, %r26;
+    add.f32 %f10, %f10, %f11;
+    setp.ne.u32 %p4, %r8, 0;
+    @%p4 bra ATTNP_SUM_BAR;
+    shl.b32 %r27, %r9, 2;
+    add.s32 %r28, %r13, %r27;
+    st.shared.f32 [%r28], %f10;
+ATTNP_SUM_BAR:
+    bar.sync 0;
+    setp.ne.u32 %p5, %r6, 0;
+    @%p5 bra ATTNP_SUM_BC;
+    mov.f32 %f15, 0f00000000;
+    mov.u32 %r29, 0;
+ATTNP_SUM_W:
+    setp.ge.u32 %p6, %r29, %r11;
+    @%p6 bra ATTNP_SUM_ST;
+    shl.b32 %r30, %r29, 2;
+    add.s32 %r31, %r13, %r30;
+    ld.shared.f32 %f16, [%r31];
+    add.f32 %f15, %f15, %f16;
+    add.s32 %r29, %r29, 1;
+    bra ATTNP_SUM_W;
+ATTNP_SUM_ST:
+    st.shared.f32 [%r13+32], %f15;
+ATTNP_SUM_BC:
+    bar.sync 0;
+    ld.shared.f32 %f17, [%r13+32];       // sum, uniform
+    setp.gt.f32 %p7, %f17, 0f00000000;
+    mov.f32 %f18, 0f3F800000;            // 1.0 default (no-op divide)
+    @!%p7 bra ATTNP_RCP_DONE;
+    rcp.rn.f32 %f18, %f17;               // 1/sum
+ATTNP_RCP_DONE:
+    bar.sync 0;
+
+    // stop == 2: return after softmax. Thread 0 publishes a normalized
+    // weight (depends on the whole pass) to out[0]; uniform exit.
+    setp.ne.u32 %p8, %r48, 2;
+    @%p8 bra ATTNP_S2_SKIP;
+    setp.ne.u32 %p0, %r6, 0;
+    @%p0 bra ATTNP_S2_RET;
+    ld.shared.f32 %f30, [%r12];
+    mul.rn.f32 %f30, %f30, %f18;
+    st.global.f32 [%rd14], %f30;
+ATTNP_S2_RET:
+    ret;
+ATTNP_S2_SKIP:
+
+    // ---- Pass 3: out[d] = sum_t (scores[t]*inv_sum) * v[t][d] ----
+    mov.u32 %r35, %r6;                   // d = tid
+ATTNP_OUT:
+    setp.ge.u32 %p1, %r35, %r1;
+    @%p1 bra ATTNP_OUT_DONE;
+    mov.f32 %f19, 0f00000000;            // out acc
+    mov.u32 %r36, 0;                     // t
+    mul.wide.u32 %rd18, %r35, 4;
+    add.s64 %rd19, %rd11, %rd18;         // &v[0][d]
+    mul.lo.s32 %r37, %r1, 4;             // row stride bytes
+    cvt.u64.u32 %rd20, %r37;
+ATTNP_OUT_LOOP:
+    setp.ge.u32 %p2, %r36, %r2;
+    @%p2 bra ATTNP_OUT_STORE;
+    shl.b32 %r38, %r36, 2;
+    add.s32 %r39, %r12, %r38;
+    ld.shared.f32 %f20, [%r39];          // exp weight (un-normalized)
+    mul.rn.f32 %f21, %f20, %f18;         // * inv_sum -> normalized weight
+    ld.global.f32 %f22, [%rd19];         // v[t][d]
+    fma.rn.f32 %f19, %f21, %f22, %f19;
+    add.s64 %rd19, %rd19, %rd20;
+    add.s32 %r36, %r36, 1;
+    bra ATTNP_OUT_LOOP;
+ATTNP_OUT_STORE:
+    add.s64 %rd21, %rd14, %rd18;
+    st.global.f32 [%rd21], %f19;
+    add.s32 %r35, %r35, %r7;
+    bra ATTNP_OUT;
+ATTNP_OUT_DONE:
+    ret;
+}

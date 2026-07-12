@@ -739,6 +739,111 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ============================================================
+    // 4. [attn] Prefill attention-core PASS SPLIT (M2.3 Stage 2c evidence).
+    //    The prefill profiler shows gl_attn_decode_rows_f32 = 39% of a
+    //    596-token 7B prefill but cannot see inside the launch: the three
+    //    passes (QK scores / softmax / V-accum) are separated by bar.sync,
+    //    not by kernel boundaries. gl_attn_rows_probe is a copy of the
+    //    kernel with a uniform early-exit param: stop=1 ends after the
+    //    score pass, stop=2 after softmax, stop=0 runs everything.
+    //    Subtraction attributes the time — at real 7B shapes (28 q heads,
+    //    4 kv heads GQA, head_dim 128) on a mid-prompt 64-token chunk, so
+    //    cached_len matches the profiled run's average (~298).
+    // ============================================================
+    {
+        let n_heads = 28u32;
+        let n_kv = 4usize;
+        let head_dim = 128usize;
+        let heads_per_kv = 7u32;
+        let ntok = 64usize;
+        let base = 266usize; // chunk base -> avg cached_len ~298 (mid-prompt)
+        let max_seq = base + ntok;
+        let head_stride = (max_seq * head_dim) as u32;
+
+        let mark = buf.mark();
+        let q = buf.alloc_f32(ntok * n_heads as usize * head_dim)?.dptr;
+        let out = buf.alloc_f32(ntok * n_heads as usize * head_dim)?.dptr;
+        let kc = buf.alloc_f32(n_kv * max_seq * head_dim)?.dptr;
+        let vc = buf.alloc_f32(n_kv * max_seq * head_dim)?.dptr;
+        let pos = buf.alloc((ntok * 4) as u64)?.dptr;
+
+        // Deterministic, non-degenerate data so the softmax sees a real
+        // distribution (timing is data-independent, but keep NaN out).
+        let qh: Vec<f32> = (0..ntok * n_heads as usize * head_dim)
+            .map(|i| ((i * 37 % 251) as f32 - 125.0) / 251.0)
+            .collect();
+        let kh: Vec<f32> = (0..n_kv * max_seq * head_dim)
+            .map(|i| ((i * 53 % 241) as f32 - 120.0) / 241.0)
+            .collect();
+        cuda.htod_f32(q, &qh)?;
+        cuda.htod_f32(kc, &kh)?;
+        cuda.htod_f32(vc, &kh)?;
+        let posh: Vec<u8> = (0..ntok)
+            .flat_map(|t| ((base + t) as u32).to_le_bytes())
+            .collect();
+        cuda.htod(pos, &posh)?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let probe = |stop: u32| {
+            k.attn_rows_probe(
+                &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+                head_stride, scale, ntok as u32, stop,
+            )
+        };
+        // Warm every variant (JIT + caches), plus the real kernel.
+        for stop in [1u32, 2, 0] {
+            probe(stop)?;
+        }
+        k.attn_decode_rows(
+            &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+            head_stride, scale, ntok as u32,
+        )?;
+        cuda.synchronize()?;
+
+        let iters = 50;
+        let time_probe = |stop: u32| -> Result<f64, glcore::GlError> {
+            let t = Instant::now();
+            for _ in 0..iters {
+                probe(stop)?;
+            }
+            cuda.synchronize()?;
+            Ok(t.elapsed().as_secs_f64() / iters as f64)
+        };
+        let t1 = time_probe(1)?; // score pass only
+        let t12 = time_probe(2)?; // + softmax
+        let tful = time_probe(0)?; // + V-accum (everything)
+        // Cross-check that the probe copy costs the same as the real kernel.
+        let t = Instant::now();
+        for _ in 0..iters {
+            k.attn_decode_rows(
+                &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+                head_stride, scale, ntok as u32,
+            )?;
+        }
+        cuda.synchronize()?;
+        let treal = t.elapsed().as_secs_f64() / iters as f64;
+
+        let (p1, p2, p3) = (t1, (t12 - t1).max(0.0), (tful - t12).max(0.0));
+        let pct = |x: f64| 100.0 * x / tful.max(1e-12);
+        println!(
+            "\n[attn] probe {n_heads}h x {ntok}tok, cached_len ~{}: full {:.0} us | real kernel {:.0} us (should match)",
+            base + ntok / 2,
+            tful * 1e6,
+            treal * 1e6,
+        );
+        println!(
+            "[attn]   score(QK) {:.0} us ({:.0}%) | softmax {:.0} us ({:.0}%) | V-accum {:.0} us ({:.0}%)",
+            p1 * 1e6,
+            pct(p1),
+            p2 * 1e6,
+            pct(p2),
+            p3 * 1e6,
+            pct(p3),
+        );
+        buf.reset_to(mark);
+    }
+
     buf.free(&cuda)?;
     println!("\ndone.");
     Ok(())

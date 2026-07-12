@@ -64,6 +64,9 @@ pub struct KernelSet {
     f_rope_rows: Kernel,
     f_kv_write_rows: Kernel,
     f_attn_decode_rows: Kernel,
+    /// Diagnostic pass-split copy of `gl_attn_decode_rows_f32` (bench-only —
+    /// the engine never launches it; see [`Self::attn_rows_probe`]).
+    f_attn_rows_probe: Kernel,
 }
 
 impl KernelSet {
@@ -111,6 +114,7 @@ impl KernelSet {
             f_rope_rows: module.get_function("gl_rope_rows_f32")?,
             f_kv_write_rows: module.get_function("gl_kv_write_rows")?,
             f_attn_decode_rows: module.get_function("gl_attn_decode_rows_f32")?,
+            f_attn_rows_probe: module.get_function("gl_attn_rows_probe")?,
             _module: module,
         })
     }
@@ -352,6 +356,48 @@ impl KernelSet {
             &mut sc as *mut _ as *mut c_void,
         ];
         cuda.launch(self.f_attn_decode_rows, (n_heads, ntok, 1), (128, 1, 1), 0, &mut params)
+    }
+
+    /// Diagnostic pass-split launch of the prefill attention kernel (bench
+    /// `[attn]` section only — never on the inference path). `stop` selects
+    /// how much of the kernel runs: 0 = full (identical work to
+    /// [`Self::attn_decode_rows`]), 1 = return after Pass 1 (QK scores),
+    /// 2 = return after Pass 2 (softmax). The three passes are separated by
+    /// `bar.sync` inside one launch, so this early-exit copy is the only way
+    /// to attribute time to them without an external profiler.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_rows_probe(
+        &self,
+        cuda: &Cuda,
+        q: CUdeviceptr,
+        k_base: CUdeviceptr,
+        v_base: CUdeviceptr,
+        out: CUdeviceptr,
+        n_heads: u32,
+        head_dim: u32,
+        pos_seq: CUdeviceptr,
+        heads_per_kv: u32,
+        head_stride: u32,
+        scale: f32,
+        ntok: u32,
+        stop: u32,
+    ) -> Result<(), GlError> {
+        let (mut q, mut k, mut v, mut o) = (q, k_base, v_base, out);
+        let (mut hd, mut ps, mut hpk, mut hs) = (head_dim, pos_seq, heads_per_kv, head_stride);
+        let (mut sc, mut st) = (scale, stop);
+        let mut params = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut hpk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut st as *mut _ as *mut c_void,
+        ];
+        cuda.launch(self.f_attn_rows_probe, (n_heads, ntok, 1), (128, 1, 1), 0, &mut params)
     }
 
     /// Decode GEMV: `y = W @ x`, `W` row-major `[out_dim, in_dim]`.
@@ -857,6 +903,7 @@ mod tests {
             "gl_rope_rows_f32",
             "gl_kv_write_rows",
             "gl_attn_decode_rows_f32",
+            "gl_attn_rows_probe",
         ] {
             assert!(
                 PTX.contains(&format!(".visible .entry {entry}(")),
