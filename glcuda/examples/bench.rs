@@ -707,8 +707,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cuda.htod(d_xqs, as_u8(&(0..max_ntok * in_dim).map(|i| qb(i * 7 + 3)).collect::<Vec<i8>>()))?;
             cuda.htod_f32(d_xsc, &vec![0.5f32; max_ntok * nb])?;
 
+            // The RIGHT question (v2 metric): does per-call time grow
+            // proportionally with ntok? Weight bytes are fixed per call, so
+            //   - compute/issue-bound  -> time ~ ntok, and time/token is FLAT
+            //     while the fixed weight cost amortizes -> Phase B (more reuse)
+            //     buys nothing.
+            //   - weight-BW-bound       -> time barely grows (the reused weight
+            //     stream dominates), so time/token FALLS steeply with ntok ->
+            //     Phase B pays.
+            // (The old weight-bytes/time metric divided a constant by a growing
+            // time, so it fell monotonically no matter what — uninformative.)
             print!("[gemm-reuse {label}] in={in_dim:<5} wt={:.0}MB | ", wbytes / 1e6);
-            for &ntok in &[8u32, 16, 32, 64] {
+            let mut tpt_prev = 0.0f64;
+            for (idx, &ntok) in [8u32, 16, 32, 64].iter().enumerate() {
                 k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok)?;
                 cuda.synchronize()?;
                 let iters = 50;
@@ -718,14 +729,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 cuda.synchronize()?;
                 let each = t.elapsed().as_secs_f64() / iters as f64;
-                // Weight fragment is streamed once per call regardless of ntok,
-                // so weight-bytes/time rising with ntok = reuse working.
-                print!("n{ntok}: {:.0} GB/s  ", wbytes / each / 1e9);
+                let tpt = each * 1e6 / ntok as f64; // us per token
+                // total bytes moved: weights (once) + act (int8+f32/32) + out f32.
+                let abytes = (ntok as usize * in_dim + ntok as usize * (in_dim / 32) * 4) as f64;
+                let obytes = (ntok as usize * out_dim * 4) as f64;
+                let eff_gbs = (wbytes + abytes + obytes) / each / 1e9;
+                let trend = if idx == 0 { "".to_string() } else { format!(" ({:+.0}%)", 100.0 * (tpt - tpt_prev) / tpt_prev) };
+                tpt_prev = tpt;
+                print!("n{ntok}: {:.1}us/tok{}  [{:.0} GB/s eff]  ", tpt, trend, eff_gbs);
             }
             println!();
             buf.reset_to(mark);
         }
-        println!("[gemm-reuse] rising GB/s with ntok => weight-BW-bound, more reuse (Phase B 256-row) pays; flat => L2/other cap");
+        println!("[gemm-reuse] time/token FLAT across ntok => compute/issue-bound, Phase B reuse buys ~0; time/token FALLING steeply => weight-BW-bound, Phase B pays. Compare eff GB/s to the ~266 achievable.");
     }
 
     // ============================================================
