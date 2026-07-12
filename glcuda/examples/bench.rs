@@ -667,6 +667,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2d. [gemm-reuse] Acceleratio Stellarum Phase B ceiling probe.
+    //     The MMA GEMM streams each weight fragment from DRAM once and reuses
+    //     it across an ntok-row m-tile (currently <= 64). Phase B proposes
+    //     raising that reuse to 256 rows so weight DRAM traffic for a 512-tok
+    //     chunk drops 4x. BUT the down projection's activation tile
+    //     (256 x 18944) is ~5.5 MB > the T4's 4 MB L2, so its reuse may not
+    //     scale. This probe measures effective WEIGHT bandwidth (weight bytes
+    //     / time) at ntok = 8/16/32/64 for gate_up (in=3584, act tile fits)
+    //     and down (in=18944, act tile spills). If GB/s climbs with ntok, the
+    //     kernel is weight-BW-bound and more reuse pays; if it plateaus early
+    //     — especially for down — that is the L2 spill capping Phase B, and
+    //     the 256-row kernel is not worth 400 lines of PTX for that matmul.
+    //     Measure before building.
+    if k.has_mma() {
+        let d7 = 3584usize;
+        let h7 = 18944usize;
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        // (label, out_dim, in_dim) at real 7B shapes.
+        for (label, out_dim, in_dim) in
+            [("gate_up", 2 * h7, d7), ("down   ", d7, h7)]
+        {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            let wbytes = (out_dim * in_dim + out_dim * nb * 2) as f64; // qs + f16 scales
+            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            // Fill weights once (values irrelevant to timing; just not NaN).
+            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            cuda.htod(d_wqs, as_u8(&wqs))?;
+            cuda.htod(d_wsc, &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
+            // Activation + output sized for the largest ntok (64); extra rows
+            // are read-safe per the kernel's round8 contract.
+            let max_ntok = 64usize;
+            let d_xqs = buf.alloc((max_ntok * in_dim) as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(max_ntok * nb)?.dptr;
+            let d_y = buf.alloc_f32(max_ntok * out_dim)?.dptr;
+            cuda.htod(d_xqs, as_u8(&(0..max_ntok * in_dim).map(|i| qb(i * 7 + 3)).collect::<Vec<i8>>()))?;
+            cuda.htod_f32(d_xsc, &vec![0.5f32; max_ntok * nb])?;
+
+            print!("[gemm-reuse {label}] in={in_dim:<5} wt={:.0}MB | ", wbytes / 1e6);
+            for &ntok in &[8u32, 16, 32, 64] {
+                k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok)?;
+                cuda.synchronize()?;
+                let iters = 50;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok)?;
+                }
+                cuda.synchronize()?;
+                let each = t.elapsed().as_secs_f64() / iters as f64;
+                // Weight fragment is streamed once per call regardless of ntok,
+                // so weight-bytes/time rising with ntok = reuse working.
+                print!("n{ntok}: {:.0} GB/s  ", wbytes / each / 1e9);
+            }
+            println!();
+            buf.reset_to(mark);
+        }
+        println!("[gemm-reuse] rising GB/s with ntok => weight-BW-bound, more reuse (Phase B 256-row) pays; flat => L2/other cap");
+    }
+
+    // ============================================================
     // 2c. The dp4a QUANTIZE TAX. Every Q8_0 matmul first quantizes its input
     //     activation (quantize_q8) — an extra kernel the dp4a path added that
     //     did not exist before. Per decode token there are ~4/layer (qkv,
