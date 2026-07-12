@@ -560,8 +560,12 @@ MMA_DONE:
     // staging runs FOUR passes (row += 64) to cover 0..255. Here we set
     // up the pass-0 pointers; the per-pass loop lives in MMA_KLOOP.
     shr.u32 %r25, %r4, 2;                // stage row0 = tid / 4
-    and.b32 %r26, %r4, 3;
-    shl.b32 %r27, %r26, 3;               // stage byte offset = (tid%4)*8
+    and.b32 %r45, %r4, 3;
+    shl.b32 %r45, %r45, 3;               // stage byte offset = (tid%4)*8
+    // NB: staging byte offset lives in %r45, NOT %r27 ? the weight
+    // fragment load (ld.global.u32 %r27) clobbers %r27 every k-block, and
+    // this offset is read INSIDE the k-loop (4-pass staging), so a shared
+    // register corrupts all staging after the first block.
     // (per-k-block base pointers rebuilt each pass from %r25 in the loop)
     mov.u32 %r29, sm_a;
     // xsc staging base: thread tid handles scale row (tid & 255) but with
@@ -660,13 +664,13 @@ MMA_KLOOP:
     @!%p13 bra MMA_STAGE_A0;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
     add.s64 %rd20, %rd8, %rd20;
-    cvt.u64.u32 %rd21, %r27;            // + (tid%4)*8
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
     add.s64 %rd20, %rd20, %rd21;
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
     shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
-    add.s32 %r43, %r43, %r27;           // + byte offset
+    add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A0:
@@ -676,13 +680,13 @@ MMA_STAGE_A0:
     @!%p13 bra MMA_STAGE_A1;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
     add.s64 %rd20, %rd8, %rd20;
-    cvt.u64.u32 %rd21, %r27;            // + (tid%4)*8
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
     add.s64 %rd20, %rd20, %rd21;
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
     shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
-    add.s32 %r43, %r43, %r27;           // + byte offset
+    add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A1:
@@ -692,13 +696,13 @@ MMA_STAGE_A1:
     @!%p13 bra MMA_STAGE_A2;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
     add.s64 %rd20, %rd8, %rd20;
-    cvt.u64.u32 %rd21, %r27;            // + (tid%4)*8
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
     add.s64 %rd20, %rd20, %rd21;
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
     shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
-    add.s32 %r43, %r43, %r27;           // + byte offset
+    add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A2:
@@ -708,13 +712,13 @@ MMA_STAGE_A2:
     @!%p13 bra MMA_STAGE_A3;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
     add.s64 %rd20, %rd8, %rd20;
-    cvt.u64.u32 %rd21, %r27;            // + (tid%4)*8
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
     add.s64 %rd20, %rd20, %rd21;
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
     shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
-    add.s32 %r43, %r43, %r27;           // + byte offset
+    add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A3:
