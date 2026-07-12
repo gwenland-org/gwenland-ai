@@ -824,22 +824,72 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cuda.synchronize()?;
         let treal = t.elapsed().as_secs_f64() / iters as f64;
 
-        let (p1, p2, p3) = (t1, (t12 - t1).max(0.0), (tful - t12).max(0.0));
-        let pct = |x: f64| 100.0 * x / tful.max(1e-12);
+        // The naive subtraction model (pass_i = t_i - t_{i-1}) is INVALID at
+        // full grid: the first T4 run measured score-only SLOWER than the
+        // full kernel (3138 vs 2679 us, same SASS — stop is a runtime param).
+        // Cause: ~4 resident blocks/SM overlap different passes. Early exit
+        // raises block turnover so every in-flight block is in the
+        // uncoalesced Pass-1 K loads at once (homogeneous contention); in
+        // the full kernel a block's softmax/V-accum stagger the memory
+        // demand of its neighbors' Pass 1. So at full grid we report RAW
+        // times and SIGNED marginal costs — "what does adding this pass
+        // cost at production concurrency". Marginal ~0 (or negative) means
+        // the pass is completely hidden under Pass-1 traffic.
         println!(
-            "\n[attn] probe {n_heads}h x {ntok}tok, cached_len ~{}: full {:.0} us | real kernel {:.0} us (should match)",
+            "\n[attn] full-grid {n_heads}h x {ntok}tok, cached_len ~{}: score-only {:.0} us | +softmax {:.0} us | full {:.0} us | real kernel {:.0} us (should match full)",
             base + ntok / 2,
+            t1 * 1e6,
+            t12 * 1e6,
             tful * 1e6,
             treal * 1e6,
         );
         println!(
-            "[attn]   score(QK) {:.0} us ({:.0}%) | softmax {:.0} us ({:.0}%) | V-accum {:.0} us ({:.0}%)",
-            p1 * 1e6,
-            pct(p1),
-            p2 * 1e6,
-            pct(p2),
-            p3 * 1e6,
-            pct(p3),
+            "[attn]   marginal cost at full concurrency: softmax {:+.0} us | V-accum {:+.0} us (vs score-only {:.0} us)",
+            (t12 - t1) * 1e6,
+            (tful - t12) * 1e6,
+            t1 * 1e6,
+        );
+
+        // SINGLE BLOCK (grid 1x1): no inter-block overlap, so passes really
+        // do run back-to-back and subtraction is valid — this is the true
+        // intra-block pass ratio, measured as latency instead of
+        // throughput. Constant launch overhead cancels in the differences.
+        // pos pointer offset to the chunk middle so cached_len stays ~298.
+        let pos_mid = pos + ((ntok / 2) * 4) as u64;
+        for stop in [1u32, 2, 0] {
+            k.attn_rows_probe(
+                &cuda, q, kc, vc, out, 1, head_dim as u32, pos_mid, heads_per_kv,
+                head_stride, scale, 1, stop,
+            )?;
+        }
+        cuda.synchronize()?;
+        let single_iters = 400;
+        let time_single = |stop: u32| -> Result<f64, glcore::GlError> {
+            let t = Instant::now();
+            for _ in 0..single_iters {
+                k.attn_rows_probe(
+                    &cuda, q, kc, vc, out, 1, head_dim as u32, pos_mid, heads_per_kv,
+                    head_stride, scale, 1, stop,
+                )?;
+            }
+            cuda.synchronize()?;
+            Ok(t.elapsed().as_secs_f64() / single_iters as f64)
+        };
+        let s1 = time_single(1)?;
+        let s12 = time_single(2)?;
+        let sful = time_single(0)?;
+        let (q1, q2, q3) = (s1, s12 - s1, sful - s12);
+        let spct = |x: f64| 100.0 * x / sful.max(1e-12);
+        println!(
+            "[attn] single-block (subtraction valid, cached_len ~{}): score(QK) {:.1} us ({:.0}%) | softmax {:+.1} us ({:.0}%) | V-accum {:+.1} us ({:.0}%) | full {:.1} us",
+            base + ntok / 2,
+            q1 * 1e6,
+            spct(q1),
+            q2 * 1e6,
+            spct(q2),
+            q3 * 1e6,
+            spct(q3),
+            sful * 1e6,
         );
         buf.reset_to(mark);
     }
