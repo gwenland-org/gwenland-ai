@@ -120,7 +120,7 @@ fn cpu_model() -> GlprocModel {
             head_dim: HEAD_DIM,
             hidden_dim: HIDDEN,
             vocab_size: VOCAB,
-            max_seq: 64,
+            max_seq: 576,
             rms_eps: 1e-5,
             rope_freq_base: 10_000.0,
             rope_style: CpuRopeStyle::Neox,
@@ -175,7 +175,7 @@ fn host_model() -> HostModel {
             head_dim: HEAD_DIM,
             hidden_dim: HIDDEN,
             vocab_size: VOCAB,
-            max_seq: 64,
+            max_seq: 576,
             rms_eps: 1e-5,
             rope_freq_base: 10_000.0,
             rope_style: RopeStyle::Neox,
@@ -226,8 +226,10 @@ fn forward_logits_match_glproc() {
 }
 
 /// Batched prefill must produce the same final-token logits as the sequential
-/// CPU reference. The 35-token prompt crosses the PREFILL_BATCH (32) boundary,
-/// so chunking is exercised too.
+/// CPU reference. The 530-token prompt crosses the PREFILL_BATCH (512)
+/// boundary, so the super-chunk loop (and the KV-cursor handoff between
+/// chunks — the class of bug behind the old 28x advance overcount) is
+/// exercised too.
 #[test]
 fn batched_prefill_matches_glproc() {
     let Some((cuda, k)) = gpu() else { return };
@@ -235,7 +237,7 @@ fn batched_prefill_matches_glproc() {
     let mut cpu_run = Runner::new(&cpu);
     let mut gpu_model = GpuModel::upload(&cuda, host_model()).unwrap();
 
-    let prompt: Vec<u32> = (0..35).map(|i| (i % 5 + 1) as u32).collect();
+    let prompt: Vec<u32> = (0..530).map(|i| (i % 5 + 1) as u32).collect();
     for (pos, &tok) in prompt.iter().enumerate() {
         cpu_run.forward_into(tok, pos).unwrap();
     }

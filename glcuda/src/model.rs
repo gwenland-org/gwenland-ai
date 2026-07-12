@@ -390,6 +390,10 @@ pub(crate) struct Workspace {
     pub logits_host: Vec<f32>,
     /// Host staging for the embedding row uploaded per token.
     pub embed_host: Vec<f32>,
+    /// Host staging for a whole prefill chunk's embeddings — filled row by
+    /// row, uploaded in ONE HtoD per chunk (Acceleratio Stellarum Phase A;
+    /// the old per-token copies were n small synchronous transfers).
+    pub pf_embed_host: Vec<f32>,
     /// Q8_0 decoupled quantizer output (INT8 weights), `[hidden_dim]` max.
     pub q8_qs: DevSlice,
     /// Q8_0 decoupled quantizer output (FP32 block scales), `[hidden_dim / 32]` max.
@@ -412,12 +416,19 @@ pub(crate) struct Workspace {
     pub pf_scales: DevSlice,
 }
 
-/// Prompt tokens processed per batched-prefill pass. Bounds the batched
+/// Prompt tokens resident per batched-prefill pass. Bounds the batched
 /// workspace VRAM; longer prompts are processed in consecutive chunks.
-/// 64 = the MMA GEMM's full m-tile span (M2.3 Stage 2a): one weight stream
-/// covers the whole chunk. Scratch cost is linear in this (~15 MiB at 64
-/// for 7B shapes).
-pub(crate) const PREFILL_BATCH: usize = 64;
+///
+/// Acceleratio Stellarum Phase A (Stage 3 execution-graph redesign): 512 —
+/// the layer-first ubatch. Prompts up to 512 tokens now traverse the layer
+/// loop ONCE with all rows resident, which is the prerequisite for the
+/// Phase B GEMM contract (weights streamed once per layer). Until Phase B,
+/// `gemm_rows` still issues the tensor-core GEMM in 64-row sub-slabs (the
+/// kernel's m-tile reuse span), so weight DRAM traffic is unchanged in
+/// Phase A by design — Phase A isolates graph correctness from the traffic
+/// win. Scratch cost is linear in this (~125 MiB at 512 for 7B shapes; the
+/// footprint check at load still guards VRAM).
+pub(crate) const PREFILL_BATCH: usize = 512;
 
 /// A model resident in VRAM: weights, KV cache and workspace, all carved
 /// from one backend buffer.
@@ -641,6 +652,7 @@ impl GpuModel {
             },
             logits_host: vec![0.0; c.vocab_size],
             embed_host: vec![0.0; c.dim],
+            pf_embed_host: vec![0.0; PREFILL_BATCH * c.dim],
             q8_qs: buf.alloc(c.hidden_dim as u64)?,
             q8_scales: buf.alloc_f32(c.hidden_dim / 32)?,
             pf_x: buf.alloc_f32(PREFILL_BATCH * c.dim)?,

@@ -150,7 +150,29 @@ fn gemm_rows(
             // test shapes). The prefill scratch is PREFILL_BATCH rows, so
             // the MMA's read-padding to 8 token rows is always in bounds.
             if k.has_mma() && rows.is_multiple_of(8) {
-                k.gemm_mma_q8(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
+                // Phase A: the MMA kernel's contract covers <= 64 token rows
+                // (its register m-tile span), so a layer-first chunk is
+                // issued as 64-row sub-slabs. Weights are re-streamed per
+                // sub-slab — unchanged from the old 64-token graph BY
+                // DESIGN; the Phase B kernel contract (weights once per
+                // resident chunk) removes this loop's re-streaming.
+                let mut t0 = 0u32;
+                while t0 < n {
+                    let nn = (n - t0).min(64);
+                    k.gemm_mma_q8(
+                        cuda,
+                        wqs,
+                        wsc,
+                        x_qs + (t0 * inb) as u64,
+                        x_scales + (t0 * (inb / 32)) as u64 * 4,
+                        y + (t0 * rows) as u64 * 4,
+                        rows,
+                        inb,
+                        nn,
+                    )?;
+                    t0 += nn;
+                }
+                Ok(())
             } else {
                 k.gemm_q8_0_soa(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
             }
@@ -346,13 +368,16 @@ impl GpuModel {
         Ok(())
     }
 
-    /// Batched prefill: run the whole prompt through the model, processing up to
-    /// `PREFILL_BATCH` tokens per pass so the weight matmuls become batched GEMMs
-    /// (each weight streamed once per 4-token tile instead of once per token).
-    /// The weight-free per-token work (RoPE, KV write, attention) stays a loop
-    /// over the batch, using the same kernels as the sequential path — identical
-    /// semantics. Leaves the last prompt token's logits in `ws.logits` and
-    /// advances the KV cursor to `prompt.len()`.
+    /// Batched prefill: run the whole prompt through the model with up to
+    /// `PREFILL_BATCH` (512) tokens RESIDENT per pass — the layer-first
+    /// execution graph (Acceleratio Stellarum Phase A): prompts up to 512
+    /// tokens traverse the layer loop once with every row available to each
+    /// weight's GEMM. Causality is per-row inside the attention kernel
+    /// (`cached_len = pos_seq[t] + 1`), so the schedule change does not touch
+    /// the math. Until the Phase B GEMM contract lands, `gemm_rows` still
+    /// issues the tensor-core GEMM in 64-row sub-slabs, so weight traffic is
+    /// unchanged in Phase A by design. Leaves the last prompt token's logits
+    /// in `ws.logits` and advances the KV cursor to `prompt.len()`.
     pub fn prefill_batched(&mut self, cuda: &Cuda, k: &KernelSet, prompt: &[u32]) -> Result<(), GlError> {
         let c = &self.config;
         let dim = c.dim;
@@ -433,13 +458,25 @@ impl GpuModel {
         while base < p {
             let n = (p - base).min(PREFILL_BATCH);
 
-            // Embed this chunk's tokens into pf_x rows.
-            for i in 0..n {
-                let mut embed = std::mem::take(&mut self.ws.embed_host);
-                let r = self.embed_row(prompt[base + i], &mut embed);
-                self.ws.embed_host = embed;
-                r?;
-                cuda.htod_f32(fq(pf_x, i * dim), &self.ws.embed_host)?;
+            // Embed this chunk's tokens host-side, then ONE HtoD for the
+            // whole chunk (Phase A: the old per-token copies were n small
+            // synchronous transfers). The staging vec lives in the workspace
+            // so prefill stays allocation-free across chunks.
+            {
+                let mut staging = std::mem::take(&mut self.ws.pf_embed_host);
+                let mut embed_err = Ok(());
+                for i in 0..n {
+                    let row = &mut staging[i * dim..(i + 1) * dim];
+                    if let Err(e) = self.embed_row(prompt[base + i], row) {
+                        embed_err = Err(e);
+                        break;
+                    }
+                }
+                // Return the vec before bailing so the workspace keeps it.
+                let upload = cuda.htod_f32(pf_x, &staging[..n * dim]);
+                self.ws.pf_embed_host = staging;
+                embed_err?;
+                upload?;
             }
 
             // Positions are consecutive integers: element i of the pos_seq
