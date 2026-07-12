@@ -150,16 +150,19 @@ fn gemm_rows(
             // test shapes). The prefill scratch is PREFILL_BATCH rows, so
             // the MMA's read-padding to 8 token rows is always in bounds.
             if k.has_mma() && rows.is_multiple_of(8) {
-                // Phase A: the MMA kernel's contract covers <= 64 token rows
-                // (its register m-tile span), so a layer-first chunk is
-                // issued as 64-row sub-slabs. Weights are re-streamed per
-                // sub-slab — unchanged from the old 64-token graph BY
-                // DESIGN; the Phase B kernel contract (weights once per
-                // resident chunk) removes this loop's re-streaming.
+                // Phase B (Acceleratio Stellarum): the r256 GEMM reuses each
+                // weight fragment across 256 token rows (32 m-tiles) instead
+                // of 64, so a 512-row layer-first chunk re-streams weights
+                // TWICE instead of eight times. T4 A/B (bench [gemm-phaseb]):
+                // 512-row chunk 41-43% faster at 256-row tiles than 64 on
+                // gate_up + down, despite 50% occupancy (96 reg, 0 spill) —
+                // the BW-bound FFN GEMMs are dominated by weight traffic, so
+                // reuse beats the occupancy loss. 256 is the kernel's m-tile
+                // cap; PREFILL_BATCH=512 chunks issue two r256 sub-slabs.
                 let mut t0 = 0u32;
                 while t0 < n {
-                    let nn = (n - t0).min(64);
-                    k.gemm_mma_q8(
+                    let nn = (n - t0).min(256);
+                    k.gemm_mma_q8_r256(
                         cuda,
                         wqs,
                         wsc,
