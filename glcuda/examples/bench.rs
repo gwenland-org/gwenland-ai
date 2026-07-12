@@ -753,6 +753,65 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     and prints max_rel_err — turning the opaque crash into a number. If
     //     it faults here, the CUDA error surfaces at the sync below.
     // ============================================================
+    // ============================================================
+    // 2d1. [r256-ladder] Localize the r256 bug by shape. Sweep (in_dim, ntok)
+    //     from the minimal valid shape (32 K, 8 rows = 1 k-block, 1 m-tile)
+    //     upward, comparing r256 to the trusted gemm_mma_q8. The FIRST
+    //     MISMATCH tells us which dimension triggers the bug: fails at ntok=8
+    //     => m-tile 0 / epilogue; passes 8 but fails 16 => m-tile advance;
+    //     fails only when in_dim>32 => k-loop; fails only at ntok>64 =>
+    //     4-pass staging. Measurement, not inspection.
+    // ============================================================
+    if k.has_mma() {
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let scale_bits = 0x3C00u16;
+        println!("[r256-ladder] (out=8) sweeping shapes; first MISMATCH localizes the bug:");
+        for &(in_dim, ntok) in &[
+            (32usize, 8usize), (64, 8), (32, 16), (32, 64), (32, 72), (32, 256),
+            (128, 8), (128, 256), (3584, 8), (3584, 256),
+        ] {
+            let out_dim = 8usize;
+            let nb = in_dim / 32;
+            let mark = buf.mark();
+            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+            let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
+            let d_w = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            let d_s = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            let d_x = buf.alloc((ntok * in_dim) as u64)?.dptr;
+            let d_xs = buf.alloc_f32(ntok * nb)?.dptr;
+            let d_yr = buf.alloc_f32(ntok * out_dim)?.dptr;
+            let d_yc = buf.alloc_f32(ntok * out_dim)?.dptr;
+            cuda.htod(d_w, as_u8(&wqs))?;
+            cuda.htod(d_s, &vec![scale_bits; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
+            cuda.htod(d_x, as_u8(&xqs))?;
+            cuda.htod_f32(d_xs, &vec![1.0f32; ntok * nb])?;
+            // reference: 8-tile kernel in 64-row sub-slabs
+            for t0 in (0..ntok).step_by(64) {
+                let nn = (ntok - t0).min(64) as u32;
+                k.gemm_mma_q8(&cuda, d_w, d_s, d_x + (t0 * in_dim) as u64, d_xs + (t0 * nb) as u64 * 4, d_yr + (t0 * out_dim) as u64 * 4, out_dim as u32, in_dim as u32, nn)?;
+            }
+            let launched = k.gemm_mma_q8_r256(&cuda, d_w, d_s, d_x, d_xs, d_yc, out_dim as u32, in_dim as u32, ntok as u32);
+            let synced = cuda.synchronize();
+            let verdict = match (launched, synced) {
+                (Ok(()), Ok(())) => {
+                    let mut yr = vec![0f32; ntok * out_dim];
+                    let mut yc = vec![0f32; ntok * out_dim];
+                    cuda.dtoh_f32(&mut yr, d_yr)?;
+                    cuda.dtoh_f32(&mut yc, d_yc)?;
+                    let bad = (0..ntok * out_dim).find(|&i| (yr[i] - yc[i]).abs() > 1.0);
+                    match bad {
+                        None => "MATCH".to_string(),
+                        Some(i) => format!("MISMATCH @ (t={},r={}) ref={:.0} r256={:.0}", i / out_dim, i % out_dim, yr[i], yc[i]),
+                    }
+                }
+                (l, s) => format!("FAULT {l:?}/{s:?}"),
+            };
+            println!("  in={in_dim:<5} ntok={ntok:<4} nb={nb:<3}: {verdict}");
+            buf.reset_to(mark);
+        }
+    }
+
     if k.has_mma() {
         let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
         // Real 7B in-dims (3584 gate_up, 18944 down); out_dim trimmed to 256
