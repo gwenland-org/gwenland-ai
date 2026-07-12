@@ -825,23 +825,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let treal = t.elapsed().as_secs_f64() / iters as f64;
 
         // The naive subtraction model (pass_i = t_i - t_{i-1}) is INVALID at
-        // full grid: the first T4 run measured score-only SLOWER than the
-        // full kernel (3138 vs 2679 us, same SASS — stop is a runtime param).
-        // Cause: ~4 resident blocks/SM overlap different passes. Early exit
-        // raises block turnover so every in-flight block is in the
-        // uncoalesced Pass-1 K loads at once (homogeneous contention); in
-        // the full kernel a block's softmax/V-accum stagger the memory
-        // demand of its neighbors' Pass 1. So at full grid we report RAW
-        // times and SIGNED marginal costs — "what does adding this pass
-        // cost at production concurrency". Marginal ~0 (or negative) means
-        // the pass is completely hidden under Pass-1 traffic.
+        // full grid: ~4 resident blocks/SM overlap different passes, so early
+        // exit raises block turnover and every in-flight block hits the
+        // Pass-1 K loads at once (homogeneous contention) while the full
+        // kernel's softmax/V-accum stagger neighbors' demand. So full grid
+        // reports RAW times + SIGNED marginal costs only (marginal ~0 = pass
+        // hidden under Pass-1 traffic).
+        //
+        // CAVEAT (measured, Stage 2c.1): since Pass 1 became warp-per-row,
+        // the probe's full path no longer matches the real kernel at full
+        // grid (T4: 1543 vs 1060 us). Identical inner loops — the mismatch
+        // is the probe's THREE ret sites changing ptxas block scheduling
+        // across 1792 memory-bound blocks. So the full-grid probe numbers
+        // are CONTENTION INDICATORS, not absolute pass times; trust the
+        // single-block ratio below for the split. The full-vs-real gap is
+        // reported precisely so this stays visible, not asserted away.
         println!(
-            "\n[attn] full-grid {n_heads}h x {ntok}tok, cached_len ~{}: score-only {:.0} us | +softmax {:.0} us | full {:.0} us | real kernel {:.0} us (should match full)",
+            "\n[attn] full-grid {n_heads}h x {ntok}tok, cached_len ~{}: score-only {:.0} us | +softmax {:.0} us | probe-full {:.0} us | real kernel {:.0} us",
             base + ntok / 2,
             t1 * 1e6,
             t12 * 1e6,
             tful * 1e6,
             treal * 1e6,
+        );
+        println!(
+            "[attn]   probe-vs-real gap {:+.0} us ({:+.0}%) — probe scheduling artifact, full-grid times are contention indicators only",
+            (tful - treal) * 1e6,
+            100.0 * (tful - treal) / treal.max(1e-12),
         );
         println!(
             "[attn]   marginal cost at full concurrency: softmax {:+.0} us | V-accum {:+.0} us (vs score-only {:.0} us)",
