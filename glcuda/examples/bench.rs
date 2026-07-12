@@ -745,6 +745,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2d2. [r256-parity] r256 correctness at real 7B shapes, on hardware.
+    //     The engine wire-in crashed with CUDA_ERROR_MISALIGNED_ADDRESS but
+    //     the parity test only runs under `cargo test` (the notebook runs
+    //     bench, not tests), so r256 has NEVER been validated on the T4. This
+    //     runs it at gate_up/down shapes and ntok=256 against a CPU reference
+    //     and prints max_rel_err — turning the opaque crash into a number. If
+    //     it faults here, the CUDA error surfaces at the sync below.
+    // ============================================================
+    if k.has_mma() {
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        // Real 7B in-dims (3584 gate_up, 18944 down); out_dim trimmed to 256
+        // so the CPU reference stays cheap. ntok=256 = the r256 cap and the
+        // engine's second sub-slab size. This mirrors the engine call shape.
+        for (label, out_dim, in_dim, ntok) in
+            [("gate_up", 256usize, 3584usize, 256usize), ("down", 256, 18944, 256)]
+        {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            let scale_bits = 0x3C00u16; // 1.0 in f16, so scales are exactly 1.
+            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+            let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
+            let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
+            cuda.htod(d_wqs, as_u8(&wqs))?;
+            cuda.htod(d_wsc, &vec![scale_bits; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
+            cuda.htod(d_xqs, as_u8(&xqs))?;
+            cuda.htod_f32(d_xsc, &vec![1.0f32; ntok * nb])?;
+
+            // This launch is the suspect; the sync makes a fault visible here.
+            let launched = k.gemm_mma_q8_r256(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32);
+            let synced = cuda.synchronize();
+            match (launched, synced) {
+                (Ok(()), Ok(())) => {
+                    let mut y_host = vec![0f32; ntok * out_dim];
+                    cuda.dtoh_f32(&mut y_host, d_y)?;
+                    // Reference: scales all 1.0, so y[t][r] = sum_k wqs*xqs.
+                    let mut max_rel = 0f32;
+                    for t in 0..ntok {
+                        for r in 0..out_dim {
+                            let mut acc = 0i64;
+                            for kk in 0..in_dim {
+                                acc += wqs[r * in_dim + kk] as i64 * xqs[t * in_dim + kk] as i64;
+                            }
+                            let want = acc as f32;
+                            let got = y_host[t * out_dim + r];
+                            max_rel = max_rel.max((got - want).abs() / want.abs().max(1.0));
+                        }
+                    }
+                    println!("[r256-parity {label}] {out_dim}x{in_dim} ntok={ntok}: OK, max_rel_err {max_rel:.2e}");
+                }
+                (l, s) => {
+                    println!("[r256-parity {label}] FAULT: launch={l:?} sync={s:?}");
+                }
+            }
+            buf.reset_to(mark);
+        }
+    }
+
+    // ============================================================
     // 2e. [gemm-phaseb] The A/B that decides Phase B's m-tile count. The
     //     [gemm-reuse] trend says weight-BW-bound (reuse pays), but the
     //     register model warns 32 m-tiles (256 rows) drops occupancy to ~50%,
