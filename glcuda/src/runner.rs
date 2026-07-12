@@ -397,12 +397,23 @@ impl GpuModel {
         // attn (bias/qk-norm/rope/kv-write/attention core), ffn (norm+quant+
         // gate/up/down GEMMs+silu+residual).
         let prof = std::env::var_os("GLCUDA_PROFILE_PREFILL").is_some();
-        let (mut t_qkv, mut t_attn, mut t_ffn) =
+        // t_attn/t_ffn are recomputed from their sub-buckets below; only t_qkv
+        // is still accumulated directly in the loop.
+        let (mut t_qkv, t_attn, t_ffn) =
             (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
         // Fine-grained FFN sub-buckets (only meaningful with the profiler on):
         // gate+up GEMMs, down GEMM, and the elementwise glue (quant/silu/
         // norm/add) — to localize the 51-67% FFN cost the coarse split shows.
         let (mut t_gu, mut t_dn, mut t_elt) =
+            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Fine-grained attn sub-buckets: profiling showed attn is ~40% of
+        // prefill and, unlike FFN, contains no big GEMM — so localize it into
+        // norm (bias+qk-norm+rope), kv-write, and the attention core. t_attn is
+        // their sum, so these inner phase! calls replace the outer wrapper (no
+        // double-counting). "norm" groups the pre-core elementwise/rope glue;
+        // "core" is attn_decode_rows, the decode-shaped kernel run over prefill
+        // rows and the prime suspect for the disproportionate attn cost.
+        let (mut t_an, mut t_kv, mut t_ac) =
             (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
         macro_rules! phase {
             ($bucket:expr, $body:block) => {{
@@ -452,7 +463,10 @@ impl GpuModel {
                     gemm_rows(cuda, k, &layer.wv, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_v, n as u32)?;
                 });
 
-                phase!(t_attn, {
+                // attn, split into norm (bias+qk-norm+rope) / kv-write / core.
+                // t_attn is their sum, reported below — no outer phase! wrapper,
+                // so the inner syncs don't double-count.
+                phase!(t_an, {
                     if let Some(b) = &layer.bq {
                         k.add_bias_rows(cuda, pf_q, b.dptr, q_dim as u32, (n * q_dim) as u32)?;
                     }
@@ -472,8 +486,12 @@ impl GpuModel {
                     }
                     k.rope_rows(cuda, pf_q, rope_cos, rope_sin, n_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
                     k.rope_rows(cuda, pf_k, rope_cos, rope_sin, n_kv_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
+                });
+                phase!(t_kv, {
                     k.kv_write_rows(cuda, self.kv.read_k(l, 0), pf_k, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
                     k.kv_write_rows(cuda, self.kv.read_v(l, 0), pf_v, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
+                });
+                phase!(t_ac, {
                     // Causal by construction: row t reads cached_len = pos+1
                     // rows, so later rows (already written above) are never seen.
                     k.attn_decode_rows(
@@ -532,7 +550,9 @@ impl GpuModel {
             base += n;
         }
         if prof {
+            let _ = t_attn; // superseded by the t_an/t_kv/t_ac sub-buckets
             let _ = t_ffn; // superseded by the t_gu/t_dn/t_elt sub-buckets
+            let t_attn = t_an + t_kv + t_ac;
             let t_ffn = t_gu + t_dn + t_elt;
             let tot = (t_qkv + t_attn + t_ffn).as_secs_f64().max(1e-9);
             let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
@@ -540,6 +560,10 @@ impl GpuModel {
             eprintln!(
                 "[prefill split] {p} tok | qkv {:.0}ms ({:.0}%) | attn {:.0}ms ({:.0}%) | ffn {:.0}ms ({:.0}%)",
                 ms(t_qkv), pc(t_qkv), ms(t_attn), pc(t_attn), ms(t_ffn), pc(t_ffn),
+            );
+            eprintln!(
+                "[attn detail]  norm+rope {:.0}ms ({:.0}%) | kv-write {:.0}ms ({:.0}%) | attn core {:.0}ms ({:.0}%)",
+                ms(t_an), pc(t_an), ms(t_kv), pc(t_kv), ms(t_ac), pc(t_ac),
             );
             eprintln!(
                 "[ffn detail]   gate+up GEMM {:.0}ms ({:.0}%) | down+o GEMM {:.0}ms ({:.0}%) | elementwise {:.0}ms ({:.0}%)",
