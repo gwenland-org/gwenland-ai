@@ -47,6 +47,10 @@ pub const JIT_INFO_LOG_BUFFER: i32 = 3;
 pub const JIT_INFO_LOG_BUFFER_SIZE_BYTES: i32 = 4;
 pub const JIT_ERROR_LOG_BUFFER: i32 = 5;
 pub const JIT_ERROR_LOG_BUFFER_SIZE_BYTES: i32 = 6;
+/// CU_JIT_LOG_VERBOSE — makes the JIT emit per-function register and
+/// shared-memory usage into the info-log buffer (the ptxas -v numbers we
+/// otherwise cannot see, since we JIT at runtime not offline).
+pub const JIT_LOG_VERBOSE: i32 = 12;
 
 /// Owned handle to the dynamically loaded driver library. Never unloaded —
 /// the driver stays resident for the life of the process, matching the

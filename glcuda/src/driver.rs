@@ -266,23 +266,47 @@ impl Cuda {
     /// image reports the assembler's own diagnostic (line + reason), not a
     /// bare `CUDA_ERROR_INVALID_PTX`.
     pub fn load_module(&self, ptx: &str) -> Result<Module, GlError> {
-        use crate::ffi::{JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES};
+        use crate::ffi::{
+            JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES, JIT_INFO_LOG_BUFFER,
+            JIT_INFO_LOG_BUFFER_SIZE_BYTES, JIT_LOG_VERBOSE,
+        };
 
         // cuModuleLoadData* requires a NUL-terminated image for PTX text.
         let image = std::ffi::CString::new(ptx)
             .map_err(|_| GlError::Engine("PTX image contains interior NUL".into()))?;
 
         let mut err_log = vec![0u8; 16 * 1024];
-        let mut err_size: usize = err_log.len();
-        let mut options = [JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES];
+        let err_cap = err_log.len();
+        // Info log + CU_JIT_LOG_VERBOSE: with GLCUDA_JIT_VERBOSE=1 the driver
+        // writes per-function register/shared-mem usage here (the ptxas -v
+        // numbers, unavailable to us otherwise since we JIT at runtime). Off
+        // by default — pure diagnostic, no effect on the compiled module.
+        let want_info = std::env::var_os("GLCUDA_JIT_VERBOSE").is_some();
+        let mut info_log = vec![0u8; 16 * 1024];
+        let info_cap = info_log.len();
+
         // The size option's value is passed by value in the pointer slot
         // (CUDA's documented convention for scalar JIT options).
-        let mut values: [*mut std::ffi::c_void; 2] =
-            [err_log.as_mut_ptr().cast(), err_size as *mut std::ffi::c_void];
+        let (mut options, mut values): (Vec<i32>, Vec<*mut std::ffi::c_void>) = (
+            vec![JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES],
+            vec![err_log.as_mut_ptr().cast(), err_cap as *mut std::ffi::c_void],
+        );
+        if want_info {
+            options.extend_from_slice(&[
+                JIT_INFO_LOG_BUFFER,
+                JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+                JIT_LOG_VERBOSE,
+            ]);
+            values.extend_from_slice(&[
+                info_log.as_mut_ptr().cast(),
+                info_cap as *mut std::ffi::c_void,
+                1_usize as *mut std::ffi::c_void, // verbose = true
+            ]);
+        }
 
         let mut raw: CUmodule = std::ptr::null_mut();
         // SAFETY: image and buffers outlive the call; out pointer is valid;
-        // option/value arrays are length 2 as declared to numOptions.
+        // options/values are the same length, matching numOptions.
         let res = unsafe {
             (self.api.cu_module_load_data_ex)(
                 &mut raw,
@@ -294,14 +318,23 @@ impl Cuda {
         };
         if res != crate::ffi::CUDA_SUCCESS {
             // The driver wrote the used length back into the value slot.
-            err_size = values[1] as usize;
-            let log = String::from_utf8_lossy(&err_log[..err_size.min(err_log.len())]);
+            let err_size = values[1] as usize;
+            let log = String::from_utf8_lossy(&err_log[..err_size.min(err_cap)]);
             let log = log.trim_end_matches('\0').trim();
             return Err(GlError::Engine(if log.is_empty() {
                 "cuModuleLoadDataEx(PTX JIT) failed with no log".into()
             } else {
                 format!("cuModuleLoadDataEx(PTX JIT) failed:\n{log}")
             }));
+        }
+        if want_info {
+            // values[3] slot (INFO_LOG_BUFFER_SIZE_BYTES) holds the used length.
+            let info_size = values[3] as usize;
+            let log = String::from_utf8_lossy(&info_log[..info_size.min(info_cap)]);
+            let log = log.trim_end_matches('\0').trim();
+            if !log.is_empty() {
+                eprintln!("[glcuda jit] register/smem usage (ptxas -v):\n{log}");
+            }
         }
         Ok(Module { api: self.api.clone(), raw })
     }
