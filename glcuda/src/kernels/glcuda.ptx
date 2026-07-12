@@ -2756,6 +2756,11 @@ KVWR_DONE:
 // gl_kv_write_rows launch; later rows exist but are never read - causal).
 // Launch: grid (n_heads, ntok) x 128 threads. Same shared plan as the
 // original (16 KiB scores + 36 B reduction scratch).
+// Stage 2c.1: Pass 1 here is v2 (one WARP per key row, coalesced lane-
+// strided loads + shfl-tree reduce) and deliberately DIVERGES from the
+// single-token kernel above, which keeps the thread-per-row v1 dot - the
+// decode graph is captured against it and decode attention is not the
+// bottleneck. See the Pass 1 comment below for the measured rationale.
 // ---------------------------------------------------------------------------
 .visible .entry gl_attn_decode_rows_f32(
     .param .u64 p_q,
@@ -2829,33 +2834,72 @@ KVWR_DONE:
     add.s64 %rd13, %rd5, %rd12;          // q_base
     add.s64 %rd14, %rd8, %rd12;          // out_base
 
-    // ---- Pass 1: scores[t] = (q . k[t]) * scale, one thread per t ----
-    mov.u32 %r17, %r6;                   // t = tid
+    // ---- Pass 1 (v2): scores[t] = (q . k[t]) * scale, one WARP per t ----
+    // v1 used one THREAD per key row (scalar sequential dot): a warp's
+    // lanes read k[t+lane][d], addresses head_dim*4 B apart, so every load
+    // instruction touched 32 distinct 32-B sectors (~8x read
+    // amplification). The T4 pass probe measured that as the wall:
+    // score-only 3138 us vs full kernel 2679 us - passes 2+3 ride
+    // completely hidden under Pass-1 K traffic. v2 assigns one WARP per
+    // key row with lane-strided elements: one load instruction reads 32
+    // CONSECUTIVE floats (a single 128-B coalesced transaction), and a
+    // shfl tree reduces the 32 lane partials - the same reduction
+    // gl_gemv_f32 has used since Phase 1. q re-reads hit L1 (one 512-B
+    // row, loop-invariant across rows). Reduction ORDER differs from the
+    // sequential glproc dot; covered by the parity epsilon like every
+    // warp reduction in this module. Softmax and Pass 3 are untouched.
+    mov.u32 %r17, %r9;                   // t = warp_id
 ATTNR_SCORE:
     setp.ge.u32 %p1, %r17, %r2;
     @%p1 bra ATTNR_SCORE_DONE;
     mul.lo.s32 %r18, %r17, %r1;
     mul.wide.u32 %rd15, %r18, 4;
     add.s64 %rd16, %rd10, %rd15;         // &k[t][0]
-    mov.u64 %rd17, %rd13;                // &q[0]
-    mov.f32 %f2, 0f00000000;             // dot acc (FP32)
-    mov.u32 %r19, 0;                     // d
+    mul.wide.u32 %rd15, %r8, 4;          // lane byte offset
+    add.s64 %rd16, %rd16, %rd15;         // &k[t][lane]
+    add.s64 %rd17, %rd13, %rd15;         // &q[lane]
+    mov.f32 %f2, 0f00000000;             // lane partial (FP32)
+    mov.u32 %r19, %r8;                   // d = lane
 ATTNR_DOT:
     setp.ge.u32 %p2, %r19, %r1;
     @%p2 bra ATTNR_DOT_DONE;
     ld.global.f32 %f3, [%rd17];
     ld.global.f32 %f4, [%rd16];
     fma.rn.f32 %f2, %f3, %f4, %f2;
-    add.s64 %rd17, %rd17, 4;
-    add.s64 %rd16, %rd16, 4;
-    add.s32 %r19, %r19, 1;
+    add.s64 %rd17, %rd17, 128;           // +32 floats
+    add.s64 %rd16, %rd16, 128;
+    add.s32 %r19, %r19, 32;
     bra ATTNR_DOT;
 ATTNR_DOT_DONE:
+    // reduce the 32 lane partials to the row dot (shfl tree, full mask)
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    setp.ne.u32 %p2, %r8, 0;             // lane 0 stores the score
+    @%p2 bra ATTNR_SCORE_NEXT;
     mul.rn.f32 %f2, %f2, %f1;            // * scale
     shl.b32 %r20, %r17, 2;
     add.s32 %r21, %r12, %r20;
     st.shared.f32 [%r21], %f2;
-    add.s32 %r17, %r17, %r7;             // t += blockDim
+ATTNR_SCORE_NEXT:
+    add.s32 %r17, %r17, %r11;            // t += n_warps
     bra ATTNR_SCORE;
 ATTNR_SCORE_DONE:
     bar.sync 0;
@@ -3106,33 +3150,61 @@ ATTNR_OUT_DONE:
     add.s64 %rd13, %rd5, %rd12;          // q_base
     add.s64 %rd14, %rd8, %rd12;          // out_base
 
-    // ---- Pass 1: scores[t] = (q . k[t]) * scale, one thread per t ----
-    mov.u32 %r17, %r6;                   // t = tid
+    // ---- Pass 1 (v2): one WARP per t, lane-strided coalesced dot ----
+    // Kept identical to gl_attn_decode_rows_f32 v2 so the probe remains a
+    // faithful copy (the [attn] full-vs-real cross-check depends on it).
+    mov.u32 %r17, %r9;                   // t = warp_id
 ATTNP_SCORE:
     setp.ge.u32 %p1, %r17, %r2;
     @%p1 bra ATTNP_SCORE_DONE;
     mul.lo.s32 %r18, %r17, %r1;
     mul.wide.u32 %rd15, %r18, 4;
     add.s64 %rd16, %rd10, %rd15;         // &k[t][0]
-    mov.u64 %rd17, %rd13;                // &q[0]
-    mov.f32 %f2, 0f00000000;             // dot acc (FP32)
-    mov.u32 %r19, 0;                     // d
+    mul.wide.u32 %rd15, %r8, 4;          // lane byte offset
+    add.s64 %rd16, %rd16, %rd15;         // &k[t][lane]
+    add.s64 %rd17, %rd13, %rd15;         // &q[lane]
+    mov.f32 %f2, 0f00000000;             // lane partial (FP32)
+    mov.u32 %r19, %r8;                   // d = lane
 ATTNP_DOT:
     setp.ge.u32 %p2, %r19, %r1;
     @%p2 bra ATTNP_DOT_DONE;
     ld.global.f32 %f3, [%rd17];
     ld.global.f32 %f4, [%rd16];
     fma.rn.f32 %f2, %f3, %f4, %f2;
-    add.s64 %rd17, %rd17, 4;
-    add.s64 %rd16, %rd16, 4;
-    add.s32 %r19, %r19, 1;
+    add.s64 %rd17, %rd17, 128;           // +32 floats
+    add.s64 %rd16, %rd16, 128;
+    add.s32 %r19, %r19, 32;
     bra ATTNP_DOT;
 ATTNP_DOT_DONE:
+    // reduce the 32 lane partials to the row dot (shfl tree, full mask)
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 16, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 8, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 4, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 2, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    mov.b32 %r25, %f2;
+    shfl.sync.down.b32 %r26, %r25, 1, 31, 0xffffffff;
+    mov.b32 %f3, %r26;
+    add.f32 %f2, %f2, %f3;
+    setp.ne.u32 %p2, %r8, 0;             // lane 0 stores the score
+    @%p2 bra ATTNP_SCORE_NEXT;
     mul.rn.f32 %f2, %f2, %f1;            // * scale
     shl.b32 %r20, %r17, 2;
     add.s32 %r21, %r12, %r20;
     st.shared.f32 [%r21], %f2;
-    add.s32 %r17, %r17, %r7;             // t += blockDim
+ATTNP_SCORE_NEXT:
+    add.s32 %r17, %r17, %r11;            // t += n_warps
     bra ATTNP_SCORE;
 ATTNP_SCORE_DONE:
     bar.sync 0;
