@@ -13,3 +13,7 @@ num_cpus = "1.16"
 libc = "0.2"
 
 [dev-dependencies]
+
+[[bench]]
+name = "moe_threads"
+harness = false
