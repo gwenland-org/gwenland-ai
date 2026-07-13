@@ -96,6 +96,25 @@ pub enum QkvWeights {
     Split(WeightMatrix, WeightMatrix, WeightMatrix),
 }
 
+/// A block's feed-forward network: one dense SwiGLU, or a routed mixture.
+///
+/// Per layer, not per model: Qwen3-MoE may interleave dense and MoE blocks,
+/// and the loader decides from the presence of `ffn_gate_exps` tensors.
+pub enum FfnLayer {
+    /// Dense SwiGLU — every token through the same weights.
+    Dense {
+        /// Gate + up projections, `[hidden_dim, dim]` each (row-interleaved
+        /// when quantized — see [`GateUp`]).
+        gate_up: GateUp,
+        /// Down projection, `[dim, hidden_dim]`.
+        w_down: WeightMatrix,
+    },
+    /// Routed mixture of experts. Boxed: an `MoELayer` owns `num_experts`
+    /// weight sets, so inlining it would bloat every dense layer's
+    /// `LayerWeights` by the size of the largest MoE variant.
+    MoE(Box<crate::moe::MoELayer>),
+}
+
 /// Weights of a single transformer block.
 ///
 /// Matrices use GGUF layout `[out_features, in_features]`, row-major.
@@ -119,11 +138,8 @@ pub struct LayerWeights {
     pub k_norm: Option<Vec<f32>>,
     /// Pre-FFN RMSNorm gain, `[dim]`.
     pub ffn_norm: Vec<f32>,
-    /// SwiGLU gate + up projections, `[hidden_dim, dim]` each (interleaved
-    /// when quantized — see [`GateUp`]).
-    pub gate_up: GateUp,
-    /// Down projection, `[dim, hidden_dim]`.
-    pub w_down: WeightMatrix,
+    /// The feed-forward network: dense SwiGLU or routed experts.
+    pub ffn: FfnLayer,
 }
 
 /// A fully loaded model: config plus all weights.

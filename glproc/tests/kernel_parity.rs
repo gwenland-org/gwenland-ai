@@ -530,11 +530,13 @@ fn warm_model_pages_loaded() {
         ffn_norm: vec![1.0; dim],
         // One quantized matrix so the raw-bytes region path is exercised,
         // split so the F32 arm is covered too.
-        gate_up: GateUp::Split(
-            WeightMatrix::Quant(QuantFormat::Q8_0, vec![7u8; dim / 32 * 34 * dim]),
-            WeightMatrix::F32(vec![0.5; dim * dim]),
-        ),
-        w_down: WeightMatrix::F32(vec![0.5; dim * dim]),
+        ffn: glproc::model::FfnLayer::Dense {
+            gate_up: GateUp::Split(
+                WeightMatrix::Quant(QuantFormat::Q8_0, vec![7u8; dim / 32 * 34 * dim]),
+                WeightMatrix::F32(vec![0.5; dim * dim]),
+            ),
+            w_down: WeightMatrix::F32(vec![0.5; dim * dim]),
+        },
     };
     let model = GlprocModel {
         config: ModelConfig {
@@ -561,10 +563,11 @@ fn warm_model_pages_loaded() {
 
     assert!(model.token_embd.as_f32().unwrap().iter().all(|&v| v == 0.25));
     assert!(model.output_norm.iter().all(|&v| v == 1.0));
-    match &model.layers[0].gate_up {
-        GateUp::Split(WeightMatrix::Quant(QuantFormat::Q8_0, b), _) => {
-            assert!(b.iter().all(|&v| v == 7))
-        }
+    match &model.layers[0].ffn {
+        glproc::model::FfnLayer::Dense {
+            gate_up: GateUp::Split(WeightMatrix::Quant(QuantFormat::Q8_0, b), _),
+            ..
+        } => assert!(b.iter().all(|&v| v == 7)),
         _ => unreachable!("gate was constructed as Q8_0"),
     }
     match &model.layers[0].qkv {

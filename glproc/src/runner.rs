@@ -15,7 +15,7 @@ use crate::kernels;
 use crate::kernels::bridge::bridge_matvec_quant;
 use crate::kernels::qdot::{self, QuantizedActivation};
 use crate::kv_cache::KvCache;
-use crate::model::{GateUp, GlprocModel, QkvWeights, RopeStyle, WeightMatrix};
+use crate::model::{FfnLayer, GateUp, GlprocModel, QkvWeights, RopeStyle, WeightMatrix};
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
 use crate::threading::{
@@ -566,66 +566,78 @@ impl<'m> Runner<'m> {
             }
             lap(&mut self.prof, |p| &mut p.wo);
 
-            // --- SwiGLU feed-forward block ---
+            // --- feed-forward block (dense SwiGLU or routed experts) ---
             kernels::rms_norm_into(&ws.x, &layer.ffn_norm, c.rms_eps, &mut ws.xn);
-            match &layer.gate_up {
-                // Fused SwiGLU over row-interleaved weights: one contiguous
-                // stream per thread, one dispatch, no intermediate vectors.
-                GateUp::FusedQuant(fmt, packed) => {
-                    ws.act.quantize(&ws.xn);
-                    par_matvec_swiglu(
-                        &self.pool,
-                        *fmt,
-                        packed,
-                        &ws.act,
-                        &mut ws.gate,
-                        c.hidden_dim,
-                        dim,
-                        self.strategy,
-                    );
+            match &layer.ffn {
+                FfnLayer::MoE(moe) => {
+                    // Routes this token to top-k experts and writes the
+                    // weighted combination into `proj`. Same contract as the
+                    // dense path below: overwrite, caller adds the residual.
+                    moe.forward(&ws.xn, &mut ws.proj, 1, &self.pool, self.strategy);
+                    lap(&mut self.prof, |p| &mut p.gateup);
                 }
-                GateUp::Split(w_gate, w_up) => {
-                    // One quantization feeds both gate and up.
-                    if needs_q8(w_gate) || needs_q8(w_up) {
-                        ws.act.quantize(&ws.xn);
+                FfnLayer::Dense { gate_up, w_down } => {
+                    match gate_up {
+                        // Fused SwiGLU over row-interleaved weights: one
+                        // contiguous stream per thread, one dispatch, no
+                        // intermediate vectors.
+                        GateUp::FusedQuant(fmt, packed) => {
+                            ws.act.quantize(&ws.xn);
+                            par_matvec_swiglu(
+                                &self.pool,
+                                *fmt,
+                                packed,
+                                &ws.act,
+                                &mut ws.gate,
+                                c.hidden_dim,
+                                dim,
+                                self.strategy,
+                            );
+                        }
+                        GateUp::Split(w_gate, w_up) => {
+                            // One quantization feeds both gate and up.
+                            if needs_q8(w_gate) || needs_q8(w_up) {
+                                ws.act.quantize(&ws.xn);
+                            }
+                            matvec_w(
+                                &self.pool,
+                                self.strategy,
+                                w_gate,
+                                &ws.xn,
+                                &ws.act,
+                                &mut ws.gate,
+                                c.hidden_dim,
+                                dim,
+                            );
+                            matvec_w(
+                                &self.pool,
+                                self.strategy,
+                                w_up,
+                                &ws.xn,
+                                &ws.act,
+                                &mut ws.up,
+                                c.hidden_dim,
+                                dim,
+                            );
+                            kernels::silu_mul(&mut ws.gate, &ws.up);
+                        }
+                    }
+                    lap(&mut self.prof, |p| &mut p.gateup);
+                    if needs_q8(w_down) {
+                        ws.act.quantize(&ws.gate);
                     }
                     matvec_w(
                         &self.pool,
                         self.strategy,
-                        w_gate,
-                        &ws.xn,
+                        w_down,
+                        &ws.gate,
                         &ws.act,
-                        &mut ws.gate,
-                        c.hidden_dim,
+                        &mut ws.proj,
                         dim,
-                    );
-                    matvec_w(
-                        &self.pool,
-                        self.strategy,
-                        w_up,
-                        &ws.xn,
-                        &ws.act,
-                        &mut ws.up,
                         c.hidden_dim,
-                        dim,
                     );
-                    kernels::silu_mul(&mut ws.gate, &ws.up);
                 }
             }
-            lap(&mut self.prof, |p| &mut p.gateup);
-            if needs_q8(&layer.w_down) {
-                ws.act.quantize(&ws.gate);
-            }
-            matvec_w(
-                &self.pool,
-                self.strategy,
-                &layer.w_down,
-                &ws.gate,
-                &ws.act,
-                &mut ws.proj,
-                dim,
-                c.hidden_dim,
-            );
             for (xi, di) in ws.x.iter_mut().zip(&ws.proj) {
                 *xi += di;
             }
@@ -918,74 +930,94 @@ impl<'m> Runner<'m> {
                     &mut bws.xnb[b * dim..(b + 1) * dim],
                 );
             }
-            match &layer.gate_up {
-                GateUp::FusedQuant(fmt, packed) => {
-                    for b in 0..bsz {
-                        bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
-                    }
+            match &layer.ffn {
+                FfnLayer::MoE(moe) => {
+                    // Batched routing: tokens are grouped by expert inside
+                    // `forward`, so each active expert streams its weights
+                    // once for all of its tokens, and inactive experts are
+                    // never touched.
                     lap(&mut self.prof, |p| &mut p.p_serial);
-                    par_matmul_swiglu(
+                    moe.forward(
+                        &bws.xnb[..bsz * dim],
+                        &mut bws.projb[..bsz * dim],
+                        bsz,
                         &self.pool,
-                        *fmt,
-                        packed,
-                        &bws.acts[..bsz],
-                        &mut bws.gateb,
-                        c.hidden_dim,
-                        c.hidden_dim,
-                        dim,
                         self.strategy,
                     );
+                    lap(&mut self.prof, |p| &mut p.p_gateup);
                 }
-                GateUp::Split(w_gate, w_up) => {
-                    if needs_q8(w_gate) || needs_q8(w_up) {
-                        for b in 0..bsz {
-                            bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                FfnLayer::Dense { gate_up, w_down } => {
+                    match gate_up {
+                        GateUp::FusedQuant(fmt, packed) => {
+                            for b in 0..bsz {
+                                bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                            }
+                            lap(&mut self.prof, |p| &mut p.p_serial);
+                            par_matmul_swiglu(
+                                &self.pool,
+                                *fmt,
+                                packed,
+                                &bws.acts[..bsz],
+                                &mut bws.gateb,
+                                c.hidden_dim,
+                                c.hidden_dim,
+                                dim,
+                                self.strategy,
+                            );
+                        }
+                        GateUp::Split(w_gate, w_up) => {
+                            if needs_q8(w_gate) || needs_q8(w_up) {
+                                for b in 0..bsz {
+                                    bws.acts[b].quantize(&bws.xnb[b * dim..(b + 1) * dim]);
+                                }
+                            }
+                            for (w, y) in [(w_gate, &mut bws.gateb), (w_up, &mut bws.upb)] {
+                                matmul_w(
+                                    &self.pool,
+                                    self.strategy,
+                                    w,
+                                    &bws.xnb,
+                                    dim,
+                                    &bws.acts[..bsz],
+                                    y,
+                                    c.hidden_dim,
+                                    0,
+                                    c.hidden_dim,
+                                    dim,
+                                    bsz,
+                                );
+                            }
+                            for b in 0..bsz {
+                                let lo = b * c.hidden_dim;
+                                let hi = lo + c.hidden_dim;
+                                kernels::silu_mul(&mut bws.gateb[lo..hi], &bws.upb[lo..hi]);
+                            }
                         }
                     }
-                    for (w, y) in [(w_gate, &mut bws.gateb), (w_up, &mut bws.upb)] {
-                        matmul_w(
-                            &self.pool,
-                            self.strategy,
-                            w,
-                            &bws.xnb,
-                            dim,
-                            &bws.acts[..bsz],
-                            y,
-                            c.hidden_dim,
-                            0,
-                            c.hidden_dim,
-                            dim,
-                            bsz,
-                        );
+                    lap(&mut self.prof, |p| &mut p.p_gateup);
+                    if needs_q8(w_down) {
+                        for b in 0..bsz {
+                            bws.acts[b]
+                                .quantize(&bws.gateb[b * c.hidden_dim..(b + 1) * c.hidden_dim]);
+                        }
                     }
-                    for b in 0..bsz {
-                        let lo = b * c.hidden_dim;
-                        let hi = lo + c.hidden_dim;
-                        kernels::silu_mul(&mut bws.gateb[lo..hi], &bws.upb[lo..hi]);
-                    }
+                    lap(&mut self.prof, |p| &mut p.p_downq);
+                    matmul_w(
+                        &self.pool,
+                        self.strategy,
+                        w_down,
+                        &bws.gateb,
+                        c.hidden_dim,
+                        &bws.acts[..bsz],
+                        &mut bws.projb,
+                        dim,
+                        0,
+                        dim,
+                        c.hidden_dim,
+                        bsz,
+                    );
                 }
             }
-            lap(&mut self.prof, |p| &mut p.p_gateup);
-            if needs_q8(&layer.w_down) {
-                for b in 0..bsz {
-                    bws.acts[b].quantize(&bws.gateb[b * c.hidden_dim..(b + 1) * c.hidden_dim]);
-                }
-            }
-            lap(&mut self.prof, |p| &mut p.p_downq);
-            matmul_w(
-                &self.pool,
-                self.strategy,
-                &layer.w_down,
-                &bws.gateb,
-                c.hidden_dim,
-                &bws.acts[..bsz],
-                &mut bws.projb,
-                dim,
-                0,
-                dim,
-                c.hidden_dim,
-                bsz,
-            );
             for b in 0..bsz {
                 for (xi, di) in bws.xb[b * dim..(b + 1) * dim]
                     .iter_mut()
@@ -1182,11 +1214,13 @@ mod tests {
                 q_norm: None,
                 k_norm: None,
                 ffn_norm: vec![1.0; dim],
-                gate_up: crate::model::GateUp::Split(
-                    w(hidden * dim, 55 + i),
-                    w(hidden * dim, 66 + i),
-                ),
-                w_down: w(dim * hidden, 77 + i),
+                ffn: crate::model::FfnLayer::Dense {
+                    gate_up: crate::model::GateUp::Split(
+                        w(hidden * dim, 55 + i),
+                        w(hidden * dim, 66 + i),
+                    ),
+                    w_down: w(dim * hidden, 77 + i),
+                },
             })
             .collect();
         GlprocModel {

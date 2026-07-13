@@ -107,7 +107,7 @@ impl GlprocEngine {
 /// weight class will take — a scalar fallback in the FFN would silently eat
 /// the whole token budget, so make the dispatch visible.
 fn log_simd_paths(model: &GlprocModel) {
-    use crate::model::{GateUp, WeightMatrix};
+    use crate::model::{FfnLayer, GateUp, WeightMatrix};
     let strategy = crate::simd_strategy::SimdStrategy::detect();
     let vnni = crate::kernels::qdot::has_vnni_256();
     let path = |w: &WeightMatrix| match w {
@@ -117,15 +117,47 @@ fn log_simd_paths(model: &GlprocModel) {
         }
         WeightMatrix::Quant(fmt, _) => format!("{fmt:?} f32-bridge"),
     };
+    let gu_path = |gu: &GateUp| match gu {
+        GateUp::FusedQuant(fmt, _) => format!("{fmt:?} fused-swiglu integer-dot"),
+        GateUp::Split(g, _) => path(g),
+    };
+    // Report the MoE shape up front: on a routed model the expert count and
+    // top-k are the first thing worth confirming, since the `_exps` tensor
+    // layout is the one part of the load path not verified against a real file.
+    let n_moe = model
+        .layers
+        .iter()
+        .filter(|l| matches!(l.ffn, FfnLayer::MoE(_)))
+        .count();
+    if n_moe > 0 {
+        if let Some(FfnLayer::MoE(moe)) = model.layers.iter().find_map(|l| match &l.ffn {
+            m @ FfnLayer::MoE(_) => Some(m),
+            _ => None,
+        }) {
+            let c = &moe.config;
+            eprintln!(
+                "[moe] {n_moe}/{} layers routed | {} experts, top-{} | expert_ffn {} | \
+                 norm_topk {}",
+                model.layers.len(),
+                c.num_experts,
+                c.num_experts_per_tok,
+                c.expert_ffn_size,
+                c.norm_topk_prob,
+            );
+        }
+    }
     let (ffn_gateup, ffn_down) = model
         .layers
         .first()
-        .map(|l| {
-            let gu = match &l.gate_up {
-                GateUp::FusedQuant(fmt, _) => format!("{fmt:?} fused-swiglu integer-dot"),
-                GateUp::Split(g, _) => path(g),
-            };
-            (gu, path(&l.w_down))
+        .map(|l| match &l.ffn {
+            FfnLayer::Dense { gate_up, w_down } => (gu_path(gate_up), path(w_down)),
+            FfnLayer::MoE(moe) => match moe.experts.first() {
+                Some(e) => (
+                    format!("moe expert[0] {}", gu_path(&e.gate_up)),
+                    path(&e.w_down),
+                ),
+                None => ("moe (no experts)".into(), "?".into()),
+            },
         })
         .unwrap_or_else(|| ("?".into(), "?".into()));
     eprintln!(
