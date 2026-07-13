@@ -62,6 +62,11 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
         measurements,
     );
 
+    // 7. Pull the engine's own view of the last run. Taken after the measured
+    //    iterations (not the warmups) so the stage timings describe the same
+    //    work the reported tok/s came from.
+    session.telemetry = adapter.telemetry();
+
     session.analysis = Some(summary::analyze(&session));
     session.validation = Some(integrity::validate(&session));
     Ok(session)

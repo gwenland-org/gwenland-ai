@@ -55,6 +55,24 @@ fn n_threads() -> usize {
         .max(1)
 }
 
+/// The decode pool's thread count, for telemetry. Same value the Runner uses.
+pub fn thread_count() -> usize {
+    n_threads()
+}
+
+/// Bytes the KV cache will allocate for this model — K and V, every layer,
+/// every KV head, at the capped context length, f32.
+///
+/// Exposed for telemetry: this is the one part of the memory footprint that
+/// scales with context, so a combined "peak RSS" figure cannot substitute for
+/// it. Mirrors the sizing in [`Runner::new`]; a divergence here would misreport
+/// rather than misbehave, so the constant is shared rather than duplicated.
+pub fn kv_cache_bytes(c: &crate::model::ModelConfig) -> usize {
+    let capacity = c.max_seq.min(MAX_KV_CONTEXT).max(1);
+    // 2 = K and V.
+    2 * c.n_layers * c.n_kv_heads * c.head_dim * capacity * std::mem::size_of::<f32>()
+}
+
 /// Below this many multiply-accumulates a matvec runs on the calling thread —
 /// waking workers costs more than the work itself.
 const PAR_MIN_WORK: usize = 1 << 16;
@@ -290,6 +308,13 @@ struct Prof {
     /// Down projection matmul + residual.
     p_down: std::time::Duration,
     p_tokens: u32,
+
+    /// Tokens routed to each expert, summed over every MoE layer and token.
+    /// Empty on a dense model — which is itself the signal that no routing
+    /// happened, so it is left empty rather than zero-filled.
+    expert_load: Vec<u64>,
+    /// Shape of the MoE layers, if any: (num_experts, top_k, moe_layer_count).
+    moe_shape: Option<(usize, usize, usize)>,
 }
 
 impl Prof {
@@ -326,6 +351,114 @@ impl Prof {
             ms(self.lm_head),
             ms(self.sampler),
         );
+    }
+
+    /// Project the raw counters into glcore's shared telemetry vocabulary.
+    ///
+    /// Totals, not per-token averages: glbench divides by whatever denominator
+    /// it is reporting against, and an already-averaged number cannot be
+    /// re-aggregated across iterations.
+    ///
+    /// `calls` counts actual *invocations*, which is not the token count: the
+    /// per-layer stages (qkv, attention, ffn, ...) run once per layer per
+    /// token, while `lm_head` and `sampler` run once per token. Reporting the
+    /// token count for everything would understate the per-layer stages by a
+    /// factor of `n_layers` and make `ms/call` meaningless.
+    fn to_telemetry(&self, n_layers: usize) -> glcore::telemetry::EngineTelemetry {
+        use glcore::telemetry::{EngineTelemetry, MoeTelemetry, PhaseProfile, StageTiming};
+
+        let stage = |name: &str, d: std::time::Duration, calls: u64| StageTiming {
+            name: name.to_string(),
+            total_ms: d.as_secs_f64() * 1e3,
+            calls,
+        };
+
+        let decode = (self.tokens > 0).then(|| {
+            let toks = self.tokens as u64;
+            let per_layer = toks * n_layers as u64;
+            let stages = vec![
+                stage("qkv", self.qkv, per_layer),
+                stage("attention", self.attn, per_layer),
+                stage("attn_out", self.wo, per_layer),
+                stage("ffn_gate_up", self.gateup, per_layer),
+                stage("ffn_down", self.down, per_layer),
+                // Once per token, not per layer — the LM head runs after the
+                // whole stack, and sampling after that.
+                stage("lm_head", self.lm_head, toks),
+                stage("sampler", self.sampler, toks),
+            ];
+            // The phase total is the sum of what we measured. glproc times
+            // every stage of the decode loop, so there is no separate
+            // wall-clock to compare against here; `unattributed_ms()` will
+            // read 0, which is honest — the blind spot really is zero.
+            let total_ms = stages.iter().map(|s| s.total_ms).sum();
+            PhaseProfile { stages, total_ms }
+        });
+
+        let prefill = (self.p_tokens > 0).then(|| {
+            // Every prefill bucket is inside the per-layer loop, so each ran
+            // once per layer per chunk. Chunks, not tokens: prefill batches
+            // tokens (PREFILL_CHUNK at a time), so a "call" processes a whole
+            // batch. Round up — a partial last chunk is still a call.
+            let chunks = (self.p_tokens as u64).div_ceil(PREFILL_CHUNK as u64);
+            let per_layer = chunks * n_layers as u64;
+            let stages = vec![
+                stage("serial", self.p_serial, per_layer),
+                stage("qkv", self.p_qkv, per_layer),
+                stage("fixup", self.p_fixup, per_layer),
+                stage("attention", self.p_attn, per_layer),
+                stage("attn_out", self.p_wo, per_layer),
+                stage("ffn_gate_up", self.p_gateup, per_layer),
+                stage("ffn_downq", self.p_downq, per_layer),
+                stage("ffn_down", self.p_down, per_layer),
+            ];
+            let total_ms = stages.iter().map(|s| s.total_ms).sum();
+            PhaseProfile { stages, total_ms }
+        });
+
+        let moe = self
+            .moe_shape
+            .map(|(num_experts, num_experts_per_tok, moe_layers)| MoeTelemetry {
+                num_experts,
+                num_experts_per_tok,
+                expert_load: self.expert_load.clone(),
+                moe_layers,
+            });
+
+        EngineTelemetry {
+            prefill,
+            decode,
+            backend: None, // filled by the engine, which knows the strategy
+            memory: None,  // filled by the engine, which knows the model size
+            moe,
+        }
+    }
+}
+
+/// Accumulate one MoE layer's routing into the profile.
+///
+/// No-op when profiling is off (`prof == None`), which is the common case —
+/// so a routed model pays nothing for telemetry it did not ask for. When on,
+/// the cost is one add per selected expert (top_k per token), which is
+/// negligible next to the expert FFN it just ran.
+fn record_moe(
+    prof: &mut Option<Box<Prof>>,
+    config: &crate::moe::MoEConfig,
+    routing: &crate::moe::RoutingResult,
+) {
+    let Some(p) = prof.as_mut() else {
+        return;
+    };
+    // First MoE layer seen defines the shape and sizes the accumulator. The
+    // layer *count* is not derivable here (this fires once per layer per
+    // token, so counting visits would multiply by token count) — the engine
+    // fills it from the model, which actually knows.
+    if p.moe_shape.is_none() {
+        p.moe_shape = Some((config.num_experts, config.num_experts_per_tok, 0));
+        p.expert_load = vec![0u64; config.num_experts];
+    }
+    for (e, &count) in routing.expert_load.iter().enumerate() {
+        p.expert_load[e] += count as u64;
     }
 }
 
@@ -573,7 +706,8 @@ impl<'m> Runner<'m> {
                     // Routes this token to top-k experts and writes the
                     // weighted combination into `proj`. Same contract as the
                     // dense path below: overwrite, caller adds the residual.
-                    moe.forward(&ws.xn, &mut ws.proj, 1, &self.pool, self.strategy);
+                    let routing = moe.forward(&ws.xn, &mut ws.proj, 1, &self.pool, self.strategy);
+                    record_moe(&mut self.prof, &moe.config, &routing);
                     lap(&mut self.prof, |p| &mut p.gateup);
                 }
                 FfnLayer::Dense { gate_up, w_down } => {
@@ -937,13 +1071,14 @@ impl<'m> Runner<'m> {
                     // once for all of its tokens, and inactive experts are
                     // never touched.
                     lap(&mut self.prof, |p| &mut p.p_serial);
-                    moe.forward(
+                    let routing = moe.forward(
                         &bws.xnb[..bsz * dim],
                         &mut bws.projb[..bsz * dim],
                         bsz,
                         &self.pool,
                         self.strategy,
                     );
+                    record_moe(&mut self.prof, &moe.config, &routing);
                     lap(&mut self.prof, |p| &mut p.p_gateup);
                 }
                 FfnLayer::Dense { gate_up, w_down } => {
@@ -1083,6 +1218,20 @@ impl<'m> Runner<'m> {
     /// of a model's EOS variants (`<|im_end|>`, `<|endoftext|>`, ...) halt
     /// generation, not just the single metadata EOS.
     ///
+    /// Per-stage telemetry for the runs so far, or `None` when profiling is
+    /// off (`GLPROC_PROFILE` unset).
+    ///
+    /// `None` means *not measured*, never *zero* — a consumer that renders a
+    /// missing profile as "0 ms in attention" would be inventing a fact.
+    ///
+    /// Backend/memory/layer-count fields are left empty here and filled by
+    /// [`crate::engine::GlprocEngine`], which is the layer that knows the SIMD
+    /// strategy, the model size, and how many layers are routed.
+    pub fn telemetry(&self) -> Option<glcore::telemetry::EngineTelemetry> {
+        let n_layers = self.model.config.n_layers;
+        self.prof.as_ref().map(|p| p.to_telemetry(n_layers))
+    }
+
     /// Returns the generated tokens plus a [`GenTiming`] separating prefill
     /// from decode wall time.
     pub fn generate(

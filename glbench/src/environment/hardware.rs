@@ -52,8 +52,26 @@ impl ToJson for HardwareSnapshot {
                 "cpu",
                 Json::obj([
                     ("logical_cores", Json::n(self.cpu.logical_cores as f64)),
+                    (
+                        "physical_cores",
+                        opt_num(self.cpu.physical_cores.map(|n| n as f64)),
+                    ),
                     ("model", opt_str(self.cpu.model.as_deref())),
                     ("mhz", opt_num(self.cpu.mhz)),
+                    // What the CPU *supports*. What the engine actually chose
+                    // is a different fact, and lives in telemetry.backend.
+                    (
+                        "isa",
+                        Json::obj([
+                            ("avx2", Json::Bool(self.cpu.isa.avx2)),
+                            ("fma", Json::Bool(self.cpu.isa.fma)),
+                            ("f16c", Json::Bool(self.cpu.isa.f16c)),
+                            ("avx512f", Json::Bool(self.cpu.isa.avx512f)),
+                            ("avx512bw", Json::Bool(self.cpu.isa.avx512bw)),
+                            ("avx512_vnni", Json::Bool(self.cpu.isa.avx512_vnni)),
+                            ("avx_vnni", Json::Bool(self.cpu.isa.avx_vnni)),
+                        ]),
+                    ),
                 ]),
             ),
             (

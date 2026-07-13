@@ -1,6 +1,7 @@
 //! The `GlEngine` trait — the contract every GL compute backend implements.
 
 use crate::error::GlError;
+use crate::telemetry::EngineTelemetry;
 
 /// Input to the engine for a single inference request.
 #[derive(Debug, Clone)]
@@ -78,6 +79,20 @@ pub trait GlEngine: Send + Sync {
 
     /// Run synchronous inference.
     fn infer(&self, input: InferInput) -> Result<InferOutput, GlError>;
+
+    /// Per-stage facts about the most recent run: stage timings, kernel
+    /// selection, memory split, MoE routing.
+    ///
+    /// This is a **pull**, not a callback: the engine hands over a snapshot of
+    /// counters it already keeps, and never learns who asked. See
+    /// [`crate::telemetry`] for why that direction matters.
+    ///
+    /// Defaults to `None`, so a backend that collects nothing (or has
+    /// profiling switched off) is fully conforming and pays zero cost. The
+    /// caller must treat absence as "not measured", never as "zero".
+    fn telemetry(&self) -> Option<EngineTelemetry> {
+        None
+    }
 
     /// Stream tokens via callback, returning the same stats as
     /// [`GlEngine::infer`] — the default implementation wraps `infer` and

@@ -61,6 +61,17 @@ impl EngineAdapter {
         &self.gpu
     }
 
+    /// Per-stage telemetry from the engine's most recent run, or `None` if it
+    /// collects none (profiling off, or a backend that reports nothing).
+    ///
+    /// A pull, not a callback: glbench asks the engine for facts it already
+    /// keeps. The engine never learns that a benchmark harness is what asked —
+    /// which is what keeps `glbench observes, it does not control` true in code
+    /// rather than only in DESIGN.md.
+    pub fn telemetry(&self) -> Option<glcore::telemetry::EngineTelemetry> {
+        self.runtime.telemetry()
+    }
+
     /// Run one inference request for `spec`'s prompt and token budget, returning
     /// the raw per-iteration facts. This is a thin pass-through to the engine —
     /// the engine already separates prefill from decode timing in its output.

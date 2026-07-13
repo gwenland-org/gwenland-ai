@@ -26,6 +26,13 @@ pub struct GlprocEngine {
     model: Option<GlprocModel>,
     tokenizer: Option<Tokenizer>,
     config: GlprocConfig,
+    /// Telemetry from the most recent `infer`/`stream`.
+    ///
+    /// A `Mutex` because `GlEngine::infer` takes `&self` (the trait is
+    /// `Send + Sync` so `Runtime` can hold engines behind a `Box<dyn>`), yet
+    /// the run produces facts we must keep. Locked exactly twice per inference
+    /// — once to store, once when a consumer pulls — never in the hot path.
+    last_telemetry: std::sync::Mutex<Option<glcore::telemetry::EngineTelemetry>>,
 }
 
 impl GlprocEngine {
@@ -40,6 +47,7 @@ impl GlprocEngine {
             model: None,
             tokenizer: None,
             config,
+            last_telemetry: std::sync::Mutex::new(None),
         }
     }
 
@@ -90,6 +98,27 @@ impl GlprocEngine {
             },
         )?;
 
+        // Capture the run's telemetry before the Runner (and its counters) drop.
+        // The Runner knows stage timings and expert load; only the engine knows
+        // the SIMD strategy, the model's byte size, and how many layers are
+        // routed — so enrich here rather than plumbing the model into `Prof`.
+        if let Some(mut t) = runner.telemetry() {
+            t.backend = Some(self.backend_telemetry(model));
+            t.memory = Some(self.memory_telemetry(model));
+            if let Some(moe) = t.moe.as_mut() {
+                moe.moe_layers = model
+                    .layers
+                    .iter()
+                    .filter(|l| matches!(l.ffn, crate::model::FfnLayer::MoE(_)))
+                    .count();
+            }
+            // A poisoned lock here must not fail the inference — the tokens are
+            // already generated and correct. Drop the telemetry instead.
+            if let Ok(mut slot) = self.last_telemetry.lock() {
+                *slot = Some(t);
+            }
+        }
+
         let tokens_generated = token_ids.len();
         Ok(InferOutput {
             token_ids,
@@ -100,6 +129,107 @@ impl GlprocEngine {
             prefill_ms: timing.prefill.as_secs_f64() * 1e3,
             generation_ms: timing.decode.as_secs_f64() * 1e3,
         })
+    }
+
+    /// What the engine actually *chose* — not what the CPU supports.
+    ///
+    /// These differ, and the gap is load-bearing: glproc deliberately rejects
+    /// AVX-512 on low-core parts because it downclocks, so a machine whose
+    /// CPUID says `avx512f` may still be running AVX2 kernels. Reporting the
+    /// CPU's capability alone would hide that.
+    fn backend_telemetry(&self, model: &GlprocModel) -> glcore::telemetry::BackendTelemetry {
+        use crate::model::{FfnLayer, GateUp, WeightMatrix};
+        let strategy = crate::simd_strategy::SimdStrategy::detect();
+
+        let kernel_of = |w: &WeightMatrix| match w {
+            WeightMatrix::F32(_) => "f32 dense".to_string(),
+            WeightMatrix::Quant(fmt, _) if crate::kernels::qdot::supports(*fmt) => {
+                format!("{fmt:?} integer-dot")
+            }
+            WeightMatrix::Quant(fmt, _) => format!("{fmt:?} f32-bridge"),
+        };
+
+        let mut kernels = Vec::new();
+        if let Some(l) = model.layers.first() {
+            match &l.ffn {
+                FfnLayer::Dense { gate_up, w_down } => {
+                    kernels.push((
+                        "ffn_gate_up".to_string(),
+                        match gate_up {
+                            GateUp::FusedQuant(fmt, _) => {
+                                format!("{fmt:?} fused-swiglu integer-dot")
+                            }
+                            GateUp::Split(g, _) => kernel_of(g),
+                        },
+                    ));
+                    kernels.push(("ffn_down".to_string(), kernel_of(w_down)));
+                }
+                FfnLayer::MoE(moe) => {
+                    if let Some(e) = moe.experts.first() {
+                        kernels.push((
+                            "moe_expert_gate_up".to_string(),
+                            match &e.gate_up {
+                                GateUp::FusedQuant(fmt, _) => {
+                                    format!("{fmt:?} fused-swiglu integer-dot")
+                                }
+                                GateUp::Split(g, _) => kernel_of(g),
+                            },
+                        ));
+                        kernels.push(("moe_expert_down".to_string(), kernel_of(&e.w_down)));
+                    }
+                }
+            }
+        }
+        kernels.push(("lm_head".to_string(), kernel_of(&model.output)));
+
+        glcore::telemetry::BackendTelemetry {
+            simd_path: format!("{:?}", strategy).to_lowercase(),
+            threads: crate::runner::thread_count(),
+            kernels,
+        }
+    }
+
+    /// Weight bytes vs KV cache vs scratch. One "peak RSS" number cannot tell
+    /// these apart, yet only the KV cache grows with context length — so a
+    /// combined figure hides the thing you would actually tune.
+    fn memory_telemetry(&self, model: &GlprocModel) -> glcore::telemetry::MemoryTelemetry {
+        use crate::model::{FfnLayer, GateUp, WeightMatrix};
+        let wbytes = |w: &WeightMatrix| match w {
+            WeightMatrix::F32(v) => v.len() * 4,
+            WeightMatrix::Quant(_, b) => b.len(),
+        };
+        let gu_bytes = |gu: &GateUp| match gu {
+            GateUp::FusedQuant(_, p) => p.len(),
+            GateUp::Split(g, u) => wbytes(g) + wbytes(u),
+        };
+
+        let mut model_bytes = wbytes(&model.token_embd) + wbytes(&model.output);
+        for l in &model.layers {
+            model_bytes += wbytes(&l.wo);
+            model_bytes += match &l.qkv {
+                crate::model::QkvWeights::FusedQuant(_, p) => p.len(),
+                crate::model::QkvWeights::Split(q, k, v) => wbytes(q) + wbytes(k) + wbytes(v),
+            };
+            model_bytes += match &l.ffn {
+                FfnLayer::Dense { gate_up, w_down } => gu_bytes(gate_up) + wbytes(w_down),
+                // Every expert counts, not just the active ones: they are all
+                // resident, which is exactly why MoE trades RAM for compute.
+                FfnLayer::MoE(moe) => {
+                    moe.router.len() * 4
+                        + moe
+                            .experts
+                            .iter()
+                            .map(|e| gu_bytes(&e.gate_up) + wbytes(&e.w_down))
+                            .sum::<usize>()
+                }
+            };
+        }
+
+        glcore::telemetry::MemoryTelemetry {
+            model_bytes: model_bytes as u64,
+            kv_cache_bytes: crate::runner::kv_cache_bytes(&model.config) as u64,
+            scratch_bytes: 0, // workspace is per-Runner and already dropped
+        }
     }
 }
 
@@ -175,6 +305,12 @@ impl GlEngine for GlprocEngine {
     fn init(&mut self) -> Result<(), GlError> {
         // CPU backend: nothing to detect or allocate up front.
         Ok(())
+    }
+
+    /// Telemetry from the most recent run, or `None` if profiling was off
+    /// (`GLPROC_PROFILE` unset) or nothing has run yet.
+    fn telemetry(&self) -> Option<glcore::telemetry::EngineTelemetry> {
+        self.last_telemetry.lock().ok()?.clone()
     }
 
     fn load_model(&mut self, path: &str) -> Result<(), GlError> {

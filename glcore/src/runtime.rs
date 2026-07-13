@@ -78,6 +78,16 @@ impl Runtime {
         self.tokenizer.as_ref()
     }
 
+    /// Per-stage telemetry from the engine's most recent run, if it collects
+    /// any. See [`crate::telemetry`].
+    ///
+    /// Deliberately narrow: it forwards one read-only pull rather than handing
+    /// out the `Box<dyn GlEngine>`, so a consumer can observe the engine but
+    /// cannot drive it.
+    pub fn telemetry(&self) -> Option<crate::telemetry::EngineTelemetry> {
+        self.engine.telemetry()
+    }
+
     /// Run inference on a text prompt; returns the generated text.
     pub fn infer(&self, prompt: &str, mut config: InferInput) -> Result<String, GlError> {
         config.token_ids = self.encode_prompt(prompt)?;

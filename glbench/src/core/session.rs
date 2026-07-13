@@ -31,6 +31,10 @@ pub struct BenchmarkSession {
     pub workload: WorkloadSpec,
     /// Raw measured facts.
     pub measurements: MeasurementSet,
+    /// What the engine reported about its own internals: stage timings, kernel
+    /// selection, memory split, MoE routing. `None` when the engine collects
+    /// none — which means *not measured*, never *zero*.
+    pub telemetry: Option<glcore::telemetry::EngineTelemetry>,
     /// Derived analysis (filled after the run; `None` until then).
     pub analysis: Option<AnalysisReport>,
     /// Comparison against another session (filled only by `compare`).
@@ -55,6 +59,7 @@ impl BenchmarkSession {
             engine,
             workload,
             measurements,
+            telemetry: None,
             analysis: None,
             comparison: None,
             validation: None,
@@ -69,6 +74,10 @@ impl BenchmarkSession {
             ("engine", self.engine.to_json()),
             ("workload", self.workload.to_json()),
             ("measurements", self.measurements.to_json()),
+            (
+                "telemetry",
+                self.telemetry.as_ref().map(telemetry_json).unwrap_or(Json::Null),
+            ),
             ("analysis", opt(&self.analysis)),
             ("comparison", opt(&self.comparison)),
             ("validation", opt(&self.validation)),
@@ -97,6 +106,11 @@ impl BenchmarkSession {
             engine,
             workload,
             measurements,
+            // Telemetry is not read back from the archive: reconstructing the
+            // stage tree adds a parser that can only ever agree with the
+            // writer. `inspect` re-renders the measured facts; the profile
+            // section is a live-run view. Revisit if archives need diffing.
+            telemetry: None,
             analysis: None,
             comparison: None,
             validation: None,
@@ -110,6 +124,114 @@ fn opt<T: ToJson>(v: &Option<T>) -> Json {
         Some(inner) => inner.to_json(),
         None => Json::Null,
     }
+}
+
+/// JSON projection of the engine's telemetry.
+///
+/// Lives here, not in glcore, on purpose: glcore's telemetry module is a pure
+/// data vocabulary with no serialization framework, and glbench is the consumer
+/// that happens to want JSON. Putting the writer here keeps every backend free
+/// of a format dependency it never asked for.
+///
+/// Derived values (share, entropy, load balance) are written alongside the raw
+/// counters rather than instead of them: a consumer that disagrees with our
+/// definition of "hotspot share" can recompute from `total_ms`, but only if we
+/// did not throw it away.
+fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
+    let phase = |p: &glcore::telemetry::PhaseProfile| {
+        Json::obj([
+            ("total_ms", Json::Num(p.total_ms)),
+            ("unattributed_ms", Json::Num(p.unattributed_ms())),
+            (
+                "stages",
+                Json::Arr(
+                    p.stages
+                        .iter()
+                        .map(|s| {
+                            Json::obj([
+                                ("name", Json::Str(s.name.clone())),
+                                ("total_ms", Json::Num(s.total_ms)),
+                                ("calls", Json::Num(s.calls as f64)),
+                                (
+                                    "share",
+                                    s.share_of(p.total_ms).map(Json::Num).unwrap_or(Json::Null),
+                                ),
+                            ])
+                        })
+                        .collect(),
+                ),
+            ),
+        ])
+    };
+
+    let backend = {
+        match &t.backend {
+            Some(b) => Json::obj([
+                ("simd_path", Json::Str(b.simd_path.clone())),
+                ("threads", Json::Num(b.threads as f64)),
+                (
+                    "kernels",
+                    Json::Arr(
+                        b.kernels
+                            .iter()
+                            .map(|(role, kernel)| {
+                                Json::obj([
+                                    ("role", Json::Str(role.clone())),
+                                    ("kernel", Json::Str(kernel.clone())),
+                                ])
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]),
+            None => Json::Null,
+        }
+    };
+
+    let memory = match &t.memory {
+        Some(m) => Json::obj([
+            ("model_bytes", Json::Num(m.model_bytes as f64)),
+            ("kv_cache_bytes", Json::Num(m.kv_cache_bytes as f64)),
+            ("scratch_bytes", Json::Num(m.scratch_bytes as f64)),
+        ]),
+        None => Json::Null,
+    };
+
+    let moe = {
+        match &t.moe {
+            Some(m) => {
+                let (min, max, mean) = m.load_balance().unwrap_or((0, 0, 0.0));
+                Json::obj([
+                    ("num_experts", Json::Num(m.num_experts as f64)),
+                    ("top_k", Json::Num(m.num_experts_per_tok as f64)),
+                    ("moe_layers", Json::Num(m.moe_layers as f64)),
+                    ("experts_touched", Json::Num(m.experts_touched() as f64)),
+                    ("load_min", Json::Num(min as f64)),
+                    ("load_max", Json::Num(max as f64)),
+                    ("load_mean", Json::Num(mean)),
+                    (
+                        "routing_entropy",
+                        m.routing_entropy().map(Json::Num).unwrap_or(Json::Null),
+                    ),
+                    (
+                        "expert_load",
+                        Json::Arr(
+                            m.expert_load.iter().map(|&c| Json::Num(c as f64)).collect(),
+                        ),
+                    ),
+                ])
+            }
+            None => Json::Null,
+        }
+    };
+
+    Json::obj([
+        ("prefill", t.prefill.as_ref().map(phase).unwrap_or(Json::Null)),
+        ("decode", t.decode.as_ref().map(phase).unwrap_or(Json::Null)),
+        ("backend", backend),
+        ("memory", memory),
+        ("moe", moe),
+    ])
 }
 
 /// Reconstruct engine metadata from JSON (the fields comparison needs).
@@ -143,8 +265,30 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
         cpu: CpuInfo {
             logical_cores: cpu.and_then(|c| c.get("logical_cores")).and_then(|n| n.as_f64()).unwrap_or(0.0)
                 as usize,
+            physical_cores: cpu
+                .and_then(|c| c.get("physical_cores"))
+                .and_then(|n| n.as_f64())
+                .map(|n| n as usize),
             model: cpu.and_then(|c| c.get("model")).and_then(|s| s.as_str()).map(String::from),
             mhz: cpu.and_then(|c| c.get("mhz")).and_then(|n| n.as_f64()),
+            // Archived ISA flags are re-read from the record, not re-probed:
+            // an archive is a fact about the machine that RAN it, and probing
+            // the machine now `inspect`ing it would silently rewrite history.
+            isa: cpu
+                .and_then(|c| c.get("isa"))
+                .map(|i| {
+                    let flag = |k: &str| i.get(k).and_then(|b| b.as_bool()).unwrap_or(false);
+                    crate::environment::cpu::IsaSupport {
+                        avx2: flag("avx2"),
+                        fma: flag("fma"),
+                        f16c: flag("f16c"),
+                        avx512f: flag("avx512f"),
+                        avx512bw: flag("avx512bw"),
+                        avx512_vnni: flag("avx512_vnni"),
+                        avx_vnni: flag("avx_vnni"),
+                    }
+                })
+                .unwrap_or_default(),
         },
         gpu: GpuInfo {
             name: gpu.and_then(|g| g.get("name")).and_then(|s| s.as_str()).map(String::from),

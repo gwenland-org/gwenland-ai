@@ -36,7 +36,18 @@ pub fn session(session: &BenchmarkSession) -> String {
         }
         s.push('\n');
     } else if let Some(cpu) = &hw.cpu.model {
-        s.push_str(&format!("device {cpu} ({} cores)\n", hw.cpu.logical_cores));
+        s.push_str(&format!("device {cpu} ("));
+        match hw.cpu.physical_cores {
+            Some(p) => s.push_str(&format!("{p}p/{}l cores", hw.cpu.logical_cores)),
+            None => s.push_str(&format!("{} cores", hw.cpu.logical_cores)),
+        }
+        s.push_str(")\n");
+    }
+    // Capability: what the CPU supports. The engine's actual pick is printed in
+    // the profile section below — they differ, and the difference is the point.
+    let isa = hw.cpu.isa.names();
+    if !isa.is_empty() {
+        s.push_str(&format!("isa {}\n", isa.join(" ")));
     }
     if let Some(bytes) = hw.storage.model_file_bytes {
         s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
@@ -71,6 +82,10 @@ pub fn session(session: &BenchmarkSession) -> String {
         }
     }
 
+    if let Some(t) = &session.telemetry {
+        s.push_str(&telemetry(t));
+    }
+
     if let Some(v) = &session.validation {
         if !v.passed() || !v.findings.is_empty() {
             s.push_str(&format!(
@@ -82,6 +97,105 @@ pub fn session(session: &BenchmarkSession) -> String {
             }
         }
     }
+    s
+}
+
+/// The profile sections: what the engine chose, where the time went, where the
+/// memory went, and how routing behaved.
+///
+/// Only sections the engine actually reported are printed. A missing section
+/// means "not measured" — it is left out rather than rendered as zeros, because
+/// a zeroed row is a claim and an absent row is an admission.
+fn telemetry(t: &glcore::telemetry::EngineTelemetry) -> String {
+    let mut s = String::new();
+
+    if let Some(b) = &t.backend {
+        s.push_str(&format!(
+            "\nbackend: simd {} | {} threads\n",
+            b.simd_path, b.threads
+        ));
+        for (role, kernel) in &b.kernels {
+            s.push_str(&format!("  {role:<20} {kernel}\n"));
+        }
+    }
+
+    // Timeline. Decode first: it is the phase that dominates a real session,
+    // and the one whose hotspot decides what to optimize next.
+    for (label, phase) in [("decode", &t.decode), ("prefill", &t.prefill)] {
+        let Some(p) = phase else { continue };
+        if p.total_ms <= 0.0 {
+            continue;
+        }
+        s.push_str(&format!("\n{label} timeline ({:.1} ms total)\n", p.total_ms));
+        let mut tab = Table::new(&["stage", "ms", "share", "calls", "ms/call"])
+            .right_align(1)
+            .right_align(2)
+            .right_align(3)
+            .right_align(4);
+        for st in p.hotspots() {
+            tab.row(&[
+                st.name.clone(),
+                format!("{:.2}", st.total_ms),
+                match st.share_of(p.total_ms) {
+                    Some(f) => format!("{:.1}%", f * 100.0),
+                    None => "-".into(),
+                },
+                st.calls.to_string(),
+                // Cost of one invocation — the number to act on. `share` says
+                // where the time went; `ms/call` says whether a stage is slow
+                // or merely frequent, and those call for different fixes.
+                if st.calls > 0 {
+                    format!("{:.3}", st.total_ms / st.calls as f64)
+                } else {
+                    "-".into()
+                },
+            ]);
+        }
+        s.push_str(&tab.render());
+        let un = p.unattributed_ms();
+        if un > 0.0 {
+            // Surfaced, not hidden: a large residual means the engine's
+            // instrumentation has a blind spot, which is worth knowing.
+            s.push_str(&format!(
+                "  unattributed {:.2} ms ({:.1}%)\n",
+                un,
+                un / p.total_ms * 100.0
+            ));
+        }
+    }
+
+    if let Some(m) = &t.memory {
+        s.push_str(&format!(
+            "\nmemory: model {:.2} GiB | kv cache {:.2} GiB\n",
+            bytes_to_gib(m.model_bytes),
+            bytes_to_gib(m.kv_cache_bytes),
+        ));
+    }
+
+    if let Some(m) = &t.moe {
+        s.push_str(&format!(
+            "\nmoe: {} experts, top-{} | {} routed layers\n",
+            m.num_experts, m.num_experts_per_tok, m.moe_layers
+        ));
+        s.push_str(&format!(
+            "  experts touched {}/{}\n",
+            m.experts_touched(),
+            m.num_experts
+        ));
+        if let Some((min, max, mean)) = m.load_balance() {
+            s.push_str(&format!(
+                "  load per live expert  min {min} | max {max} | mean {mean:.1}\n"
+            ));
+        }
+        if let Some(e) = m.routing_entropy() {
+            // The one number that says whether routing is healthy. A collapsing
+            // router shows up here long before output quality degrades.
+            s.push_str(&format!(
+                "  routing entropy {e:.3} (1.0 = uniform, 0.0 = collapsed)\n"
+            ));
+        }
+    }
+
     s
 }
 

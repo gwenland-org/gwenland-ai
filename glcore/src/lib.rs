@@ -11,10 +11,14 @@ pub mod engine_trait;
 pub mod error;
 pub mod format;
 pub mod runtime;
+pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;
 
 pub use engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
+pub use telemetry::{
+    BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile, StageTiming,
+};
 pub use error::GlError;
 pub use runtime::Runtime;
 pub use tensor::{DType, Tensor};
