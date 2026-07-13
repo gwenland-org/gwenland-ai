@@ -32,6 +32,16 @@ const MAX_KV_CONTEXT: usize = 4096;
 /// machine's actual core count so small VMs don't oversubscribe.
 /// `GLPROC_THREADS` overrides — for benchmarking and as the X5 thermal
 /// knob (reduce thread count if the CPU runs hot).
+///
+/// Deliberately *logical* threads, not physical cores. Sizing this pool from
+/// `topology::physical_core_count()` (2 on the i3-1115G4) was measured on
+/// Qwen3-1.7B Q8_0 decode and lost: 8.5 vs 11.0 tok/s at steady state, a 23%
+/// regression, reproduced across three alternating runs. Decode is
+/// bandwidth-heavy but not issue-saturated — the per-block f16 scale
+/// conversions, integer dot chains and scalar tails leave gaps that an SMT
+/// sibling fills, keeping more loads in flight than 2 threads can. Running at
+/// ~69% of the DRAM read ceiling is the evidence *for* SMT here, not against:
+/// a saturated loop would sit near the ceiling with nothing left to overlap.
 const N_THREADS: usize = 4;
 
 /// Thread count after the optional `GLPROC_THREADS` override.

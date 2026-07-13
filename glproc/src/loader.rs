@@ -380,6 +380,11 @@ pub fn load_gguf(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
     // The work is a mix of mmap reads and requantization compute, so it
     // scales with cores until the disk saturates. Workers pull layer
     // indices from a shared counter; results land in per-index slots.
+    // Logical threads, not physical cores (unlike the decode pool in
+    // `runner.rs`): this work interleaves mmap page faults with requantization
+    // compute, so an SMT sibling issues real work while its partner stalls on
+    // a fault. Decode has no such stalls to hide, which is why it sizes from
+    // `topology::physical_core_count()` instead.
     let n_workers = num_cpus::get().clamp(1, 8).min(n_layers.max(1));
     let next = std::sync::atomic::AtomicUsize::new(0);
     let slots: Vec<std::sync::Mutex<Option<Result<LayerWeights, GlError>>>> =
