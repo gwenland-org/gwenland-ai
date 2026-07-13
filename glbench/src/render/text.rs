@@ -86,6 +86,10 @@ pub fn session(session: &BenchmarkSession) -> String {
         s.push_str(&telemetry(t));
     }
 
+    if let Some(b) = &session.behavior {
+        s.push_str(&behavior(b));
+    }
+
     if let Some(v) = &session.validation {
         if !v.passed() || !v.findings.is_empty() {
             s.push_str(&format!(
@@ -196,6 +200,65 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry) -> String {
         }
     }
 
+    s
+}
+
+/// The behavior sections: what the model did, in pure numbers.
+///
+/// Every line is a measurement. None of it is a verdict — where a threshold is
+/// applied (`degenerate`, `stalls`), it is flagged as a hint and the raw number
+/// is printed next to it so the reader can disagree.
+fn behavior(b: &crate::behavior::BehaviorReport) -> String {
+    let mut s = String::new();
+    s.push_str("\nbehavior (from a separate traced run — tracing perturbs timing)\n");
+
+    if let Some(r) = &b.repetition {
+        s.push_str(&format!(
+            "  repetition   1-gram {:.2} | 2-gram {:.2} | 3-gram {:.2} | max run {}{}\n",
+            r.unique_1gram_ratio,
+            r.unique_2gram_ratio,
+            r.unique_3gram_ratio,
+            r.max_token_run,
+            if r.looks_degenerate() { "  <- LOOPING" } else { "" },
+        ));
+    }
+    if let Some(e) = &b.entropy {
+        s.push_str(&format!(
+            "  entropy      mean {:.2} nats | p95 {:.2} | top-prob {:.2}\n",
+            e.mean, e.p95, e.mean_top_prob
+        ));
+    }
+    if let Some(o) = &b.ood {
+        s.push_str(&format!(
+            "  perplexity   {:.1} | worst-token surprise {:.1} nats\n",
+            o.perplexity, o.p95_surprise
+        ));
+    }
+    if let Some(h) = &b.hallucination {
+        // Named honestly: this is confidence/rank divergence, NOT hallucination
+        // detection. See behavior::hallucination — a confidently-wrong model
+        // scores clean here.
+        s.push_str(&format!(
+            "  confidence   top-choice {:.0}% | mean rank {:.1} | uncertain off-pick {:.0}%\n",
+            h.top_choice_rate * 100.0,
+            h.mean_rank,
+            h.uncertain_offpick_rate * 100.0,
+        ));
+    }
+    if let Some(st) = &b.stall {
+        s.push_str(&format!(
+            "  stall        p50 {:.1} ms | p99 {:.1} ms | max {:.1} ms | jitter {:.2}{}\n",
+            st.p50_ms,
+            st.p99_ms,
+            st.max_ms,
+            st.jitter,
+            if st.has_stalls() {
+                format!("  <- {} SPIKE(S)", st.stall_count)
+            } else {
+                String::new()
+            },
+        ));
+    }
     s
 }
 

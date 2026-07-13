@@ -76,7 +76,10 @@ impl EngineAdapter {
     /// the raw per-iteration facts. This is a thin pass-through to the engine —
     /// the engine already separates prefill from decode timing in its output.
     pub fn run_once(&self, spec: &WorkloadSpec) -> Result<IterationMetrics, GlError> {
-        let out = self.run_request(spec)?;
+        // Tracing OFF: this is the timed path, and tracing costs an O(vocab)
+        // sweep per token. Taxing the measurement with the instrument is
+        // exactly the mistake this split exists to avoid.
+        let out = self.run_request(spec, false)?;
         Ok(IterationMetrics {
             prompt_tokens: out.prompt_tokens as u64,
             generated_tokens: out.tokens_generated as u64,
@@ -89,10 +92,27 @@ impl EngineAdapter {
     /// Run a request and return the generated token ids — used by numerical
     /// validation against the glproc oracle.
     pub fn run_tokens(&self, spec: &WorkloadSpec) -> Result<Vec<u32>, GlError> {
-        Ok(self.run_request(spec)?.token_ids)
+        Ok(self.run_request(spec, false)?.token_ids)
     }
 
-    fn run_request(&self, spec: &WorkloadSpec) -> Result<InferOutput, GlError> {
+    /// Run once **with per-token tracing on**, for the behavioral signals.
+    ///
+    /// This is a separate run, deliberately not one of the measured iterations:
+    /// tracing costs an O(vocab) sweep plus a logits copy per token, so folding
+    /// it into the timed loop would tax the very throughput being reported. The
+    /// behavior of the model does not change — the same tokens come out — but
+    /// the clock does, so the two must not share a run.
+    ///
+    /// Returns the generated tokens and their traces.
+    pub fn run_traced(
+        &self,
+        spec: &WorkloadSpec,
+    ) -> Result<(Vec<u32>, Vec<glcore::trace::TokenTrace>), GlError> {
+        let out = self.run_request(spec, true)?;
+        Ok((out.token_ids, out.traces))
+    }
+
+    fn run_request(&self, spec: &WorkloadSpec, trace: bool) -> Result<InferOutput, GlError> {
         let config = InferInput {
             token_ids: Vec::new(), // Runtime fills these from the prompt
             max_new_tokens: spec.max_new_tokens,
@@ -100,6 +120,11 @@ impl EngineAdapter {
             top_k: 40,
             top_p: 0.95,
             repeat_penalty: 1.1,
+            trace: if trace {
+                glcore::trace::TraceConfig::on()
+            } else {
+                glcore::trace::TraceConfig::default()
+            },
         };
         // A no-op sink: glbench measures, it does not consume the text stream.
         self.runtime.stream(&spec.prompt, config, |_text| {})

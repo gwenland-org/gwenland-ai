@@ -9,6 +9,7 @@
 use glcore::GlError;
 
 use crate::analysis::summary;
+use crate::behavior::BehaviorReport;
 use crate::core::metrics::MeasurementSet;
 use crate::core::result::SessionMetadata;
 use crate::core::session::BenchmarkSession;
@@ -66,6 +67,25 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     //    iterations (not the warmups) so the stage timings describe the same
     //    work the reported tok/s came from.
     session.telemetry = adapter.telemetry();
+
+    // 8. Behavioral signals, from one EXTRA traced run.
+    //
+    //    Deliberately not one of the measured iterations: tracing costs an
+    //    O(vocab) sweep per token, so including it would tax the throughput
+    //    being reported. The model emits the same tokens either way — only the
+    //    clock differs — so the timing facts above stay untainted while the
+    //    behavior facts below come from a run that actually recorded them.
+    //
+    //    A failure here is not fatal: the benchmark's numbers are already
+    //    collected and valid. Behavior is additive, so a backend that cannot
+    //    trace simply reports no behavior rather than failing the whole run.
+    progress("behavior", 0, 1);
+    if let Ok((tokens, traces)) = adapter.run_traced(spec) {
+        let report = BehaviorReport::compute(&tokens, &traces);
+        if !report.is_empty() {
+            session.behavior = Some(report);
+        }
+    }
 
     session.analysis = Some(summary::analyze(&session));
     session.validation = Some(integrity::validate(&session));

@@ -35,6 +35,10 @@ pub struct BenchmarkSession {
     /// selection, memory split, MoE routing. `None` when the engine collects
     /// none — which means *not measured*, never *zero*.
     pub telemetry: Option<glcore::telemetry::EngineTelemetry>,
+    /// What the model *did*: repetition, entropy, stalls, perplexity. Comes
+    /// from a separate traced run (tracing perturbs timing, so it must not
+    /// share a run with the measured iterations). `None` when not captured.
+    pub behavior: Option<crate::behavior::BehaviorReport>,
     /// Derived analysis (filled after the run; `None` until then).
     pub analysis: Option<AnalysisReport>,
     /// Comparison against another session (filled only by `compare`).
@@ -60,6 +64,7 @@ impl BenchmarkSession {
             workload,
             measurements,
             telemetry: None,
+            behavior: None,
             analysis: None,
             comparison: None,
             validation: None,
@@ -77,6 +82,10 @@ impl BenchmarkSession {
             (
                 "telemetry",
                 self.telemetry.as_ref().map(telemetry_json).unwrap_or(Json::Null),
+            ),
+            (
+                "behavior",
+                self.behavior.as_ref().map(behavior_json).unwrap_or(Json::Null),
             ),
             ("analysis", opt(&self.analysis)),
             ("comparison", opt(&self.comparison)),
@@ -106,11 +115,13 @@ impl BenchmarkSession {
             engine,
             workload,
             measurements,
-            // Telemetry is not read back from the archive: reconstructing the
-            // stage tree adds a parser that can only ever agree with the
-            // writer. `inspect` re-renders the measured facts; the profile
-            // section is a live-run view. Revisit if archives need diffing.
+            // Telemetry and behavior are not read back from the archive:
+            // reconstructing them adds a parser that can only ever agree with
+            // the writer. `inspect` re-renders the measured facts; the profile
+            // and behavior sections are live-run views. Revisit if archives
+            // need diffing (drift analysis will want exactly that).
             telemetry: None,
+            behavior: None,
             analysis: None,
             comparison: None,
             validation: None,
@@ -124,6 +135,81 @@ fn opt<T: ToJson>(v: &Option<T>) -> Json {
         Some(inner) => inner.to_json(),
         None => Json::Null,
     }
+}
+
+/// JSON projection of the behavioral signals — the CI-readable form.
+///
+/// Absent signals are written as `null`, never as zeros. A CI job asserting
+/// "repetition ratio > 0.6" must fail loudly on a run that never measured
+/// repetition, not silently pass on a fabricated 0.0.
+fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
+    let rep = match &b.repetition {
+        Some(r) => Json::obj([
+            ("unique_1gram_ratio", Json::Num(r.unique_1gram_ratio)),
+            ("unique_2gram_ratio", Json::Num(r.unique_2gram_ratio)),
+            ("unique_3gram_ratio", Json::Num(r.unique_3gram_ratio)),
+            ("max_token_run", Json::Num(r.max_token_run as f64)),
+            ("looks_degenerate", Json::Bool(r.looks_degenerate())),
+            ("tokens", Json::Num(r.tokens as f64)),
+        ]),
+        None => Json::Null,
+    };
+    let ent = match &b.entropy {
+        Some(e) => Json::obj([
+            ("mean_nats", Json::Num(e.mean)),
+            ("std_dev", Json::Num(e.std_dev)),
+            ("min", Json::Num(e.min)),
+            ("max", Json::Num(e.max)),
+            ("p50", Json::Num(e.p50)),
+            ("p95", Json::Num(e.p95)),
+            ("mean_top_prob", Json::Num(e.mean_top_prob)),
+        ]),
+        None => Json::Null,
+    };
+    let stall = match &b.stall {
+        Some(s) => Json::obj([
+            ("mean_ms", Json::Num(s.mean_ms)),
+            ("std_dev_ms", Json::Num(s.std_dev_ms)),
+            ("p50_ms", Json::Num(s.p50_ms)),
+            ("p99_ms", Json::Num(s.p99_ms)),
+            ("max_ms", Json::Num(s.max_ms)),
+            ("stall_count", Json::Num(s.stall_count as f64)),
+            ("jitter", Json::Num(s.jitter)),
+        ]),
+        None => Json::Null,
+    };
+    let ood = match &b.ood {
+        Some(o) => Json::obj([
+            ("perplexity", Json::Num(o.perplexity)),
+            ("mean_logprob", Json::Num(o.mean_logprob)),
+            ("min_logprob", Json::Num(o.min_logprob)),
+            ("p95_surprise", Json::Num(o.p95_surprise)),
+        ]),
+        None => Json::Null,
+    };
+    let hall = match &b.hallucination {
+        Some(h) => Json::obj([
+            ("top_choice_rate", Json::Num(h.top_choice_rate)),
+            ("mean_rank", Json::Num(h.mean_rank)),
+            ("max_rank", Json::Num(h.max_rank as f64)),
+            ("mean_confidence_gap", Json::Num(h.mean_confidence_gap)),
+            ("uncertain_offpick_rate", Json::Num(h.uncertain_offpick_rate)),
+        ]),
+        None => Json::Null,
+    };
+
+    Json::obj([
+        ("repetition", rep),
+        ("entropy", ent),
+        ("stall", stall),
+        ("ood", ood),
+        // Named for what it is. The struct's docs spell out that this is a
+        // confidence/rank proxy and NOT a hallucination detector; the key is
+        // kept honest here too.
+        ("confidence_divergence", hall),
+        // Toxicity is deliberately absent, not zero. See behavior::toxicity.
+        ("toxicity", Json::Null),
+    ])
 }
 
 /// JSON projection of the engine's telemetry.

@@ -80,6 +80,7 @@ impl GlprocEngine {
             .ok_or_else(|| GlError::Engine("no tokenizer loaded".into()))?;
 
         let mut runner = Runner::new(model);
+        runner.set_trace(input.trace.enabled);
         let mut sampler = self.sampler_for(input);
         let started = Instant::now();
         let mut text = String::new();
@@ -119,6 +120,7 @@ impl GlprocEngine {
             }
         }
 
+        let traces = runner.traces().to_vec();
         let tokens_generated = token_ids.len();
         Ok(InferOutput {
             token_ids,
@@ -128,6 +130,7 @@ impl GlprocEngine {
             prompt_tokens: timing.prompt_tokens,
             prefill_ms: timing.prefill.as_secs_f64() * 1e3,
             generation_ms: timing.decode.as_secs_f64() * 1e3,
+            traces,
         })
     }
 

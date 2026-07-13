@@ -36,6 +36,7 @@
 //! workspace crates only. The JSON/CSV/Markdown writers are hand-rolled.
 
 pub mod analysis;
+pub mod behavior;
 pub mod comparison;
 pub mod core;
 pub mod engine;

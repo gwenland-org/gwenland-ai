@@ -486,6 +486,11 @@ pub struct Runner<'m> {
     bws: BatchWorkspace,
     /// `Some` only when `GLPROC_PROFILE` is set in the environment.
     prof: Option<Box<Prof>>,
+    /// Capture per-token behavioral traces. Off unless a caller asks — it
+    /// costs an O(vocab) sweep plus a logits copy per token.
+    trace_on: bool,
+    /// Traces from the most recent `generate`; empty when `trace_on` is false.
+    traces: Vec<glcore::trace::TokenTrace>,
 }
 
 impl<'m> Runner<'m> {
@@ -535,6 +540,8 @@ impl<'m> Runner<'m> {
                 .ok()
                 .filter(|v| !v.is_empty() && v != "0")
                 .map(|_| Box::new(Prof::default())),
+            trace_on: false,
+            traces: Vec::new(),
         }
     }
 
@@ -1232,6 +1239,23 @@ impl<'m> Runner<'m> {
         self.prof.as_ref().map(|p| p.to_telemetry(n_layers))
     }
 
+    /// Turn per-token behavioral tracing on for subsequent `generate` calls.
+    ///
+    /// Costs an O(vocab) sweep per token, so throughput measured with this on
+    /// is not comparable to throughput with it off. Off by default.
+    pub fn set_trace(&mut self, enabled: bool) {
+        self.trace_on = enabled;
+        if !enabled {
+            self.traces = Vec::new();
+        }
+    }
+
+    /// Per-token traces from the most recent `generate`. Empty when tracing was
+    /// off — empty means *not captured*, never *nothing happened*.
+    pub fn traces(&self) -> &[glcore::trace::TokenTrace] {
+        &self.traces
+    }
+
     /// Returns the generated tokens plus a [`GenTiming`] separating prefill
     /// from decode wall time.
     pub fn generate(
@@ -1274,9 +1298,22 @@ impl<'m> Runner<'m> {
         let mut recent: std::collections::VecDeque<u32> =
             std::collections::VecDeque::with_capacity(REPEAT_WINDOW);
         let mut pos = prompt.len();
+        self.traces.clear();
+        // Scratch for the untouched logits. `apply_repetition_penalty` rewrites
+        // `ws.logits` in place, so a trace taken after it would describe our
+        // sampler settings rather than the model — the exact confound
+        // `glcore::trace` exists to avoid. Snapshot first, and only when
+        // tracing is on (allocated once, reused every token).
+        let mut raw_logits: Vec<f32> = Vec::new();
+        let mut last_token_at: Option<std::time::Instant> = None;
+
         for _ in 0..max_new_tokens {
             if pos >= max_seq {
                 break;
+            }
+            if self.trace_on {
+                raw_logits.clear();
+                raw_logits.extend_from_slice(&self.ws.logits);
             }
             let t = self.prof.as_ref().map(|_| std::time::Instant::now());
             crate::sampler::apply_repetition_penalty(
@@ -1288,8 +1325,21 @@ impl<'m> Runner<'m> {
             if let (Some(p), Some(t)) = (self.prof.as_deref_mut(), t) {
                 p.sampler += t.elapsed();
             }
+            // Stop token first: it is not emitted, so tracing it would leave
+            // `traces` one longer than `generated` and silently misalign every
+            // per-token metric downstream.
             if is_stop(next) {
                 break;
+            }
+            if self.trace_on {
+                let now = std::time::Instant::now();
+                let since = last_token_at
+                    .map(|prev| now.duration_since(prev).as_nanos() as u64)
+                    .unwrap_or(0);
+                last_token_at = Some(now);
+                if let Some(tr) = glcore::trace::trace_step(&raw_logits, next, since) {
+                    self.traces.push(tr);
+                }
             }
             on_token(next);
             generated.push(next);

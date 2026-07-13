@@ -182,6 +182,12 @@ impl GlcudaEngine {
             prompt_tokens: timing.prompt_tokens,
             prefill_ms: timing.prefill.as_secs_f64() * 1e3,
             generation_ms: timing.decode.as_secs_f64() * 1e3,
+            // No per-token tracing on the CUDA path yet: logits live in device
+            // memory, so capturing the raw distribution per token means a
+            // device-to-host copy of the full vocabulary every step. Empty
+            // means NOT captured — glbench reports no behavior signals for
+            // this backend rather than fabricating them.
+            traces: Vec::new(),
         })
     }
 }

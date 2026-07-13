@@ -18,6 +18,10 @@ pub struct InferInput {
     pub top_p: f32,
     /// Repetition penalty on recently generated tokens. `1.0` = disabled.
     pub repeat_penalty: f32,
+    /// Capture per-token behavioral facts (entropy, rank, logprob, latency).
+    /// Off by default — it costs an O(vocab) sweep per token, so throughput
+    /// measured with tracing on is not comparable to throughput without it.
+    pub trace: crate::trace::TraceConfig,
 }
 
 impl Default for InferInput {
@@ -29,6 +33,7 @@ impl Default for InferInput {
             top_k: 40,
             top_p: 0.95,
             repeat_penalty: 1.1,
+            trace: crate::trace::TraceConfig::default(),
         }
     }
 }
@@ -52,6 +57,10 @@ pub struct InferOutput {
     /// this, not `elapsed_ms` — blending prefill into the rate hides the
     /// real generation speed.
     pub generation_ms: f64,
+    /// Per-token behavioral facts, one entry per generated token, in order.
+    /// Empty unless [`InferInput::trace`] asked for them — empty means *not
+    /// captured*, never *nothing happened*.
+    pub traces: Vec<crate::trace::TokenTrace>,
 }
 
 /// Static metadata about an engine.
