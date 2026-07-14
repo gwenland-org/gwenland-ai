@@ -8,6 +8,7 @@ use crate::comparison::runs::ComparisonReport;
 use crate::comparison::statistics::Stats;
 use crate::core::session::BenchmarkSession;
 use crate::measurement::memory::bytes_to_gib;
+use crate::environment::bandwidth::CEILING_TOLERANCE;
 use crate::render::table::Table;
 
 /// Render a full session report for the terminal.
@@ -140,9 +141,19 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
         .right_align(4)
         .right_align(5)
         .right_align(6);
+        let mut over_ceiling = false;
         for st in p.hotspots() {
             let ceil_cell = match (ceiling_gbs, st.gb_per_s()) {
                 (Some(c), Some(_)) => match st.ceiling_frac(c) {
+                    // Nothing can read faster than DRAM allows. A stage above
+                    // 100% is not an impossible stage — it is a ceiling that was
+                    // measured while the machine was slower than it was during
+                    // the stage (thermal state, contention). Say so, rather than
+                    // print "101%" as if it were an efficiency.
+                    Some(f) if f > CEILING_TOLERANCE => {
+                        over_ceiling = true;
+                        format!("{:.0}% ?", f * 100.0)
+                    }
                     // Flag stages far from the ceiling: they are NOT
                     // bandwidth-bound, so reading fewer bytes will not speed
                     // them up. Mistaking one for the other is exactly how the
@@ -178,8 +189,18 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
 
         if let Some(c) = ceiling_gbs {
             s.push_str(&format!(
-                "  ceiling {c:.1} GB/s (measured)  |  '!' = under 25% of it, so NOT bandwidth-bound\n"
+                "  ceiling {c:.1} GB/s (measured)  |  '!' = under 25%, NOT bandwidth-bound\n"
             ));
+            if over_ceiling {
+                // The stage is not impossible; the ruler is. Saying which one is
+                // wrong is the whole difference between a useful report and a
+                // misleading one.
+                s.push_str(
+                    "  '?' = above the measured ceiling, which means the CEILING is wrong, \
+                     not the stage:\n       it was measured while the machine was slower \
+                     (thermal / contention). Treat as ~100%.\n",
+                );
+            }
         }
 
         let un = p.unattributed_ms();

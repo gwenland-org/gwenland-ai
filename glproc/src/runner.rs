@@ -437,7 +437,12 @@ impl Prof {
             // scale with the batch. That ratio is exactly why prefill is
             // compute-bound where decode is bandwidth-bound, and reporting the
             // same numbers for both phases would hide it.
-            let batch = (self.p_tokens as u64).min(PREFILL_CHUNK as u64).max(1);
+            //
+            // Mean batch, not PREFILL_CHUNK: the last chunk of a prompt is
+            // usually partial (a 220-token prompt is 6 full chunks plus one of
+            // 28), and charging it a full chunk's MACs overstates the compute.
+            // `p_tokens / chunks` is the true average tokens per call.
+            let batch = (self.p_tokens as u64).div_ceil(chunks.max(1)).max(1);
             let batched = |(b, m): (u64, u64)| (b, m * batch);
             let stages = vec![
                 stage("serial", self.p_serial, per_layer, None),

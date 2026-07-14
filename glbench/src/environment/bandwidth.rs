@@ -33,7 +33,24 @@ const BUF_BYTES: usize = 256 * 1024 * 1024;
 
 /// Passes to time. The first is discarded — it faults the pages in, which
 /// measures the page allocator rather than the memory bus.
-const PASSES: usize = 4;
+///
+/// More than a couple, because we take the **best** pass and a thermally noisy
+/// laptop needs several tries to land one clean one. On the i3-1115G4 a 4-pass
+/// probe swung between 26.6 and 31.6 GB/s across sessions (±19%) — enough that
+/// a stage running at the machine's real limit would land anywhere from 85% to
+/// 101% of "the ceiling" depending on which session measured it. A ceiling that
+/// moves 19% is not a ceiling.
+const PASSES: usize = 12;
+
+/// A stage may legitimately exceed the measured ceiling by this much before we
+/// call the measurement unreliable rather than the stage impossible.
+///
+/// Nothing can actually read faster than DRAM allows. So a stage above 100% does
+/// not mean the stage is wrong — it means the **ceiling** was measured while the
+/// machine was slower than it was during the stage (thermal state, another
+/// process, a scheduling hiccup). Reporting "101%" as though it were a real
+/// efficiency invites exactly the wrong conclusion.
+pub const CEILING_TOLERANCE: f64 = 1.02;
 
 /// Measure sustained sequential read bandwidth, GB/s.
 ///
