@@ -98,6 +98,23 @@ pub fn silu_mul(gate: &mut [f32], up: &[f32]) {
     }
 }
 
+/// Attention value accumulation: `out[d] = Σ_t weights[t] * v_cache[t][d]`.
+///
+/// The second half of single-query attention, collapsing the V cache to one
+/// `head_dim` vector. Was a scalar loop while the Q·K half beside it ran AVX2 —
+/// see [`ops::attn_accum`] for the measurement.
+pub fn attn_accum(weights: &[f32], v_cache: &[f32], out: &mut [f32], head_dim: usize) {
+    match SimdStrategy::detect() {
+        // AVX-512 falls back to AVX2 — no AVX-512-specific kernel yet, and on
+        // the parts where AVX-512 is selected the 256-bit path is not the
+        // bottleneck here (this loop stalls on DRAM, not on issue width).
+        SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe {
+            ops::attn_accum::avx2::run(weights, v_cache, out, head_dim)
+        },
+        SimdStrategy::Scalar => ops::attn_accum::scalar::run(weights, v_cache, out, head_dim),
+    }
+}
+
 /// Allocation-free RMSNorm for the decode loop. `out.len() == x.len()`.
 pub fn rms_norm_into(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     match SimdStrategy::detect() {

@@ -126,13 +126,10 @@ pub fn attention_one_into(
     }
     softmax(scores);
 
-    out.fill(0.0);
-    for (t, &w) in scores.iter().enumerate() {
-        let v_row = &v_cache[t * head_dim..(t + 1) * head_dim];
-        for d in 0..head_dim {
-            out[d] += w * v_row[d];
-        }
-    }
+    // out[d] = Σ_t scores[t] * v_cache[t][d]. This was a scalar loop while the
+    // Q·K dots above it were already AVX2 — half of attention's arithmetic was
+    // leaving the vector units idle. See `kernels::ops::attn_accum`.
+    crate::kernels::attn_accum(scores, v_cache, out, head_dim);
 }
 
 #[cfg(test)]

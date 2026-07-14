@@ -17,3 +17,7 @@ libc = "0.2"
 [[bench]]
 name = "moe_threads"
 harness = false
+
+[[bench]]
+name = "attn_probe"
+harness = false
