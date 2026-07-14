@@ -45,8 +45,63 @@
 
 use glcore::format::gguf::f16_to_f32;
 
-use crate::kernels::dequant::q4_k::scalar::{scale_min, BLOCK_BYTES};
+use crate::kernels::dequant::q4_k::scalar::{decode_scales, scale_min, BLOCK_BYTES};
+use crate::kernels::qdot::q8_k::Q8KActivation;
 use crate::kernels::qdot::QuantizedActivation;
+
+/// One Q4_K row · **Q8_K** activation — the super-block-aligned variant.
+///
+/// Q8_K has ONE f32 scale per 256 elements, aligned with Q4_K's super-block,
+/// so the 8 sub-block scales become **integer multipliers** and the float math
+/// collapses to two multiplies per super-block:
+///
+/// ```text
+///   acc += d·d8 · (Σ_j sc_j · idot_j)  −  dmin·d8 · (Σ_j m_j · bsum_j)
+/// ```
+///
+/// This is the structural difference from [`row_dot`] (the per-32-scale
+/// variant that lost 33% end-to-end): there the per-group activation scales
+/// forced 8 float-scaled accumulations per super-block; here both inner sums
+/// stay integer until one final scale.
+///
+/// Overflow, checked: `idot_j <= 32·15·127 = 60 960`; `sc_j <= 63`;
+/// `Σ_j sc_j·idot_j <= 8·63·60 960 ≈ 30.7M` — comfortably inside i32.
+pub fn row_dot_q8k(row: &[u8], act: &Q8KActivation) -> f32 {
+    let mut acc = 0f32;
+
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        let d = f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_to_f32(u16::from_le_bytes([block[2], block[3]]));
+        let (sc, mn) = decode_scales(&block[4..16]);
+        let qs = &block[16..144];
+        let d8 = act.d[b];
+
+        let mut isum = 0i32;
+        for chunk in 0..4 {
+            let j_lo = 2 * chunk;
+            let q = &qs[chunk * 32..chunk * 32 + 32];
+            let a_lo = &act.q[b * 256 + j_lo * 32..b * 256 + j_lo * 32 + 32];
+            let a_hi = &act.q[b * 256 + (j_lo + 1) * 32..b * 256 + (j_lo + 1) * 32 + 32];
+
+            let mut idot_lo = 0i32;
+            let mut idot_hi = 0i32;
+            for (i, &byte) in q.iter().enumerate() {
+                idot_lo += (byte & 0x0F) as i32 * a_lo[i] as i32;
+                idot_hi += (byte >> 4) as i32 * a_hi[i] as i32;
+            }
+            isum += sc[j_lo] * idot_lo + sc[j_lo + 1] * idot_hi;
+        }
+
+        // Min term: entirely from the precomputed activation sums.
+        let mut msum = 0i32;
+        for j in 0..8 {
+            msum += mn[j] * act.bsums[b * 8 + j];
+        }
+
+        acc += d * d8 * isum as f32 - dmin * d8 * msum as f32;
+    }
+    acc
+}
 
 /// One Q4_K row (`n_blocks * 144` bytes) · quantized activation.
 ///

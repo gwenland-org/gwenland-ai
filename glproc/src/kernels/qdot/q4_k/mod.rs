@@ -110,6 +110,126 @@ mod tests {
         }
     }
 
+    /// The Q8_K-activation scalar kernel vs an independent reference:
+    /// dequantize the row to f32 (via the validated `dequant_block`), then dot
+    /// against the DEQUANTIZED Q8_K activation (`d8 * q8`). Only the weight-side
+    /// integer derivation is under test — both sides share the activation's
+    /// quantization noise.
+    #[test]
+    fn q8k_scalar_matches_dequantized_f32_dot() {
+        use crate::kernels::qdot::q8_k::Q8KActivation;
+        let mut seed = 0x08AB4Bu64;
+
+        for &n_blocks in &[1usize, 3, 8] {
+            let in_dim = n_blocks * BLOCK_NUMEL;
+            let row = q4_k_row(n_blocks, &mut seed);
+
+            let mut w = vec![0f32; in_dim];
+            for b in 0..n_blocks {
+                let mut blk = [0f32; 256];
+                dequant_block(&row[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES], &mut blk);
+                w[b * BLOCK_NUMEL..(b + 1) * BLOCK_NUMEL].copy_from_slice(&blk);
+            }
+
+            let x: Vec<f32> = (0..in_dim).map(|_| prng_f32(&mut seed)).collect();
+            let mut act = Q8KActivation::with_capacity(in_dim);
+            act.quantize(&x);
+
+            let want: f32 = (0..in_dim)
+                .map(|i| w[i] * act.d[i / 256] * act.q[i] as f32)
+                .sum();
+            let got = super::scalar::row_dot_q8k(&row, &act);
+
+            let tol = want.abs().max(1.0) * 1e-4;
+            assert!(
+                (got - want).abs() < tol,
+                "n_blocks={n_blocks}: got {got}, want {want}"
+            );
+        }
+    }
+
+    /// AVX2/VNNI Q8_K kernel vs the scalar ground truth.
+    #[test]
+    fn q8k_simd_matches_scalar() {
+        use crate::kernels::qdot::q8_k::Q8KActivation;
+        use crate::simd_strategy::SimdStrategy;
+        if !matches!(SimdStrategy::detect(), SimdStrategy::Avx2 | SimdStrategy::Avx512) {
+            eprintln!("skipping: no wide backend");
+            return;
+        }
+        eprintln!(
+            "q4_k/q8_k simd parity on {:?}, vnni256={}",
+            SimdStrategy::detect(),
+            crate::kernels::qdot::has_vnni_256()
+        );
+
+        let mut seed = 0xD08Bu64;
+        for &n_blocks in &[1usize, 2, 7, 35] {
+            // 35 blocks = the real gate_up in_dim (8960) — exercises the i32
+            // accumulation bound at production row length.
+            let in_dim = n_blocks * BLOCK_NUMEL;
+            let row = q4_k_row(n_blocks, &mut seed);
+            let x: Vec<f32> = (0..in_dim).map(|_| prng_f32(&mut seed)).collect();
+            let mut act = Q8KActivation::with_capacity(in_dim);
+            act.quantize(&x);
+
+            let want = super::scalar::row_dot_q8k(&row, &act);
+            // SAFETY: wide backend confirmed above.
+            let got = unsafe { super::avx2::row_dot_q8k(&row, &act) };
+
+            // Integer terms are exact; only f32 accumulation order differs.
+            let tol = want.abs().max(1.0) * 1e-5;
+            assert!(
+                (got - want).abs() < tol,
+                "n_blocks={n_blocks}: simd {got}, scalar {want}"
+            );
+        }
+    }
+
+    /// The Wave-2 stop-condition test: the native Q4_K/Q8_K path against the
+    /// production Q8_0 path (repack the same weights to Q8_0, quantize the same
+    /// activation per-32) — the two must agree within the spec's 1e-2 relative
+    /// tolerance. Each path carries its own activation-quantization noise, so
+    /// this bound is looser than the parity tests above by design.
+    #[test]
+    fn q8k_path_matches_q8_0_path() {
+        use crate::kernels::bridge::QuantFormat;
+        use crate::kernels::dequant::q4_k::scalar::repack_to_q8_0;
+        use crate::kernels::qdot::q8_k::Q8KActivation;
+        use crate::kernels::qdot::{row_dot_q8, QuantizedActivation};
+        use crate::simd_strategy::SimdStrategy;
+
+        let strategy = SimdStrategy::detect();
+        let mut seed = 0x0A7Bu64;
+        let mut worst = 0f32;
+
+        for &n_blocks in &[2usize, 8, 35] {
+            let in_dim = n_blocks * BLOCK_NUMEL;
+            let row = q4_k_row(n_blocks, &mut seed);
+            let x: Vec<f32> = (0..in_dim).map(|_| prng_f32(&mut seed)).collect();
+
+            // Path A — production today: Q4_K repacked to Q8_0 at load,
+            // per-32 activation, Q8_0 integer dot.
+            let repacked = repack_to_q8_0(&row).unwrap();
+            let mut act32 = QuantizedActivation::with_capacity(in_dim);
+            act32.quantize(&x);
+            let q8_0_result = row_dot_q8(QuantFormat::Q8_0, &repacked, &act32, strategy);
+
+            // Path B — Wave 2: native Q4_K bytes, Q8_K activation.
+            let mut act_k = Q8KActivation::with_capacity(in_dim);
+            act_k.quantize(&x);
+            let q8k_result = super::scalar::row_dot_q8k(&row, &act_k);
+
+            let rel = (q8k_result - q8_0_result).abs() / q8_0_result.abs().max(1.0);
+            worst = worst.max(rel);
+            assert!(
+                rel < 1e-2,
+                "n_blocks={n_blocks}: q8k {q8k_result} vs q8_0 {q8_0_result} (rel {rel:.2e})"
+            );
+        }
+        eprintln!("q8k-vs-q8_0 worst relative error: {worst:.2e}");
+    }
+
     /// A zero activation must dot to exactly zero, offset term included. If the
     /// `dmin·m·Σa` correction were applied with the wrong sign or without the
     /// activation sum, this would drift off zero.

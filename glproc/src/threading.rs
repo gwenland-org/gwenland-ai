@@ -339,6 +339,145 @@ pub fn par_attention(
     });
 }
 
+/// Threaded native-Q4_K matvec with **Q8_K** activation: quantizes `x` once
+/// (256-element super-blocks, one f32 scale each) and dots every row in the
+/// integer domain via `row_dot_q8k`.
+///
+/// The activation scratch lives in a `thread_local` (the same pattern as the
+/// packed-panel scratch in [`par_matmul_qdot`]): a fresh allocation per matvec
+/// would fault in demand-zero pages, which measured as random 25–40 ms stalls.
+/// Steady-state this allocates nothing.
+pub fn par_matvec_q4k(
+    pool: &ThreadPool,
+    weights: &[u8],
+    x: &[f32],
+    y: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    strategy: SimdStrategy,
+) {
+    use crate::kernels::qdot::q4_k;
+    use crate::kernels::qdot::q8_k::Q8KActivation;
+
+    debug_assert_eq!(in_dim % 256, 0, "Q4_K rows are whole super-blocks");
+    let row_bytes = in_dim / 256 * 144;
+    debug_assert_eq!(weights.len(), out_dim * row_bytes);
+    debug_assert_eq!(y.len(), out_dim);
+
+    thread_local! {
+        static ACT: std::cell::RefCell<Q8KActivation> =
+            std::cell::RefCell::new(Q8KActivation::with_capacity(0));
+    }
+    // Take the scratch out so the pool closure can borrow it without holding
+    // the RefCell guard across `run` — the PACK-scratch precedent.
+    let mut act = ACT.with(|a| {
+        std::mem::replace(&mut *a.borrow_mut(), Q8KActivation::with_capacity(0))
+    });
+    if act.q.len() < in_dim {
+        act = Q8KActivation::with_capacity(in_dim);
+    }
+    act.quantize(x); // once per matvec, amortized over out_dim rows
+
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    let chunk = out_dim.div_ceil(n);
+    let act_ref = &act;
+    let wide = matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+            // SAFETY: wide implies AVX2+FMA+F16C per SimdStrategy::detect().
+            let dot = if wide {
+                unsafe { q4_k::avx2::row_dot_q8k(row, act_ref) }
+            } else {
+                q4_k::scalar::row_dot_q8k(row, act_ref)
+            };
+            // SAFETY: o < out_dim == y.len(); rows disjoint per thread.
+            unsafe { *out.0.add(o) = dot };
+        }
+    });
+
+    ACT.with(|a| *a.borrow_mut() = act);
+}
+
+/// Batched (prefill) variant of [`par_matvec_q4k`]: quantizes each of the
+/// `batch` activation rows once, then every weight row is dotted with all of
+/// them while cache-hot. Output cell `(b, col_off + o)` lands at
+/// `y[b * y_stride + col_off + o]`, matching [`par_matmul_qdot`].
+///
+/// No grouped/packed-panel variants yet — correctness first; the Q8_0 path's
+/// panel packing is a later optimization if prefill profiling asks for it.
+#[allow(clippy::too_many_arguments)]
+pub fn par_matmul_q4k(
+    pool: &ThreadPool,
+    weights: &[u8],
+    xb: &[f32],
+    x_stride: usize,
+    y: &mut [f32],
+    y_stride: usize,
+    col_off: usize,
+    out_dim: usize,
+    in_dim: usize,
+    batch: usize,
+    strategy: SimdStrategy,
+) {
+    use crate::kernels::qdot::q4_k;
+    use crate::kernels::qdot::q8_k::Q8KActivation;
+
+    debug_assert!(batch > 0);
+    debug_assert_eq!(in_dim % 256, 0);
+    let row_bytes = in_dim / 256 * 144;
+    debug_assert_eq!(weights.len(), out_dim * row_bytes);
+    debug_assert!(y.len() >= (batch - 1) * y_stride + col_off + out_dim);
+
+    thread_local! {
+        static ACTS: std::cell::RefCell<Vec<Q8KActivation>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let mut acts = ACTS.with(|a| std::mem::take(&mut *a.borrow_mut()));
+    while acts.len() < batch {
+        acts.push(Q8KActivation::with_capacity(in_dim));
+    }
+    for (b, act) in acts.iter_mut().enumerate().take(batch) {
+        if act.q.len() < in_dim {
+            *act = Q8KActivation::with_capacity(in_dim);
+        }
+        act.quantize(&xb[b * x_stride..b * x_stride + in_dim]);
+    }
+
+    let n = pool.n_threads();
+    let out = RowWriter(y.as_mut_ptr());
+    let chunk = out_dim.div_ceil(n);
+    let acts_ref = &acts;
+    let wide = matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512);
+
+    pool.run(&|tid| {
+        let out = &out;
+        let lo = (tid * chunk).min(out_dim);
+        let hi = (lo + chunk).min(out_dim);
+        for o in lo..hi {
+            let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+            for (b, act) in acts_ref.iter().enumerate().take(batch) {
+                // SAFETY: wide implies AVX2+FMA+F16C.
+                let dot = if wide {
+                    unsafe { q4_k::avx2::row_dot_q8k(row, act) }
+                } else {
+                    q4_k::scalar::row_dot_q8k(row, act)
+                };
+                // SAFETY: disjoint (b, col_off + o) cells per thread, bounds
+                // per the debug_assert above.
+                unsafe { *out.0.add(b * y_stride + col_off + o) = dot };
+            }
+        }
+    });
+
+    ACTS.with(|a| *a.borrow_mut() = acts);
+}
+
 /// Threaded f32 matvec: `y[o] = dot(w[o], x)`, rows interleaved across the
 /// pool. `w` is `[out_dim, in_dim]` row-major, `y.len() == out_dim`.
 pub fn par_matvec(

@@ -38,6 +38,26 @@ pub fn scale_min(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Unpack all 8 (scale, min) pairs at once — the bulk form of [`scale_min`],
+/// for kernels that hoist the decode out of their sub-block loop.
+///
+/// Format fact, since the Wave-2 spec got it wrong ("6 values, 4-bit each"):
+/// a Q4_K super-block has **8** sub-blocks of 32 weights, each with a **6-bit**
+/// scale and a 6-bit min — 16 six-bit values = 96 bits = exactly the 12 packed
+/// bytes. [`scale_min`] is the ground truth; the repack loader has exercised it
+/// against every Q4_K model this engine has run correctly.
+#[inline]
+pub fn decode_scales(scales: &[u8]) -> ([i32; 8], [i32; 8]) {
+    let mut sc = [0i32; 8];
+    let mut mn = [0i32; 8];
+    for j in 0..8 {
+        let (s, m) = scale_min(j, scales);
+        sc[j] = s as i32;
+        mn[j] = m as i32;
+    }
+    (sc, mn)
+}
+
 /// Dequantize one 144-byte Q4_K super-block into 256 f32 weights.
 /// Pure safe Rust — this is the parity reference for the SIMD kernels.
 pub fn dequant_block(data: &[u8], output: &mut [f32; 256]) {
@@ -96,4 +116,68 @@ pub fn run(data: &[u8]) -> Result<Vec<f32>, GlError> {
 /// Q4_K layers ~15x slower than repacked ones in prefill.
 pub fn repack_to_q8_0(data: &[u8]) -> Result<Vec<u8>, GlError> {
     Ok(crate::kernels::dequant::q8_0::scalar::quantize(&run(data)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Known-vector test for the 6-bit unpack: hand-computed from the packed
+    /// layout, independent of `scale_min`'s own arithmetic.
+    ///
+    /// Layout: for j<4, scale_j = bytes[j] & 63 and min_j = bytes[j+4] & 63;
+    /// for j>=4, the low 4 bits come from bytes[j+4] (scale = low nibble,
+    /// min = high nibble) and the top 2 bits are borrowed from the high bits
+    /// of bytes[j-4] (scale) and bytes[j] (min).
+    #[test]
+    fn decode_scales_known_vector() {
+        // Choose bytes whose fields are all distinct so a swapped index or
+        // shift shows up as a wrong VALUE, not a coincidental match.
+        let s: [u8; 12] = [
+            0b01_000001, // byte0: sc0=1,  high bits 01 -> top of sc4
+            0b10_000010, // byte1: sc1=2,  high bits 10 -> top of sc5
+            0b11_000011, // byte2: sc2=3,  high bits 11 -> top of sc6
+            0b00_000100, // byte3: sc3=4,  high bits 00 -> top of sc7
+            0b01_000101, // byte4: mn0=5,  high bits 01 -> top of mn4
+            0b10_000110, // byte5: mn1=6,  high bits 10 -> top of mn5
+            0b11_000111, // byte6: mn2=7,  high bits 11 -> top of mn6
+            0b00_001000, // byte7: mn3=8,  high bits 00 -> top of mn7
+            0b1010_0011, // byte8:  sc4 low=3,  mn4 low=10
+            0b1100_0101, // byte9:  sc5 low=5,  mn5 low=12
+            0b0001_0110, // byte10: sc6 low=6,  mn6 low=1
+            0b0111_1001, // byte11: sc7 low=9,  mn7 low=7
+        ];
+        let (sc, mn) = decode_scales(&s);
+        assert_eq!(sc, [1, 2, 3, 4, 3 | (0b01 << 4), 5 | (0b10 << 4), 6 | (0b11 << 4), 9]);
+        assert_eq!(mn, [5, 6, 7, 8, 10 | (0b01 << 4), 12 | (0b10 << 4), 1 | (0b11 << 4), 7]);
+    }
+
+    /// The bulk decoder must agree with the per-index `scale_min` (the
+    /// validated ground truth) on arbitrary bytes.
+    #[test]
+    fn decode_scales_matches_scale_min() {
+        let mut seed = 0x5CA1E5u64;
+        for _ in 0..200 {
+            let mut s = [0u8; 12];
+            for b in s.iter_mut() {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                *b = (seed >> 33) as u8;
+            }
+            let (sc, mn) = decode_scales(&s);
+            for j in 0..8 {
+                let (ws, wm) = scale_min(j, &s);
+                assert_eq!(sc[j], ws as i32, "scale j={j} bytes={s:?}");
+                assert_eq!(mn[j], wm as i32, "min j={j} bytes={s:?}");
+            }
+        }
+    }
+
+    /// All 6-bit fields saturated: every scale and min must read 63, and the
+    /// j>=4 borrow logic must not leak bits between neighbours.
+    #[test]
+    fn decode_scales_saturated() {
+        let (sc, mn) = decode_scales(&[0xFF; 12]);
+        assert_eq!(sc, [63; 8]);
+        assert_eq!(mn, [63; 8]);
+    }
 }

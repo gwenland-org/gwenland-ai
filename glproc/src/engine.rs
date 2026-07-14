@@ -146,6 +146,11 @@ impl GlprocEngine {
 
         let kernel_of = |w: &WeightMatrix| match w {
             WeightMatrix::F32(_) => "f32 dense".to_string(),
+            // Native Q4_K routes through its own Q8_K-activation kernel, not
+            // the per-32 qdot path and not the bridge — label it truthfully.
+            WeightMatrix::Quant(crate::kernels::bridge::QuantFormat::Q4K, _) => {
+                "Q4K q8k integer-dot (native)".to_string()
+            }
             WeightMatrix::Quant(fmt, _) if crate::kernels::qdot::supports(*fmt) => {
                 format!("{fmt:?} integer-dot")
             }
@@ -245,6 +250,9 @@ fn log_simd_paths(model: &GlprocModel) {
     let vnni = crate::kernels::qdot::has_vnni_256();
     let path = |w: &WeightMatrix| match w {
         WeightMatrix::F32(_) => "f32 dense".to_string(),
+        WeightMatrix::Quant(crate::kernels::bridge::QuantFormat::Q4K, _) => {
+            "Q4K q8k integer-dot (native)".to_string()
+        }
         WeightMatrix::Quant(fmt, _) if crate::kernels::qdot::supports(*fmt) => {
             format!("{fmt:?} integer-dot")
         }

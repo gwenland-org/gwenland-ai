@@ -102,6 +102,49 @@ fn main() {
             "format", "MB", "ms", "GMAC/s", "GB/s"
         );
 
+        // Wave 2 addition: the Q8_K-activation variant. Same Q4_K bytes, but
+        // sub-block scales applied in the INTEGER domain (one float FMA per
+        // super-block instead of 8) — the structural change hypothesized to
+        // close the compute gap that made the first Q4_K kernel lose 33%.
+        {
+            let mut act_k = glproc::kernels::qdot::q8_k::Q8KActivation::with_capacity(in_dim);
+            act_k.quantize(&x);
+            let run = || {
+                let mut s = 0f32;
+                for o in 0..out_dim {
+                    // SAFETY: probe only runs on AVX2 machines (checked in main).
+                    s += unsafe {
+                        glproc::kernels::qdot::q4_k::avx2::row_dot_q8k(
+                            &w4[o * rb4..(o + 1) * rb4],
+                            &act_k,
+                        )
+                    };
+                }
+                s
+            };
+            let iters = if out_dim > 1000 { 40 } else { 2000 };
+            let mut sink = 0f32;
+            for _ in 0..3 {
+                sink += run();
+            }
+            let t = Instant::now();
+            for _ in 0..iters {
+                sink += run();
+            }
+            let el = t.elapsed().as_secs_f64() / iters as f64;
+            std::hint::black_box(sink);
+            let bytes = (out_dim * rb4) as f64;
+            let macs = (out_dim * in_dim) as f64;
+            println!(
+                "{:<10} {:>10.1} {:>10.3} {:>10.1} {:>10.1}",
+                "Q4K/Q8K",
+                bytes / 1e6,
+                el * 1e3,
+                macs / el / 1e9,
+                bytes / el / 1e9
+            );
+        }
+
         let iters = if out_dim > 1000 { 40 } else { 2000 };
         for (name, w, rb, fmt) in [
             ("Q4_K", &w4, rb4, QuantFormat::Q4K),

@@ -240,10 +240,34 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<WeightMatrix, GlError> {
                 kernels::dequant::q6_k::scalar::repack_to_q8_0(gguf.tensor_data(info)?)?,
             ))
         }
-        // Q4_K too: it has no integer-dot kernel, so unrepacked it takes
-        // the f32 bridge — which re-dequantizes every block once per batch
-        // row in the prefill matmul (measured ~15x slower than repacked
-        // layers). Requantization error is the same class as Q6_K's.
+        // Q4_K, Wave 3: keep the NATIVE 144-byte super-blocks when the Q8_K
+        // integer-dot kernel can run them (wide SIMD present). This is the
+        // second attempt — the first native path (per-32 activation scales)
+        // lost 33% and was reverted; the Q8_K kernel reached per-MAC parity
+        // with Q8_0 in isolation before being allowed back in here.
+        // `GLPROC_Q4K_NATIVE=0` restores the repack for A/B.
+        Some(QuantFormat::Q4K) if info.dimensions[0] as usize % 256 == 0 && qdot::q4k_native() => {
+            let data = gguf.tensor_data(info)?;
+            // Size validation per spec: whole super-blocks, and exactly as
+            // many as the declared element count implies. A mismatch means a
+            // corrupt or misdeclared tensor, and slicing it would misread
+            // every row after the first bad block.
+            let numel: usize = info.dimensions.iter().map(|&d| d as usize).product();
+            let want = numel / 256 * 144;
+            if data.len() != want {
+                return Err(GlError::Parse(format!(
+                    "GGUF: Q4_K tensor '{}' is {} bytes, expected {want} ({} blocks x 144)",
+                    info.name,
+                    data.len(),
+                    numel / 256
+                )));
+            }
+            Ok(WeightMatrix::Quant(QuantFormat::Q4K, data.to_vec()))
+        }
+        // Fallback (no wide SIMD, or GLPROC_Q4K_NATIVE=0): repack to Q8_0 for
+        // the integer-dot kernels. The f32 bridge re-dequantizes every block
+        // once per batch row in prefill (measured ~15x slower), so repack
+        // remains the correct non-native choice.
         Some(QuantFormat::Q4K) if info.dimensions[0] as usize % 256 == 0 => {
             Ok(WeightMatrix::Quant(
                 QuantFormat::Q8_0,
@@ -391,6 +415,11 @@ fn weight_from_bytes(
             QuantFormat::Q8_0,
             kernels::dequant::q6_k::scalar::repack_to_q8_0(bytes)?,
         )),
+        // MoE experts stay on the repack DELIBERATELY, unlike dense weights:
+        // moe.rs's dense_matmul routes on qdot::supports(), which excludes
+        // Q4K, so a native expert would silently fall to the f32 bridge —
+        // measured ~15x slower in prefill. Native Q4_K for experts needs its
+        // own arm in moe.rs first; until then repack is the fast correct path.
         Some(QuantFormat::Q4K) if in_features % 256 == 0 => Ok(WeightMatrix::Quant(
             QuantFormat::Q8_0,
             kernels::dequant::q4_k::scalar::repack_to_q8_0(bytes)?,

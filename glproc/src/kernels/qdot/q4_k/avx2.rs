@@ -33,8 +33,124 @@
 
 use std::arch::x86_64::*;
 
-use crate::kernels::dequant::q4_k::scalar::{scale_min, BLOCK_BYTES};
+use crate::kernels::dequant::q4_k::scalar::{decode_scales, scale_min, BLOCK_BYTES};
+use crate::kernels::qdot::q8_k::Q8KActivation;
 use crate::kernels::qdot::{f16_hw, has_vnni_256, QuantizedActivation};
+
+/// One Q4_K row · **Q8_K** activation, AVX2 (+VNNI), integer-domain sub-block
+/// scaling.
+///
+/// See [`super::scalar::row_dot_q8k`] for the derivation. The vector trick
+/// that distinguishes this from the per-32-scale kernel that lost 33%:
+///
+/// - **AVX2 path:** `maddubs` gives i16 pair-sums (≤ 3810, no overflow), and
+///   `madd_epi16(p16, set1(sc))` **fuses the 6-bit sub-block scale into the
+///   16→32 widening step** — the scale costs zero extra instructions.
+///   Per-lane bound: 2·3810·63 ≈ 480K; 8 sub-blocks per super-block ≈ 3.84M
+///   per lane; a 143k-wide row would be needed to overflow i32.
+/// - **VNNI path:** `vpdpbusd` goes straight to i32, so the scale is a
+///   `mullo_epi32` afterwards.
+/// - Per super-block, the only float work is ONE `cvtepi32_ps` + ONE broadcast
+///   FMA (for `d·d8`) plus one scalar FMA for the min term. The failed kernel
+///   did 8 of each.
+///
+/// # Safety
+/// Caller must ensure AVX2, FMA and F16C, and that `act` was quantized for at
+/// least `row.len() / 144 * 256` elements.
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+pub unsafe fn row_dot_q8k(row: &[u8], act: &Q8KActivation) -> f32 {
+    if has_vnni_256() {
+        row_dot_q8k_inner::<true>(row, act)
+    } else {
+        row_dot_q8k_inner::<false>(row, act)
+    }
+}
+
+#[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+unsafe fn row_dot_q8k_inner<const VNNI: bool>(row: &[u8], act: &Q8KActivation) -> f32 {
+    let lo_mask = _mm256_set1_epi8(0x0F);
+    // f32 accumulator lanes across the whole row; one hsum at the end.
+    let mut accf = _mm256_setzero_ps();
+    // Min-term accumulates as a scalar — it is 8 integer multiplies per
+    // super-block on precomputed sums, nothing to vectorize.
+    let mut offset = 0f32;
+
+    for (b, block) in row.chunks_exact(BLOCK_BYTES).enumerate() {
+        // SAFETY: block is 144 bytes; f16_hw needs F16C (enabled above).
+        let d = f16_hw(u16::from_le_bytes([block[0], block[1]]));
+        let dmin = f16_hw(u16::from_le_bytes([block[2], block[3]]));
+        let (sc, mn) = decode_scales(&block[4..16]);
+        let d8 = act.d[b];
+
+        // Integer accumulator for THIS super-block (reset per block because
+        // d·d8 differs per block). Two chains for ILP across the 4 chunks.
+        let mut isum = [_mm256_setzero_si256(); 2];
+
+        for chunk in 0..4 {
+            let j_lo = 2 * chunk;
+            // SAFETY: qs starts at byte 16; chunk < 4 keeps the load inside
+            // the 144-byte block.
+            let packed =
+                _mm256_loadu_si256(block.as_ptr().add(16 + chunk * 32) as *const __m256i);
+            let w_lo = _mm256_and_si256(packed, lo_mask);
+            let w_hi = _mm256_and_si256(_mm256_srli_epi16::<4>(packed), lo_mask);
+
+            // SAFETY: act quantized for n_blocks*256 elements (contract).
+            let a_lo = _mm256_loadu_si256(
+                act.q.as_ptr().add(b * 256 + j_lo * 32) as *const __m256i
+            );
+            let a_hi = _mm256_loadu_si256(
+                act.q.as_ptr().add(b * 256 + (j_lo + 1) * 32) as *const __m256i
+            );
+
+            if VNNI {
+                // dpbusd lands in i32; scale with a 32-bit multiply.
+                let p_lo = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_lo, a_lo);
+                let p_hi = _mm256_dpbusd_epi32(_mm256_setzero_si256(), w_hi, a_hi);
+                isum[0] = _mm256_add_epi32(
+                    isum[0],
+                    _mm256_mullo_epi32(p_lo, _mm256_set1_epi32(sc[j_lo])),
+                );
+                isum[1] = _mm256_add_epi32(
+                    isum[1],
+                    _mm256_mullo_epi32(p_hi, _mm256_set1_epi32(sc[j_lo + 1])),
+                );
+            } else {
+                // maddubs -> i16 pair sums (<= 3810), then madd BY THE SCALE:
+                // the widening multiply-add does the scaling for free.
+                let p16_lo = _mm256_maddubs_epi16(w_lo, a_lo);
+                let p16_hi = _mm256_maddubs_epi16(w_hi, a_hi);
+                isum[0] = _mm256_add_epi32(
+                    isum[0],
+                    _mm256_madd_epi16(p16_lo, _mm256_set1_epi16(sc[j_lo] as i16)),
+                );
+                isum[1] = _mm256_add_epi32(
+                    isum[1],
+                    _mm256_madd_epi16(p16_hi, _mm256_set1_epi16(sc[j_lo + 1] as i16)),
+                );
+            }
+        }
+
+        // ONE float scale for the whole super-block's positive term.
+        let block_i = _mm256_add_epi32(isum[0], isum[1]);
+        accf = _mm256_fmadd_ps(
+            _mm256_set1_ps(d * d8),
+            _mm256_cvtepi32_ps(block_i),
+            accf,
+        );
+
+        // Min term from precomputed sums.
+        let mut msum = 0i32;
+        for j in 0..8 {
+            msum += mn[j] * act.bsums[b * 8 + j];
+        }
+        offset += dmin * d8 * msum as f32;
+    }
+
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), accf);
+    tmp.iter().sum::<f32>() - offset
+}
 
 /// `Σ q_i · a_i` over 32 unsigned-4-bit weights × 32 signed int8 activations,
 /// left in i32 lanes (NOT horizontally summed).

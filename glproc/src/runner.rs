@@ -19,8 +19,8 @@ use crate::model::{FfnLayer, GateUp, GlprocModel, QkvWeights, RopeStyle, WeightM
 use crate::sampler::Sampler;
 use crate::simd_strategy::SimdStrategy;
 use crate::threading::{
-    par_matmul, par_matmul_qdot, par_matmul_swiglu, par_matvec, par_matvec_qdot,
-    par_matvec_quant, par_matvec_swiglu, ThreadPool,
+    par_matmul, par_matmul_q4k, par_matmul_qdot, par_matmul_swiglu, par_matvec,
+    par_matvec_q4k, par_matvec_qdot, par_matvec_quant, par_matvec_swiglu, ThreadPool,
 };
 
 /// KV cache sequence capacity cap. Qwen-class models advertise 32k context;
@@ -177,6 +177,14 @@ fn matvec_w(
             }
         }
         WeightMatrix::Quant(fmt, blocks) => {
+            // Native Q4_K (Wave 3): its own activation format (Q8_K, quantized
+            // inside the wrapper), so it routes before the per-32 qdot path.
+            // Every Q4_K tensor in practice is >= 1536 wide x hundreds of rows,
+            // far past PAR_MIN_WORK, so no inline fallback is needed.
+            if *fmt == crate::kernels::bridge::QuantFormat::Q4K {
+                par_matvec_q4k(pool, blocks, x, y, out_dim, in_dim, strategy);
+                return;
+            }
             if qdot::supports(*fmt) {
                 debug_assert_eq!(act.len, in_dim, "caller must quantize x into act first");
                 if parallel {
@@ -225,6 +233,16 @@ fn matmul_w(
             );
         }
         WeightMatrix::Quant(fmt, blocks) => {
+            // Native Q4_K: Q8_K activations are quantized inside the wrapper
+            // (once per batch row per matmul), so this needs neither `acts`
+            // nor the per-32 quantize pass the caller did for qdot formats.
+            if *fmt == crate::kernels::bridge::QuantFormat::Q4K {
+                par_matmul_q4k(
+                    pool, blocks, xb, x_stride, yb, y_stride, col_off, out_dim, in_dim,
+                    batch, strategy,
+                );
+                return;
+            }
             if qdot::supports(*fmt) {
                 debug_assert_eq!(acts.len(), batch, "caller must quantize xb rows first");
                 par_matmul_qdot(

@@ -17,6 +17,7 @@
 //! `q[j*32..j*32+32]`, `scales[j]`, `sums[j]`.
 
 pub mod q4_k;
+pub mod q8_k;
 pub mod q5_0;
 pub mod q6_k;
 pub mod q8_0;
@@ -158,6 +159,42 @@ pub fn row_dot_q8(
             SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { q4_k::avx2::row_dot(row, act) },
             SimdStrategy::Scalar => q4_k::scalar::row_dot(row, act),
         },
+    }
+}
+
+/// Should the loader keep Q4_K tensors native (Wave 3) instead of repacking
+/// them to Q8_0?
+///
+/// Default: **false** — opt in with `GLPROC_Q4K_NATIVE=1` (still needs AVX2).
+///
+/// The kernel is correct (E2E: top-1 identical, top-5 5/5 vs the repack path;
+/// isolated probe: per-MAC parity with Q8_0). But routing dense gate/up
+/// weights through it **loses ~30% end-to-end**, and the reason is not the
+/// kernel — it is that native Q4_K forces `GateUp::Split`, giving up the
+/// **fused SwiGLU** path (`par_matvec_swiglu`: one dispatch, gate+up
+/// interleaved into a single DRAM stream, SiLU inline). Measured on
+/// Qwen2.5-1.5B-q4_k_m decode, gate_up:
+///
+/// | path                    | GMAC/s | %ceiling |
+/// |-------------------------|--------|----------|
+/// | Q8_0 repack, fused      | 19.6   | 86%      |
+/// | Q4_K native, un-fused   | 7.5    | 13%      |
+///
+/// Same weights, half the throughput — from losing fusion, not from the dot.
+/// A fused Q4_K SwiGLU kernel would close this; that is Wave-4 work. Until it
+/// exists, repack-to-Q8_0 stays the production default.
+///
+/// Deliberately NOT cached in a OnceLock: consulted only at load time (~200
+/// getenv calls per model), and the E2E test flips it between two loads in one
+/// process.
+pub fn q4k_native() -> bool {
+    let wide = matches!(
+        SimdStrategy::detect(),
+        SimdStrategy::Avx2 | SimdStrategy::Avx512
+    );
+    match std::env::var("GLPROC_Q4K_NATIVE") {
+        Ok(v) if !v.is_empty() && v != "0" => wide, // opt-in, still needs AVX2
+        _ => false,
     }
 }
 
