@@ -252,6 +252,93 @@ struct RowWriter(*mut f32);
 unsafe impl Send for RowWriter {}
 unsafe impl Sync for RowWriter {}
 
+/// Read-only view of the KV cache, shared across attention threads.
+///
+/// Threads only *read* it, and they read disjoint head regions besides — but
+/// `&KvCache` cannot cross the pool boundary because the closure is `Sync` and
+/// the cache is borrowed mutably elsewhere in the decode loop. The pointer is
+/// valid for the whole of `pool.run`, which blocks until every worker is done.
+struct KvView<'a>(&'a crate::kv_cache::KvCache);
+
+// SAFETY: read-only access to disjoint head regions; `par_attention` blocks
+// until all workers finish, so the borrow outlives every use.
+unsafe impl Send for KvView<'_> {}
+unsafe impl Sync for KvView<'_> {}
+
+/// Threaded single-query attention: each thread takes a contiguous range of
+/// query heads and writes its own slice of `attn_out`.
+///
+/// # Why per-thread `scores`
+///
+/// The sequential path reuses one `scores` scratch buffer across all heads.
+/// Threads cannot share it — each head's softmax would clobber its neighbours'.
+/// Each worker therefore gets its own `[max_context]` slice out of `scratch`,
+/// which the caller allocates once (`n_threads * max_context` floats, 64 KB at
+/// 4 threads x 4096) so the decode loop stays allocation-free.
+///
+/// # Why contiguous head ranges
+///
+/// Head `h` reads KV head `h / heads_per_kv`. Under GQA several query heads
+/// share one KV region, so a contiguous range keeps a thread on the *same* KV
+/// data for consecutive heads — which matters more than usual here, because
+/// `KvCache` spaces each head's region `max_context` apart (2 MB at 4096) and
+/// every jump between them is an L2-cold start.
+#[allow(clippy::too_many_arguments)]
+pub fn par_attention(
+    pool: &ThreadPool,
+    cache: &crate::kv_cache::KvCache,
+    layer: usize,
+    q: &[f32],
+    attn_out: &mut [f32],
+    scratch: &mut [f32],
+    n_heads: usize,
+    heads_per_kv: usize,
+    head_dim: usize,
+    cached_len: usize,
+) {
+    debug_assert_eq!(q.len(), n_heads * head_dim);
+    debug_assert_eq!(attn_out.len(), n_heads * head_dim);
+
+    let n = pool.n_threads();
+    debug_assert!(
+        scratch.len() >= n * cached_len,
+        "scratch must hold one `cached_len` scores buffer per thread"
+    );
+
+    let out = RowWriter(attn_out.as_mut_ptr());
+    let scr = RowWriter(scratch.as_mut_ptr());
+    let kv = KvView(cache);
+    let chunk = n_heads.div_ceil(n);
+
+    pool.run(&|tid| {
+        let (out, scr, kv) = (&out, &scr, &kv);
+        let lo = (tid * chunk).min(n_heads);
+        let hi = (lo + chunk).min(n_heads);
+
+        // SAFETY: thread `tid` owns scratch[tid*cached_len .. (tid+1)*cached_len],
+        // which is disjoint from every other thread's (asserted above).
+        let scores =
+            unsafe { std::slice::from_raw_parts_mut(scr.0.add(tid * cached_len), cached_len) };
+
+        for h in lo..hi {
+            let kv_head = h / heads_per_kv.max(1);
+            // SAFETY: heads are disjoint across threads (contiguous ranges), so
+            // no two threads write the same `attn_out` slice.
+            let o = unsafe {
+                std::slice::from_raw_parts_mut(out.0.add(h * head_dim), head_dim)
+            };
+            crate::attention::attention_one_into(
+                &q[h * head_dim..(h + 1) * head_dim],
+                kv.0.read_k(layer, kv_head),
+                kv.0.read_v(layer, kv_head),
+                head_dim,
+                scores,
+                o,
+            );
+        }
+    });
+}
+
 /// Threaded f32 matvec: `y[o] = dot(w[o], x)`, rows interleaved across the
 /// pool. `w` is `[out_dim, in_dim]` row-major, `y.len() == out_dim`.
 pub fn par_matvec(
@@ -1042,6 +1129,107 @@ mod tests {
                 assert!(
                     (got[b * out_dim + o] - want[o]).abs() < 1e-5,
                     "b={b} o={o}"
+                );
+            }
+        }
+    }
+
+    /// Threaded attention must produce bit-comparable results to the sequential
+    /// head loop it replaces.
+    ///
+    /// This is the load-bearing test for `par_attention`: the two failure modes
+    /// it guards are (a) threads sharing one `scores` buffer and clobbering each
+    /// other's softmax, and (b) an off-by-one in the head->thread mapping
+    /// leaving some heads unwritten or written twice. Both would still produce
+    /// *plausible* output, which is exactly why a parity test is needed rather
+    /// than a smoke test.
+    #[test]
+    fn par_attention_matches_sequential() {
+        use crate::attention::attention_one_into;
+        use crate::kv_cache::KvCache;
+
+        // GQA shape, like Qwen3: several query heads per KV head, and a head
+        // count that does NOT divide evenly by the thread count (16 heads over
+        // 3 threads) so the chunking remainder is exercised.
+        let (n_heads, n_kv_heads, head_dim, ctx, max_ctx) = (16usize, 4usize, 32usize, 25usize, 64usize);
+        let heads_per_kv = n_heads / n_kv_heads;
+        let layer = 1usize;
+
+        let mut seed = 0xA77Eu64;
+        let mut prng = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+        };
+
+        // Fill a 2-layer cache so `layer` indexing is actually exercised.
+        let mut cache = KvCache::new(2, n_kv_heads, head_dim, max_ctx);
+        for _ in 0..ctx {
+            for h in 0..n_kv_heads {
+                let k: Vec<f32> = (0..head_dim).map(|_| prng()).collect();
+                let v: Vec<f32> = (0..head_dim).map(|_| prng()).collect();
+                for l in 0..2 {
+                    cache.write_k(l, h, &k);
+                    cache.write_v(l, h, &v);
+                }
+            }
+            cache.advance();
+        }
+        let cached_len = cache.current_pos(); // `ctx` rows written
+
+        let q: Vec<f32> = (0..n_heads * head_dim).map(|_| prng()).collect();
+
+        // Sequential reference — one shared scores buffer, exactly as the
+        // pre-threading decode loop did it.
+        let mut want = vec![f32::NAN; n_heads * head_dim];
+        let mut scores = vec![0f32; cached_len];
+        for h in 0..n_heads {
+            let kv = h / heads_per_kv;
+            attention_one_into(
+                &q[h * head_dim..(h + 1) * head_dim],
+                cache.read_k(layer, kv),
+                cache.read_v(layer, kv),
+                head_dim,
+                &mut scores,
+                &mut want[h * head_dim..(h + 1) * head_dim],
+            );
+        }
+
+        // Threaded, across several pool sizes — including 3, which does not
+        // divide 16 evenly.
+        for n_threads in [1usize, 2, 3, 4] {
+            let pool = ThreadPool::new(n_threads);
+            let n = pool.n_threads();
+            let mut got = vec![f32::NAN; n_heads * head_dim];
+            let mut scratch = vec![0f32; n * cached_len];
+            par_attention(
+                &pool,
+                &cache,
+                layer,
+                &q,
+                &mut got,
+                &mut scratch,
+                n_heads,
+                heads_per_kv,
+                head_dim,
+                cached_len,
+            );
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    g.is_finite(),
+                    "n_threads={n_threads} head={} dim={}: unwritten (NaN)",
+                    i / head_dim,
+                    i % head_dim
+                );
+                // Identical arithmetic in a different order across threads —
+                // but each head's dot chain is unchanged, so this should be
+                // exact. A tolerance would hide a real clobbering bug.
+                assert_eq!(
+                    g, w,
+                    "n_threads={n_threads} head={} dim={}",
+                    i / head_dim,
+                    i % head_dim
                 );
             }
         }

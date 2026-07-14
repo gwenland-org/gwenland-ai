@@ -3,26 +3,11 @@
 use crate::kernels::matmul_t;
 
 /// Numerically stable in-place softmax over a slice.
+///
+/// Dispatches to the vectorized kernel (see [`crate::kernels::ops::softmax`]);
+/// the scalar body that used to live here is now that module's ground truth.
 pub fn softmax(x: &mut [f32]) {
-    let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    if !max.is_finite() {
-        // All -inf (fully masked row) — degenerate; spread uniformly.
-        let n = x.len() as f32;
-        x.fill(1.0 / n);
-        return;
-    }
-    let mut sum = 0.0f32;
-    for v in x.iter_mut() {
-        // X5 §4.8: fast_exp (range-reduced polynomial, ~1e-4 rel err) in
-        // place of f32::exp — well under the weights' quantization noise.
-        *v = crate::kernels::fast_exp(*v - max);
-        sum += *v;
-    }
-    if sum > 0.0 {
-        for v in x.iter_mut() {
-            *v /= sum;
-        }
-    }
+    crate::kernels::softmax_inplace(x);
 }
 
 /// Scaled dot-product attention for a single head.

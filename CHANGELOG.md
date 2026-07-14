@@ -2,6 +2,42 @@
 
 The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
+## 0.1.129 — 2026-07-14
+
+### glproc — the attention anomaly, chased to ground
+
+Attention sat at 29–40% of the bandwidth ceiling and 3.5× slower per MAC than
+the FFN even after the SIMD fix. Phase-splitting the bucket (cold rotate over
+all 28 layers, ctx 252) found the truth: qk dots 41% / **softmax 17%** /
+v-accum 42% — the two big halves were already vectorized, and softmax was the
+last scalar holdout (252 scalar `fast_exp` calls per head ≈ 113k per token).
+
+- **Vectorized softmax** (`kernels/ops/softmax/{avx2,scalar}`): max, exp (vector
+  `fast_exp`) and normalize 8 lanes at a time; the old scalar body is the parity
+  ground truth. Degenerate all-`-inf` rows preserved. 4 tests incl. lane-boundary
+  lengths and the overflow case. Softmax share 17% → 7%.
+- **Threaded attention** (`par_attention`): heads split across the pool in
+  contiguous ranges, one score-scratch buffer per thread (allocated once —
+  zero-alloc rule intact). Exact-equality parity test vs the sequential loop at
+  1/2/3/4 threads, incl. 16 heads over 3 threads.
+- **Thresholds from data, and one that flipped a gate.** Crossover sweep:
+  threading wins at *every* ctx ≥ 16 on the Qwen3 shape → `ATTN_PAR_MIN_WORK`
+  1<<17 → 1<<15. But on Qwen2.5-0.5B it **loses** (0.062 → 0.087 ms/call)
+  despite 7× the MACs — the predictor is not work but **independent KV
+  streams**: the 1.7B has 8 cold regions 2 MB apart to overlap, the 0.5B has 2
+  L2-resident regions that threads pull into two private L2s. New gate
+  `ATTN_PAR_MIN_KV_HEADS = 4`, verified to return the 0.5B to its sequential
+  0.061 ms/call.
+
+Result (Qwen3-1.7B, alternating A/B, cooled machine): attention 0.245–0.274 →
+**0.175–0.188 ms/call**, 22–26% → **33–36% of ceiling**, share 8.7% → 5.6%;
+decode 11.2–11.5 → 11.7 tok/s. Qwen2.5-0.5B unregressed at 37.7.
+
+**The anomaly is explained, not just patched**: sequential QK/V ran at ~14 GB/s
+— exactly the single-core line-fill-buffer ceiling (14.8–16 measured). Attention
+is latency-bound on cold strided KV; threading is the correct medicine, and the
+remaining gap is the 2-physical-core budget, not a kernel defect.
+
 ## 0.1.125 — 2026-07-14
 
 ### glproc — attention SIMD, decode +35%

@@ -98,6 +98,20 @@ pub fn silu_mul(gate: &mut [f32], up: &[f32]) {
     }
 }
 
+/// Numerically stable in-place softmax over one score row.
+///
+/// Was the last scalar holdout in attention: the Q·K dots and the V
+/// accumulation on either side of it were already vectorized, while this
+/// called the scalar `fast_exp` once per cached position — measured at 17% of
+/// the whole attention bucket (phase-split, ctx 252, cold rotate).
+pub fn softmax_inplace(x: &mut [f32]) {
+    match SimdStrategy::detect() {
+        // AVX-512 falls back to AVX2 — no AVX-512-specific softmax yet.
+        SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { ops::softmax::avx2::run(x) },
+        SimdStrategy::Scalar => ops::softmax::scalar::run(x),
+    }
+}
+
 /// Attention value accumulation: `out[d] = Σ_t weights[t] * v_cache[t][d]`.
 ///
 /// The second half of single-query attention, collapsing the V cache to one

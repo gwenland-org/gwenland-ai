@@ -77,6 +77,47 @@ pub fn kv_cache_bytes(c: &crate::model::ModelConfig) -> usize {
 /// waking workers costs more than the work itself.
 const PAR_MIN_WORK: usize = 1 << 16;
 
+/// Same idea for attention: below this much work (`n_heads * cached_len *
+/// head_dim` MACs) the head loop runs inline rather than paying a pool dispatch.
+///
+/// Attention is *not* a matvec — it streams the KV cache, not weights — so it
+/// needs its own threshold rather than reusing `PAR_MIN_WORK`.
+///
+/// Measured, not estimated (cold rotate over 28 layers, Qwen3 shape, seq vs
+/// threaded): threading won at **every** context down to the smallest probed —
+/// 1.38x at ctx 16, 1.7x through the ctx 64–256 band. ctx 16 on this shape is
+/// 16 heads * 16 * 128 = 2^15 MACs, so that is the gate: everything at or above
+/// the smallest measured win runs parallel, and only the unmeasured sub-16-ctx
+/// sliver (the first few tokens of an unprompted decode, microseconds either
+/// way) stays inline. The initial guess of 1<<17 was leaving the measured
+/// ctx 16–63 wins on the table.
+const ATTN_PAR_MIN_WORK: usize = 1 << 15;
+
+/// Threaded attention also requires at least this many KV heads.
+///
+/// MAC count alone cannot predict the win: Qwen3-1.7B at ctx 16 (2^15 MACs)
+/// gained 1.38x from threading, while Qwen2.5-0.5B at ctx 252 (~2^18 MACs)
+/// **lost** — 0.062 -> 0.087 ms/call measured in production. The differentiator
+/// is not the work, it is the *memory shape*: threading pays by overlapping
+/// independent cold KV streams, and the number of independent streams is
+/// `n_kv_heads`. The 1.7B has 8 regions spaced 2 MB apart (every one an
+/// L2-cold stream to overlap); the 0.5B has **2** small L2-resident regions,
+/// so its threads fetch the same lines into two private L2s — duplicated
+/// traffic, nothing overlapped, pure dispatch overhead.
+const ATTN_PAR_MIN_KV_HEADS: usize = 4;
+
+/// `GLPROC_ATTN_SEQ=1` forces sequential attention — the A/B knob for measuring
+/// whether threading the head loop actually pays on a given machine and context
+/// length. Cached: this is read once per decode step, not once per layer.
+fn attn_force_sequential() -> bool {
+    static SEQ: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SEQ.get_or_init(|| {
+        std::env::var("GLPROC_ATTN_SEQ")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// Prompt tokens processed per batched-prefill chunk. Batching lets every
 /// weight row stream from DRAM once per chunk instead of once per token —
 /// prefill flips from bandwidth-bound to compute-bound. 32 keeps the chunk's
@@ -223,7 +264,13 @@ struct Workspace {
     gate: Vec<f32>,
     /// SwiGLU up, `[hidden_dim]`.
     up: Vec<f32>,
-    /// Attention score scratch, `[kv capacity]`.
+    /// Attention score scratch: **one `[kv capacity]` buffer per pool thread**,
+    /// laid out back to back.
+    ///
+    /// Threaded attention runs several heads at once and each needs its own
+    /// softmax scratch — sharing one buffer would have heads clobber each
+    /// other. Sized `n_threads * kv_capacity` (64 KB at 4 threads x 4096) and
+    /// allocated once, so the decode loop stays allocation-free.
     scores: Vec<f32>,
     /// Output logits, `[vocab_size]`.
     logits: Vec<f32>,
@@ -654,10 +701,14 @@ impl<'m> Runner<'m> {
         let kv_capacity = c.max_seq.min(MAX_KV_CONTEXT).max(1);
         let q_dim = c.n_heads * c.head_dim;
         let kv_dim = c.n_kv_heads * c.head_dim;
+        // The pool decides how many score scratch buffers the workspace needs;
+        // build it first so the two cannot disagree.
+        let pool = ThreadPool::new(n_threads());
+        let n_pool = pool.n_threads();
         Runner {
             model,
             cache: KvCache::new(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity),
-            pool: ThreadPool::new(n_threads()),
+            pool,
             strategy: SimdStrategy::detect(),
             ws: Workspace {
                 x: vec![0.0; c.dim],
@@ -668,7 +719,9 @@ impl<'m> Runner<'m> {
                 proj: vec![0.0; c.dim],
                 gate: vec![0.0; c.hidden_dim],
                 up: vec![0.0; c.hidden_dim],
-                scores: vec![0.0; kv_capacity],
+                // One scores buffer per pool thread — threaded attention runs
+                // several heads at once and each needs its own softmax scratch.
+                scores: vec![0.0; n_pool * kv_capacity],
                 logits: vec![0.0; c.vocab_size],
                 act: QuantizedActivation::with_capacity(
                     c.dim.max(c.hidden_dim).max(q_dim),
@@ -834,16 +887,49 @@ impl<'m> Runner<'m> {
                 p.ctx_sum += cached_len as u64;
                 p.ctx_calls += 1;
             }
-            for h in 0..c.n_heads {
-                let kv_head = h / heads_per_kv.max(1);
-                attention_one_into(
-                    &q[h * head_dim..(h + 1) * head_dim],
-                    self.cache.read_k(l, kv_head),
-                    self.cache.read_v(l, kv_head),
+            // Threaded when the pool has workers and there is enough KV to make
+            // waking them worth it; inline otherwise.
+            //
+            // Threshold, not a guess: `par_attention` costs one pool dispatch
+            // (~5-50us to wake workers) against `n_heads * cached_len * head_dim`
+            // MACs of work. At a short context that work is smaller than the
+            // dispatch, and threading loses — the same reason `PAR_MIN_WORK`
+            // gates the matvecs. `GLPROC_ATTN_SEQ=1` forces the sequential path
+            // for A/B measurement.
+            let attn_work = c.n_heads * cached_len * head_dim;
+            let parallel = self.pool.n_threads() > 1
+                && attn_work >= ATTN_PAR_MIN_WORK
+                // Threading overlaps independent cold KV streams; with too few
+                // KV heads there is nothing independent to overlap and it was
+                // measured to LOSE (see ATTN_PAR_MIN_KV_HEADS).
+                && c.n_kv_heads >= ATTN_PAR_MIN_KV_HEADS
+                && !attn_force_sequential();
+
+            if parallel {
+                crate::threading::par_attention(
+                    &self.pool,
+                    &self.cache,
+                    l,
+                    &q[..c.n_heads * head_dim],
+                    &mut ws.attn_out,
+                    &mut ws.scores,
+                    c.n_heads,
+                    heads_per_kv,
                     head_dim,
-                    &mut ws.scores[..cached_len],
-                    &mut ws.attn_out[h * head_dim..(h + 1) * head_dim],
+                    cached_len,
                 );
+            } else {
+                for h in 0..c.n_heads {
+                    let kv_head = h / heads_per_kv.max(1);
+                    attention_one_into(
+                        &q[h * head_dim..(h + 1) * head_dim],
+                        self.cache.read_k(l, kv_head),
+                        self.cache.read_v(l, kv_head),
+                        head_dim,
+                        &mut ws.scores[..cached_len],
+                        &mut ws.attn_out[h * head_dim..(h + 1) * head_dim],
+                    );
+                }
             }
             lap(&mut self.prof, |p| &mut p.attn);
 

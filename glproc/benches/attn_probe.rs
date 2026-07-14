@@ -328,4 +328,116 @@ fn main() {
     println!("If 'baseline' above lands near 13.89 ms/token, the probe is faithful and");
     println!("the fix numbers are trustworthy. If it lands near 1.4 ms, the cache is");
     println!("still warm and something ELSE is costing 12 ms in the real attn bucket.");
+
+    // ---------------------------------------------------------------------
+    // Phase breakdown: WHERE inside attention does the time go?
+    //
+    // After SIMD (fix A) and threading (fix B), attention still runs at only
+    // 40% of the bandwidth ceiling and 6.3 GMAC/s against the FFN's 22.9 —
+    // 3.5x slower per MAC. Something inside the head loop is not accounted
+    // for by "it reads the KV cache".
+    //
+    // Three timed variants, identical inputs, cold rotate over 28 layers:
+    //   qk_only      = the Q.K dot loop, nothing else
+    //   qk_softmax   = dots + softmax
+    //   full         = attention_one_into (dots + softmax + V accumulation)
+    // so softmax = (B - A) and V-accum = (C - B) by subtraction.
+    //
+    // The prime suspect going in: softmax calls the SCALAR fast_exp once per
+    // cached position (252 per head, 16 heads, 28 layers = ~113k scalar exp
+    // calls per token) while Q.K and V-accum are both vectorized. If softmax
+    // dominates (B - A), the fix is a vectorized softmax, not a KV layout
+    // change.
+    // ---------------------------------------------------------------------
+    println!("\n--- phase breakdown at ctx {cached}, cold rotate, sequential ---\n");
+
+    let strategy2 = strategy; // captured by the closures below
+    let qk_tok = time_tok(&mut |l| {
+        let k = &kc[l * layer_span..(l + 1) * layer_span];
+        for h in 0..HEADS {
+            let kv = h / (HEADS / KV_HEADS);
+            let base = kv * MAX_CONTEXT * HEAD_DIM;
+            let krows = &k[base..base + cached * HEAD_DIM];
+            let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+            for (t, s) in scores.iter_mut().enumerate().take(cached) {
+                let row = &krows[t * HEAD_DIM..(t + 1) * HEAD_DIM];
+                // SAFETY: strategy from detect(); AVX2 present.
+                let dot = match strategy2 {
+                    SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe {
+                        glproc::kernels::matmul::avx2::dot_f32(qh, row)
+                    },
+                    SimdStrategy::Scalar => glproc::kernels::matmul::scalar::dot_f32(qh, row),
+                };
+                *s = dot * scale;
+            }
+            std::hint::black_box(&mut scores);
+        }
+    });
+    let qk_sm_tok = time_tok(&mut |l| {
+        let k = &kc[l * layer_span..(l + 1) * layer_span];
+        for h in 0..HEADS {
+            let kv = h / (HEADS / KV_HEADS);
+            let base = kv * MAX_CONTEXT * HEAD_DIM;
+            let krows = &k[base..base + cached * HEAD_DIM];
+            let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+            for (t, s) in scores.iter_mut().enumerate().take(cached) {
+                let row = &krows[t * HEAD_DIM..(t + 1) * HEAD_DIM];
+                let dot = match strategy2 {
+                    SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe {
+                        glproc::kernels::matmul::avx2::dot_f32(qh, row)
+                    },
+                    SimdStrategy::Scalar => glproc::kernels::matmul::scalar::dot_f32(qh, row),
+                };
+                *s = dot * scale;
+            }
+            glproc::attention::softmax(&mut scores[..cached]);
+            std::hint::black_box(&mut scores);
+        }
+    });
+    let full_tok = time_tok(&mut |l| {
+        let k = &kc[l * layer_span..(l + 1) * layer_span];
+        let v = &vc[l * layer_span..(l + 1) * layer_span];
+        baseline(&q, k, v, &mut scores, &mut out, cached);
+    });
+
+    println!("{:<18}{:>12}{:>12}", "phase", "ms/token", "share");
+    println!("{}", "-".repeat(42));
+    let sm = (qk_sm_tok - qk_tok).max(0.0);
+    let vacc = (full_tok - qk_sm_tok).max(0.0);
+    for (name, t) in [
+        ("qk dots", qk_tok),
+        ("softmax", sm),
+        ("v-accum", vacc),
+        ("TOTAL", full_tok),
+    ] {
+        println!("{name:<18}{t:>12.2}{:>11.0}%", t / full_tok * 100.0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Crossover sweep: at what context does threading start paying?
+    //
+    // ATTN_PAR_MIN_WORK was set to 1<<17 without measurement (parallel from
+    // ctx >= 64 on this shape). This sweeps seq vs threaded on the cold rotate
+    // so the threshold can be a measurement instead of a guess.
+    // ---------------------------------------------------------------------
+    println!("\n--- seq vs threaded crossover (cold rotate) ---\n");
+    println!("{:<8}{:>12}{:>12}{:>10}", "ctx", "seq ms/tok", "par ms/tok", "speedup");
+    println!("{}", "-".repeat(44));
+    for &cx in &[16usize, 32, 64, 128, 256, 512, 1024] {
+        let mut sc = vec![0f32; cx];
+        let seq = time_tok(&mut |l| {
+            let k = &kc[l * layer_span..(l + 1) * layer_span];
+            let v = &vc[l * layer_span..(l + 1) * layer_span];
+            baseline(&q, k, v, &mut sc, &mut out, cx);
+        });
+        let par = time_tok(&mut |l| {
+            let k = &kc[l * layer_span..(l + 1) * layer_span];
+            let v = &vc[l * layer_span..(l + 1) * layer_span];
+            fix_ab(&pool, &q, k, v, &mut out, cx);
+        });
+        let mark = if par < seq { "  <- par wins" } else { "" };
+        println!("{cx:<8}{seq:>12.3}{par:>12.3}{:>9.2}x{mark}", seq / par);
+    }
 }
