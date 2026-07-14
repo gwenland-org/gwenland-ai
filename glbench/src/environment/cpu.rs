@@ -89,6 +89,14 @@ pub struct CpuInfo {
     pub mhz: Option<f64>,
     /// SIMD instruction sets the CPU supports (not necessarily what runs).
     pub isa: IsaSupport,
+    /// Sustained sequential read bandwidth, GB/s — **measured on this machine**,
+    /// not looked up from a vendor table.
+    ///
+    /// This is the ceiling every other bandwidth figure is judged against.
+    /// Without it, a stage reporting "23 GB/s" is uninterpretable: it could be
+    /// 78% of the machine (nothing left to win) or 30% (something is wrong), and
+    /// those call for opposite decisions. See [`super::bandwidth`].
+    pub read_bandwidth_gbs: Option<f64>,
 }
 
 impl CpuInfo {
@@ -101,6 +109,10 @@ impl CpuInfo {
             model: None,
             mhz: None,
             isa: IsaSupport::probe(),
+            // Measured, not assumed. Costs ~1s of streaming reads at startup,
+            // paid once per session — cheap against the alternative of every
+            // efficiency number in the report being uninterpretable.
+            read_bandwidth_gbs: super::bandwidth::measure_read_gbs(),
         };
         info.probe_os();
         info

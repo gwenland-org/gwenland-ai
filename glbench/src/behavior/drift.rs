@@ -123,7 +123,13 @@ mod tests {
     fn phase(stages: &[(&str, f64, u64)]) -> PhaseProfile {
         let stages: Vec<StageTiming> = stages
             .iter()
-            .map(|&(n, ms, c)| StageTiming { name: n.into(), total_ms: ms, calls: c })
+            .map(|&(n, ms, c)| StageTiming {
+                name: n.into(),
+                total_ms: ms,
+                calls: c,
+                bytes_read: None,
+                macs: None,
+            })
             .collect();
         let total_ms = stages.iter().map(|s| s.total_ms).sum();
         PhaseProfile { stages, total_ms }

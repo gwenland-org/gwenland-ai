@@ -47,6 +47,31 @@ pub struct StageTiming {
     pub total_ms: f64,
     /// How many times the stage ran (layers x tokens, typically).
     pub calls: u64,
+
+    /// Bytes this stage read, in total, across all `calls`. `None` when the
+    /// engine cannot attribute traffic to the stage.
+    ///
+    /// Together with `total_ms` this yields the stage's achieved GB/s — and
+    /// therefore what fraction of the machine's bandwidth ceiling it reached.
+    /// A bandwidth-bound stage should sit near the ceiling; one far below it is
+    /// stalled on something else, and that gap is the signal.
+    pub bytes_read: Option<u64>,
+
+    /// Multiply-accumulate operations this stage performed, in total.
+    ///
+    /// **This is the metric that actually diagnoses a kernel.** GB/s alone
+    /// cannot compare formats — Q4_K and Q8_0 move different bytes per MAC, so
+    /// a slower kernel can look "efficient" simply by reading less. GMAC/s is
+    /// format-independent, and it is what exposed both real kernel bugs found
+    /// so far:
+    ///
+    /// - attention ran at **0.83 GMAC/s** while `qkv` on the same machine hit
+    ///   **18.1** — a 22x gap that `share%` showed as an unremarkable 14.9%.
+    /// - a native Q4_K kernel hit **1.5–2.0 GMAC/s** against Q8_0's **3.3**,
+    ///   which is why it lost 33% end-to-end despite reading 1.89x fewer bytes.
+    ///
+    /// Neither was visible in wall-time share. Both were obvious in GMAC/s.
+    pub macs: Option<u64>,
 }
 
 impl StageTiming {
@@ -55,6 +80,30 @@ impl StageTiming {
     /// has no meaningful breakdown, and reporting `0%` would imply it did.
     pub fn share_of(&self, phase_total_ms: f64) -> Option<f64> {
         (phase_total_ms > 0.0).then(|| self.total_ms / phase_total_ms)
+    }
+
+    /// Achieved read bandwidth, GB/s. `None` when the engine did not attribute
+    /// bytes to this stage, or the stage took no measurable time.
+    pub fn gb_per_s(&self) -> Option<f64> {
+        let bytes = self.bytes_read? as f64;
+        (self.total_ms > 0.0).then(|| bytes / (self.total_ms / 1e3) / 1e9)
+    }
+
+    /// Achieved compute throughput, GMAC/s. See [`StageTiming::macs`] for why
+    /// this is the number to look at rather than GB/s.
+    pub fn gmac_per_s(&self) -> Option<f64> {
+        let macs = self.macs? as f64;
+        (self.total_ms > 0.0).then(|| macs / (self.total_ms / 1e3) / 1e9)
+    }
+
+    /// Fraction of the machine's bandwidth ceiling this stage reached, `[0, 1]`.
+    ///
+    /// A stage near 1.0 is bandwidth-bound and cannot be made faster without
+    /// reading fewer bytes. A stage far below it is bound by something else —
+    /// compute, latency, or a serial section — and reading fewer bytes will not
+    /// help it. **Confusing these two is how the Q4_K experiment lost 33%.**
+    pub fn ceiling_frac(&self, ceiling_gbs: f64) -> Option<f64> {
+        (ceiling_gbs > 0.0).then(|| self.gb_per_s())?.map(|gbs| gbs / ceiling_gbs)
     }
 }
 
@@ -220,6 +269,8 @@ mod tests {
             name: name.into(),
             total_ms: ms,
             calls,
+            bytes_read: None,
+            macs: None,
         }
     }
 

@@ -38,19 +38,27 @@ pub fn analyze(session: &BenchmarkSession, decode_tps: &Stats) -> Ceiling {
         .model_bytes
         .or(session.environment.hardware.storage.model_file_bytes);
 
-    // Ceiling basis: the device's peak bandwidth if a GPU reported one,
-    // otherwise fall back to any observed bandwidth the run captured.
+    // Ceiling basis, in order of preference:
+    //   1. the GPU's published peak, if this is a GPU run;
+    //   2. the CPU's MEASURED sequential read bandwidth (environment probe);
+    //   3. anything the run itself observed.
+    //
+    // (2) is why CPU runs used to report `bottleneck: undetermined` forever —
+    // the analysis looked only at (1), so on a CPU there was never a ceiling and
+    // the whole roofline stayed dark. A measured number beats a vendor table
+    // anyway: DDR4-2667 single- vs dual-channel differ 2x and no CPUID bit
+    // distinguishes them.
     let peak_bw = session
         .environment
         .hardware
         .gpu
         .peak_bandwidth_gbs
+        .or(session.environment.hardware.cpu.read_bandwidth_gbs)
         .or(session.measurements.observed_bandwidth_gbs);
 
     let (Some(bytes), Some(bw_gbs)) = (model_bytes, peak_bw) else {
         c.notes.push(
-            "No hardware bandwidth ceiling available (CPU run or unknown device); \
-             efficiency vs peak cannot be computed."
+            "No bandwidth ceiling available; efficiency vs peak cannot be computed."
                 .to_string(),
         );
         return c;

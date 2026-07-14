@@ -309,6 +309,16 @@ struct Prof {
     p_down: std::time::Duration,
     p_tokens: u32,
 
+    /// Sum of KV-cache depth over every attention call, and the call count —
+    /// their ratio is the mean context, which is what attention's byte traffic
+    /// actually scales with.
+    ///
+    /// Tracked rather than assumed: an earlier estimate of ctx≈68 was wrong by
+    /// 4x (the real mean was 252), which alone made every derived number
+    /// meaningless.
+    ctx_sum: u64,
+    ctx_calls: u64,
+
     /// Tokens routed to each expert, summed over every MoE layer and token.
     /// Empty on a dense model — which is itself the signal that no routing
     /// happened, so it is left empty rather than zero-filled.
@@ -364,28 +374,47 @@ impl Prof {
     /// token, while `lm_head` and `sampler` run once per token. Reporting the
     /// token count for everything would understate the per-layer stages by a
     /// factor of `n_layers` and make `ms/call` meaningless.
-    fn to_telemetry(&self, n_layers: usize) -> glcore::telemetry::EngineTelemetry {
+    fn to_telemetry(&self, w: &StageWork) -> glcore::telemetry::EngineTelemetry {
         use glcore::telemetry::{EngineTelemetry, MoeTelemetry, PhaseProfile, StageTiming};
 
-        let stage = |name: &str, d: std::time::Duration, calls: u64| StageTiming {
-            name: name.to_string(),
-            total_ms: d.as_secs_f64() * 1e3,
-            calls,
+        // `bytes`/`macs` are per *call*; multiply by `calls` for the totals the
+        // telemetry contract asks for. `None` for stages whose traffic the
+        // engine cannot attribute (sampler reads logits, not weights).
+        let stage = |name: &str,
+                     d: std::time::Duration,
+                     calls: u64,
+                     per_call: Option<(u64, u64)>|
+         -> StageTiming {
+            let (bytes_read, macs) = match per_call {
+                Some((b, m)) => (Some(b * calls), Some(m * calls)),
+                None => (None, None),
+            };
+            StageTiming {
+                name: name.to_string(),
+                total_ms: d.as_secs_f64() * 1e3,
+                calls,
+                bytes_read,
+                macs,
+            }
         };
 
         let decode = (self.tokens > 0).then(|| {
             let toks = self.tokens as u64;
-            let per_layer = toks * n_layers as u64;
+            let per_layer = toks * w.n_layers as u64;
             let stages = vec![
-                stage("qkv", self.qkv, per_layer),
-                stage("attention", self.attn, per_layer),
-                stage("attn_out", self.wo, per_layer),
-                stage("ffn_gate_up", self.gateup, per_layer),
-                stage("ffn_down", self.down, per_layer),
+                stage("qkv", self.qkv, per_layer, Some(w.qkv)),
+                // Attention reads the KV cache, not weights — and the amount
+                // grows with context, so this is an average over the run.
+                stage("attention", self.attn, per_layer, Some(w.attn)),
+                stage("attn_out", self.wo, per_layer, Some(w.wo)),
+                stage("ffn_gate_up", self.gateup, per_layer, Some(w.gate_up)),
+                stage("ffn_down", self.down, per_layer, Some(w.down)),
                 // Once per token, not per layer — the LM head runs after the
                 // whole stack, and sampling after that.
-                stage("lm_head", self.lm_head, toks),
-                stage("sampler", self.sampler, toks),
+                stage("lm_head", self.lm_head, toks, Some(w.lm_head)),
+                // Sampling touches the logit vector, not the model. Attributing
+                // "bytes read" to it would invite a meaningless GB/s.
+                stage("sampler", self.sampler, toks, None),
             ];
             // The phase total is the sum of what we measured. glproc times
             // every stage of the decode loop, so there is no separate
@@ -401,16 +430,24 @@ impl Prof {
             // tokens (PREFILL_CHUNK at a time), so a "call" processes a whole
             // batch. Round up — a partial last chunk is still a call.
             let chunks = (self.p_tokens as u64).div_ceil(PREFILL_CHUNK as u64);
-            let per_layer = chunks * n_layers as u64;
+            let per_layer = chunks * w.n_layers as u64;
+
+            // The whole point of batched prefill: a call streams the weights
+            // ONCE but does `batch` times the MACs. Bytes stay per-call; MACs
+            // scale with the batch. That ratio is exactly why prefill is
+            // compute-bound where decode is bandwidth-bound, and reporting the
+            // same numbers for both phases would hide it.
+            let batch = (self.p_tokens as u64).min(PREFILL_CHUNK as u64).max(1);
+            let batched = |(b, m): (u64, u64)| (b, m * batch);
             let stages = vec![
-                stage("serial", self.p_serial, per_layer),
-                stage("qkv", self.p_qkv, per_layer),
-                stage("fixup", self.p_fixup, per_layer),
-                stage("attention", self.p_attn, per_layer),
-                stage("attn_out", self.p_wo, per_layer),
-                stage("ffn_gate_up", self.p_gateup, per_layer),
-                stage("ffn_downq", self.p_downq, per_layer),
-                stage("ffn_down", self.p_down, per_layer),
+                stage("serial", self.p_serial, per_layer, None),
+                stage("qkv", self.p_qkv, per_layer, Some(batched(w.qkv))),
+                stage("fixup", self.p_fixup, per_layer, None),
+                stage("attention", self.p_attn, per_layer, Some(batched(w.attn))),
+                stage("attn_out", self.p_wo, per_layer, Some(batched(w.wo))),
+                stage("ffn_gate_up", self.p_gateup, per_layer, Some(batched(w.gate_up))),
+                stage("ffn_downq", self.p_downq, per_layer, None),
+                stage("ffn_down", self.p_down, per_layer, Some(batched(w.down))),
             ];
             let total_ms = stages.iter().map(|s| s.total_ms).sum();
             PhaseProfile { stages, total_ms }
@@ -431,6 +468,117 @@ impl Prof {
             backend: None, // filled by the engine, which knows the strategy
             memory: None,  // filled by the engine, which knows the model size
             moe,
+        }
+    }
+}
+
+/// Bytes read and MACs performed by one call of each stage.
+///
+/// Derived from the loaded model, not assumed: byte counts come from the actual
+/// `WeightMatrix` buffers, so a Q4_K weight reports Q4_K bytes and a repacked
+/// one reports Q8_0 bytes. Guessing the format here would produce a GB/s that
+/// silently describes a model we are not running.
+///
+/// These feed `StageTiming::{gb_per_s, gmac_per_s}`, which is how a kernel that
+/// is slow *per MAC* becomes visible. Wall-time share cannot show that: a stage
+/// can hold a small share simply by doing little work, and a stage can hold a
+/// large one simply by being called often.
+#[derive(Debug, Clone, Copy, Default)]
+struct StageWork {
+    n_layers: usize,
+    /// `(bytes, macs)` per call, for one layer.
+    qkv: (u64, u64),
+    attn: (u64, u64),
+    wo: (u64, u64),
+    gate_up: (u64, u64),
+    down: (u64, u64),
+    /// Per call = per token (runs once after the whole stack).
+    lm_head: (u64, u64),
+}
+
+impl StageWork {
+    /// Measure the work one decode call of each stage does, from the model.
+    ///
+    /// `avg_ctx` is the mean KV-cache depth over the run — attention is the one
+    /// stage whose traffic grows with context, so a fixed number would be wrong
+    /// for every token but one.
+    fn measure(model: &GlprocModel, avg_ctx: usize) -> StageWork {
+        let c = &model.config;
+        let (dim, hd) = (c.dim, c.head_dim);
+        let q_dim = c.n_heads * hd;
+        let kv_dim = c.n_kv_heads * hd;
+
+        let wbytes = |w: &WeightMatrix| -> u64 {
+            match w {
+                WeightMatrix::F32(v) => (v.len() * 4) as u64,
+                WeightMatrix::Quant(_, b) => b.len() as u64,
+            }
+        };
+
+        // Layer 0 stands in for all layers — they are homogeneous, and a mixed
+        // model would need per-layer telemetry to describe honestly anyway.
+        let Some(l) = model.layers.first() else {
+            return StageWork::default();
+        };
+
+        let qkv_bytes = match &l.qkv {
+            crate::model::QkvWeights::FusedQuant(_, p) => p.len() as u64,
+            crate::model::QkvWeights::Split(q, k, v) => wbytes(q) + wbytes(k) + wbytes(v),
+        };
+        let (gu_bytes, gu_macs, dn_bytes, dn_macs) = match &l.ffn {
+            FfnLayer::Dense { gate_up, w_down } => {
+                let gb = match gate_up {
+                    GateUp::FusedQuant(_, p) => p.len() as u64,
+                    GateUp::Split(g, u) => wbytes(g) + wbytes(u),
+                };
+                (
+                    gb,
+                    2 * (dim * c.hidden_dim) as u64,
+                    wbytes(w_down),
+                    (c.hidden_dim * dim) as u64,
+                )
+            }
+            // MoE: only the routed experts run, so per-call work is top_k of
+            // them, not all. Reporting all would understate GMAC/s by
+            // num_experts/top_k — the very skip that makes MoE worth doing.
+            FfnLayer::MoE(moe) => {
+                let k = moe.config.num_experts_per_tok as u64;
+                let f = moe.config.expert_ffn_size;
+                let per_expert_gu = moe
+                    .experts
+                    .first()
+                    .map(|e| match &e.gate_up {
+                        GateUp::FusedQuant(_, p) => p.len() as u64,
+                        GateUp::Split(g, u) => wbytes(g) + wbytes(u),
+                    })
+                    .unwrap_or(0);
+                let per_expert_dn = moe.experts.first().map(|e| wbytes(&e.w_down)).unwrap_or(0);
+                (
+                    per_expert_gu * k,
+                    k * 2 * (dim * f) as u64,
+                    per_expert_dn * k,
+                    k * (f * dim) as u64,
+                )
+            }
+        };
+
+        // Attention reads the KV cache (f32), not weights: K and V, one row per
+        // cached position, per KV head.
+        let kv_bytes = (2 * c.n_kv_heads * avg_ctx * hd * 4) as u64;
+        // Q·K plus the V accumulation, over every query head.
+        let attn_macs = (2 * c.n_heads * avg_ctx * hd) as u64;
+
+        StageWork {
+            n_layers: c.n_layers,
+            qkv: (qkv_bytes, (dim * (q_dim + 2 * kv_dim)) as u64),
+            attn: (kv_bytes, attn_macs),
+            wo: (wbytes(&l.wo), (q_dim * dim) as u64),
+            gate_up: (gu_bytes, gu_macs),
+            down: (dn_bytes, dn_macs),
+            lm_head: (
+                wbytes(&model.output),
+                (c.vocab_size * dim) as u64,
+            ),
         }
     }
 }
@@ -675,6 +823,12 @@ impl<'m> Runner<'m> {
             lap(&mut self.prof, |p| &mut p.qkv);
 
             let cached_len = self.cache.current_pos() + 1;
+            // Attention's traffic scales with cache depth; record it so the
+            // telemetry reports the real mean rather than an assumed one.
+            if let Some(p) = self.prof.as_deref_mut() {
+                p.ctx_sum += cached_len as u64;
+                p.ctx_calls += 1;
+            }
             for h in 0..c.n_heads {
                 let kv_head = h / heads_per_kv.max(1);
                 attention_one_into(
@@ -1235,8 +1389,15 @@ impl<'m> Runner<'m> {
     /// [`crate::engine::GlprocEngine`], which is the layer that knows the SIMD
     /// strategy, the model size, and how many layers are routed.
     pub fn telemetry(&self) -> Option<glcore::telemetry::EngineTelemetry> {
-        let n_layers = self.model.config.n_layers;
-        self.prof.as_ref().map(|p| p.to_telemetry(n_layers))
+        let p = self.prof.as_ref()?;
+        // Mean KV depth over the run — measured, not assumed. Falls back to 1
+        // if attention never ran (a prefill-only or zero-token run).
+        let avg_ctx = if p.ctx_calls > 0 {
+            (p.ctx_sum / p.ctx_calls) as usize
+        } else {
+            1
+        };
+        Some(p.to_telemetry(&StageWork::measure(self.model, avg_ctx)))
     }
 
     /// Turn per-token behavioral tracing on for subsequent `generate` calls.

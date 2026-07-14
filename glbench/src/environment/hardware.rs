@@ -58,6 +58,9 @@ impl ToJson for HardwareSnapshot {
                     ),
                     ("model", opt_str(self.cpu.model.as_deref())),
                     ("mhz", opt_num(self.cpu.mhz)),
+                    // Measured ceiling — every efficiency figure in the report
+                    // is a fraction of this, so it must travel with the archive.
+                    ("read_bandwidth_gbs", opt_num(self.cpu.read_bandwidth_gbs)),
                     // What the CPU *supports*. What the engine actually chose
                     // is a different fact, and lives in telemetry.backend.
                     (

@@ -242,6 +242,22 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
                                     "share",
                                     s.share_of(p.total_ms).map(Json::Num).unwrap_or(Json::Null),
                                 ),
+                                (
+                                    "bytes_read",
+                                    s.bytes_read.map(|b| Json::Num(b as f64)).unwrap_or(Json::Null),
+                                ),
+                                (
+                                    "macs",
+                                    s.macs.map(|m| Json::Num(m as f64)).unwrap_or(Json::Null),
+                                ),
+                                // Derived, but written alongside the raw counts
+                                // rather than instead of them: a consumer that
+                                // disagrees with our definition can recompute.
+                                ("gb_per_s", s.gb_per_s().map(Json::Num).unwrap_or(Json::Null)),
+                                (
+                                    "gmac_per_s",
+                                    s.gmac_per_s().map(Json::Num).unwrap_or(Json::Null),
+                                ),
                             ])
                         })
                         .collect(),
@@ -357,6 +373,12 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
                 .map(|n| n as usize),
             model: cpu.and_then(|c| c.get("model")).and_then(|s| s.as_str()).map(String::from),
             mhz: cpu.and_then(|c| c.get("mhz")).and_then(|n| n.as_f64()),
+            // Read back from the archive, never re-measured: the ceiling is a
+            // fact about the machine that RAN the benchmark, and re-probing on
+            // whatever machine is `inspect`ing it would silently rewrite history.
+            read_bandwidth_gbs: cpu
+                .and_then(|c| c.get("read_bandwidth_gbs"))
+                .and_then(|n| n.as_f64()),
             // Archived ISA flags are re-read from the record, not re-probed:
             // an archive is a fact about the machine that RAN it, and probing
             // the machine now `inspect`ing it would silently rewrite history.

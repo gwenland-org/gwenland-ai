@@ -77,7 +77,7 @@ mod tests {
     use glcore::telemetry::StageTiming;
 
     fn stage(name: &str, ms: f64, calls: u64) -> StageTiming {
-        StageTiming { name: name.into(), total_ms: ms, calls }
+        StageTiming { name: name.into(), total_ms: ms, calls, bytes_read: None, macs: None }
     }
 
     #[test]

@@ -83,7 +83,7 @@ pub fn session(session: &BenchmarkSession) -> String {
     }
 
     if let Some(t) = &session.telemetry {
-        s.push_str(&telemetry(t));
+        s.push_str(&telemetry(t, hw.cpu.read_bandwidth_gbs));
     }
 
     if let Some(b) = &session.behavior {
@@ -110,7 +110,7 @@ pub fn session(session: &BenchmarkSession) -> String {
 /// Only sections the engine actually reported are printed. A missing section
 /// means "not measured" — it is left out rather than rendered as zeros, because
 /// a zeroed row is a claim and an absent row is an admission.
-fn telemetry(t: &glcore::telemetry::EngineTelemetry) -> String {
+fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -> String {
     let mut s = String::new();
 
     if let Some(b) = &t.backend {
@@ -131,12 +131,28 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry) -> String {
             continue;
         }
         s.push_str(&format!("\n{label} timeline ({:.1} ms total)\n", p.total_ms));
-        let mut tab = Table::new(&["stage", "ms", "share", "calls", "ms/call"])
-            .right_align(1)
-            .right_align(2)
-            .right_align(3)
-            .right_align(4);
+        let mut tab = Table::new(&[
+            "stage", "ms", "share", "ms/call", "GB/s", "%ceil", "GMAC/s",
+        ])
+        .right_align(1)
+        .right_align(2)
+        .right_align(3)
+        .right_align(4)
+        .right_align(5)
+        .right_align(6);
         for st in p.hotspots() {
+            let ceil_cell = match (ceiling_gbs, st.gb_per_s()) {
+                (Some(c), Some(_)) => match st.ceiling_frac(c) {
+                    // Flag stages far from the ceiling: they are NOT
+                    // bandwidth-bound, so reading fewer bytes will not speed
+                    // them up. Mistaking one for the other is exactly how the
+                    // native-Q4_K experiment lost 33%.
+                    Some(f) if f < 0.25 => format!("{:.0}% !", f * 100.0),
+                    Some(f) => format!("{:.0}%", f * 100.0),
+                    None => "-".into(),
+                },
+                _ => "-".into(),
+            };
             tab.row(&[
                 st.name.clone(),
                 format!("{:.2}", st.total_ms),
@@ -144,18 +160,28 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry) -> String {
                     Some(f) => format!("{:.1}%", f * 100.0),
                     None => "-".into(),
                 },
-                st.calls.to_string(),
-                // Cost of one invocation — the number to act on. `share` says
-                // where the time went; `ms/call` says whether a stage is slow
-                // or merely frequent, and those call for different fixes.
+                // Cost of one invocation. `share` says where the time went;
+                // `ms/call` says whether a stage is slow or merely frequent.
                 if st.calls > 0 {
                     format!("{:.3}", st.total_ms / st.calls as f64)
                 } else {
                     "-".into()
                 },
+                st.gb_per_s().map_or("-".into(), |v| format!("{v:.1}")),
+                ceil_cell,
+                // The number that actually diagnoses a kernel. GB/s cannot
+                // compare formats (different bytes per MAC); GMAC/s can.
+                st.gmac_per_s().map_or("-".into(), |v| format!("{v:.1}")),
             ]);
         }
         s.push_str(&tab.render());
+
+        if let Some(c) = ceiling_gbs {
+            s.push_str(&format!(
+                "  ceiling {c:.1} GB/s (measured)  |  '!' = under 25% of it, so NOT bandwidth-bound\n"
+            ));
+        }
+
         let un = p.unattributed_ms();
         if un > 0.0 {
             // Surfaced, not hidden: a large residual means the engine's
