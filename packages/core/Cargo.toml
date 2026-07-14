@@ -1,6 +1,6 @@
 [package]
 name = "gwenland-core"
-version = "0.1.48"
+version = "0.1.125"
 authors = ["JinXSuper <jinxsuper@vercel.app>"]
 edition = "2024"
 description = "GwenLand — AI toolkit. Local-first, <50MB, zero Python."

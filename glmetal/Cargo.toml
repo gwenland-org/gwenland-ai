@@ -1,6 +1,6 @@
 [package]
 name = "glmetal"
-version = "0.1.48"
+version = "0.1.125"
 edition = "2021"
 description = "GwenLand AI Apple Silicon Metal engine (stub — implemented in M2+)"
 license-file = "../LICENSE"

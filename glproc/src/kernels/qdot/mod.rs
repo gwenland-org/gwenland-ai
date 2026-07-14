@@ -16,6 +16,7 @@
 //! in matching 32-element groups, so block `j` of a row always pairs with
 //! `q[j*32..j*32+32]`, `scales[j]`, `sums[j]`.
 
+pub mod q4_k;
 pub mod q5_0;
 pub mod q6_k;
 pub mod q8_0;
@@ -153,12 +154,42 @@ pub fn row_dot_q8(
             SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { q6_k::avx2::row_dot(row, act) },
             SimdStrategy::Scalar => q6_k::scalar::row_dot(row, act),
         },
-        // Q4_K has no integer kernel yet; callers route it to the f32 bridge.
-        QuantFormat::Q4K => unreachable!("Q4_K uses the f32 bridge"),
+        QuantFormat::Q4K => match strategy {
+            SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { q4_k::avx2::row_dot(row, act) },
+            SimdStrategy::Scalar => q4_k::scalar::row_dot(row, act),
+        },
     }
 }
 
-/// True if `fmt` has an integer-domain kernel.
+/// True if `fmt` should be consumed through the integer-dot path.
+///
+/// Q4_K is **excluded on purpose, despite having a working kernel**
+/// ([`q4_k`]). The loader repacks it to Q8_0 instead, and that is the faster
+/// choice — counter-intuitively, since the repack inflates per-token DRAM
+/// traffic 1.70x on a real Q4_K model.
+///
+/// Measured on Qwen2.5-1.5B-q4_k_m (75.7% Q4_K by weight), decode:
+///
+/// | path                  | tok/s (3 runs)      |
+/// |-----------------------|---------------------|
+/// | repack to Q8_0        | **14,1 · 14,2 · 14,1** |
+/// | native Q4_K integer-dot | 9,4 · 9,6 · 9,5   |
+///
+/// A 33% regression, with no overlap between the groups. The reason is in the
+/// kernel, not the loader: isolated on identical work, Q4_K runs at **1.5–2.0
+/// GMAC/s against Q8_0's 3.3** — 1.7–2.2x slower per MAC. Crucially the gap is
+/// **the same when the data is L2-resident**, so it is not a memory effect: the
+/// nibble unpack genuinely costs more compute than the bytes it saves. Q4_K
+/// reaches only 0.8–1.1 GB/s where Q8_0 sustains 3.5, so it never gets close to
+/// being bandwidth-bound in the first place.
+///
+/// This is the exact failure mode ARTX04 warned about — quantization only pays
+/// "asalkan overhead dequantisasi tidak melebihi penghematan bandwidth". Here it
+/// does. See `benches/q4k_probe.rs` for the measurement.
+///
+/// The kernel is kept (parity-tested, correct) so a future AVX-512 / VNNI-512
+/// path, or a wider unpack, can be evaluated against a working baseline rather
+/// than written from scratch.
 pub fn supports(fmt: crate::kernels::bridge::QuantFormat) -> bool {
     !matches!(fmt, crate::kernels::bridge::QuantFormat::Q4K)
 }

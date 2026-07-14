@@ -2,6 +2,96 @@
 
 The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
+## 0.1.125 — 2026-07-14
+
+### glproc — attention SIMD, decode +35%
+
+The V-accumulation half of single-query attention ran as a scalar loop while the
+Q·K half beside it was already AVX2 — half of attention's arithmetic left the
+vector units idle, at **0.83 GMAC/s against `qkv`'s 18.1 on the same machine**.
+New kernel `kernels/ops/attn_accum/` (AVX2 + scalar + 5 parity tests).
+
+| | before | after |
+|---|---|---|
+| attention ms/call (decode) | 496 µs | **253–329 µs** |
+| attention share | 14.9% | **7.5%** |
+| **decode end-to-end** | 7.5–8.6 tok/s | **10.1–11.8** (**+35%**) |
+
+Cross-validated on Qwen2.5-0.5B (different head_dim and KV-head count): 4.08 vs
+4.80 GMAC/s — consistent, not a shape coincidence.
+
+### glproc — native Q4_K integer-dot: **built, measured, REVERTED**
+
+A negative result, recorded because it overturns the roadmap's top priority.
+
+Q4_K was the only format without an integer-dot kernel, so the loader repacked
+it to Q8_0 — inflating per-token DRAM traffic **1.70×** on a real Q4_K model.
+Decode is bandwidth-bound, so a native kernel looked like the one remaining
+lever. It was built (affine derivation, `vpdpbusd`, parity-tested against
+full-dequant reference) and it **lost 33%**:
+
+| path | tok/s (Qwen2.5-1.5B-q4_k_m, 3 runs) |
+|---|---|
+| repack → Q8_0 | **14.1 · 14.2 · 14.1** |
+| native Q4_K | 9.4 · 9.6 · 9.5 |
+
+Isolated on identical work: Q4_K runs at **1.5–2.0 GMAC/s vs Q8_0's 3.3**, and
+**the gap is identical when the data is L2-resident** — so it is not a memory
+effect. The nibble unpack genuinely costs more compute than the bytes it saves;
+Q4_K reaches only 0.8–1.1 GB/s where Q8_0 sustains 3.5, never getting close to
+bandwidth-bound. Two "obviously right" kernel fixes (vector-domain accumulation
+removing 8 horizontal sums per super-block; hoisting `scale_min` out of the
+chunk loop) recovered only ~9% of the 2.7× needed.
+
+This is the exact failure ARTX04 warned about: quantization pays *"provided the
+dequantization overhead does not exceed the bandwidth saving"*. Here it does.
+**Paying 1.89× the bytes to avoid a kernel is the right trade on this ISA.**
+
+The kernel is kept (`kernels/qdot/q4_k/`, 4 parity tests green) so a future
+AVX-512 / wider-unpack path can be evaluated against a working baseline.
+`qdot::supports()` excludes Q4_K deliberately, with the measurement in its doc
+comment. Probe: `benches/q4k_probe.rs`.
+
+Note glcuda *does* have a native Q4_K kernel and it wins there — GPU bandwidth is
+far more expensive relative to compute. The trade-off is ISA-specific.
+
+### glbench — observability + behavioral signals
+
+- **Engine telemetry as pull-based data** (`glcore/src/telemetry.rs`): stage
+  timeline (ms / share / **calls** / **ms/call**), kernel selection, memory
+  split, MoE routing. A `BenchmarkReporter` callback trait was rejected — it
+  inverts the dependency and lets the harness inject behavior into the hot path.
+- **Behavioral signals** (`glbench/src/behavior/`): repetition, entropy,
+  perplexity/OOD, stall, confidence-divergence, drift. Computed from **raw
+  logits** (full vocab, pre-temperature, pre-top-k, pre-repetition-penalty) on a
+  **separate traced run**, since tracing perturbs timing.
+- **Toxicity deliberately NOT implemented** — word-list affinity is not
+  toxicity. `ToxicitySignal` is an uninhabited enum returning `None`, so it can
+  never read as a clean 0.0.
+- Capability (what the CPU supports) and choice (what the engine picked) are
+  separate fields. This i3-1115G4 reports `avx512vnni` yet runs `Avx2+vnni256`.
+
+### glproc — Qwen3-MoE support
+
+`moe.rs`: top-k routing (Qwen3 is **top-8 of 128**), expert dispatch, weighted
+combine. Reuses the dense path — each expert's gate/up goes through
+`GateUp::FusedQuant` into the existing `par_matvec_swiglu`. Zero new kernels.
+Verified against a naive reference at Qwen3-30B-A3B's real dims on two CPU
+architectures.
+
+> ⚠️ The GGUF `_exps` tensor layout is an **UNVERIFIED assumption** (no MoE GGUF
+> was available). A wrong stacking order loads each expert as a stripe of all the
+> others — and the model still *runs*, emitting fluent garbage. Grep
+> `_EXPS_LAYOUT_ASSUMPTION`.
+
+### Docs
+
+- **`Mensura_Veritatis.md`** — canonical knowledge base synthesizing the CPU
+  quantization research against glproc's measured reality. Records 4
+  `Research Conflict`s, the largest being physical-core threading: the
+  literature says physical cores; **measurement says it loses 23%** on this
+  hardware.
+
 ## Unreleased
 
 The M2.1–M2.3 arc (native Q4_K/Q4_0/Q6_K kernels, INT8 Tensor Cores, prefill

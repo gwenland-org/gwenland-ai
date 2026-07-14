@@ -1,6 +1,6 @@
 [package]
 name = "glbench"
-version = "0.1.48"
+version = "0.1.125"
 edition = "2021"
 description = "GwenLand AI benchmark framework (Mensura Veritatis) — measure truth about engine performance"
 license-file = "../LICENSE"
