@@ -25,3 +25,7 @@ harness = false
 [[bench]]
 name = "q4k_probe"
 harness = false
+
+[[bench]]
+name = "q4k_regime"
+harness = false

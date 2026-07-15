@@ -7,6 +7,7 @@
 
 pub mod avx2;
 pub mod scalar;
+pub mod swiglu;
 
 #[cfg(test)]
 mod tests {

@@ -186,4 +186,95 @@ fn main() {
     println!("  the unpack costs more than the bytes it saves.");
     println!("  If Q4_K's GMAC/s matches Q8_0's, the kernel is fine and the");
     println!("  regression is elsewhere (e.g. prefill, or a non-FFN path).");
+
+    // ---------------------------------------------------------------------
+    // Wave 4: FUSED SwiGLU head-to-head. gate + up in one pass.
+    //
+    // Three kernels, same gate_up shape, same activation, cold DRAM:
+    //   q8_0 fused  — the production baseline (par_matvec_swiglu, 86% ceiling)
+    //   q4k q8k     — integer-domain fused (candidate A)
+    //   q4k f32     — f32-domain fused, the literal spec (candidate B)
+    //
+    // Per-row work here is 2x a plain matvec (gate AND up). MACs are counted
+    // as 2*out*in; bytes as the fused pair's footprint.
+    // ---------------------------------------------------------------------
+    {
+        use glproc::kernels::qdot::q4_k::swiglu;
+        use glproc::kernels::qdot::q8_k::Q8KActivation;
+
+        let (out_dim, in_dim) = (8960usize, 1536usize);
+        let mut seed = 0x5F00u64;
+        let rb4 = in_dim / 256 * 144;
+
+        // Interleaved Q4_K gate/up rows: [gate 144B][up 144B] per output.
+        let mut packed4 = Vec::with_capacity(out_dim * 2 * rb4);
+        for _ in 0..out_dim {
+            packed4.extend(q4k_rows(1, in_dim, &mut seed)); // gate
+            packed4.extend(q4k_rows(1, in_dim, &mut seed)); // up
+        }
+        // Interleaved Q8_0 gate/up for the baseline.
+        let rb8 = in_dim / 32 * 34;
+        let mut packed8 = Vec::with_capacity(out_dim * 2 * rb8);
+        for _ in 0..out_dim {
+            packed8.extend(q8_rows(1, in_dim, &mut seed));
+            packed8.extend(q8_rows(1, in_dim, &mut seed));
+        }
+
+        let x: Vec<f32> = (0..in_dim).map(|_| prng_f32(&mut seed)).collect();
+        let mut ak = Q8KActivation::with_capacity(in_dim);
+        ak.quantize(&x);
+        let mut a32 = QuantizedActivation::with_capacity(in_dim);
+        a32.quantize(&x);
+
+        println!("\n--- FUSED SwiGLU: gate_up {out_dim} x {in_dim}, cold ---");
+        println!("{:<14} {:>10} {:>10} {:>10}", "kernel", "ms", "GMAC/s", "GB/s");
+
+        let macs = (2 * out_dim * in_dim) as f64; // gate + up
+        let time = |label: &str, bytes: f64, f: &dyn Fn() -> f32| {
+            let mut sink = 0f32;
+            for _ in 0..3 { sink += f(); }
+            let t = Instant::now();
+            for _ in 0..40 { sink += f(); }
+            let el = t.elapsed().as_secs_f64() / 40.0;
+            std::hint::black_box(sink);
+            println!(
+                "{label:<14} {:>10.3} {:>10.1} {:>10.1}",
+                el * 1e3, macs / el / 1e9, bytes / el / 1e9
+            );
+        };
+
+        // q8_0 fused baseline (row_dot_q8 twice + silu, matching production).
+        time("q8_0 fused", (out_dim * 2 * rb8) as f64, &|| {
+            let mut s = 0f32;
+            for o in 0..out_dim {
+                let pair = &packed8[o * 2 * rb8..(o + 1) * 2 * rb8];
+                let g = glproc::kernels::qdot::row_dot_q8(
+                    QuantFormat::Q8_0, &pair[..rb8], &a32, strategy);
+                let u = glproc::kernels::qdot::row_dot_q8(
+                    QuantFormat::Q8_0, &pair[rb8..], &a32, strategy);
+                s += g / (1.0 + glproc::kernels::fast_exp(-g)) * u;
+            }
+            s
+        });
+        time("q4k q8k", (out_dim * 2 * rb4) as f64, &|| {
+            let mut s = 0f32;
+            for o in 0..out_dim {
+                let pair = &packed4[o * 2 * rb4..(o + 1) * 2 * rb4];
+                // SAFETY: probe gated on AVX2 in main().
+                s += unsafe { swiglu::fused_swiglu_q8k(&pair[..rb4], &pair[rb4..], &ak) };
+            }
+            s
+        });
+        time("q4k f32", (out_dim * 2 * rb4) as f64, &|| {
+            let mut s = 0f32;
+            for o in 0..out_dim {
+                let pair = &packed4[o * 2 * rb4..(o + 1) * 2 * rb4];
+                // SAFETY: as above.
+                s += unsafe { swiglu::fused_swiglu_f32(&pair[..rb4], &pair[rb4..], &ak) };
+            }
+            s
+        });
+        println!("\n  Winner is whichever fused Q4_K kernel matches or beats q8_0 fused GMAC/s");
+        println!("  while reading fewer bytes. That one goes to integration; the other is dropped.");
+    }
 }
