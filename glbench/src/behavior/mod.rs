@@ -15,6 +15,8 @@
 //! | [`stall`] | inter-token latency spikes | token trace |
 //! | [`ood`] | perplexity, and its gap vs a baseline | token trace |
 //! | [`hallucination`] | confidence/rank divergence (a **proxy**) | token trace |
+//! | [`anomaly`] | intra-session drift + perplexity spikes, by position | token trace |
+//! | [`cot`] | whether low entropy is expected (thinking model) | entropy + model facts |
 //! | [`drift`] | Δ ms/call between sessions | telemetry |
 //! | [`performance`] | ms/call, share, layer variance | telemetry |
 //! | [`toxicity`] | **not implemented** — see the module | — |
@@ -36,6 +38,8 @@
 //! have. Read the number as "how sure was the model about what it picked",
 //! never as "how much did it make up".
 
+pub mod anomaly;
+pub mod cot;
 pub mod drift;
 pub mod entropy;
 pub mod hallucination;
@@ -64,6 +68,12 @@ pub struct BehaviorReport {
     pub ood: Option<ood::OodSignal>,
     /// Confidence/rank divergence proxy. Needs tracing.
     pub hallucination: Option<hallucination::HallucinationSignal>,
+    /// Positional signals: intra-session latency drift and perplexity spikes.
+    /// Needs tracing, and enough tokens for the buckets to mean something.
+    pub anomaly: Option<anomaly::AnomalySignal>,
+    /// The CoT-aware read of the entropy level. Filled by the runner (it needs
+    /// model facts the traces do not carry), so it stays `None` here.
+    pub cot: Option<cot::CotAssessment>,
 }
 
 impl BehaviorReport {
@@ -79,6 +89,10 @@ impl BehaviorReport {
             stall: stall::StallSignal::compute(traces),
             ood: ood::OodSignal::compute(traces),
             hallucination: hallucination::HallucinationSignal::compute(traces),
+            anomaly: anomaly::AnomalySignal::compute(traces),
+            // Needs model facts (thinking capability), which the runner has
+            // and this function deliberately does not — see the field docs.
+            cot: None,
         }
     }
 
@@ -89,6 +103,7 @@ impl BehaviorReport {
             && self.stall.is_none()
             && self.ood.is_none()
             && self.hallucination.is_none()
+            && self.anomaly.is_none()
     }
 }
 

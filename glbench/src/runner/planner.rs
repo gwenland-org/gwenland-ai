@@ -15,7 +15,9 @@ use crate::core::result::SessionMetadata;
 use crate::core::session::BenchmarkSession;
 use crate::core::workload::WorkloadSpec;
 use crate::engine::adapter::EngineAdapter;
+use crate::engine::model_probe::ModelProbe;
 use crate::environment::hardware::EnvironmentSnapshot;
+use crate::environment::power::EnergyMeter;
 use crate::validation::integrity;
 
 /// A progress callback: `(phase, iteration, total)` — lets the CLI print a
@@ -28,26 +30,49 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // 1. Environment snapshot (before load, so memory reflects the idle baseline).
     let mut environment = EnvironmentSnapshot::probe(&spec.model_path);
 
-    // 2. Load the engine + model.
+    // 2. Load the engine + model, and probe the model file's own header —
+    //    finally filling the arch/quant fields the adapter leaves None, plus
+    //    the thinking-capability fact the CoT-aware entropy read needs.
     progress("load", 0, 1);
     let adapter = EngineAdapter::load(spec)?;
+    let probe = ModelProbe::probe(&spec.model_path);
+    let mut engine_meta = adapter.metadata().clone();
+    engine_meta.model_arch = probe.arch.clone();
+    engine_meta.quantization = probe.quantization.clone();
+    // The workload's manual override wins over auto-detection (decision
+    // record: dual approach, GGUF auto-detect + config override).
+    engine_meta.thinking_capable = spec.cot_mode.or(probe.thinking_capable);
 
     // Attach the engine's GPU facts to the hardware snapshot.
     environment.hardware = environment.hardware.clone().with_gpu(adapter.gpu().clone());
 
-    // 3. Warmup — untimed, to pay JIT/cold-cache costs before measuring.
+    // 3. Warmup — kept out of the statistics, to pay JIT/cold-cache costs
+    //    before measuring. The FIRST warmup pass is still timed and recorded
+    //    separately as the cold figure: it is the one iteration that shows
+    //    page-in and cache-fill costs, and discarding it entirely (as pre-v2
+    //    glbench did) threw away the number a deployment's first request pays.
+    let mut cold = None;
     for i in 0..spec.warmup_iters {
         progress("warmup", i, spec.warmup_iters);
-        adapter.run_once(spec)?;
+        let iter = adapter.run_once(spec)?;
+        if i == 0 {
+            cold = Some(iter);
+        }
     }
 
-    // 4. Measured iterations.
+    // 4. Measured iterations, bracketed by the energy meter so Joules cover
+    //    exactly the work the tok/s figures describe. RAPL is package-level
+    //    and Linux-only; where unreadable the meter is None and the report
+    //    simply carries no energy figure (never a TDP estimate).
+    let meter = EnergyMeter::start();
     let mut measurements = MeasurementSet::default();
     for i in 0..spec.measure_iters.max(1) {
         progress("measure", i, spec.measure_iters.max(1));
         let iter = adapter.run_once(spec)?;
         measurements.iterations.push(iter);
     }
+    measurements.energy_joules = meter.and_then(EnergyMeter::stop);
+    measurements.cold = cold;
 
     // 5. Fill in facts known only after the run: the model footprint decode
     //    streams. Prefer the file size the environment probe already captured.
@@ -58,7 +83,7 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     let mut session = BenchmarkSession::new(
         SessionMetadata::new(label),
         environment,
-        adapter.metadata().clone(),
+        engine_meta,
         spec.clone(),
         measurements,
     );
@@ -81,7 +106,13 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     //    trace simply reports no behavior rather than failing the whole run.
     progress("behavior", 0, 1);
     if let Ok((tokens, traces)) = adapter.run_traced(spec) {
-        let report = BehaviorReport::compute(&tokens, &traces);
+        let mut report = BehaviorReport::compute(&tokens, &traces);
+        // The CoT-aware read of the entropy level. Only when the thinking
+        // capability is actually known (probed or overridden): assessing
+        // against a guessed model kind would manufacture false anomalies.
+        if let (Some(e), Some(thinking)) = (&report.entropy, session.engine.thinking_capable) {
+            report.cot = Some(crate::behavior::cot::CotAssessment::assess(e, thinking));
+        }
         if !report.is_empty() {
             session.behavior = Some(report);
         }

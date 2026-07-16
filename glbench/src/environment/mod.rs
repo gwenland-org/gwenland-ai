@@ -7,5 +7,6 @@ pub mod cpu;
 pub mod gpu;
 pub mod hardware;
 pub mod memory;
+pub mod power;
 pub mod runtime;
 pub mod storage;

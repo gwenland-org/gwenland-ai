@@ -57,6 +57,14 @@ glbench run --engine glproc --model model.gguf \
     --out benchmarks/qwen-glproc-001.json
 ```
 
+A/B two (or more) models under one identical workload, in one command — each
+candidate is diffed against the first. Sequential on purpose: parallel decodes
+would contend for the memory bus and corrupt every number:
+
+```sh
+glbench ab --engine glproc --model qwen2.5-0.5b-q8_0.gguf --model qwen2.5-0.5b-q4_k_m.gguf
+```
+
 Compare two archived runs (regression check at a 5% threshold by default):
 
 ```sh
@@ -84,7 +92,28 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--temperature` | 0.0     | sampling temperature (0 = greedy, deterministic) |
 | `--seed`        | 42      | RNG seed for deterministic sampling              |
 | `--kind`        | end_to_end | `prefill`, `decode`, `end_to_end`, `stress`   |
+| `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--out`         | —       | archive the session as JSON                      |
+
+### What a report contains (v2)
+
+Beyond throughput statistics, a report carries — each section only when its
+inputs were actually measured, absent otherwise:
+
+- **cold vs warm** — the first-ever iteration is timed separately (page-in /
+  cache-fill cost), never mixed into the warm statistics.
+- **roofline** — engine stage telemetry bucketed into attention / ffn /
+  lm_head, each classified against the *measured* bandwidth ceiling
+  (bandwidth-bound / not-bandwidth-bound / indeterminate).
+- **behavior** — entropy (with a CoT-aware flag: low entropy on a
+  thinking-capable model is expected, on a plain model it is an anomaly),
+  repetition, perplexity, confidence, stall, and intra-session drift
+  (per-quarter inter-token latency plus the worst OOD perplexity window).
+- **hypotheses** — cross-signal root-cause patterns, phrased as what the data
+  is *consistent with*, never as verdicts.
+- **energy** — Joules/token via Linux RAPL (powercap sysfs) when readable;
+  never estimated from TDP. Not available on Windows/macOS (RAPL needs a
+  kernel driver there, and glbench will not pretend otherwise).
 
 ## Architecture
 
