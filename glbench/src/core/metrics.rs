@@ -85,6 +85,15 @@ pub struct MeasurementSet {
     /// Model file size on disk, bytes — the weight footprint that decode must
     /// stream. Used later as the numerator for a bandwidth-efficiency estimate.
     pub model_bytes: Option<u64>,
+    /// The very first (cold) iteration, timed but kept out of `iterations`:
+    /// it pays page-in and cache-fill costs the warm numbers deliberately
+    /// exclude, and mixing it in would corrupt both figures. `None` when the
+    /// run had no warmup phase to observe.
+    pub cold: Option<IterationMetrics>,
+    /// Package energy consumed across the measured iterations, Joules —
+    /// measured via RAPL, never estimated from TDP. `None` when no energy
+    /// counter was readable (non-Linux, missing permissions, no RAPL).
+    pub energy_joules: Option<f64>,
 }
 
 impl MeasurementSet {
@@ -107,6 +116,14 @@ impl MeasurementSet {
     pub fn prefill_tps_samples(&self) -> Vec<f64> {
         self.iterations.iter().map(|m| m.prefill_tps()).collect()
     }
+
+    /// Measured Joules per generated token across the measured iterations.
+    /// `None` unless energy was measured AND tokens were generated.
+    pub fn joules_per_token(&self) -> Option<f64> {
+        let tokens: u64 = self.iterations.iter().map(|i| i.generated_tokens).sum();
+        let j = self.energy_joules?;
+        (tokens > 0).then(|| j / tokens as f64)
+    }
 }
 
 impl ToJson for MeasurementSet {
@@ -125,6 +142,14 @@ impl ToJson for MeasurementSet {
                 opt_num(self.observed_bandwidth_gbs),
             ),
             ("model_bytes", opt_num(self.model_bytes.map(|b| b as f64))),
+            (
+                "cold",
+                match &self.cold {
+                    Some(c) => c.to_json(),
+                    None => Json::Null,
+                },
+            ),
+            ("energy_joules", opt_num(self.energy_joules)),
         ])
     }
 }
@@ -143,6 +168,9 @@ impl FromJson for MeasurementSet {
             peak_memory_bytes: v.get("peak_memory_bytes").and_then(|n| n.as_f64()).map(|n| n as u64),
             observed_bandwidth_gbs: v.get("observed_bandwidth_gbs").and_then(|n| n.as_f64()),
             model_bytes: v.get("model_bytes").and_then(|n| n.as_f64()).map(|n| n as u64),
+            // Both absent from pre-v2 archives: absent reads as "not measured".
+            cold: v.get("cold").and_then(|c| IterationMetrics::from_json(c).ok()),
+            energy_joules: v.get("energy_joules").and_then(|n| n.as_f64()),
         })
     }
 }
@@ -198,11 +226,37 @@ mod tests {
             peak_memory_bytes: Some(1 << 30),
             observed_bandwidth_gbs: Some(240.5),
             model_bytes: Some(4_400_000_000),
+            cold: Some(IterationMetrics {
+                prompt_tokens: 10,
+                generated_tokens: 20,
+                prefill_ms: 50.0, // cold prefill pays page-in: 10x the warm one
+                decode_ms: 150.0,
+                total_ms: 200.0,
+            }),
+            energy_joules: Some(41.5),
         };
         let back = MeasurementSet::from_json(&set.to_json()).unwrap();
         assert_eq!(back.iterations, set.iterations);
         assert_eq!(back.peak_memory_bytes, set.peak_memory_bytes);
         assert_eq!(back.observed_bandwidth_gbs, set.observed_bandwidth_gbs);
         assert_eq!(back.model_bytes, set.model_bytes);
+        assert_eq!(back.cold, set.cold);
+        assert_eq!(back.energy_joules, set.energy_joules);
+    }
+
+    #[test]
+    fn joules_per_token_needs_both_energy_and_tokens() {
+        let mut set = MeasurementSet::default();
+        assert!(set.joules_per_token().is_none(), "no energy, no figure");
+        set.energy_joules = Some(50.0);
+        assert!(set.joules_per_token().is_none(), "energy but zero tokens");
+        set.iterations.push(IterationMetrics {
+            prompt_tokens: 5,
+            generated_tokens: 25,
+            prefill_ms: 10.0,
+            decode_ms: 100.0,
+            total_ms: 110.0,
+        });
+        assert!((set.joules_per_token().unwrap() - 2.0).abs() < 1e-9);
     }
 }

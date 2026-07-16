@@ -66,6 +66,25 @@ pub fn session(session: &BenchmarkSession) -> String {
     t.row(&stat_cells("prefill", &pre));
     t.row(&stat_cells("decode", &dec));
     s.push_str(&t.render());
+    // The cold (first-ever) iteration, kept out of the warm statistics: it is
+    // what a deployment's first request pays. Printed next to the warm P50 so
+    // the page-in/cache-fill cost is one glance.
+    if let Some(c) = &m.cold {
+        s.push_str(&format!(
+            "cold first run: prefill {:.1} tok/s | decode {:.1} tok/s (warm median {:.1} / {:.1})\n",
+            c.prefill_tps(),
+            c.decode_tps(),
+            pre.median,
+            dec.median,
+        ));
+    }
+    if let Some(jpt) = m.joules_per_token() {
+        s.push_str(&format!(
+            "energy: {:.2} J/token ({:.1} J total, RAPL package-level)\n",
+            jpt,
+            m.energy_joules.unwrap_or(0.0),
+        ));
+    }
     s.push('\n');
 
     if let Some(a) = &session.analysis {
@@ -80,6 +99,17 @@ pub fn session(session: &BenchmarkSession) -> String {
         s.push_str("\n\n");
         for note in &a.notes {
             s.push_str(&format!("  - {note}\n"));
+        }
+
+        if let Some(r) = &a.roofline {
+            s.push_str(&roofline(r));
+        }
+
+        if !a.hypotheses.is_empty() {
+            s.push_str("\nhypotheses (patterns, not verdicts — each says what the data is consistent with)\n");
+            for h in &a.hypotheses {
+                s.push_str(&format!("  * {h}\n"));
+            }
         }
     }
 
@@ -100,6 +130,39 @@ pub fn session(session: &BenchmarkSession) -> String {
             for f in &v.findings {
                 s.push_str(&format!("  [{}] {}: {}\n", f.severity.as_str(), f.check, f.message));
             }
+        }
+    }
+    s
+}
+
+/// The per-bucket roofline: which part of the model sits where relative to
+/// the bandwidth ceiling. Decode first, same reasoning as the timeline.
+fn roofline(r: &crate::analysis::roofline::RooflineReport) -> String {
+    let mut s = String::new();
+    s.push_str("\nroofline");
+    match r.ceiling_gbs {
+        Some(c) => s.push_str(&format!(" (vs {c:.1} GB/s ceiling)\n")),
+        None => s.push_str(" (no bandwidth ceiling — verdicts unknown)\n"),
+    }
+    for (label, buckets) in [("decode", &r.decode), ("prefill", &r.prefill)] {
+        if buckets.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("  {label}:\n"));
+        for b in buckets {
+            let ceil = b
+                .ceiling_frac
+                .map(|f| format!("{:>3.0}% ceiling", f * 100.0))
+                .unwrap_or_else(|| "  - ceiling".into());
+            let intensity = b
+                .intensity_flop_per_byte
+                .map(|i| format!("{i:.2} FLOP/B"))
+                .unwrap_or_else(|| "-".into());
+            s.push_str(&format!(
+                "    {:<10} {ceil}  {intensity:>12}  -> {}\n",
+                b.bucket.as_str(),
+                b.verdict.as_str(),
+            ));
         }
     }
     s
@@ -270,8 +333,19 @@ fn behavior(b: &crate::behavior::BehaviorReport) -> String {
         ));
     }
     if let Some(e) = &b.entropy {
+        // The CoT-aware read rides on the entropy line: same number, opposite
+        // meaning depending on whether the model has a thinking mode.
+        let flag = match b.cot.as_ref().map(|c| c.flag) {
+            Some(crate::behavior::cot::EntropyFlag::LowEntropyCotExpected) => {
+                "  [COT_EXPECTED — thinking model]"
+            }
+            Some(crate::behavior::cot::EntropyFlag::LowEntropyAnomaly) => {
+                "  <- LOW_ENTROPY_ANOMALY"
+            }
+            _ => "",
+        };
         s.push_str(&format!(
-            "  entropy      mean {:.2} nats | p95 {:.2} | top-prob {:.2}\n",
+            "  entropy      mean {:.2} nats | p95 {:.2} | top-prob {:.2}{flag}\n",
             e.mean, e.p95, e.mean_top_prob
         ));
     }
@@ -305,6 +379,23 @@ fn behavior(b: &crate::behavior::BehaviorReport) -> String {
                 String::new()
             },
         ));
+    }
+    if let Some(a) = &b.anomaly {
+        s.push_str(&format!(
+            "  drift        quarters {:.1} / {:.1} / {:.1} / {:.1} ms | Δ {:+.0}%{}\n",
+            a.quarter_gap_ms[0],
+            a.quarter_gap_ms[1],
+            a.quarter_gap_ms[2],
+            a.quarter_gap_ms[3],
+            a.drift_frac * 100.0,
+            if a.has_drift() { "  <- DRIFT" } else { "" },
+        ));
+        if let (Some(r), Some(at)) = (a.spike_ratio, a.spike_token) {
+            s.push_str(&format!(
+                "  ood window   worst {:.1}x baseline perplexity at token {}\n",
+                r, at
+            ));
+        }
     }
     s
 }

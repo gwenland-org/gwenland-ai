@@ -71,6 +71,10 @@ pub struct WorkloadSpec {
     pub seed: u64,
     /// Which phase(s) this workload measures.
     pub kind: WorkloadKind,
+    /// Manual override for CoT (thinking-model) detection: `Some(true)` /
+    /// `Some(false)` forces the flag; `None` (default) lets the GGUF header
+    /// decide. Feeds the entropy assessment, never the engine.
+    pub cot_mode: Option<bool>,
 }
 
 impl Default for WorkloadSpec {
@@ -85,6 +89,7 @@ impl Default for WorkloadSpec {
             temperature: 0.0, // greedy by default: deterministic timing
             seed: 42,
             kind: WorkloadKind::EndToEnd,
+            cot_mode: None,
         }
     }
 }
@@ -101,6 +106,13 @@ impl ToJson for WorkloadSpec {
             ("temperature", Json::n(self.temperature as f64)),
             ("seed", Json::n(self.seed as f64)),
             ("kind", Json::s(self.kind.as_str())),
+            (
+                "cot_mode",
+                match self.cot_mode {
+                    Some(b) => Json::Bool(b),
+                    None => Json::Null,
+                },
+            ),
         ])
     }
 }
@@ -119,6 +131,8 @@ impl FromJson for WorkloadSpec {
             seed: field_f64(v, "seed")? as u64,
             kind: WorkloadKind::from_str(&kind_s)
                 .ok_or_else(|| format!("unknown workload kind '{kind_s}'"))?,
+            // Optional and absent from pre-v2 archives: absent means "auto".
+            cot_mode: v.get("cot_mode").and_then(|b| b.as_bool()),
         })
     }
 }

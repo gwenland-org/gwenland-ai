@@ -42,6 +42,7 @@ impl EngineAdapter {
             available: spec_meta.available,
             model_arch: None,
             quantization: None,
+            thinking_capable: None,
         };
 
         let mut runtime = Runtime::new(engine)?;

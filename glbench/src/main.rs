@@ -2,6 +2,7 @@
 //!
 //! Subcommands:
 //!   glbench run     --engine <name> --model <path> [options]   run a benchmark
+//!   glbench ab      --engine <name> --model <A> --model <B>    A/B N models in one command
 //!   glbench compare <baseline.json> <candidate.json>           diff two runs
 //!   glbench inspect <session.json>                             re-render an archive
 //!   glbench export  <session.json> --format <json|md|csv>       convert an archive
@@ -23,6 +24,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
+        Some("ab") => cmd_ab(&args[1..]),
         Some("compare") => cmd_compare(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
@@ -46,7 +48,13 @@ const USAGE: &str = "\
 usage:
   glbench run     --engine <name> --model <path> [--prompt <text>] [--tokens N]
                   [--warmup N] [--iters N] [--temperature F] [--seed N]
-                  [--kind prefill|decode|end_to_end|stress] [--out <file.json>]
+                  [--kind prefill|decode|end_to_end|stress] [--cot on|off]
+                  [--out <file.json>]
+  glbench ab      --engine <name> --model <baseline> --model <candidate> [...]
+                  (same options as run; each extra --model is benchmarked with
+                   the identical workload, sequentially, and diffed against the
+                   first — sequential on purpose: parallel runs would contend
+                   for bandwidth and corrupt every number)
   glbench compare <baseline.json> <candidate.json> [--threshold F]
   glbench inspect <session.json>
   glbench export  <session.json> --format <json|md|csv> [--out <file>]
@@ -57,9 +65,17 @@ fn print_usage() {
     println!("{USAGE}");
 }
 
-/// `glbench run` — execute a benchmark and print (and optionally archive) it.
-fn cmd_run(args: &[String]) -> Result<(), String> {
+/// Flags shared by `run` and `ab`, parsed once. `models` collects every
+/// `--model` in order — `run` demands exactly one, `ab` at least two.
+struct RunArgs {
+    spec: WorkloadSpec,
+    models: Vec<String>,
+    out_path: Option<PathBuf>,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut spec = WorkloadSpec::default();
+    let mut models = Vec::new();
     let mut out_path: Option<PathBuf> = None;
     let mut prompt_set = false;
 
@@ -73,7 +89,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         };
         match flag.as_str() {
             "--engine" => spec.engine = value(&mut i)?,
-            "--model" => spec.model_path = value(&mut i)?,
+            "--model" => models.push(value(&mut i)?),
             "--prompt" => {
                 spec.prompt = value(&mut i)?;
                 prompt_set = true;
@@ -88,34 +104,91 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
                 spec.kind = WorkloadKind::from_str(&k)
                     .ok_or_else(|| format!("unknown --kind '{k}'"))?;
             }
+            // Manual CoT override; unset ("auto") lets the GGUF header decide.
+            "--cot" => {
+                spec.cot_mode = match value(&mut i)?.as_str() {
+                    "on" | "true" => Some(true),
+                    "off" | "false" => Some(false),
+                    other => return Err(format!("--cot takes on|off, got '{other}'")),
+                };
+            }
             "--out" => out_path = Some(PathBuf::from(value(&mut i)?)),
             other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
         }
         i += 1;
     }
 
-    if spec.model_path.is_empty() {
-        return Err("--model is required".into());
-    }
     if !prompt_set {
         // A representative default prompt (~long enough to exercise prefill).
         spec.prompt = default_prompt();
     }
+    Ok(RunArgs { spec, models, out_path })
+}
 
-    // Progress heartbeat to stderr so stdout stays the report.
-    let progress = |phase: &str, iter: usize, total: usize| {
-        eprintln!("[{phase}] {}/{}", iter + 1, total.max(1));
-    };
+/// Progress heartbeat to stderr so stdout stays the report.
+fn progress(phase: &str, iter: usize, total: usize) {
+    eprintln!("[{phase}] {}/{}", iter + 1, total.max(1));
+}
 
-    let session = planner::run(&spec, &progress).map_err(|e| e.to_string())?;
+/// `glbench run` — execute a benchmark and print (and optionally archive) it.
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let mut a = parse_run_args(args)?;
+    match a.models.len() {
+        0 => return Err("--model is required".into()),
+        1 => a.spec.model_path = a.models.remove(0),
+        _ => return Err("run takes one --model; use 'glbench ab' for several".into()),
+    }
+
+    let session = planner::run(&a.spec, &progress).map_err(|e| e.to_string())?;
 
     // Report to stdout.
     print!("{}", text::session(&session));
 
     // Archive if requested.
-    if let Some(path) = out_path {
+    if let Some(path) = a.out_path {
         archive::write(&session, &path)?;
         eprintln!("archived to {}", path.display());
+    }
+    Ok(())
+}
+
+/// `glbench ab` — benchmark N models under one identical workload, in one
+/// command, and diff each against the first.
+///
+/// Runs are sequential by design: models on one machine share the memory bus,
+/// so "parallel benchmark" is an oxymoron — two decodes contending for
+/// bandwidth would each report a number describing neither. What v2 adds is
+/// the orchestration (one command, one workload, N models, a delta table),
+/// not concurrency.
+fn cmd_ab(args: &[String]) -> Result<(), String> {
+    let a = parse_run_args(args)?;
+    if a.models.len() < 2 {
+        return Err("ab needs at least two --model flags (baseline first)".into());
+    }
+    if a.out_path.is_some() {
+        return Err("ab does not take --out; archive individual runs with 'run'".into());
+    }
+
+    // Run them all under the byte-identical spec except the model path.
+    let mut sessions = Vec::new();
+    for (n, model) in a.models.iter().enumerate() {
+        eprintln!("=== model {}/{}: {model}", n + 1, a.models.len());
+        let mut spec = a.spec.clone();
+        spec.model_path = model.clone();
+        sessions.push(planner::run(&spec, &progress).map_err(|e| e.to_string())?);
+    }
+
+    // Every session's full report first (the facts) ...
+    for s in &sessions {
+        print!("{}", text::session(s));
+        println!();
+    }
+    // ... then each candidate against the baseline (the deltas).
+    let baseline = &sessions[0];
+    for candidate in &sessions[1..] {
+        let report = runs::compare(baseline, candidate, 0.05);
+        print!("{}", text::comparison(&report));
+        println!();
     }
     Ok(())
 }
