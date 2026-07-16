@@ -187,6 +187,35 @@ fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
         ]),
         None => Json::Null,
     };
+    let anomaly = match &b.anomaly {
+        Some(a) => Json::obj([
+            (
+                "quarter_gap_ms",
+                Json::Arr(a.quarter_gap_ms.iter().map(|&q| Json::Num(q)).collect()),
+            ),
+            ("drift_frac", Json::Num(a.drift_frac)),
+            ("drift_monotonic", Json::Bool(a.drift_is_monotonic())),
+            (
+                "spike_ratio",
+                a.spike_ratio.map(Json::Num).unwrap_or(Json::Null),
+            ),
+            (
+                "spike_token",
+                a.spike_token.map(|t| Json::Num(t as f64)).unwrap_or(Json::Null),
+            ),
+            ("samples", Json::Num(a.samples as f64)),
+        ]),
+        None => Json::Null,
+    };
+    let cot = match &b.cot {
+        Some(c) => Json::obj([
+            ("flag", Json::s(c.flag.as_str())),
+            ("thinking_capable", Json::Bool(c.thinking_capable)),
+            ("threshold_nats", Json::Num(c.threshold_nats)),
+            ("threshold_top_prob", Json::Num(c.threshold_top_prob)),
+        ]),
+        None => Json::Null,
+    };
     let hall = match &b.hallucination {
         Some(h) => Json::obj([
             ("top_choice_rate", Json::Num(h.top_choice_rate)),
@@ -203,6 +232,10 @@ fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
         ("entropy", ent),
         ("stall", stall),
         ("ood", ood),
+        ("anomaly", anomaly),
+        // The CoT-aware entropy read; carries its own thresholds so the flag
+        // is auditable from the archive alone.
+        ("cot", cot),
         // Named for what it is. The struct's docs spell out that this is a
         // confidence/rank proxy and NOT a hallucination detector; the key is
         // kept honest here too.
@@ -344,6 +377,7 @@ fn engine_from_json(v: &Json) -> Result<EngineMetadata, String> {
         available: v.get("available").and_then(|b| b.as_bool()).unwrap_or(false),
         model_arch: v.get("model_arch").and_then(|s| s.as_str()).map(String::from),
         quantization: v.get("quantization").and_then(|s| s.as_str()).map(String::from),
+        thinking_capable: v.get("thinking_capable").and_then(|b| b.as_bool()),
     })
 }
 

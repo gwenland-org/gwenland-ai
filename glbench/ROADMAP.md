@@ -13,9 +13,30 @@ first, do not over-engineer.**
 | 2     | Benchmark runner, engine adapter, exporters (JSON/MD/CSV), storage | ✅ done |
 | 3     | Analysis, comparison, validation subsystems                  | ✅ done |
 | 4     | Advanced rendering                                           | 🚧 baseline in place |
+| v2    | Mensura Veritatis v2: CoT-aware quality, per-bucket roofline, intra-session anomaly + hypotheses, cold/warm split, `ab` command, RAPL energy | ✅ done |
 
 Phase 1–3 landed together as the first foundation; Phase 4 has a working text +
 table renderer, with the richer output below still open.
+
+## v2 — "LLM Performance Doctor" (landed)
+
+The five v2 modules, mapped onto the existing single-crate layout rather than
+the PRD's two-crate sketch (DESIGN.md §10: split only under real pressure):
+
+- **Quality RCA** — `engine::model_probe` reads the GGUF header (arch, quant,
+  thinking capability); `behavior::cot` flags low entropy as
+  `LOW_ENTROPY_COT_EXPECTED` vs `LOW_ENTROPY_ANOMALY`. Override: `--cot on|off`.
+- **Roofline** — `analysis::roofline::RooflineReport` buckets stage telemetry
+  into attention/ffn/lm_head and classifies each against the measured ceiling.
+- **Anomaly** — `behavior::anomaly` (per-quarter drift, OOD perplexity window)
+  plus `analysis::hypothesis` (cross-signal root-cause patterns, phrased as
+  "consistent with", never verdicts).
+- **Hardware** — `environment::power` measures Joules/token via Linux RAPL
+  (powercap sysfs, std-only). Cache counters / PCIe / Windows RAPL are out:
+  not honestly reachable without kernel drivers or external deps.
+- **Throughput** — cold first-run captured separately from warm stats;
+  `glbench ab` benchmarks N models under one identical workload sequentially
+  (parallel would contend for bandwidth and corrupt both numbers).
 
 ## Phase 4 and beyond — planned
 

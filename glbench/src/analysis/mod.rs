@@ -7,6 +7,7 @@ pub mod bottleneck;
 pub mod ceiling;
 pub mod efficiency;
 pub mod health;
+pub mod hypothesis;
 pub mod roofline;
 pub mod scaling;
 pub mod summary;

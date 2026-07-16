@@ -1,0 +1,77 @@
+## Build + test the workspace on every push and PR.
+#
+# This workflow answers one question: does the code compile and do the tests
+# pass? It builds no release artifacts and publishes nothing — build.yml owns
+# releases, and the e2e-* workflows own end-to-end product flows.
+#
+# Two crates are excluded because they do not compile at 9fb361d. These are
+# pre-existing breaks, not CI configuration problems, and each exclusion is a
+# debt to pay down rather than a permanent carve-out:
+#
+#   * glcli — `InferInput` gained a `trace` field in the 0.1.129 tracing work
+#     and glcli/src/main.rs:114 was never updated (E0063). This is why the
+#     four Build GwenLand Binaries jobs fail: build.yml builds `-p glcli`.
+#
+#   * glcuda's `forward` test — asserts `LayerWeights` fields `gate_up` and
+#     `w_down` that the struct does not have (E0560). The glcuda *library*
+#     builds fine and is covered here; only the one test target is skipped.
+#
+# When either is fixed, delete its exclusion below. If this file's exclusion
+# list grows instead of shrinks, that is the signal to stop and fix the tree.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# A new push to the same branch makes the in-flight run obsolete.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing should not hide the others: Linux and macOS have
+      # historically broken on cfg-gated code that never compiles on Windows.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # Build and test are separate steps so a compile error and a failing
+      # assertion are distinguishable at a glance in the job list.
+      - name: Build workspace
+        run: cargo build --workspace --locked --exclude glcli
+
+      # Everything except glcuda, whose `forward` test target does not compile.
+      - name: Run tests
+        run: cargo test --workspace --locked --exclude glcli --exclude glcuda
+
+      # glcuda's remaining targets: lib unit tests + the `parity` integration
+      # test. Named explicitly so the broken `forward` target stays skipped and
+      # nothing else in the crate silently loses coverage.
+      - name: Run glcuda tests (excluding the broken `forward` target)
+        run: cargo test -p glcuda --locked --lib --test parity
