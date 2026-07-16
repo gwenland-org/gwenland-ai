@@ -17,6 +17,10 @@ pub struct EngineMetadata {
     pub model_arch: Option<String>,
     /// Quantization label of the model, if known (e.g. `"Q4_K_M"`).
     pub quantization: Option<String>,
+    /// Whether the model is thinking-capable (CoT), as resolved for this run:
+    /// GGUF auto-detection, overridden by the workload's `cot_mode` when set.
+    /// `None` when the model file could not be probed and no override was given.
+    pub thinking_capable: Option<bool>,
 }
 
 impl ToJson for EngineMetadata {
@@ -36,6 +40,13 @@ impl ToJson for EngineMetadata {
                 "quantization",
                 match &self.quantization {
                     Some(s) => Json::s(s.clone()),
+                    None => Json::Null,
+                },
+            ),
+            (
+                "thinking_capable",
+                match self.thinking_capable {
+                    Some(b) => Json::Bool(b),
                     None => Json::Null,
                 },
             ),

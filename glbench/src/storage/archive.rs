@@ -68,6 +68,7 @@ mod tests {
                 available: true,
                 model_arch: Some("qwen2".into()),
                 quantization: Some("Q8_0".into()),
+                thinking_capable: Some(false),
             },
             WorkloadSpec::default(),
             m,

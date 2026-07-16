@@ -48,6 +48,19 @@ pub fn render(session: &BenchmarkSession) -> String {
     s.push_str(&stat_row("decode", &dec));
     s.push('\n');
 
+    if let Some(c) = &session.measurements.cold {
+        s.push_str(&format!(
+            "**Cold first run:** prefill {:.1} tok/s · decode {:.1} tok/s (excluded from the warm statistics above)\n\n",
+            c.prefill_tps(),
+            c.decode_tps(),
+        ));
+    }
+    if let Some(jpt) = session.measurements.joules_per_token() {
+        s.push_str(&format!(
+            "**Energy:** {jpt:.2} J/token (RAPL, package-level)\n\n"
+        ));
+    }
+
     // Analysis.
     if let Some(a) = &session.analysis {
         s.push_str("## Analysis\n\n");
@@ -63,6 +76,38 @@ pub fn render(session: &BenchmarkSession) -> String {
             }
         }
         s.push('\n');
+
+        // Per-bucket roofline.
+        if let Some(r) = &a.roofline {
+            s.push_str("## Roofline\n\n");
+            if let Some(c) = r.ceiling_gbs {
+                s.push_str(&format!("Bandwidth ceiling: {c:.1} GB/s\n\n"));
+            }
+            s.push_str("| Phase | Bucket | share | GB/s | % ceiling | FLOP/B | verdict |\n");
+            s.push_str("|-------|--------|------:|-----:|----------:|-------:|---------|\n");
+            for (phase, buckets) in [("decode", &r.decode), ("prefill", &r.prefill)] {
+                for b in buckets {
+                    s.push_str(&format!(
+                        "| {phase} | {} | {} | {} | {} | {} | {} |\n",
+                        b.bucket.as_str(),
+                        b.share.map_or("-".into(), |v| format!("{:.1}%", v * 100.0)),
+                        b.gb_per_s.map_or("-".into(), |v| format!("{v:.1}")),
+                        b.ceiling_frac.map_or("-".into(), |v| format!("{:.0}%", v * 100.0)),
+                        b.intensity_flop_per_byte.map_or("-".into(), |v| format!("{v:.2}")),
+                        b.verdict.as_str(),
+                    ));
+                }
+            }
+            s.push('\n');
+        }
+
+        if !a.hypotheses.is_empty() {
+            s.push_str("## Hypotheses\n\nPatterns, not verdicts — each states what the data is consistent with.\n\n");
+            for h in &a.hypotheses {
+                s.push_str(&format!("- {h}\n"));
+            }
+            s.push('\n');
+        }
     }
 
     // Validation.

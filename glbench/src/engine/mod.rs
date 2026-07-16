@@ -5,3 +5,4 @@
 pub mod adapter;
 pub mod capability;
 pub mod metadata;
+pub mod model_probe;
