@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for wanting to help out. GwenLand is a local-first AI toolkit written in Rust, and this is the short version of how to build it, test it, and send changes.
+Thanks for wanting to help out. GwenLand is an **Inference First** AI engine written in pure Rust — correct inference on whatever hardware is present comes before everything else — and this is the short version of how to build it, test it, and send changes.
 
 ## Getting oriented
 
@@ -58,6 +58,51 @@ There's a GitLab pipeline in `.gitlab-ci.yml.disabled` that runs the checks. It'
 GwenLand targets modest hardware — think an 11th-gen i3, 8 GB of RAM, no GPU, on Linux — served by an mmap loader that keeps the weight working set small. Two things follow. Don't hold extra full-size copies of weights and blow the memory budget. And when you write OS-specific code, gate it as narrowly as you can and actually compile it on the platforms it claims to support. We got bitten by exactly this: `MADV_DONTNEED` was under `#[cfg(unix)]`, but `memmap2::Advice::DontNeed` is gated off on macOS in some versions, so it built fine on Windows (where the block is skipped) and Linux, then broke a contributor's macOS build. It should have been `#[cfg(target_os = "linux")]`. If you touch a `cfg`-gated path, build it somewhere other than your own machine before you assume it compiles.
 
 The same discipline applies to the GPU backends: hand-authored PTX must be pure ASCII with LF line endings (`ptxas` rejects a stray em-dash before it parses a single instruction), and every GPU kernel is validated against `glproc` within an explicit per-operation tolerance — see `architecture/ArchGLML_X2.md`.
+
+## Dependencies: the bar is deliberately high
+
+GwenLand's core promise is a **from-scratch, fully understood engine**: no
+external ML runtimes, no C bindings, no CMake — the GGUF parser, tokenizer,
+kernels, and even the benchmark exporter are hand-written. Every crate you add
+works against that promise: it's supply-chain surface we now have to trust and
+audit, transitive dependencies we didn't choose, build time on every
+contributor's machine, binary size on an 8 GB target, and a license to check.
+So: **don't add trivial dependencies.** If five lines of `std` can do it, five
+lines of `std` win — a helper crate for one call site (`left-pad`-class,
+`lazy_static` where `std::sync::OnceLock` works, `itertools` for a single
+`chunks` loop) will be rejected regardless of how popular it is.
+
+The current dependency budget, so you know the baseline you're changing:
+
+- **Engine crates are near-frozen.** `glcore` carries `thiserror`, `memmap2`,
+  `byteorder`, `serde`/`serde_json` (metadata only — never on the hot path);
+  `glproc` adds `num_cpus`; `glcuda` has *zero* external deps (the driver is
+  `dlopen`ed, not linked); `glbench` is workspace-only **by charter**.
+- **Interface crates get more latitude** — `glcli` uses `clap`; `gltui` uses
+  `ratatui`/`crossterm`/`tokio`/`reqwest`. More latitude is not a free pass:
+  the same questions below apply.
+- **ML dependencies are never acceptable in any crate** — no torch/candle/ort
+  bindings, no ggml FFI, no "just for reference" inference crates. That's the
+  project.
+
+If you believe a new dependency is justified, make the case **in the PR
+description**, answering all three:
+
+1. **Reason** — what does it do that `std`, an existing dependency, or a
+   reasonable amount of our own code can't? "Saves me writing ~40 lines" is
+   not a reason; "implements RFC-compliant X that is genuinely hard to get
+   right (and security-relevant to get wrong)" is.
+2. **Impact, argued logically** — how many transitive dependencies does it
+   pull (check `cargo tree`)? What does it do to clean-build time and binary
+   size? Which crates does it infect (an engine crate or a leaf tool)? Is it
+   maintained, and what's the license? Does it touch the hot path or startup?
+3. **Use cases** — the concrete, current use cases it unlocks (plural beats
+   singular; "we might need it later" doesn't count). If only one call site
+   uses it, say so — that's usually the argument *against* it.
+
+Reviewers will hold the line here; expect "rewrite it by hand" as a common
+answer, especially anywhere near `glcore`/`glproc`/`glcuda`. Removing a
+dependency is always a welcome PR.
 
 ## Branches, commits, and changelogs
 

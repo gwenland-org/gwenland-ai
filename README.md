@@ -1,28 +1,51 @@
+<div align="center">
+
 # GwenLand
 
-**Local-first LLM inference in pure Rust.** No Python, no CUDA toolkit, no
-`nvcc`, no vendor SDKs at build time — one Cargo workspace that loads GGUF /
-safetensors models and runs them on your CPU or GPU. The GPU backends ship
-hand-written kernels (PTX for CUDA) and load the driver at runtime, so the same
-tree builds on a machine with no GPU at all.
+**Inference First — LLM inference in pure Rust, correct on whatever hardware you have.**
+
+[![CI](https://github.com/gwenland-org/gwenland-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/gwenland-org/gwenland-ai/actions/workflows/ci.yml)
+[![License: MIT + Commons Clause](https://img.shields.io/badge/license-MIT%20%2B%20Commons%20Clause-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://rustup.rs)
+
+</div>
+
+No Python, no CUDA toolkit, no `nvcc`, no vendor SDKs at build time — one Cargo
+workspace that loads GGUF / safetensors models and runs them on your CPU or GPU.
+The GPU backends ship hand-written kernels (PTX for CUDA) and load the driver at
+runtime, so the same tree builds on a machine with no GPU at all.
 
 GwenLand targets modest hardware — the reference CPU box is an 11th-gen i3 with
 8 GB of RAM — with an mmap-based loader that streams model weights without
 blowing the RAM budget. A GPU is optional.
 
-> Status: pre-1.0. The CPU engine (`glproc`) runs models end-to-end today. The
-> CUDA engine (`glcuda`) has **passed its M2 milestone** — validated on real
+> **Status: pre-1.0.** The CPU engine (`glproc`) runs models end-to-end today.
+> The CUDA engine (`glcuda`) has **passed its M2 milestone** — validated on real
 > hardware (see below). Vulkan and Metal backends are scaffolded but not yet
 > implemented.
 
----
+## Highlights
+
+- **From-scratch everything** — GGUF and safetensors parsers, BPE tokenizer,
+  attention, KV cache, sampler. No `llama.cpp` bindings, no candle, no torch.
+- **Runs on small machines** — mmap zero-copy weight loading keeps the working
+  set inside an 8 GB RAM budget.
+- **Hand-authored GPU kernels** — `glcuda` talks to the CUDA *driver* directly
+  over FFI and ships its kernels as PTX text; nothing to install beyond the
+  NVIDIA driver you already have.
+- **CPU engine as ground truth** — every GPU kernel is validated
+  tensor-by-tensor against `glproc` within an explicit per-operation tolerance.
+- **Built-in profiler** — `glbench` pulls engine telemetry (per-bucket timings,
+  roofline, anomaly detection) and behavioral signals from raw logits.
+- **Private by construction** — inference runs entirely on your machine; the
+  engines make no network calls. See [PRIVACY.md](PRIVACY.md).
 
 ## Architecture: the "gl-stack"
 
 Every backend is an independent engine implementing one shared trait
 (`glcore::engine_trait`). A thin runtime selects an engine and routes requests —
-it owns no compute logic — so engines never depend on each other and can be added
-without touching the runtime.
+it owns no compute logic — so engines never depend on each other and can be
+added without touching the runtime.
 
 ```mermaid
 graph TD
@@ -41,24 +64,28 @@ graph TD
 | Crate | Role | Status |
 |-------|------|--------|
 | `glcore` | Shared: GGUF/safetensors parsers (from scratch, mmap zero-copy), BPE tokenizer, `Tensor` types, the engine trait, the runtime | ✅ |
-| `glproc` | CPU engine — scalar → SIMD + threaded matmul, attention, KV cache, sampler | ✅ M1 |
+| `glproc` | CPU engine — SIMD + threaded matmul, attention, KV cache, sampler; the numerical ground truth | ✅ M1 |
 | `glcuda` | CUDA engine — CUDA Driver FFI, hand-written PTX kernels (SIMT), VRAM bump allocator, CUDA-graph decode | ✅ **M2** |
 | `glvulkan` | Vulkan compute backend (cross-vendor) | ◻ planned |
 | `glmetal` | Metal backend (Apple Silicon) | ◻ planned |
+| `glbench` | Profiler & benchmark harness — engine telemetry, roofline, A/B runs | ✅ |
 | `glcli` | The `gwen` command-line interface | ✅ |
 
----
+There is also a `packages/` group (`packages/core`, `packages/gltui`,
+`packages/mcp`) holding the `gltui` terminal UI and an MCP server.
 
 ## Building
 
-Needs a recent Rust toolchain. From the workspace root:
+Needs a recent Rust toolchain ([rustup](https://rustup.rs), 1.85+). From the
+workspace root:
 
 ```bash
 cargo build --release -p glcli      # builds the `gwen` binary
 ```
 
-The binary lands at `target/release/gwen`. No CUDA toolkit is required to build —
-`glcuda` loads `libcuda.so.1` at runtime and ships its kernels as PTX.
+The binary lands at `target/release/gwen`. No CUDA toolkit is required to
+build — `glcuda` loads `libcuda.so.1` at runtime and ships its kernels as PTX.
+`Cargo.lock` is committed; build with `--locked` for reproducible deps.
 
 ## Running
 
@@ -71,15 +98,20 @@ gwen run model.gguf
 
 # model metadata
 gwen info model.gguf
+
+# terminal UI
+cargo run -p gltui
 ```
 
 `gwen run` flags: `--prompt`, `--max-tokens` (256), `--temperature` (0.8),
-`--top-k` (40), `--top-p` (0.95), `--repeat-penalty` (1.1), `--raw` (skip the chat
-template). The CLI currently runs on the CPU engine; the CUDA engine is validated
-standalone (see the notebook below) and is being wired into the runtime's
-fallback chain.
+`--top-k` (40), `--top-p` (0.95), `--repeat-penalty` (1.1), `--raw` (skip the
+chat template). The CLI currently runs on the CPU engine; the CUDA engine is
+validated standalone (see the notebook below) and is being wired into the
+runtime's fallback chain.
 
----
+**Model support:** GGUF models in the Llama and Qwen2/Qwen3 families (GQA and
+NeoX-style RoPE included), Q8_0 and Q4_K quantizations. Qwen3 MoE support is
+experimental.
 
 ## glcuda — the CUDA backend (M2 ✅)
 
@@ -87,7 +119,8 @@ fallback chain.
 kernels** — no `nvcc`, no cuBLAS. It has passed every criterion of its M2
 Definition of Done on a **Tesla T4** (sm_75): full forward pass with coherent
 output, tensor-by-tensor numerical parity against the CPU engine (14/14 tests),
-backend-buffer reuse (zero `cudaMalloc` after init), mmap loading, no VRAM leaks.
+backend-buffer reuse (zero `cudaMalloc` after init), mmap loading, no VRAM
+leaks.
 
 Measured on the T4 (Qwen2.5-7B-Q8_0):
 
@@ -98,18 +131,20 @@ Measured on the T4 (Qwen2.5-7B-Q8_0):
 
 Full write-up, charts, and the Definition-of-Done table:
 [`docs/ArchGLCuda/ArchGLML_Done.md`](docs/ArchGLCuda/ArchGLML_Done.md).
-Benchmark methodology: [`docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md`](docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md).
+Benchmark methodology:
+[`docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md`](docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md).
 The whole validation is reproducible on a free Colab T4 via
-[`glcuda_t4_validation.ipynb`](glcuda_t4_validation.ipynb).
-
----
+[`notebooks/glcuda_t4_validation.ipynb`](notebooks/glcuda_t4_validation.ipynb).
 
 ## Development
 
 ```bash
 cargo build --workspace
-cargo test  -p glcore --lib
-cargo test  -p glproc --lib
+cargo test  -p glcore -p glproc
+cargo test  -p gltui
+
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
 
 # glcuda's host tests run without a GPU; its parity/forward tests skip cleanly
 # when no CUDA device is present, and are meaningful on GPU hardware:
@@ -118,16 +153,29 @@ cargo test  -p glcuda --test parity  -- --test-threads=1
 ```
 
 The architecture specs live in [`architecture/`](architecture/) (e.g.
-`ArchGLML_X2.md` is the glcuda M2 ground truth) and the roadmap in
-[`ROADMAP.md`](ROADMAP.md).
+`ArchGLML_X2.md` is the glcuda M2 ground truth), the roadmap in
+[`ROADMAP.md`](ROADMAP.md), and per-session engineering notes in
+[`changelog/`](changelog/).
+
+## Contributing & community
+
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** — how to build, test, and send a
+  change (branch naming, commit prefixes, changelog notes).
+- **[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)** — we follow the Contributor
+  Covenant v2.1.
+- **[SECURITY.md](SECURITY.md)** — how to report a vulnerability privately.
+  Please don't open public issues for security problems.
+- **Bugs & feature requests** — use the issue templates; they ask for the
+  model, quantization, and hardware details we need to reproduce.
 
 ## Privacy
 
 Inference runs entirely on your machine. The engines make no network calls.
+Details: [PRIVACY.md](PRIVACY.md).
 
 ## License
 
 **MIT + Commons Clause** — see [LICENSE](LICENSE). Free for personal, research,
-and internal use; modification and forking allowed. Selling GwenLand as a product
-or a substantially-unchanged hosted service requires a separate commercial
-agreement. Enquiries: jinxsuperdev@gmail.com
+and internal use; modification and forking allowed. Selling GwenLand as a
+product or a substantially-unchanged hosted service requires a separate
+commercial agreement. Enquiries: jinxsuperdev@gmail.com
