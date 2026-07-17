@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔒 Report a security vulnerability
+    url: https://github.com/gwenland-org/gwenland-ai/security/advisories/new
+    about: Please report security issues privately — never as a public issue. See SECURITY.md.
+  - name: 📖 Contributing guide
+    url: https://github.com/gwenland-org/gwenland-ai/blob/main/CONTRIBUTING.md
+    about: How to build, test, and send a change.

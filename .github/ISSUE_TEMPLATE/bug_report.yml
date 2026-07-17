@@ -1,0 +1,85 @@
+name: 🐛 Bug report
+description: Something is broken — wrong output, crash, build failure, or a performance regression.
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report! Model + quantization + hardware are what make
+        inference bugs reproducible — please fill those in even if they feel
+        irrelevant.
+
+        ⚠️ **Security issues:** do NOT file them here — see [SECURITY.md](https://github.com/gwenland-org/gwenland-ai/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+      placeholder: |
+        Ran `gwen run model.gguf --prompt "..."`, expected coherent output,
+        got garbage tokens after ~50 tokens / a panic / a wrong benchmark number.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Exact commands, in order. Include the full command line with flags.
+      render: shell
+      placeholder: |
+        cargo build --release -p glcli
+        ./target/release/gwen run Qwen2.5-0.5B-Instruct-Q8_0.gguf --prompt "hello"
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: GwenLand version / commit
+      description: Output of `gwen --version`, or the git commit hash you built from.
+      placeholder: "0.1.148 / fff304b"
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model file
+      description: Model name, quantization, and where it came from (link if public). Many "engine bugs" turn out to be broken GGUF exports.
+      placeholder: "Qwen2.5-0.5B-Instruct-Q8_0.gguf from huggingface.co/Qwen/..."
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options:
+        - glproc (CPU)
+        - glcuda (CUDA)
+        - not sure / runtime default
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware & OS
+      description: CPU model, RAM, GPU (if any) + driver version, and OS.
+      placeholder: |
+        CPU: i3-1115G4, 8 GB RAM
+        GPU: none / Tesla T4, driver 550.xx
+        OS: Ubuntu 24.04
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / output
+      description: Relevant terminal output, panic message + backtrace (`RUST_BACKTRACE=1`), or benchmark numbers.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this isn't a duplicate.
+          required: true
+        - label: I can reproduce this on the latest `main`.

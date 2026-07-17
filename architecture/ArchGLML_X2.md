@@ -39,7 +39,7 @@ The current design assumes the following invariants:
 |---|---|
 | Pure Rust | Eliminates C/C++ FFI boundary bugs; enables `cargo`-native tooling. |
 | Zero external ML runtime | No dependency on PyTorch, ONNX Runtime, or TensorRT; the engine owns every byte of computation. |
-| Local-first | The engine runs on the user's hardware. No cloud dependency. |
+| Inference First | Correct inference on the user's hardware. No cloud dependency. |
 | Single GPU | Reduces scheduling complexity by orders of magnitude. |
 | Backend isolation | Each GPU API receives a self-contained engine, not a shared abstraction. |
 | `glproc` as ground truth | CPU backend defines numerical correctness; GPU backends must match within explicit ε. |
@@ -881,9 +881,9 @@ much harder.
 
 **Why excluded:** Cloud orchestration (autoscaling, request routing, model
 serving APIs) is fundamentally different from engine design. Keeping the engine
-local-first preserves simplicity and allows cloud integration to be built as a
-separate layer. Coupling cloud concerns into the engine creates deployment
-dependencies that contradict the local-first principle.
+Inference First preserves simplicity and allows cloud integration to be built as
+a separate layer. Coupling cloud concerns into the engine creates deployment
+dependencies that contradict the Inference First principle.
 
 ### JIT Compiler
 
@@ -1110,7 +1110,7 @@ understanding of SRAM hierarchy on target GPUs.
 
 Serve multiple requests concurrently by batching tokens from different sequences
 into the same kernel launch. Relevant only if GwenLand AI evolves toward a
-serving use case. Currently out of scope due to the local-first constraint.
+serving use case. Currently out of scope due to the Inference First constraint.
 
 ### 24.5 Weight Pre-Tiling for Tensor Cores
 

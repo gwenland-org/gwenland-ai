@@ -1,184 +1,157 @@
-# GwenLand AI — Engine Roadmap (Revised)
+# GwenLand — Engine Roadmap
 
-## Milestone M1 — CPU Baseline
+> **Philosophy: Inference First.** Correct inference on whatever hardware is
+> present comes before speed, features, or ecosystem. Tagline: *"finding its
+> limit, not the speed"* — every performance number is measured, every limit
+> is documented, negative results are deliverables.
+>
+> The gl-stack **is** the engine (not an accelerator bolted onto something
+> else): independent backends behind one `GlEngine` trait, a runtime that
+> selects and routes but owns zero compute, and `glproc` (CPU) as the
+> numerical ground truth every other engine is validated against.
 
-**Goal:** Deliver a fully working CPU inference engine (`glproc`).
-
-### Issues
-
-- **GWEN-??? — glcore Workspace Scaffold**
-  - Setup Cargo workspace monorepo: `glcore`, `glproc`, `glcuda`, `glvulkan`, `glmetal`, `glcli`, `gltui`
-  - Define shared tensor types in `glcore`
-  - Done: `cargo build` succeeds across all crates
-
-- **GWEN-??? — Define Engine Trait**
-  - Define common engine interface in `glcore`:
-    ```rust
-    fn init()
-    fn load_model(path: &str)
-    fn infer(input: Input) -> Output
-    fn stream(input: Input) -> Stream
-    fn shutdown()
-    fn capabilities() -> EngineSpec
-    ```
-  - Done: `glproc` compiles against the trait
-
-- **GWEN-??? — GGUF Parser (from scratch)**
-  - Pure Rust GGUF v1/v2/v3 parser in `glcore/src/format/gguf.rs`
-  - mmap-based loading, zero-copy tensor access
-  - Done: can load a GGUF model and read tensor metadata
-
-- **GWEN-??? — Safetensors Parser (from scratch)**
-  - Pure Rust safetensors parser in `glcore/src/format/safetensors.rs`
-  - JSON header parse + mmap tensor data
-  - Done: can load a safetensors file and read tensors
-
-- **GWEN-??? — Tokenizer (BPE, from scratch)**
-  - BPE tokenizer in `glcore/src/tokenizer.rs`
-  - Load vocab from GGUF or standalone tokenizer.json
-  - Done: encode/decode round-trip matches reference tokenizer output
-
-- **GWEN-??? — glproc Skeleton**
-  - Create `glproc/` folder structure: `loader.rs`, `matmul.rs`, `attention.rs`, `kv_cache.rs`, `sampler.rs`, `runtime.rs`
-  - Register glproc against engine trait
-  - Done: glproc implements all trait methods (stubs ok)
-
-- **GWEN-??? — Implement Scalar MatMul**
-  - Baseline scalar matmul in `glproc/src/matmul.rs`
-  - No SIMD, no parallelism — correctness first
-  - Done: output matches numpy reference within float tolerance
-
-- **GWEN-??? — Implement Minimal Attention**
-  - Scaled dot-product attention in `glproc/src/attention.rs`
-  - Support causal mask
-  - Done: output matches reference within float tolerance
-
-- **GWEN-??? — Implement KV Cache**
-  - KV cache in `glproc/src/kv_cache.rs`
-  - Done: sequential generation reuses cached K/V correctly
-
-- **GWEN-??? — Implement Sampler**
-  - `glproc/src/sampler.rs`: Greedy, Top-K, Top-P, Temperature
-  - Done: greedy output is deterministic and correct
-
-- **GWEN-??? — Runtime Engine Manager**
-  - `runtime/src/manager.rs`: select engine, route request, expose unified API
-  - Runtime MUST NOT implement compute logic
-  - Done: runtime can init glproc and route an infer request
-
-- **GWEN-??? — End-to-End CLI Inference**
-  - `glcli`: `gwen run model.gguf --prompt "Hello"`
-  - Done: generates coherent text output on CPU
+Last updated: **2026-07-17**. Agents: read
+[`gl-agent-skills/`](gl-agent-skills/README.md) before touching anything.
 
 ---
 
-## Milestone M2 — GPU Engines
+## Status snapshot
 
-**Goal:** Add hardware acceleration across NVIDIA, AMD/Intel, Apple Silicon.
+| Crate | Role | Status |
+|-------|------|--------|
+| `glcore` | parsers (GGUF/safetensors), BPE tokenizer, tensor types, `GlEngine` trait, runtime | ✅ shipped |
+| `glproc` | CPU engine — SIMD (AVX2) + threading, Q8_0 hot path, Q4_K→Q8_0 repack | ✅ M1 + M1.5 done |
+| `glcuda` | CUDA engine — driver FFI, hand-written PTX, arena VRAM, CUDA-graph decode, INT8-MMA prefill | ✅ **M2 passed** (T4-validated) |
+| `glbench` | profiler/benchmark — telemetry roofline, behavior signals, A/B, archives | ✅ v2 "Mensura Veritatis" shipped |
+| `glcli` | the `gwen` binary | ✅ (CPU engine; CUDA wiring pending) |
+| `glvulkan` | cross-vendor GPU backend | ◻ stub (planned) |
+| `glmetal` | Apple Silicon backend | ◻ stub (planned) |
+| `glictus-caliburni` | GLLM shard format (MoE, lazy experts) | 🧪 experimental |
+| `packages/` (gltui, mcp, core) | TUI, MCP server, legacy core | ✅ working, separate track |
 
-### Issues
-
-- **GWEN-??? — Implement glcuda**
-  - Full glcuda engine: loader, matmul (CUDA kernels), attention, kv_cache, sampler
-  - Implements engine trait
-  - Done: same model produces parity output vs glproc
-
-- **GWEN-??? — Implement glvulkan**
-  - Full glvulkan engine via Vulkan compute shaders
-  - Cross-vendor: AMD, Intel, NVIDIA
-  - Done: same model produces parity output vs glproc
-
-- **GWEN-??? — Implement glmetal**
-  - Full glmetal engine via Metal Performance Shaders
-  - Apple Silicon (M1/M2/M3/M4)
-  - Done: same model produces parity output vs glproc
-
-- **GWEN-??? — Hardware Detection**
-  - Runtime detects available hardware at startup
-  - Done: correctly identifies CUDA/Vulkan/Metal/CPU availability
-
-- **GWEN-??? — Runtime Fallback System**
-  - Fallback chain: `glcuda → glvulkan → glmetal → glproc`
-  - Engines MUST NOT self-fallback — runtime owns this
-  - Done: if glcuda fails, runtime silently falls back to next engine
-
-- **GWEN-??? — Unified Engine Selection**
-  - Runtime selects best available engine automatically
-  - Manual override via CLI flag: `--engine glproc`
-  - Done: `gwen run model.gguf` picks the best engine automatically
+**Model support today:** Llama & Qwen2/Qwen3 families (GQA, NeoX RoPE),
+Q8_0 + Q4_K GGUF. Qwen3-MoE compute path verified; `_exps` tensor layout
+still unverified (see Risks).
 
 ---
 
-## Milestone M3 — Parity & Stability
+## ✅ Done (evidence in `architecture/`, `docs/`, `changelog/`)
 
-**Goal:** Consistent, reliable behavior across all engines.
+### M1 — CPU baseline
+End-to-end CPU inference: from-scratch GGUF/safetensors parsers, BPE
+tokenizer, scalar→correct kernels, KV cache, sampler, runtime, CLI.
+`gwen run model.gguf` generates coherent text.
 
-### Issues
+### M1.5 — CPU performance bridge (spec: `architecture/ArchGLLM_X5.md`)
+AVX2 SIMD + persistent thread pool + zero-alloc runner + cursor KV cache +
+Q4_K→Q8_0 load-time repack. Decode sits at ~70–78 % of the machine's
+*measured* (~29 GB/s) bandwidth ceiling — near the physical limit for
+weight-streaming decode on the reference i3-1115G4.
 
-- **GWEN-??? — Output Parity Testing**
-  - Test suite comparing all engine outputs vs glproc reference
-  - Done: all engines pass parity within defined tolerance
+### M2 — CUDA engine (ground truth: `architecture/ArchGLML_X2.md`)
+From-scratch SIMT engine, no `nvcc`/cuBLAS, driver loaded at runtime.
+Passed the full Definition of Done on a Tesla T4: 14/14 tensor parity vs
+glproc, zero post-init allocations, no VRAM leaks; decode 29.2 tok/s (88 %
+of card bandwidth), prefill 73 tok/s (batched GEMM + INT8 tensor cores).
+Reproducible: `notebooks/glcuda_t4_validation.ipynb`.
 
-- **GWEN-??? — Numerical Tolerance System**
-  - Define and enforce floating point tolerance per op (matmul, attention, sampler)
-  - Done: tolerance thresholds documented and enforced in CI
+### Observability — glbench v2 "Mensura Veritatis"
+Pull-based engine telemetry → bucket roofline vs measured ceiling, cold/warm
+separation, behavioral signals from raw logits (CoT-aware), cross-signal
+hypotheses, session archives + `ab`/`compare`. glbench observes; it never
+optimizes.
 
-- **GWEN-??? — Benchmark Suite**
-  - Measure TPS (tokens/sec), latency (TTFT), memory usage per engine
-  - Done: benchmark report generated for each engine on reference hardware
-
-- **GWEN-??? — Crash Isolation**
-  - Engine crash must not bring down runtime or other engines
-  - Done: glcuda panic → runtime falls back gracefully, no crash
-
-- **GWEN-??? — Engine Switching Stress Test**
-  - Run 100+ inference requests with random engine switching
-  - Done: zero panics, output consistent
-
----
-
-## Milestone M4 — Ecosystem
-
-**Goal:** GwenLand AI becomes an extensible, community-ready platform.
-
-### Issues
-
-- **GWEN-??? — Engine Plugin Standard**
-  - Finalize engine trait as stable public API
-  - Done: external crate can implement the trait and register as engine
-
-- **GWEN-??? — External Engine Support**
-  - Runtime can load external engine plugins at runtime
-  - Done: third-party engine loaded and passes parity test
-
-- **GWEN-??? — gltui — Terminal UI**
-  - Interactive TUI in `gltui/`: model picker, prompt input, streaming output, engine status
-  - Done: `gwen tui` launches interactive session
-
-- **GWEN-??? — Documentation Freeze**
-  - Full API docs, architecture guide, PLANNING.md finalized
-  - Done: docs published at gwenland.dev
-
-- **GWEN-??? — Contributor Onboarding Guide**
-  - How to add a new engine, how to run tests, how to benchmark
-  - Done: new contributor can add a stub engine following the guide
-
-- **GWEN-??? — Packaging & Distribution**
-  - Binary releases for Windows/macOS/Linux via GitHub Actions
-  - Done: `gwen` binary downloadable from gwenland.dev
+### Closed dead ends (measured, documented, not to be revisited)
+Native Q4_K CPU compute (−33 %), L2 decode tiling, interleaved rows (−35 %),
+AVX-512F on this tier, software prefetch, lazy mmap layer paging, topology
+threading (−23 %). Full list with reasoning:
+[`gl-agent-skills/cpu-skills/rejected-optimizations.md`](gl-agent-skills/cpu-skills/rejected-optimizations.md).
 
 ---
 
-# Exit Criteria
+## ▶ Now — M2.5: make the CUDA engine a first-class citizen
 
-## M1
-CPU inference fully operational — `gwen run model.gguf` generates text.
+The engine is validated standalone; the product must route to it.
 
-## M2
-Same model runs on CPU and GPU engines with parity output.
+- [ ] **Wire glcuda into the runtime fallback chain** (glcuda → glvulkan →
+      glmetal → glproc) so `gwen run` uses it automatically; explicit
+      `--engine glcuda` fails loudly instead of silently falling back.
+- [ ] **Fallback-decision logging + session recording** — every selection
+      reason visible to users and to glbench sessions.
+- [ ] **MoE `_exps` layout verification** — inspect real Qwen3-MoE GGUF
+      bytes vs llama.cpp dequant; close the `_EXPS_LAYOUT_ASSUMPTION`
+      marker (currently the biggest silent-corruption risk).
+- [ ] **CUDA-graph decode: fusion pass** — attack inter-kernel dependency
+      edges (the measured residual), not launch overhead (already spent).
 
-## M3
-Consistent multi-engine behavior, benchmarks published.
+**Exit criteria:** on a CUDA machine, `gwen run model.gguf` decodes on
+glcuda with parity output and the selection is visible in logs + glbench.
 
-## M4
-New engines can be added without modifying the runtime. gltui ships.
+## ▶ Next — M3: parity & stability across engines
+
+- [ ] Cross-engine parity suite in CI shape: every engine vs glproc within
+      the documented per-op tolerances (GPU legs run on GPU runners /
+      notebook validation until hosted GPU CI exists).
+- [ ] Crash isolation: an engine panic/init failure never kills the
+      runtime — degrade down the chain with the reason recorded.
+- [ ] Stress: long sessions + engine switching, zero panics, stable RSS/VRAM
+      (leak checks stay green).
+- [ ] Benchmark baselines archived per release (`glbench compare` as the
+      regression gate at a 5 % threshold).
+
+**Exit criteria:** same model, same seed → parity-consistent output on every
+available engine; a broken GPU setup degrades to CPU with a logged reason,
+never a crash.
+
+## ▶ Later — M4: more hardware, then ecosystem
+
+Ordered by Inference-First priority (reach more hardware correctly before
+platform features):
+
+- [ ] **glvulkan bring-up** — cross-vendor (AMD/Intel/NVIDIA/Mali), copying
+      glcuda's *pattern*: runtime loader, committed SPIR-V, arena memory,
+      parity ladder. Rules already written:
+      [`gl-agent-skills/vulkan-skills/`](gl-agent-skills/vulkan-skills/).
+- [ ] **glmetal bring-up** — Apple Silicon, same pattern.
+- [ ] **glictus-caliburni graduation or burial** — the GLLM shard format
+      (lazy expert loading for MoE on 8 GB) is validated with measurements
+      or explicitly closed like every other experiment.
+- [ ] **Engine trait as stable API** — semver the `GlEngine` contract so an
+      external crate can implement an engine.
+- [ ] **Packaging** — release binaries (Win/macOS/Linux) via CI.
+- [ ] **Docs freeze** — architecture guide + API docs published.
+
+---
+
+## Standing invariants (all milestones, non-negotiable)
+
+1. **Zero external ML dependencies; no CMake/C bindings;** builds with plain
+   `cargo build` on a machine with no GPU vendor anything. GPU drivers are
+   loaded at runtime, kernels ship as PTX/SPIR-V text/blobs.
+2. **The runtime owns no compute; engines never import each other.**
+3. **glproc is the floor and the oracle** — always available, scalar
+   fallback included.
+4. **The 8 GB reference machine stays first-class.** mmap streaming, no
+   duplicate weight copies.
+5. **Every performance claim is a measured production number** with an
+   archived glbench session behind it.
+6. **Dependency additions follow the policy in
+   [`CONTRIBUTING.md`](CONTRIBUTING.md)** — reason, impact, use cases, or no.
+
+## Non-goals
+
+- **Cloud orchestration / serving APIs** — a separate layer someday, never
+  coupled into the engine (contradicts Inference First).
+- **Training at scale** — CPU-only training experiments live in
+  [`Experimental/`](Experimental/README.md) until they graduate.
+- **Chasing llama.cpp feature-for-feature** — GwenLand's product is a fully
+  understood engine, not a feature matrix.
+
+## Risks (known, tracked)
+
+| Risk | Where tracked |
+|------|---------------|
+| `_exps` MoE layout unverified → silent fluent-garbage corruption | `_EXPS_LAYOUT_ASSUMPTION` markers; [`gl-agent-skills/gguf-skills/moe-loading.md`](gl-agent-skills/gguf-skills/moe-loading.md) |
+| GGUF spec drift (ggml upstream owns the format) | warning banners in [`gl-agent-skills/gguf-skills/`](gl-agent-skills/gguf-skills/) |
+| No hosted GPU CI → GPU regressions only caught on manual/notebook runs | M3 parity work; T4 notebooks in [`notebooks/`](notebooks/) |
+| Broken GGUF exports in the wild (norm-corruption case) | parser cross-checks; [`gl-agent-skills/gguf-skills/format-parsing.md`](gl-agent-skills/gguf-skills/format-parsing.md) |
