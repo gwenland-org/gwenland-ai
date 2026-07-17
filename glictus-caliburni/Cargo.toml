@@ -1,0 +1,4 @@
+[package]
+name = "glictus-caliburni"
+version = "0.1.148"
+edition = "2021"
