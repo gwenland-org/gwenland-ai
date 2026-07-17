@@ -327,7 +327,7 @@ CI/CD:
 
 ### 2026-07-07 — M1.5 correctness fixes, M1.6 batched prefill, M1.7 fast load: the GL engine reaches llama.cpp parity
 
-The full architecture and benchmark story is in [`ArchGLML.md`](ArchGLML.md); the session notes are in [`changelog/Gwen-Changes-2026-07-07_16-30.md`](changelog/Gwen-Changes-2026-07-07_16-30.md).
+The full architecture and benchmark story is in [`architecture/ArchGLML.md`](architecture/ArchGLML.md); the session notes are in [`changelog/Gwen-Changes-2026-07-07_16-30.md`](changelog/Gwen-Changes-2026-07-07_16-30.md).
 
 Correctness (post-audit):
 
