@@ -197,7 +197,7 @@ cache of the repacked weights exists (`GLCUDA_CACHE=1`) for fast local disks.
 
 ## 8 · Reproduction
 
-The full validation is driven by [`glcuda_t4_validation.ipynb`](../../glcuda_t4_validation.ipynb)
+The full validation is driven by [`glcuda_t4_validation.ipynb`](../../notebooks/glcuda_t4_validation.ipynb)
 (Colab, T4 runtime). It installs Rust, clones the repo, builds `glcuda` (no CUDA
 toolkit / `nvcc` — the driver is loaded at runtime and PTX ships hand-written),
 runs the host and GPU test suites, downloads real GGUF models, and reports the
