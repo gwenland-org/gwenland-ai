@@ -1,6 +1,6 @@
 [package]
 name = "glproc"
-version = "0.1.148"
+version = "0.1.155"
 edition = "2021"
 description = "GwenLand AI CPU inference engine (source of truth)"
 license-file = "../LICENSE"

@@ -1,6 +1,6 @@
 [package]
 name = "glcuda"
-version = "0.1.148"
+version = "0.1.155"
 edition = "2021"
 description = "GwenLand AI NVIDIA CUDA engine (M2 — SIMT backend per ArchGLML_X2)"
 license-file = "../LICENSE"

@@ -13,6 +13,7 @@ use glcore::engine_trait::InferInput;
 use glcore::format::gguf::{GgufFile, GgufValue};
 use glcore::format::safetensors::SafetensorsFile;
 use glcore::runtime::Runtime;
+use glcore::trace::TraceConfig;
 use glcore::GlError;
 use glproc::GlprocEngine;
 
@@ -118,6 +119,9 @@ fn cmd_run(
         top_k,
         top_p,
         repeat_penalty,
+        // Tracing off: it costs an O(vocab) sweep per token and the CLI has no
+        // surface to report it. glbench is the tool that asks for traces.
+        trace: TraceConfig::default(),
     };
 
     match prompt {
