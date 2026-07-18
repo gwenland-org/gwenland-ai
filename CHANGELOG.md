@@ -2,6 +2,49 @@
 
 The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
+## 0.1.155 — 2026-07-18
+
+### glictus-caliburni — GLLM format crate, boilerplate
+
+The ARTX01 boilerplate for **GLLM (GwenLand Language Model Format)**, codename
+*Ictus Caliburni*: a layer-native format where each transformer layer is an
+independent execution unit with its own file and checksum. Replaces the four
+empty stub modules (`format`/`shard`/`loader`/`router`) committed in 0.1.148.
+
+**This is types, traits and constants — no runtime.** Nothing reads or writes a
+`.gllm` file yet, no checksum is verified, no mmap happens, and no backend
+implements the traits. The traits state the intended contract; they are not
+backed by working code in this crate.
+
+- `constants` — magic `0x474C4C4D`, format version 1.0, 13 dtype codes, 64-byte
+  tensor alignment.
+- `error` — `GllmError`/`GllmResult`, 12 variants. Crate-local rather than
+  glcore's `GlError`, because ARTX01 mandates zero workspace dependencies;
+  embedding runtimes are expected to wrap it.
+- `types` — `GllmManifest` (+ `LayerEntry`, `SharedComponent`, `ProjectorEntry`),
+  `GllmPackage`, `LayerFile`/`LayerHeader`, `TensorEntry`/`DType`/`Shape`,
+  `Device`/`DeviceMap`/`ExecutionUnit`, `ExtensionUri`.
+- `traits` — `GllmRuntime`, `LayerPlugin`, `GllmConverter`, all object-safe and
+  held as `Box<dyn _>`. `stream()` carries a default (greedy argmax, one token)
+  so a backend is usable before it implements true streaming.
+- **Edition 2024** on this crate; deps are `serde`, `serde_json`, `sha2`,
+  `thiserror` and nothing else — zero external ML dependencies.
+
+14 tests, all passing; `cargo clippy --all-targets` clean. Object safety is
+locked by a test that boxes real stub impls, so a future generic method on
+`GllmRuntime` fails to compile rather than silently breaking the runtime. The
+nine spec tests passed on first run, so they were mutation-checked — inverting
+`ExtensionUri::is_official` did fail the suite, confirming they exercise the
+code rather than passing vacuously.
+
+Four documented deviations from the ARTX01 spec text, each because the spec as
+written would not compile or would violate an existing rule: `ExtensionUri` gets
+`impl Display` (inherent `to_string` collides with the `ToString` blanket impl);
+`Device` gets `impl Default` (`DeviceMap`'s `derive(Default)` needs it);
+`Device::from_str` stays inherent returning `Option` with a delegating `FromStr`
+alongside; and `stream()` gains a default implementation, since a required
+method would force streaming into every backend at once.
+
 ## 0.1.129 — 2026-07-14
 
 ### glproc — the attention anomaly, chased to ground

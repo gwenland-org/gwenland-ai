@@ -1315,7 +1315,12 @@ mod tests {
             }
             cache.advance();
         }
-        let cached_len = cache.current_pos(); // `ctx` rows written
+        // `read_k`/`read_v` return `current_pos + 1` rows — the cached rows plus
+        // the in-flight token — so the scores buffer must be sized to match.
+        // The decode path computes it the same way (`runner.rs`: `let cached_len
+        // = self.cache.current_pos() + 1`). Sizing it to `current_pos()` alone
+        // trips the `debug_assert_eq!` in `attention_one_into`.
+        let cached_len = cache.current_pos() + 1;
 
         let q: Vec<f32> = (0..n_heads * head_dim).map(|_| prng()).collect();
 
