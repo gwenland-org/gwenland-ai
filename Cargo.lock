@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "glbench"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "glcore",
  "glcuda",
@@ -2628,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "glcli"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "clap",
  "glcore",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "glcore"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "byteorder",
  "memmap2",
@@ -2649,7 +2649,7 @@ dependencies = [
 
 [[package]]
 name = "glcuda"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "glcore",
  "glproc",
@@ -2658,11 +2658,18 @@ dependencies = [
 
 [[package]]
 name = "glictus-caliburni"
-version = "0.1.148"
+version = "0.1.155"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+]
 
 [[package]]
 name = "glmetal"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "glcore",
 ]
@@ -2694,7 +2701,7 @@ dependencies = [
 
 [[package]]
 name = "glproc"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "glcore",
  "libc",
@@ -2703,7 +2710,7 @@ dependencies = [
 
 [[package]]
 name = "gltui"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "anyhow",
  "atty",
@@ -2744,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "glvulkan"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "glcore",
 ]
@@ -2803,7 +2810,7 @@ dependencies = [
 
 [[package]]
 name = "gwenland-core"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "actix-web",
  "anyhow",
@@ -2856,7 +2863,7 @@ dependencies = [
 
 [[package]]
 name = "gwenland-mcp"
-version = "0.1.148"
+version = "0.1.155"
 dependencies = [
  "serde",
  "serde_json",
