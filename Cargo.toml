@@ -9,9 +9,14 @@ members = [
     "glcli",
     "glictus-caliburni",
     "packages/core",
-    "packages/gltui",
     "packages/mcp",
 ]
+
+# `.abandoned/` holds retired crates kept for reference only. They are not
+# workspace members and are not built: gltui was a TUI over the legacy
+# `gwenland` stack that never called the GL engines (its CoreBridge was a
+# stub), retired 2026-07-18.
+exclude = [".abandoned"]
 resolver = "2"
 
 [profile.release]
