@@ -36,8 +36,7 @@ impl LayerHeader {
         }
         if self.version_major != GLLM_VERSION_MAJOR {
             return Err(GllmError::UnsupportedVersion {
-                major: self.version_major,
-                minor: self.version_minor,
+                version: self.version_major as u16,
             });
         }
         Ok(())

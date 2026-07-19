@@ -14,15 +14,22 @@
 
 pub mod constants;
 pub mod error;
+pub mod execution_unit;
 pub mod package;
 pub mod traits;
 pub mod types;
 
+#[cfg(test)]
+pub(crate) mod test_helpers;
+
 // Re-exports untuk convenience
 pub use error::{GllmError, GllmResult};
+pub use execution_unit::{
+    ExecutionUnit, ExecutionUnitHeader, GLLM_CURRENT_VERSION, GLLM_HEADER_SIZE, GLLM_MAGIC,
+};
 pub use package::{LayerPath, PackageFormat, PackageLayout};
 pub use types::{
-    execution::{Device, DeviceMap, ExecutionUnit},
+    execution::{Device, DeviceMap, ExecutionUnitMeta},
     extension::ExtensionUri,
     layer::LayerFile,
     manifest::GllmManifest,
