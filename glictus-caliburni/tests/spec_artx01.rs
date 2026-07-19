@@ -39,20 +39,23 @@ fn test_dtype_roundtrip() {
 
 #[test]
 fn test_dtype_bytes_per_element() {
-    assert_eq!(DType::F32.bytes_per_element(), 4.0);
-    assert_eq!(DType::F16.bytes_per_element(), 2.0);
-    assert_eq!(DType::Q8_0.bytes_per_element(), 1.0);
-    assert_eq!(DType::Q4_0.bytes_per_element(), 0.5);
+    // ARTX03 split the API: exact Option<usize> for non-block dtypes,
+    // approx f64 (this ARTX01 contract) for memory estimation.
+    assert_eq!(DType::F32.approx_bytes_per_element(), 4.0);
+    assert_eq!(DType::F16.approx_bytes_per_element(), 2.0);
+    assert_eq!(DType::Q8_0.approx_bytes_per_element(), 1.0);
+    assert_eq!(DType::Q4_0.approx_bytes_per_element(), 0.5);
 }
 
 #[test]
 fn test_extension_uri_parse() {
     let uri = "gllm:transformer/standard@v1";
     let parsed = ExtensionUri::parse(uri).expect("valid uri parses");
-    assert_eq!(parsed.namespace, "gllm");
-    assert_eq!(parsed.category, "transformer");
-    assert_eq!(parsed.name, "standard");
-    assert_eq!(parsed.version, "v1");
+    // ARTX03: ExtensionUri is a string newtype; parts are methods now.
+    assert_eq!(parsed.namespace(), "gllm");
+    assert_eq!(parsed.category(), "transformer");
+    assert_eq!(parsed.name(), "standard");
+    assert_eq!(parsed.version(), "v1");
     assert!(parsed.is_official());
     assert_eq!(parsed.to_string(), uri);
 }
@@ -61,7 +64,7 @@ fn test_extension_uri_parse() {
 fn test_extension_uri_moe() {
     let uri = "gllm:transformer/moe@v1";
     let parsed = ExtensionUri::parse(uri).expect("valid uri parses");
-    assert_eq!(parsed.name, "moe");
+    assert_eq!(parsed.name(), "moe");
 }
 
 #[test]
@@ -69,7 +72,7 @@ fn test_extension_uri_custom() {
     let uri = "myorg:custom/fused@v2";
     let parsed = ExtensionUri::parse(uri).expect("valid uri parses");
     assert!(!parsed.is_official());
-    assert_eq!(parsed.namespace, "myorg");
+    assert_eq!(parsed.namespace(), "myorg");
 }
 
 #[test]

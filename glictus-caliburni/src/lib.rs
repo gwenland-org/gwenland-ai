@@ -16,6 +16,7 @@ pub mod checksum;
 pub mod constants;
 pub mod error;
 pub mod execution_unit;
+pub mod manifest;
 pub mod package;
 pub mod shared;
 pub mod traits;
@@ -38,7 +39,7 @@ pub use types::{
     layer::LayerFile,
     manifest::GllmManifest,
     package::GllmPackageMeta,
-    tensor::{DType, Shape, TensorEntry},
+    tensor::{DType, TensorEntry},
 };
 pub use traits::{
     converter::GllmConverter,
