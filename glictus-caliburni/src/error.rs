@@ -27,6 +27,18 @@ pub enum GllmError {
     #[error("Missing execution unit: {0}")]
     MissingExecutionUnit(String),
 
+    #[error("Package is missing its manifest (gllm.json)")]
+    MissingManifest,
+
+    #[error("Package is missing its shared component (shared.gllm)")]
+    MissingSharedComponent,
+
+    #[error("Invalid package format: {0}")]
+    InvalidPackageFormat(String),
+
+    #[error("Integrity error: {0}")]
+    IntegrityError(String),
+
     #[error("Missing required metadata field: {0}")]
     MissingMetadata(String),
 
