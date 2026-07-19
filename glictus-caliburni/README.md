@@ -40,7 +40,9 @@ model.gllm/
 ## Status
 
 ARTX01 (types/traits boilerplate) + ARTX02 (package-level abstractions) +
-ARTX03 (manifest parsing & validation).
+ARTX03 (manifest parsing & validation) + ARTX04 (layer binary format:
+hybrid 16-byte header with tensor_count, tensor index codec,
+`LayerFile::read`, `write_unit_file`, manifest cross-check).
 
 What exists today:
 
@@ -60,10 +62,11 @@ What exists today:
 - `checksum` — streamed SHA-256, `checksums.sha256` parsing, verifier
 - `shared` — `SharedComponents` structural validation for `shared.gllm`
 
-What does **not** exist yet: the layer tensor binary format (ARTX04), runtime
-execution (ARTX05), and mmap + ZIP-archive reading (ARTX06). The traits
-describe the intended contract — they are not backed by working code in this
-crate. Known open problems are tracked in [`../notes/`](../notes/).
+What does **not** exist yet: reading tensor *data* (only locating it),
+quantization block interpretation (runtime plugin scope), runtime execution
+(ARTX05), and mmap + ZIP-archive reading (ARTX06). The traits describe the
+intended contract — they are not backed by working code in this crate.
+Known open problems are tracked in [`../notes/`](../notes/).
 
 ## Dependencies
 
