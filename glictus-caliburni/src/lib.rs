@@ -16,6 +16,7 @@ pub mod checksum;
 pub mod constants;
 pub mod error;
 pub mod execution_unit;
+pub mod layer_io;
 pub mod manifest;
 pub mod package;
 pub mod shared;
@@ -31,6 +32,7 @@ pub use error::{GllmError, GllmResult};
 pub use execution_unit::{
     ExecutionUnit, ExecutionUnitHeader, GLLM_CURRENT_VERSION, GLLM_HEADER_SIZE, GLLM_MAGIC,
 };
+pub use layer_io::{cross_check_manifest, read_entry, write_entry, write_unit_file};
 pub use manifest::{
     CustomMetadata, DType, DevicePlacement, ExtensionUri, FormatVersion, GllmManifest,
     LayerManifest, ManifestValidator, ModelMetadata, ProjectorManifest,

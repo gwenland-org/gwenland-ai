@@ -298,6 +298,32 @@ impl GllmPackage {
         Ok(self.layer_units[pos].insert(unit))
     }
 
+    /// Read and parse a layer's full binary tensor index (ARTX04).
+    /// Unlike [`Self::open_layer`] this parses the whole index, not just
+    /// the header; the result is not cached.
+    pub fn read_layer_file(&self, index: u32) -> Result<crate::types::layer::LayerFile, GllmError> {
+        let lp = self
+            .layout
+            .layer_path(index)
+            .ok_or(GllmError::LayerOutOfBounds {
+                index: index as usize,
+                max: self.layout.layer_count().saturating_sub(1),
+            })?;
+        crate::types::layer::LayerFile::read(&lp.path)
+    }
+
+    /// Cross-check a layer's binary tensor index against its manifest
+    /// entry. Empty result = consistent. Errors if the layer index is
+    /// unknown to layout or manifest.
+    pub fn cross_check_layer(&self, index: u32) -> Result<Vec<String>, GllmError> {
+        let layer = self.read_layer_file(index)?;
+        let manifest = self.layer_manifest(index).ok_or(GllmError::LayerOutOfBounds {
+            index: index as usize,
+            max: self.manifest.num_layers().saturating_sub(1),
+        })?;
+        Ok(crate::layer_io::cross_check_manifest(&layer, manifest))
+    }
+
     /// Verify every entry of the checksum file against the package root.
     ///
     /// Returns all `(filename, error)` failures without short-circuiting;
@@ -630,6 +656,23 @@ mod tests {
         assert_eq!(verifier.entries.len(), 3); // shared + 2 layers
         let failures = verifier.verify_all(tmp.path());
         assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[test]
+    fn test_package_read_layer_file_empty_index() {
+        // Fixture layers are pre-ARTX04 (tensor_count = 0): the full
+        // binary read must succeed with an empty index.
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 1);
+
+        let pkg = GllmPackage::open(tmp.path()).unwrap();
+        let layer = pkg.read_layer_file(0).unwrap();
+        assert!(layer.tensor_index.is_empty());
+        // Manifest fixture lists no layer tensors either → consistent.
+        assert!(pkg.cross_check_layer(0).unwrap().is_empty());
+
+        let err = pkg.read_layer_file(9).unwrap_err();
+        assert!(matches!(err, GllmError::LayerOutOfBounds { .. }), "got {err:?}");
     }
 
     #[test]
