@@ -12,6 +12,7 @@
 //! - **Fail Fast, Fail Loud** — checksum per file, detected at load time
 //! - **Extensibility Over Generality** — narrow focus, plugin for the rest
 
+pub mod checksum;
 pub mod constants;
 pub mod error;
 pub mod execution_unit;
@@ -23,6 +24,7 @@ pub mod types;
 pub(crate) mod test_helpers;
 
 // Re-exports untuk convenience
+pub use checksum::{ChecksumEntry, ChecksumVerifier, sha256_bytes, sha256_file};
 pub use error::{GllmError, GllmResult};
 pub use execution_unit::{
     ExecutionUnit, ExecutionUnitHeader, GLLM_CURRENT_VERSION, GLLM_HEADER_SIZE, GLLM_MAGIC,
