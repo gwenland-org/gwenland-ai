@@ -1,47 +1,54 @@
 ---
 title: Dua definisi binary header yang bersaing di glictus-caliburni
-status: open
+status: RESOLVED — hybrid layout (keputusan JinXSuper, 2026-07-19)
 severity: high
 found: 2026-07-19
-blocking: ARTX04 (layer binary format)
+resolved: 2026-07-19
+blocking: none (was ARTX04)
 files:
-  - glictus-caliburni/src/types/layer.rs
   - glictus-caliburni/src/execution_unit.rs
+  - glictus-caliburni/src/types/layer.rs
   - glictus-caliburni/src/constants.rs
 ---
 
-# Problem
+# Problem (historis)
 
-Crate `glictus-caliburni` sekarang punya **dua definisi header file binary yang
-saling bertentangan**, dua-duanya hidup dan dites:
+Crate punya dua definisi header binary yang bertentangan: `LayerHeader` ARTX01
+(12 byte: magic u32 + major/minor u8 + flags u16 + tensor_count u32) vs
+`ExecutionUnitHeader` ARTX02 (16 byte: magic + version u16 LE + flags +
+8 byte reserved). Spec ARTX04 kemudian memakai layout 12-byte untuk layer
+file — bertabrakan dengan yang sudah landed di runtime path.
 
-| | `LayerHeader` (ARTX01) | `ExecutionUnitHeader` (ARTX02) |
-|---|---|---|
-| File | [types/layer.rs](../glictus-caliburni/src/types/layer.rs) | [execution_unit.rs](../glictus-caliburni/src/execution_unit.rs) |
-| Ukuran | 12 byte | 16 byte |
-| Magic | u32 `0x474C4C4D` | 4 byte `b"GLLM"` (nilai sama) |
-| Versi | major u8 + minor u8 | single u16 little-endian |
-| Ekstra | flags u16 + tensor_count u32 | flags u16 + 8 byte reserved (wajib nol) |
+# Resolusi: HYBRID (dipilih JinXSuper saat review ARTX04)
 
-`ExecutionUnitHeader` adalah yang benar-benar dipakai runtime path
-(`ExecutionUnit::open`, `SharedComponents::open`, `GllmPackage::open`).
-`LayerHeader` tidak dibaca dari disk oleh siapapun — hanya dikonstruksi
-in-memory dan divalidasi di test `spec_artx01::test_layer_header_validate`.
+Satu header universal 16 byte untuk SEMUA unit file (shared/layer/projector),
+menggabungkan keduanya:
 
-# Kenapa belum dibereskan
+| Offset | Size | Isi | Asal |
+|---|---|---|---|
+| 0 | 4 | Magic `b"GLLM"` | keduanya (nilai identik) |
+| 4 | 2 | Version u16 LE | ARTX02 — byte-identical dengan major/minor u8 ARTX04 untuk v1.0 (`[0x01, 0x00]`) |
+| 6 | 2 | Flags (bitmask `types::layer::flags`) | keduanya |
+| 8 | 4 | Tensor count u32 LE | ARTX04 (menempati bekas reserved) |
+| 12 | 4 | Reserved, wajib nol | ARTX02 |
+| 16 | — | Tensor index mulai | **deviasi dari ARTX04** (spec bilang offset 12) |
 
-Rekonsiliasi butuh keputusan spec ARTX04 (layer binary format): apakah layer
-file punya sub-header sendiri (tensor_count, dst) SETELAH 16-byte
-ExecutionUnitHeader, atau `LayerHeader` memang mati.
+Implementasi: `ExecutionUnitHeader` sekarang membawa `tensor_count`
+(`new_v1_with_tensors`); `LayerHeader` DIHAPUS; `LayerFile.header` memakai
+`ExecutionUnitHeader`; test `spec_artx01::test_layer_header_validate`
+di-retarget ke kontrak hybrid. Landed v0.1.159.
 
-# Plan
+# Sisa yang perlu diingat untuk implementasi tensor index (ARTX04 lanjutan)
 
-1. Saat mengerjakan ARTX04, putuskan: kemungkinan besar `LayerHeader` ARTX01
-   dihapus dan diganti "layer section header" yang duduk setelah 16-byte
-   header universal (tensor_count pindah ke situ; index tensor per ARTX04).
-2. Migrasi `flags` bitmask (`types/layer.rs::flags`) ke tempat baru atau hapus.
-3. Update `constants.rs` — `GLLM_VERSION_MAJOR/MINOR` (u8+u8) menyisakan model
-   versi lama; ExecutionUnitHeader pakai u16 tunggal. Satukan ke satu sumber.
-4. Test `test_layer_header_validate` di `tests/spec_artx01.rs` di-update /
-   diganti test format ARTX04 (regression test ARTX01 boleh mati di sini
-   karena kontraknya memang diganti spec — declare di gate).
+- Tensor index entry per ARTX04: `name_len u16 + name + shape_len u8 +
+  shape u32[] + dtype u16 + offset u64 + size u64` — offset field relatif ke
+  region tensor data, dan region data aligned 64 byte
+  (`constants::TENSOR_ALIGNMENT`).
+- Shape di binary = u32 per dim; manifest `TensorEntry.shape` = `Vec<u64>` →
+  widen saat parse binary → manifest type.
+- `constants::GLLM_VERSION_MAJOR/MINOR` (u8+u8) masih ada sebagai konstanta
+  ARTX01; representasi runtime adalah `GLLM_CURRENT_VERSION: u16 = 1`.
+  Kalau suatu saat versi minor naik, pastikan konvensi byte (LE u16 vs
+  major,minor) diputuskan ulang — untuk 1.0 dua-duanya `[0x01, 0x00]`,
+  tapi u16 LE utk "1.1" = `[0x01+..]`... TIDAK identik lagi (LE: minor
+  jadi high byte). Keputusan versi 1.1+ harus eksplisit.

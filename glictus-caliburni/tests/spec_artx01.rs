@@ -7,7 +7,7 @@
 use glictus_caliburni::constants::GLLM_MAGIC;
 use glictus_caliburni::types::execution::Device;
 use glictus_caliburni::types::extension::ExtensionUri;
-use glictus_caliburni::types::layer::LayerHeader;
+use glictus_caliburni::ExecutionUnitHeader;
 use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::DType;
 
@@ -87,17 +87,17 @@ fn test_device_from_str() {
 
 #[test]
 fn test_layer_header_validate() {
-    let header = LayerHeader::new(10);
-    assert!(header.validate().is_ok());
+    // ARTX04 hybrid: the ARTX01 12-byte LayerHeader was retired; every
+    // unit file shares the 16-byte ExecutionUnitHeader, whose bytes 8..12
+    // now carry ARTX04's tensor_count. This pins the same contract the
+    // old test did: good header validates, bad magic is rejected.
+    let header = ExecutionUnitHeader::new_v1_with_tensors(10);
+    let parsed = ExecutionUnitHeader::parse(&header.to_bytes()).expect("valid header parses");
+    assert_eq!(parsed.tensor_count, 10);
 
-    let bad = LayerHeader {
-        magic: 0xDEADBEEF,
-        version_major: 1,
-        version_minor: 0,
-        flags: 0,
-        tensor_count: 0,
-    };
-    assert!(bad.validate().is_err());
+    let mut bad = header.to_bytes();
+    bad[0..4].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+    assert!(ExecutionUnitHeader::parse(&bad).is_err());
 }
 
 #[test]
