@@ -39,26 +39,31 @@ model.gllm/
 
 ## Status
 
-ARTX01 (types/traits boilerplate) + ARTX02 (package-level abstractions).
+ARTX01 (types/traits boilerplate) + ARTX02 (package-level abstractions) +
+ARTX03 (manifest parsing & validation).
 
 What exists today:
 
 - `constants` — magic bytes, format version, dtype codes, alignment
 - `error` — `GllmError` / `GllmResult`
-- `types` — `GllmManifest`, `GllmPackageMeta`, `LayerFile`, `TensorEntry`,
-  `DType`, `Device`, `DeviceMap`, `ExecutionUnitMeta`, `ExtensionUri`
+- `manifest` — `GllmManifest` (full `gllm.json` parsing), `ModelMetadata`,
+  `FormatVersion`, `TensorEntry`, `DType`, `ExtensionUri`,
+  `ManifestValidator` (rules V01–V17, errors + warnings)
+- `types` — `Device`, `DeviceMap`, `ExecutionUnitMeta`, `GllmPackageMeta`,
+  `LayerFile` (ARTX01 leftovers; tensor/extension/manifest are shims into
+  `manifest`)
 - `traits` — `GllmRuntime`, `LayerPlugin`, `GllmConverter` (definitions only;
   no implementations ship in this crate)
-- `package` — `GllmPackage` / `PackageLayout` discovery (directory mode;
-  ZIP-archive reading is deferred to the mmap work)
+- `package` — `GllmPackage::open` = discover + parse manifest + validate +
+  checksum-verify `shared.gllm`; lazy per-layer opens; integrity sweep
 - `execution_unit` — 16-byte file header parse/serialize, header-only `open`
 - `checksum` — streamed SHA-256, `checksums.sha256` parsing, verifier
 - `shared` — `SharedComponents` structural validation for `shared.gllm`
 
-What does **not** exist yet: manifest JSON parsing (ARTX03), the layer tensor
-binary format (ARTX04), runtime execution (ARTX05), and mmap (ARTX06). The
-traits describe the intended contract — they are not backed by working code
-in this crate.
+What does **not** exist yet: the layer tensor binary format (ARTX04), runtime
+execution (ARTX05), and mmap + ZIP-archive reading (ARTX06). The traits
+describe the intended contract — they are not backed by working code in this
+crate. Known open problems are tracked in [`../notes/`](../notes/).
 
 ## Dependencies
 

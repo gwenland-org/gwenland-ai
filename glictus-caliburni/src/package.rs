@@ -5,13 +5,14 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::checksum::ChecksumVerifier;
+use crate::checksum::{ChecksumEntry, ChecksumVerifier};
 use crate::constants::{
     CHECKSUMS_FILENAME, LAYER_FILE_EXTENSION, LAYER_FILE_PREFIX, MANIFEST_FILENAME,
     SHARED_FILENAME,
 };
 use crate::error::GllmError;
 use crate::execution_unit::ExecutionUnit;
+use crate::manifest::{GllmManifest, LayerManifest, ManifestValidator, ValidationResult};
 use crate::shared::SharedComponents;
 
 /// How the package is stored on disk.
@@ -180,42 +181,99 @@ fn optional_file(path: PathBuf) -> Option<PathBuf> {
 pub struct GllmPackage {
     /// Resolved paths for every execution unit.
     pub layout: PackageLayout,
-    /// Header-validated (and, when a checksum was available, verified)
-    /// `shared.gllm`.
+    /// Parsed and semantically validated `gllm.json`.
+    pub manifest: GllmManifest,
+    /// Header-validated, checksum-verified `shared.gllm`.
     pub shared: SharedComponents,
     /// Lazily opened layer units, parallel to `layout.layer_paths`.
     /// `None` = layer not yet opened.
     layer_units: Vec<Option<ExecutionUnit>>,
     /// Loaded from `checksums.sha256` when present.
     pub checksum_verifier: Option<ChecksumVerifier>,
+    /// Validation outcome from [`Self::open`] — errors are always empty
+    /// (fatal errors abort `open`), warnings are preserved.
+    pub validation: ValidationResult,
 }
 
 impl GllmPackage {
     /// Open a GLLM package at `root`.
     ///
-    /// Discovers the layout, loads `checksums.sha256` when present, and
-    /// opens `shared.gllm` — verifying its checksum if the checksum file
-    /// carries an entry for it. Layer files are NOT opened here (lazy).
+    /// Steps: discover layout → parse `gllm.json` → run the semantic
+    /// validator (fatal findings abort with
+    /// [`GllmError::ManifestValidationError`]) → open `shared.gllm`
+    /// verifying it against the manifest's checksum → load
+    /// `checksums.sha256` when present. Layer files stay unopened (lazy).
     pub fn open(root: &Path) -> Result<Self, GllmError> {
         let layout = PackageLayout::discover(root)?;
+
+        let manifest = GllmManifest::from_file(&layout.manifest_path)?;
+        let validation = ManifestValidator::new(&manifest).validate();
+        if !validation.is_ok() {
+            return Err(GllmError::ManifestValidationError(
+                validation.errors.join("; "),
+            ));
+        }
+
+        let shared_hex = manifest.shared.checksum_hex()?;
+        let shared = SharedComponents::open(&layout.shared_path, Some(&shared_hex))?;
 
         let checksum_verifier = match &layout.checksums_path {
             Some(path) => Some(ChecksumVerifier::from_file(path)?),
             None => None,
         };
 
-        let shared_checksum = checksum_verifier
-            .as_ref()
-            .and_then(|v| v.expected_for(SHARED_FILENAME));
-        let shared = SharedComponents::open(&layout.shared_path, shared_checksum)?;
-
         let layer_units = (0..layout.layer_count()).map(|_| None).collect();
         Ok(Self {
             layout,
+            manifest,
             shared,
             layer_units,
             checksum_verifier,
+            validation,
         })
+    }
+
+    /// The parsed manifest.
+    pub fn manifest(&self) -> &GllmManifest {
+        &self.manifest
+    }
+
+    /// Non-fatal validation warnings collected during [`Self::open`].
+    pub fn warnings(&self) -> &[String] {
+        &self.validation.warnings
+    }
+
+    /// True when validation produced warnings.
+    pub fn has_warnings(&self) -> bool {
+        self.validation.has_warnings()
+    }
+
+    /// Manifest entry for a layer by index (valid manifests have
+    /// position == index, enforced by validator rule V07).
+    pub fn layer_manifest(&self, index: u32) -> Option<&LayerManifest> {
+        self.manifest.layers.get(index as usize)
+    }
+
+    /// Build a [`ChecksumVerifier`] from the manifest's per-file
+    /// checksums — the alternative when `checksums.sha256` is absent.
+    pub fn verifier_from_manifest(&self) -> Result<ChecksumVerifier, GllmError> {
+        let mut entries = vec![ChecksumEntry {
+            filename: self.manifest.shared.file.clone(),
+            expected_sha256: self.manifest.shared.checksum_hex()?,
+        }];
+        for layer in &self.manifest.layers {
+            entries.push(ChecksumEntry {
+                filename: layer.file.clone(),
+                expected_sha256: layer.checksum_hex()?,
+            });
+        }
+        if let Some(projector) = &self.manifest.projector {
+            entries.push(ChecksumEntry {
+                filename: projector.file.clone(),
+                expected_sha256: projector.checksum_hex()?,
+            });
+        }
+        Ok(ChecksumVerifier::from_entries(entries))
     }
 
     /// Open and header-validate the layer with the given index.
@@ -372,15 +430,10 @@ mod tests {
         );
     }
 
-    /// Like `make_package_dir`, but every `.gllm` file carries a valid
-    /// GLLM header so `GllmPackage::open` accepts it.
-    fn make_valid_package_dir(dir: &Path, layer_indices: &[u32]) {
-        use crate::test_helpers::make_test_gllm_file;
-        fs::write(dir.join(MANIFEST_FILENAME), b"{}").unwrap();
-        make_test_gllm_file(&dir.join(SHARED_FILENAME));
-        for &i in layer_indices {
-            make_test_gllm_file(&dir.join(format!("layer_{i:03}.gllm")));
-        }
+    /// Full on-disk package with a valid manifest whose checksums match
+    /// the written files (ARTX03: `open` now parses + validates it).
+    fn make_valid_package_dir(dir: &Path, num_layers: u32) {
+        crate::test_helpers::fixtures::write_manifest_package(dir, num_layers);
     }
 
     /// Write a real checksums.sha256 covering shared + all layer files.
@@ -401,18 +454,19 @@ mod tests {
     #[test]
     fn test_package_open_minimal() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[]);
+        make_valid_package_dir(tmp.path(), 0);
 
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         assert_eq!(pkg.layer_count(), 0);
         assert!(!pkg.has_checksum_file());
-        assert!(!pkg.shared.is_verified());
+        // ARTX03: shared is always verified against the manifest checksum.
+        assert!(pkg.shared.is_verified());
     }
 
     #[test]
     fn test_package_open_with_layers() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0, 1, 2]);
+        make_valid_package_dir(tmp.path(), 3);
 
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         assert_eq!(pkg.layer_count(), 3);
@@ -421,7 +475,7 @@ mod tests {
     #[test]
     fn test_package_open_layer_lazy() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0, 1]);
+        make_valid_package_dir(tmp.path(), 2);
 
         let mut pkg = GllmPackage::open(tmp.path()).unwrap();
         let unit = pkg.open_layer(0).unwrap();
@@ -436,7 +490,7 @@ mod tests {
     #[test]
     fn test_package_open_layer_out_of_range() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0]);
+        make_valid_package_dir(tmp.path(), 1);
 
         let mut pkg = GllmPackage::open(tmp.path()).unwrap();
         let err = pkg.open_layer(7).unwrap_err();
@@ -449,7 +503,7 @@ mod tests {
     #[test]
     fn test_package_verify_integrity_no_checksum_file() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0]);
+        make_valid_package_dir(tmp.path(), 1);
 
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         assert!(!pkg.has_checksum_file());
@@ -459,7 +513,7 @@ mod tests {
     #[test]
     fn test_package_verify_integrity_with_checksums() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0, 1]);
+        make_valid_package_dir(tmp.path(), 2);
         write_checksums_file(tmp.path());
 
         let pkg = GllmPackage::open(tmp.path()).unwrap();
@@ -478,14 +532,120 @@ mod tests {
     #[test]
     fn test_package_open_rejects_corrupt_shared_checksum() {
         let tmp = tempfile::tempdir().unwrap();
-        make_valid_package_dir(tmp.path(), &[0]);
-        write_checksums_file(tmp.path());
-        // Corrupt shared.gllm after checksums were recorded (keep a valid
-        // header so only the checksum check can catch it).
+        make_valid_package_dir(tmp.path(), 1);
+        // Corrupt shared.gllm after the manifest recorded its checksum
+        // (keep a valid header so only the checksum check can catch it).
         let mut bytes = fs::read(tmp.path().join(SHARED_FILENAME)).unwrap();
         let last = bytes.len() - 1;
         bytes[last] ^= 0xFF;
         fs::write(tmp.path().join(SHARED_FILENAME), bytes).unwrap();
+
+        let err = GllmPackage::open(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, GllmError::ChecksumMismatch { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_package_open_with_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 2);
+
+        let pkg = GllmPackage::open(tmp.path()).unwrap();
+        assert_eq!(pkg.manifest().model_id, "org.gwenland.test-model");
+        assert_eq!(pkg.manifest().num_layers(), 2);
+        assert!(!pkg.has_warnings());
+    }
+
+    #[test]
+    fn test_package_open_manifest_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 1);
+        fs::write(tmp.path().join(MANIFEST_FILENAME), b"{ not json !").unwrap();
+
+        let err = GllmPackage::open(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, GllmError::ManifestParseError(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_package_open_manifest_validation_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 2);
+        // Valid JSON, inconsistent content: metadata claims 5 layers.
+        let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
+        fs::write(
+            tmp.path().join(MANIFEST_FILENAME),
+            manifest.replace("\"num_layers\":2", "\"num_layers\":5"),
+        )
+        .unwrap();
+
+        let err = GllmPackage::open(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, GllmError::ManifestValidationError(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_package_warnings_accessible() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 1);
+        // Same major, newer minor → loadable with a V02 warning.
+        let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
+        fs::write(
+            tmp.path().join(MANIFEST_FILENAME),
+            manifest.replace("\"1.0.0\"", "\"1.1.0\""),
+        )
+        .unwrap();
+
+        let pkg = GllmPackage::open(tmp.path()).unwrap();
+        assert!(pkg.has_warnings());
+        assert!(pkg.warnings()[0].contains("V02"), "{:?}", pkg.warnings());
+    }
+
+    #[test]
+    fn test_package_layer_manifest_lookup() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 3);
+
+        let pkg = GllmPackage::open(tmp.path()).unwrap();
+        let lm = pkg.layer_manifest(1).unwrap();
+        assert_eq!(lm.index, 1);
+        assert_eq!(lm.file, "layer_001.gllm");
+        assert!(pkg.layer_manifest(3).is_none());
+    }
+
+    #[test]
+    fn test_package_verifier_from_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 2);
+
+        let pkg = GllmPackage::open(tmp.path()).unwrap();
+        assert!(!pkg.has_checksum_file(), "no checksums.sha256 was written");
+        let verifier = pkg.verifier_from_manifest().unwrap();
+        assert_eq!(verifier.entries.len(), 3); // shared + 2 layers
+        let failures = verifier.verify_all(tmp.path());
+        assert!(failures.is_empty(), "failures: {failures:?}");
+    }
+
+    #[test]
+    fn test_package_open_manifest_validates_shared_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_valid_package_dir(tmp.path(), 1);
+        // Swap the manifest's shared checksum for a wrong (but
+        // well-formed) digest — the file itself is untouched.
+        let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
+        let shared_hex = crate::checksum::sha256_file(&tmp.path().join(SHARED_FILENAME)).unwrap();
+        let wrong = crate::checksum::sha256_bytes(b"wrong");
+        fs::write(
+            tmp.path().join(MANIFEST_FILENAME),
+            manifest.replace(&shared_hex, &wrong),
+        )
+        .unwrap();
 
         let err = GllmPackage::open(tmp.path()).unwrap_err();
         assert!(
