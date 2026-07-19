@@ -1,13 +1,20 @@
-//! Execution unit file header (ARTX02 Wave 2).
+//! Execution unit file header (ARTX02, revised by the ARTX04 hybrid
+//! decision — see `notes/gllm-layerheader-vs-executionunitheader.md`).
 //!
 //! Every `.gllm` file starts with a fixed 16-byte header:
 //!
 //! ```text
 //! Offset 0  | 4 bytes | Magic: b"GLLM"
-//! Offset 4  | 2 bytes | Version (u16 little-endian, currently 1)
-//! Offset 6  | 2 bytes | Flags (u16 little-endian, reserved — writers emit 0)
-//! Offset 8  | 8 bytes | Reserved, must be all zeros
+//! Offset 4  | 2 bytes | Version (u16 little-endian, currently 1 —
+//!           |         | byte-identical to ARTX04's major/minor u8 pair
+//!           |         | for v1.0)
+//! Offset 6  | 2 bytes | Flags (u16 little-endian; see types::layer::flags)
+//! Offset 8  | 4 bytes | Tensor count (u32 little-endian, from ARTX04)
+//! Offset 12 | 4 bytes | Reserved, must be all zeros
 //! ```
+//!
+//! The tensor index (ARTX04) begins at offset 16, not ARTX04's offset 12
+//! — the declared deviation of the hybrid layout.
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -30,9 +37,13 @@ pub const GLLM_CURRENT_VERSION: u16 = 1;
 pub struct ExecutionUnitHeader {
     /// Format version (little-endian u16 on disk).
     pub version: u16,
-    /// Reserved flag bits. Writers emit 0; readers carry the value through
-    /// without interpreting it.
+    /// Flag bits (endianness/compression bitmask, see
+    /// [`crate::types::layer::flags`]). Writers emit 0; readers carry the
+    /// value through without interpreting it.
     pub flags: u16,
+    /// Number of tensors in this unit's tensor index (ARTX04). 0 is valid
+    /// while the index itself is unimplemented (pre-ARTX04 files).
+    pub tensor_count: u32,
 }
 
 impl ExecutionUnitHeader {
@@ -58,12 +69,17 @@ impl ExecutionUnitHeader {
             return Err(GllmError::UnsupportedVersion { version });
         }
         let flags = u16::from_le_bytes([bytes[6], bytes[7]]);
-        if bytes[8..16].iter().any(|&b| b != 0) {
+        let tensor_count = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        if bytes[12..16].iter().any(|&b| b != 0) {
             return Err(GllmError::InvalidHeader(
-                "reserved bytes 8..16 must be zero".into(),
+                "reserved bytes 12..16 must be zero".into(),
             ));
         }
-        Ok(Self { version, flags })
+        Ok(Self {
+            version,
+            flags,
+            tensor_count,
+        })
     }
 
     /// Serialize the header to its 16-byte on-disk form.
@@ -72,14 +88,25 @@ impl ExecutionUnitHeader {
         out[0..4].copy_from_slice(GLLM_MAGIC);
         out[4..6].copy_from_slice(&self.version.to_le_bytes());
         out[6..8].copy_from_slice(&self.flags.to_le_bytes());
+        out[8..12].copy_from_slice(&self.tensor_count.to_le_bytes());
         out
     }
 
-    /// Create a default v1 header (flags = 0).
+    /// Create a default v1 header (flags = 0, no tensors indexed).
     pub fn new_v1() -> Self {
         Self {
             version: GLLM_CURRENT_VERSION,
             flags: 0,
+            tensor_count: 0,
+        }
+    }
+
+    /// Create a v1 header declaring `tensor_count` indexed tensors.
+    pub fn new_v1_with_tensors(tensor_count: u32) -> Self {
+        Self {
+            version: GLLM_CURRENT_VERSION,
+            flags: 0,
+            tensor_count,
         }
     }
 }
@@ -139,6 +166,16 @@ mod tests {
         let header = ExecutionUnitHeader::parse(&bytes).unwrap();
         assert_eq!(header.version, 1);
         assert_eq!(header.flags, 0);
+        assert_eq!(header.tensor_count, 0);
+    }
+
+    #[test]
+    fn test_header_tensor_count_roundtrip() {
+        // ARTX04 hybrid: tensor_count lives at bytes 8..12.
+        let header = ExecutionUnitHeader::new_v1_with_tensors(11);
+        let bytes = header.to_bytes();
+        assert_eq!(&bytes[8..12], &11u32.to_le_bytes());
+        assert_eq!(ExecutionUnitHeader::parse(&bytes).unwrap(), header);
     }
 
     #[test]
@@ -172,7 +209,11 @@ mod tests {
 
     #[test]
     fn test_header_to_bytes_roundtrip() {
-        let header = ExecutionUnitHeader { version: 1, flags: 0 };
+        let header = ExecutionUnitHeader {
+            version: 1,
+            flags: 0,
+            tensor_count: 24,
+        };
         let parsed = ExecutionUnitHeader::parse(&header.to_bytes()).unwrap();
         assert_eq!(parsed, header);
     }
