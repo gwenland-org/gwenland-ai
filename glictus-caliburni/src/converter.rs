@@ -1,0 +1,574 @@
+//! GGUF → GLLM converter (ARTX07-lite). Feature-gated behind
+//! `converter` so the core format library stays zero-workspace-dep.
+//!
+//! Pipeline (per ARTX7): parse GGUF → group tensors into shared/layers →
+//! write unit files via [`crate::layer_io::write_unit_file`] → generate
+//! `gllm.json` + `checksums.sha256` → re-open with [`GllmPackage`] and
+//! cross-check every layer as the final validation gate.
+//!
+//! Declared deviations from the ARTX7 spec text (lite scope):
+//! - RoPE tables are NOT materialized into `shared.gllm` — they are
+//!   derivable (Minimalism principle); the runtime computes them.
+//! - Unmapped non-`blk.*` tensors go to `shared.gllm` under their
+//!   original names (with a warning), not to `projector.gllm`.
+//! - Tokenizer is NOT packaged (the spec's own open question #3); a
+//!   warning is emitted. Runtimes must source the tokenizer elsewhere
+//!   until that question is settled.
+//! - GGUF dims are fastest-moving-first; manifest/binary shapes are
+//!   written row-major (reversed).
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use glcore::format::gguf::{GgufDType, GgufFile};
+
+use crate::checksum::sha256_file;
+use crate::constants::{CHECKSUMS_FILENAME, MANIFEST_FILENAME, SHARED_FILENAME};
+use crate::error::GllmError;
+use crate::layer_io::write_unit_file;
+use crate::manifest::{
+    CustomMetadata, DType, ExtensionUri, FormatVersion, GllmManifest, LayerManifest,
+    ModelMetadata, RUNTIME_FORMAT_VERSION, SharedManifest, TensorEntry, format_layer_filename,
+    known_extensions,
+};
+use crate::package::GllmPackage;
+
+/// Options for a conversion run.
+#[derive(Debug, Default)]
+pub struct ConvertOptions {
+    /// Override for the manifest `model_id` (default: GGUF `general.name`,
+    /// falling back to the input file stem).
+    pub model_id: Option<String>,
+}
+
+/// Summary of a successful conversion.
+#[derive(Debug)]
+pub struct ConvertReport {
+    /// Final `model_id` written to the manifest.
+    pub model_id: String,
+    /// Number of layer files written.
+    pub num_layers: u32,
+    /// Tensors placed in `shared.gllm`.
+    pub shared_tensors: usize,
+    /// Non-fatal notes (unmapped tensors, tokenizer skip, …).
+    pub warnings: Vec<String>,
+}
+
+fn convert_err(msg: impl Into<String>) -> GllmError {
+    GllmError::ValidationError(format!("converter: {}", msg.into()))
+}
+
+/// Map a GGUF/GGML dtype onto the GLLM dtype table. Loud error on types
+/// the format cannot represent — never a silent fallback.
+fn map_dtype(dtype: GgufDType, tensor: &str) -> Result<DType, GllmError> {
+    match dtype {
+        GgufDType::F32 => Ok(DType::F32),
+        GgufDType::F16 => Ok(DType::F16),
+        GgufDType::BF16 => Ok(DType::Bf16),
+        GgufDType::Q4_0 => Ok(DType::Q4_0),
+        GgufDType::Q5_0 => Ok(DType::Q5_0),
+        GgufDType::Q8_0 => Ok(DType::Q8_0),
+        GgufDType::Q4_K => Ok(DType::Q4K),
+        GgufDType::Q6_K => Ok(DType::Q6K),
+        GgufDType::Unknown(id) => Err(convert_err(format!(
+            "tensor {tensor}: unsupported ggml type id {id} (E004)"
+        ))),
+    }
+}
+
+/// GGUF stores dims fastest-moving first; GLLM shapes are row-major.
+fn row_major_shape(gguf_dims: &[u64]) -> Vec<u64> {
+    gguf_dims.iter().rev().copied().collect()
+}
+
+/// Where a GGUF tensor lands in the GLLM package.
+#[derive(Debug, PartialEq, Eq)]
+enum Dest {
+    /// `shared.gllm`, under the given GLLM tensor name.
+    Shared(String),
+    /// `layer_NNN.gllm`, under the given (stripped) tensor name.
+    Layer(u32, String),
+    /// Non-standard tensor routed to shared under its original name.
+    SharedUnmapped(String),
+}
+
+fn map_tensor_name(name: &str) -> Result<Dest, GllmError> {
+    match name {
+        "token_embd.weight" => Ok(Dest::Shared("token_embeddings".into())),
+        "output_norm.weight" => Ok(Dest::Shared("output_norm.weight".into())),
+        "output.weight" => Ok(Dest::Shared("output_head.weight".into())),
+        _ => {
+            if let Some(rest) = name.strip_prefix("blk.") {
+                let (idx, tensor) = rest.split_once('.').ok_or_else(|| {
+                    convert_err(format!("malformed layer tensor name {name:?}"))
+                })?;
+                let idx: u32 = idx.parse().map_err(|_| {
+                    convert_err(format!("non-numeric layer index in {name:?}"))
+                })?;
+                Ok(Dest::Layer(idx, tensor.to_string()))
+            } else {
+                Ok(Dest::SharedUnmapped(name.to_string()))
+            }
+        }
+    }
+}
+
+/// Fetch `{arch}.{key}` from GGUF metadata as u64.
+fn arch_meta_u64(gguf: &GgufFile, arch: &str, key: &str) -> Option<u64> {
+    gguf.get_meta(&format!("{arch}.{key}")).and_then(|v| v.as_u64())
+}
+
+/// Convert a GGUF file into a GLLM package directory.
+///
+/// Writes `gllm.json`, `shared.gllm`, `layer_NNN.gllm`, and
+/// `checksums.sha256` into `out_dir` (created if absent), then re-opens
+/// the result with [`GllmPackage::open`] and cross-checks every layer —
+/// the converter validates its own output rather than trusting the write
+/// path (ARTX7).
+pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertReport, GllmError> {
+    let input_str = input
+        .to_str()
+        .ok_or_else(|| convert_err("input path is not valid UTF-8"))?;
+    let gguf = GgufFile::open(input_str).map_err(|e| convert_err(format!("{input_str}: {e}")))?;
+    let mut warnings = Vec::new();
+
+    // --- Metadata mapping (ARTX7 §Metadata Extraction) ---
+    let arch = gguf
+        .get_meta("general.architecture")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| convert_err("missing general.architecture (E002)"))?
+        .to_string();
+    let num_layers = arch_meta_u64(&gguf, &arch, "block_count")
+        .ok_or_else(|| convert_err(format!("missing {arch}.block_count (E002)")))? as u32;
+    let embedding_length = arch_meta_u64(&gguf, &arch, "embedding_length")
+        .ok_or_else(|| convert_err(format!("missing {arch}.embedding_length (E002)")))?;
+    let context_length = arch_meta_u64(&gguf, &arch, "context_length")
+        .ok_or_else(|| convert_err(format!("missing {arch}.context_length (E002)")))?;
+    let num_heads = arch_meta_u64(&gguf, &arch, "attention.head_count")
+        .ok_or_else(|| convert_err(format!("missing {arch}.attention.head_count (E002)")))?
+        as u32;
+    let head_count_kv =
+        arch_meta_u64(&gguf, &arch, "attention.head_count_kv").map_or(num_heads, |v| v as u32);
+
+    let vocab_size = arch_meta_u64(&gguf, &arch, "vocab_size")
+        .or_else(|| {
+            gguf.get_meta("tokenizer.ggml.tokens")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() as u64)
+        })
+        .or_else(|| {
+            // Last resort: token_embd GGUF dims are [D, V] fastest-first.
+            gguf.find_tensor("token_embd.weight")
+                .and_then(|t| t.dimensions.last().copied())
+        })
+        .ok_or_else(|| convert_err("cannot determine vocab_size (E002)"))?;
+
+    let metadata = ModelMetadata {
+        vocab_size,
+        context_length,
+        embedding_length,
+        num_layers,
+        num_heads,
+        head_count_kv,
+        rope_dims: arch_meta_u64(&gguf, &arch, "rope.dimension_count").map(|v| v as u32),
+        rope_freq_base: gguf
+            .get_meta(&format!("{arch}.rope.freq_base"))
+            .and_then(|v| v.as_f32())
+            .map(f64::from),
+        rope_scaling: None,
+        expert_count: arch_meta_u64(&gguf, &arch, "expert_count").map(|v| v as u32),
+        expert_used_count: arch_meta_u64(&gguf, &arch, "expert_used_count").map(|v| v as u32),
+        sliding_window: arch_meta_u64(&gguf, &arch, "attention.sliding_window").map(|v| v as u32),
+        attention_bias: None,
+    };
+
+    let model_id = opts
+        .model_id
+        .clone()
+        .or_else(|| {
+            gguf.get_meta("general.name")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| input.file_stem().and_then(|s| s.to_str()).map(str::to_string))
+        .ok_or_else(|| convert_err("cannot determine model_id; pass --model-id"))?;
+
+    // --- Tensor grouping (ARTX7 §Layer Extraction), preserving GGUF file order ---
+    struct Planned {
+        gllm_name: String,
+        shape: Vec<u64>,
+        dtype: DType,
+        gguf_index: usize,
+    }
+    let mut shared_plan: Vec<Planned> = Vec::new();
+    let mut layer_plan: BTreeMap<u32, Vec<Planned>> = BTreeMap::new();
+    for (i, info) in gguf.tensors.iter().enumerate() {
+        let dtype = map_dtype(info.dtype, &info.name)?;
+        let shape = row_major_shape(&info.dimensions);
+        let planned = |gllm_name: String| Planned {
+            gllm_name,
+            shape: shape.clone(),
+            dtype,
+            gguf_index: i,
+        };
+        match map_tensor_name(&info.name)? {
+            Dest::Shared(name) => shared_plan.push(planned(name)),
+            Dest::SharedUnmapped(name) => {
+                warnings.push(format!(
+                    "tensor {name:?} has no standard GLLM mapping; stored in shared.gllm as-is"
+                ));
+                shared_plan.push(planned(name));
+            }
+            Dest::Layer(idx, name) => {
+                if idx >= num_layers {
+                    return Err(convert_err(format!(
+                        "tensor {} claims layer {idx} but {arch}.block_count is {num_layers}",
+                        info.name
+                    )));
+                }
+                layer_plan.entry(idx).or_default().push(planned(name));
+            }
+        }
+    }
+    for idx in 0..num_layers {
+        if !layer_plan.contains_key(&idx) {
+            return Err(convert_err(format!(
+                "no tensors found for layer {idx} (expected {num_layers} layers)"
+            )));
+        }
+    }
+    if gguf.get_meta("tokenizer.ggml.tokens").is_some() {
+        warnings.push(
+            "tokenizer metadata present in GGUF but NOT packaged — GLLM tokenizer \
+             packaging is an open spec question (ARTX1 OQ3)"
+                .into(),
+        );
+    }
+
+    // --- Write unit files ---
+    std::fs::create_dir_all(out_dir)?;
+    let write_group = |plans: &[Planned], path: &Path| -> Result<Vec<TensorEntry>, GllmError> {
+        let mut datas: Vec<&[u8]> = Vec::with_capacity(plans.len());
+        for p in plans {
+            let info = &gguf.tensors[p.gguf_index];
+            let bytes = gguf
+                .tensor_data(info)
+                .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
+            datas.push(bytes);
+        }
+        let spec: Vec<(&str, &[u64], DType, &[u8])> = plans
+            .iter()
+            .zip(&datas)
+            .map(|(p, d)| (p.gllm_name.as_str(), p.shape.as_slice(), p.dtype, *d))
+            .collect();
+        write_unit_file(path, &spec)
+    };
+
+    let shared_entries = write_group(&shared_plan, &out_dir.join(SHARED_FILENAME))?;
+    let mut layers: Vec<LayerManifest> = Vec::with_capacity(num_layers as usize);
+    let standard_uri = ExtensionUri(known_extensions::TRANSFORMER_STANDARD.to_string());
+    for (idx, plans) in &layer_plan {
+        let file = format_layer_filename(*idx);
+        let entries = write_group(plans, &out_dir.join(&file))?;
+        let checksum = format!("sha256:{}", sha256_file(&out_dir.join(&file))?);
+        layers.push(LayerManifest {
+            index: *idx,
+            file,
+            checksum,
+            layer_type: standard_uri.clone(),
+            tensors: entries,
+            device: None,
+        });
+    }
+
+    // --- Manifest + checksums file ---
+    let quantization = {
+        let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+        for p in layer_plan.values().flatten().filter(|p| p.dtype.is_quantized()) {
+            let name = serde_json::to_string(&p.dtype)
+                .map(|s| s.trim_matches('"').to_string())
+                .unwrap_or_default();
+            *counts.entry(name).or_default() += 1;
+        }
+        counts.into_iter().max_by_key(|(_, n)| *n).map(|(name, _)| name)
+    };
+    let manifest = GllmManifest {
+        gllm_version: FormatVersion(RUNTIME_FORMAT_VERSION.to_string()),
+        model_id: model_id.clone(),
+        architecture: arch,
+        parameters: None,
+        quantization,
+        metadata,
+        shared: SharedManifest {
+            file: SHARED_FILENAME.to_string(),
+            checksum: format!("sha256:{}", sha256_file(&out_dir.join(SHARED_FILENAME))?),
+            tensors: shared_entries,
+        },
+        layers,
+        projector: None,
+        extensions: vec![standard_uri],
+        custom_metadata: CustomMetadata::default(),
+    };
+    std::fs::write(out_dir.join(MANIFEST_FILENAME), manifest.to_json_pretty()?)?;
+
+    let mut checksum_lines = String::new();
+    checksum_lines.push_str(&format!(
+        "{}  {}\n",
+        manifest.shared.checksum_hex()?,
+        SHARED_FILENAME
+    ));
+    for layer in &manifest.layers {
+        checksum_lines.push_str(&format!("{}  {}\n", layer.checksum_hex()?, layer.file));
+    }
+    std::fs::write(out_dir.join(CHECKSUMS_FILENAME), checksum_lines)?;
+
+    // --- Final gate: re-open + cross-check own output (ARTX7 §Validation) ---
+    let pkg = GllmPackage::open(out_dir)?;
+    for idx in 0..num_layers {
+        let mismatches = pkg.cross_check_layer(idx)?;
+        if !mismatches.is_empty() {
+            return Err(GllmError::IntegrityError(format!(
+                "converter self-check failed for layer {idx}: {mismatches:?}"
+            )));
+        }
+    }
+    let failures = pkg.verify_integrity();
+    if !failures.is_empty() {
+        return Err(GllmError::IntegrityError(format!(
+            "converter self-check: checksum failures {failures:?}"
+        )));
+    }
+
+    Ok(ConvertReport {
+        model_id,
+        num_layers,
+        shared_tensors: shared_plan.len(),
+        warnings,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    // --- Minimal synthetic GGUF builder (v3, little-endian) ---
+
+    fn gstr(buf: &mut Vec<u8>, s: &str) {
+        buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        buf.extend_from_slice(s.as_bytes());
+    }
+
+    fn meta_str(buf: &mut Vec<u8>, key: &str, val: &str) {
+        gstr(buf, key);
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        gstr(buf, val);
+    }
+
+    fn meta_u32(buf: &mut Vec<u8>, key: &str, val: u32) {
+        gstr(buf, key);
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(&val.to_le_bytes());
+    }
+
+    /// F32 tensor: (name, gguf_dims fastest-first). Data = index-valued f32s.
+    fn synth_gguf(tensors: &[(&str, &[u64])], extra_meta: &[(&str, u32)]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&glcore::format::gguf::GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        let base_meta = 7 + extra_meta.len() as u64;
+        buf.extend_from_slice(&base_meta.to_le_bytes());
+
+        meta_str(&mut buf, "general.architecture", "llama");
+        meta_str(&mut buf, "general.name", "synth-model");
+        meta_u32(&mut buf, "llama.block_count", 2);
+        meta_u32(&mut buf, "llama.context_length", 128);
+        meta_u32(&mut buf, "llama.embedding_length", 8);
+        meta_u32(&mut buf, "llama.attention.head_count", 2);
+        meta_u32(&mut buf, "llama.vocab_size", 16);
+        for (k, v) in extra_meta {
+            meta_u32(&mut buf, k, *v);
+        }
+
+        // Tensor index: sequential offsets, 32-byte aligned.
+        let mut offset = 0u64;
+        for (name, dims) in tensors {
+            gstr(&mut buf, name);
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in *dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&0u32.to_le_bytes()); // F32
+            buf.extend_from_slice(&offset.to_le_bytes());
+            let numel: u64 = dims.iter().product();
+            offset = (offset + numel * 4).div_ceil(32) * 32;
+        }
+
+        let padded = buf.len().div_ceil(32) * 32;
+        buf.resize(padded, 0);
+        let mut cursor = 0u64;
+        for (_, dims) in tensors {
+            let numel: u64 = dims.iter().product();
+            for i in 0..numel {
+                buf.extend_from_slice(&(i as f32).to_le_bytes());
+            }
+            let end = (cursor + numel * 4).div_ceil(32) * 32;
+            buf.extend(std::iter::repeat_n(0u8, (end - cursor - numel * 4) as usize));
+            cursor = end;
+        }
+        buf
+    }
+
+    fn standard_tensors() -> Vec<(&'static str, &'static [u64])> {
+        vec![
+            ("token_embd.weight", &[8, 16][..]), // GGUF order [D, V]
+            ("output_norm.weight", &[8][..]),
+            ("blk.0.attn_q.weight", &[8, 8][..]),
+            ("blk.0.ffn_up.weight", &[8, 4][..]),
+            ("blk.1.attn_q.weight", &[8, 8][..]),
+            ("blk.1.ffn_up.weight", &[8, 4][..]),
+        ]
+    }
+
+    fn write_gguf(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join("model.gguf");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn convert_synthetic_gguf_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&standard_tensors(), &[]));
+        let out = tmp.path().join("out");
+
+        let report = convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+        assert_eq!(report.model_id, "synth-model");
+        assert_eq!(report.num_layers, 2);
+        assert_eq!(report.shared_tensors, 2);
+
+        // The package opens, validates, and cross-checks clean.
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert_eq!(pkg.layer_count(), 2);
+        assert!(pkg.has_checksum_file());
+        assert!(pkg.shared.is_verified());
+        assert!(pkg.verify_integrity().is_empty());
+
+        // Shape is row-major: GGUF [D=8, V=16] -> [16, 8].
+        let te = pkg.manifest().shared.tensor("token_embeddings").unwrap();
+        assert_eq!(te.shape, vec![16, 8]);
+
+        // Layer tensor names have the blk.N. prefix stripped.
+        let l0 = pkg.layer_manifest(0).unwrap();
+        assert!(l0.tensor("attn_q.weight").is_some());
+        assert!(l0.tensor("ffn_up.weight").is_some());
+
+        // head_count_kv falls back to num_heads when absent.
+        assert_eq!(pkg.manifest().metadata.head_count_kv, 2);
+    }
+
+    #[test]
+    fn convert_preserves_tensor_bytes_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&standard_tensors(), &[]));
+        let out = tmp.path().join("out");
+        convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+
+        // blk.0.attn_q.weight data = f32 values 0..64 by construction.
+        let layer = crate::types::layer::LayerFile::read(&out.join("layer_000.gllm")).unwrap();
+        let (off, size) = layer.absolute_range("attn_q.weight").unwrap();
+        let bytes = std::fs::read(out.join("layer_000.gllm")).unwrap();
+        let data = &bytes[off as usize..(off + size) as usize];
+        let vals: Vec<f32> = data
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert_eq!(vals.len(), 64);
+        assert_eq!(vals[0], 0.0);
+        assert_eq!(vals[63], 63.0);
+    }
+
+    #[test]
+    fn convert_gqa_metadata_mapped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bytes = synth_gguf(&standard_tensors(), &[("llama.attention.head_count_kv", 1)]);
+        let gguf_path = write_gguf(tmp.path(), &bytes);
+        let out = tmp.path().join("out");
+        convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert_eq!(pkg.manifest().metadata.head_count_kv, 1);
+        assert!(pkg.manifest().metadata.is_gqa());
+    }
+
+    #[test]
+    fn convert_unmapped_tensor_goes_to_shared_with_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tensors = standard_tensors();
+        tensors.push(("rope_freqs.weight", &[4][..]));
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&tensors, &[]));
+        let out = tmp.path().join("out");
+
+        let report = convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+        assert!(report.warnings.iter().any(|w| w.contains("rope_freqs.weight")));
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert!(pkg.manifest().shared.tensor("rope_freqs.weight").is_some());
+    }
+
+    #[test]
+    fn convert_missing_layer_tensors_fails_loud() {
+        let tmp = tempfile::tempdir().unwrap();
+        // block_count = 2 but only layer 0 tensors exist.
+        let tensors: Vec<(&str, &[u64])> = vec![
+            ("token_embd.weight", &[8, 16][..]),
+            ("output_norm.weight", &[8][..]),
+            ("blk.0.attn_q.weight", &[8, 8][..]),
+        ];
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&tensors, &[]));
+        let err = convert(&gguf_path, &tmp.path().join("out"), &ConvertOptions::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("no tensors found for layer 1"), "{err}");
+    }
+
+    #[test]
+    fn map_tensor_name_rules() {
+        assert_eq!(
+            map_tensor_name("token_embd.weight").unwrap(),
+            Dest::Shared("token_embeddings".into())
+        );
+        assert_eq!(
+            map_tensor_name("blk.12.attn_v.weight").unwrap(),
+            Dest::Layer(12, "attn_v.weight".into())
+        );
+        assert_eq!(
+            map_tensor_name("mystery.weight").unwrap(),
+            Dest::SharedUnmapped("mystery.weight".into())
+        );
+        assert!(map_tensor_name("blk.x.attn_q.weight").is_err());
+    }
+
+    /// Real-model conversion: opt-in via GWENLAND_TEST_GGUF (real GGUFs are
+    /// gitignored). Skips loudly when absent, per testing standards.
+    #[test]
+    fn convert_real_gguf_if_available() {
+        let Ok(path) = std::env::var("GWENLAND_TEST_GGUF") else {
+            eprintln!("SKIP: GWENLAND_TEST_GGUF not set (no real GGUF available)");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let report = convert(Path::new(&path), &out, &ConvertOptions::default()).unwrap();
+        eprintln!(
+            "converted {} ({} layers, {} shared tensors, {} warnings)",
+            report.model_id,
+            report.num_layers,
+            report.shared_tensors,
+            report.warnings.len()
+        );
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert_eq!(pkg.layer_count() as u32, report.num_layers);
+        assert!(pkg.verify_integrity().is_empty());
+    }
+}

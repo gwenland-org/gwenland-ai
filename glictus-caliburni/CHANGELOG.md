@@ -3,6 +3,28 @@
 GLLM (GwenLand Language Model Format), codename *Ictus Caliburni*.
 All notable changes to this crate. Dates are WIB/SEAST.
 
+## [0.1.161] — 2026-07-19 · ARTX07-lite: GGUF → GLLM converter
+
+- **`converter` module + `glconv` binary**, feature-gated behind
+  `converter` (pulls `glcore` for GGUF parsing) — the default build stays
+  zero-workspace-dep. Usage: `glconv <input.gguf> <out_dir> [--model-id]`.
+- Pipeline per ARTX7: GGUF parse → tensor grouping (`token_embd`/
+  `output_norm`/`output` → shared; `blk.N.*` → `layer_NNN` with prefix
+  stripped) → `write_unit_file` per unit → manifest + `checksums.sha256`
+  → **self-validation**: re-open via `GllmPackage::open` + cross-check
+  every layer + full integrity sweep.
+- Metadata mapping is architecture-prefix aware (`{arch}.block_count`,
+  …); `head_count_kv` falls back to `num_heads`; `vocab_size` from
+  `{arch}.vocab_size` → tokenizer token count → `token_embd` shape.
+- **New dtypes `Q5_0` (0x0015) and `Q6_K` (0x0018)** — real Q4_K_M GGUFs
+  carry Q5_0 fallback rows and Q6_K output heads.
+- Declared lite-scope deviations: RoPE tables not materialized
+  (derivable), unmapped tensors → shared with warning (not projector),
+  tokenizer NOT packaged (spec open question — warning emitted), GGUF
+  fastest-first dims reversed to row-major shapes.
+- Real-model test is opt-in via `GWENLAND_TEST_GGUF` (skips loudly).
+- Also: cleared new clippy-1.95 lint debt in `glcore` (tokenizer/gguf).
+
 ## [0.1.160] — 2026-07-19 · ARTX04 Waves 2–4: tensor index & layer I/O
 
 - **`layer_io` (new module):** binary tensor index codec per ARTX04 —

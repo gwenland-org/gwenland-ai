@@ -40,6 +40,11 @@ pub enum DType {
     /// 4-bit K-quant, small (`"Q4KS"` accepted as an alias)
     #[serde(rename = "Q4_K_S", alias = "Q4KS")]
     Q4Ks,
+    /// 5-bit quantization, block 32 (llama.cpp fallback rows)
+    Q5_0,
+    /// 6-bit K-quant, super-block 256 (typical GGUF output heads)
+    #[serde(rename = "Q6_K")]
+    Q6K,
     /// 8-bit block quantization
     Q8_0,
     /// 8-bit K-quant
@@ -69,6 +74,8 @@ impl DType {
             dtype_codes::Q4_K => Ok(Self::Q4K),
             dtype_codes::Q4_K_M => Ok(Self::Q4Km),
             dtype_codes::Q4_K_S => Ok(Self::Q4Ks),
+            dtype_codes::Q5_0 => Ok(Self::Q5_0),
+            dtype_codes::Q6_K => Ok(Self::Q6K),
             dtype_codes::Q8_0 => Ok(Self::Q8_0),
             dtype_codes::Q8_K => Ok(Self::Q8K),
             dtype_codes::I32 => Ok(Self::I32),
@@ -89,6 +96,8 @@ impl DType {
             Self::Q4K => dtype_codes::Q4_K,
             Self::Q4Km => dtype_codes::Q4_K_M,
             Self::Q4Ks => dtype_codes::Q4_K_S,
+            Self::Q5_0 => dtype_codes::Q5_0,
+            Self::Q6K => dtype_codes::Q6_K,
             Self::Q8_0 => dtype_codes::Q8_0,
             Self::Q8K => dtype_codes::Q8_K,
             Self::I32 => dtype_codes::I32,
@@ -116,6 +125,8 @@ impl DType {
             Self::F16 | Self::Bf16 => 2.0,
             Self::Fp8E4m3 | Self::Fp8E5m2 => 1.0,
             Self::Q8_0 | Self::Q8K => 1.0,
+            Self::Q5_0 => 22.0 / 32.0,  // GGML block: 22 bytes / 32 elements
+            Self::Q6K => 210.0 / 256.0, // GGML super-block: 210 bytes / 256 elements
             Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::Q4Km | Self::Q4Ks => 0.5,
             // Pessimistic guess for estimation; exact size must come from
             // the tensor entry's `size` field.
@@ -128,7 +139,7 @@ impl DType {
         matches!(
             self,
             Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::Q4Km | Self::Q4Ks
-                | Self::Q8_0 | Self::Q8K
+                | Self::Q5_0 | Self::Q6K | Self::Q8_0 | Self::Q8K
         )
     }
 }

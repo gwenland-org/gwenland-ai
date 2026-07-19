@@ -23,6 +23,16 @@ hardcoded `cuda:0` / `cuda:1`, dan saya implement persis begitu di
 
 Ini deviasi yang saya ikuti dari spec text, bukan bug implementasi.
 
+# Bukti tambahan dari seri spec lengkap (2026-07-19)
+
+Setelah ZIP spec dibaca: ARTX6 §Device Mapping memakai skema **berbeda lagi** —
+objek `device_map` dengan range (`{"default": "cuda:0", "layers": {"0-39":
+"cuda:0", "40-79": "cuda:1"}}`), dan ARTX10 memakai string `rank:0/cuda:0`
+untuk distributed. Tiga representasi device yang saling tidak kompatibel di
+satu seri spec (enum ARTX3, range-map ARTX6, rank-string ARTX10) —
+memperkuat usulan newtype string transparan + satu parser terpusat
+(`Device::from_str` sudah bisa `rank:`-style via `Device::Remote`).
+
 # Plan
 
 1. Usulan ke spec: ganti `DevicePlacement` jadi string newtype transparan
