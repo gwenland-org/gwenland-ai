@@ -39,20 +39,26 @@ model.gllm/
 
 ## Status
 
-`v0.1.0-boilerplate` — **types, traits, and constants only. No runtime.**
+ARTX01 (types/traits boilerplate) + ARTX02 (package-level abstractions).
 
 What exists today:
 
 - `constants` — magic bytes, format version, dtype codes, alignment
 - `error` — `GllmError` / `GllmResult`
-- `types` — `GllmManifest`, `GllmPackage`, `LayerFile`, `TensorEntry`,
-  `DType`, `Device`, `DeviceMap`, `ExtensionUri`
+- `types` — `GllmManifest`, `GllmPackageMeta`, `LayerFile`, `TensorEntry`,
+  `DType`, `Device`, `DeviceMap`, `ExecutionUnitMeta`, `ExtensionUri`
 - `traits` — `GllmRuntime`, `LayerPlugin`, `GllmConverter` (definitions only;
   no implementations ship in this crate)
+- `package` — `GllmPackage` / `PackageLayout` discovery (directory mode;
+  ZIP-archive reading is deferred to the mmap work)
+- `execution_unit` — 16-byte file header parse/serialize, header-only `open`
+- `checksum` — streamed SHA-256, `checksums.sha256` parsing, verifier
+- `shared` — `SharedComponents` structural validation for `shared.gllm`
 
-What does **not** exist yet: reading or writing a `.gllm` file, checksum
-verification, mmap, and every backend implementation. The traits describe the
-intended contract — they are not backed by working code in this crate.
+What does **not** exist yet: manifest JSON parsing (ARTX03), the layer tensor
+binary format (ARTX04), runtime execution (ARTX05), and mmap (ARTX06). The
+traits describe the intended contract — they are not backed by working code
+in this crate.
 
 ## Dependencies
 

@@ -8,7 +8,7 @@ use glictus_caliburni::constants::GLLM_MAGIC;
 use glictus_caliburni::types::execution::Device;
 use glictus_caliburni::types::extension::ExtensionUri;
 use glictus_caliburni::types::layer::LayerHeader;
-use glictus_caliburni::types::package::GllmPackage;
+use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::DType;
 
 #[test]
@@ -99,7 +99,7 @@ fn test_layer_header_validate() {
 
 #[test]
 fn test_layer_expected_filename() {
-    assert_eq!(GllmPackage::expected_layer_filename(0), "layer_000.gllm");
-    assert_eq!(GllmPackage::expected_layer_filename(42), "layer_042.gllm");
-    assert_eq!(GllmPackage::expected_layer_filename(79), "layer_079.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(0), "layer_000.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(42), "layer_042.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(79), "layer_079.gllm");
 }

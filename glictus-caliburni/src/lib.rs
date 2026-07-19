@@ -30,14 +30,14 @@ pub use error::{GllmError, GllmResult};
 pub use execution_unit::{
     ExecutionUnit, ExecutionUnitHeader, GLLM_CURRENT_VERSION, GLLM_HEADER_SIZE, GLLM_MAGIC,
 };
-pub use package::{LayerPath, PackageFormat, PackageLayout};
+pub use package::{GllmPackage, LayerPath, PackageFormat, PackageLayout};
 pub use shared::SharedComponents;
 pub use types::{
     execution::{Device, DeviceMap, ExecutionUnitMeta},
     extension::ExtensionUri,
     layer::LayerFile,
     manifest::GllmManifest,
-    package::GllmPackage,
+    package::GllmPackageMeta,
     tensor::{DType, Shape, TensorEntry},
 };
 pub use traits::{
