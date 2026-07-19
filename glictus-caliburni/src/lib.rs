@@ -14,11 +14,13 @@
 
 pub mod constants;
 pub mod error;
+pub mod package;
 pub mod traits;
 pub mod types;
 
 // Re-exports untuk convenience
 pub use error::{GllmError, GllmResult};
+pub use package::{LayerPath, PackageFormat, PackageLayout};
 pub use types::{
     execution::{Device, DeviceMap, ExecutionUnit},
     extension::ExtensionUri,

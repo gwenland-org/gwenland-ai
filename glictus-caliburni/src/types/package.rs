@@ -13,11 +13,9 @@ pub struct GllmPackage {
     pub format: PackageFormat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackageFormat {
-    Directory,
-    Zip,
-}
+// PackageFormat moved to the package-level module in ARTX02 (Wave 1);
+// re-exported here so the ARTX01 path keeps working.
+pub use crate::package::PackageFormat;
 
 impl GllmPackage {
     pub fn manifest_path(&self) -> PathBuf {
