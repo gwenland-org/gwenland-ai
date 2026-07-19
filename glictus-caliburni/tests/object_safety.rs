@@ -9,7 +9,7 @@ use std::path::Path;
 
 use glictus_caliburni::error::GllmResult;
 use glictus_caliburni::types::execution::Device;
-use glictus_caliburni::types::package::GllmPackage;
+use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::{DType, TensorEntry};
 use glictus_caliburni::{GllmConverter, GllmRuntime, LayerPlugin};
 
@@ -21,7 +21,7 @@ struct StubRuntime {
 }
 
 impl GllmRuntime for StubRuntime {
-    fn load_package(&mut self, _package: &GllmPackage) -> GllmResult<()> {
+    fn load_package(&mut self, _package: &GllmPackageMeta) -> GllmResult<()> {
         self.loaded = true;
         Ok(())
     }
@@ -81,13 +81,13 @@ impl GllmConverter for StubConverter {
         "stub"
     }
 
-    fn convert(&self, _source: &Path, _output_dir: &Path) -> GllmResult<GllmPackage> {
+    fn convert(&self, _source: &Path, _output_dir: &Path) -> GllmResult<GllmPackageMeta> {
         Err(glictus_caliburni::GllmError::ValidationError(
             "stub converter does not convert".into(),
         ))
     }
 
-    fn validate(&self, _package: &GllmPackage) -> GllmResult<()> {
+    fn validate(&self, _package: &GllmPackageMeta) -> GllmResult<()> {
         Ok(())
     }
 }

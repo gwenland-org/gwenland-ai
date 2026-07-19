@@ -102,7 +102,7 @@ impl GgufDType {
     pub fn tensor_bytes(&self, numel: usize) -> Option<usize> {
         let bn = self.block_numel()?;
         let bb = self.block_bytes()?;
-        if numel % bn != 0 {
+        if !numel.is_multiple_of(bn) {
             return None;
         }
         Some(numel / bn * bb)

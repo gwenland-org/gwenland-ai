@@ -33,6 +33,11 @@ pub mod dtype_codes {
     pub const Q4_K: u16 = 0x0012;
     pub const Q4_K_M: u16 = 0x0013;
     pub const Q4_K_S: u16 = 0x0014;
+    // 0x0015 / 0x0018: added for the GGUF converter (ARTX07) — real
+    // Q4_K_M models carry Q5_0 fallback rows and Q6_K output heads.
+    // Format not yet frozen, so this is an addition, not a minor bump.
+    pub const Q5_0: u16 = 0x0015;
+    pub const Q6_K: u16 = 0x0018;
     pub const Q8_0: u16 = 0x0020;
     pub const Q8_K: u16 = 0x0021;
     pub const I32: u16 = 0x0030;
