@@ -51,9 +51,13 @@ impl std::str::FromStr for Device {
     }
 }
 
-/// Execution unit — smallest independently loadable unit
+/// Manifest-level metadata about an execution unit (ARTX01).
+///
+/// Renamed from `ExecutionUnit` in ARTX02: the file-handle type in
+/// [`crate::execution_unit`] now owns that name; this struct is the
+/// manifest's *description* of a unit, not an opened file.
 #[derive(Debug, Clone)]
-pub struct ExecutionUnit {
+pub struct ExecutionUnitMeta {
     pub id: ExecutionUnitId,
     pub file: String,
     pub checksum: String,

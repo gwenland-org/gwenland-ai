@@ -11,8 +11,11 @@ pub enum GllmError {
     #[error("Invalid magic bytes: expected GLLM (0x474C4C4D), got 0x{0:08X}")]
     InvalidMagic(u32),
 
-    #[error("Unsupported format version: {major}.{minor}")]
-    UnsupportedVersion { major: u8, minor: u8 },
+    #[error("Unsupported format version: {version}")]
+    UnsupportedVersion { version: u16 },
+
+    #[error("Invalid header: {0}")]
+    InvalidHeader(String),
 
     #[error("Manifest parse error: {0}")]
     ManifestParse(#[from] serde_json::Error),
