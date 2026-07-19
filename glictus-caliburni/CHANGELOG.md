@@ -25,6 +25,21 @@ All notable changes to this crate. Dates are WIB/SEAST.
 - Real-model test is opt-in via `GWENLAND_TEST_GGUF` (skips loudly).
 - Also: cleared new clippy-1.95 lint debt in `glcore` (tokenizer/gguf).
 
+**Verified on real models** (2026-07-19, i3-1115G4 / Windows 11), each
+converted then byte-compared against its GGUF source via
+`examples/verify_bytes.rs`:
+
+| Model | Arch | Quant | Layers | Tensors | Verified |
+|---|---|---|---|---|---|
+| Qwen2.5-0.5B-Instruct Q4_K_M | qwen2 | Q5_0 | 24 | 291 | 462.96 MB |
+| Qwen2.5-1.5B-Instruct Q4_K_M | qwen2 | Q4_K | 28 | 339 | 1059.89 MB |
+| Qwen3-1.7B Q8_0 | qwen3 | Q8_0 | 28 | 310 | 1743.77 MB |
+
+All tensor bytes identical; package total is ~1.2% *smaller* than the
+source GGUF (its inter-tensor padding is not reproduced). Conversion of
+the 0.5B took ~7 s. Qwen3's tied embeddings (no separate `output.weight`)
+are handled without special-casing — it simply yields 2 shared tensors.
+
 ## [0.1.160] — 2026-07-19 · ARTX04 Waves 2–4: tensor index & layer I/O
 
 - **`layer_io` (new module):** binary tensor index codec per ARTX04 —
