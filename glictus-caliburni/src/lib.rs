@@ -17,6 +17,7 @@ pub mod constants;
 pub mod error;
 pub mod execution_unit;
 pub mod package;
+pub mod shared;
 pub mod traits;
 pub mod types;
 
@@ -30,6 +31,7 @@ pub use execution_unit::{
     ExecutionUnit, ExecutionUnitHeader, GLLM_CURRENT_VERSION, GLLM_HEADER_SIZE, GLLM_MAGIC,
 };
 pub use package::{LayerPath, PackageFormat, PackageLayout};
+pub use shared::SharedComponents;
 pub use types::{
     execution::{Device, DeviceMap, ExecutionUnitMeta},
     extension::ExtensionUri,
