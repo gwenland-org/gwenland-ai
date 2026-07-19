@@ -57,6 +57,33 @@ pub enum GllmError {
     #[error("Package validation failed: {0}")]
     ValidationError(String),
 
+    #[error("Manifest parse error: {0}")]
+    ManifestParseError(String),
+
+    #[error("Manifest validation failed: {0}")]
+    ManifestValidationError(String),
+
+    #[error("Invalid extension URI: {0}")]
+    InvalidExtensionUri(String),
+
+    #[error("Unknown layer type: {0}")]
+    UnknownLayerType(String),
+
+    #[error("Missing required manifest field: {0}")]
+    MissingRequiredField(String),
+
+    #[error("Layer index gap: expected {expected}, found {found}")]
+    LayerIndexGap { expected: u32, found: u32 },
+
+    #[error("Invalid tensor entry: {0}")]
+    TensorEntryInvalid(String),
+
+    #[error("Format version mismatch: manifest {manifest_version}, runtime supports {supported}")]
+    VersionMismatch {
+        manifest_version: String,
+        supported: String,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
