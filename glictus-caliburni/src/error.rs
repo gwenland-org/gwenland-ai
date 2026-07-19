@@ -11,8 +11,11 @@ pub enum GllmError {
     #[error("Invalid magic bytes: expected GLLM (0x474C4C4D), got 0x{0:08X}")]
     InvalidMagic(u32),
 
-    #[error("Unsupported format version: {major}.{minor}")]
-    UnsupportedVersion { major: u8, minor: u8 },
+    #[error("Unsupported format version: {version}")]
+    UnsupportedVersion { version: u16 },
+
+    #[error("Invalid header: {0}")]
+    InvalidHeader(String),
 
     #[error("Manifest parse error: {0}")]
     ManifestParse(#[from] serde_json::Error),
@@ -26,6 +29,18 @@ pub enum GllmError {
 
     #[error("Missing execution unit: {0}")]
     MissingExecutionUnit(String),
+
+    #[error("Package is missing its manifest (gllm.json)")]
+    MissingManifest,
+
+    #[error("Package is missing its shared component (shared.gllm)")]
+    MissingSharedComponent,
+
+    #[error("Invalid package format: {0}")]
+    InvalidPackageFormat(String),
+
+    #[error("Integrity error: {0}")]
+    IntegrityError(String),
 
     #[error("Missing required metadata field: {0}")]
     MissingMetadata(String),
@@ -41,6 +56,33 @@ pub enum GllmError {
 
     #[error("Package validation failed: {0}")]
     ValidationError(String),
+
+    #[error("Manifest parse error: {0}")]
+    ManifestParseError(String),
+
+    #[error("Manifest validation failed: {0}")]
+    ManifestValidationError(String),
+
+    #[error("Invalid extension URI: {0}")]
+    InvalidExtensionUri(String),
+
+    #[error("Unknown layer type: {0}")]
+    UnknownLayerType(String),
+
+    #[error("Missing required manifest field: {0}")]
+    MissingRequiredField(String),
+
+    #[error("Layer index gap: expected {expected}, found {found}")]
+    LayerIndexGap { expected: u32, found: u32 },
+
+    #[error("Invalid tensor entry: {0}")]
+    TensorEntryInvalid(String),
+
+    #[error("Format version mismatch: manifest {manifest_version}, runtime supports {supported}")]
+    VersionMismatch {
+        manifest_version: String,
+        supported: String,
+    },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

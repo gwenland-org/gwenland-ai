@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::error::GllmResult;
-use crate::types::package::GllmPackage;
+use crate::types::package::GllmPackageMeta;
 
 /// Converter trait — transforms a source format into a GLLM package.
 ///
@@ -22,8 +22,8 @@ pub trait GllmConverter {
     fn source_format(&self) -> &str;
 
     /// Convert the source model into a GLLM package under `output_dir`.
-    fn convert(&self, source: &Path, output_dir: &Path) -> GllmResult<GllmPackage>;
+    fn convert(&self, source: &Path, output_dir: &Path) -> GllmResult<GllmPackageMeta>;
 
     /// Validate a converted package.
-    fn validate(&self, package: &GllmPackage) -> GllmResult<()>;
+    fn validate(&self, package: &GllmPackageMeta) -> GllmResult<()>;
 }

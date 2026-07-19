@@ -1,6 +1,6 @@
 use crate::error::GllmResult;
 use crate::types::execution::Device;
-use crate::types::package::GllmPackage;
+use crate::types::package::GllmPackageMeta;
 
 /// Core runtime trait — implemented by CPU/CUDA/Vulkan/Metal runtimes.
 ///
@@ -28,7 +28,7 @@ use crate::types::package::GllmPackage;
 /// any new callback-taking method.
 pub trait GllmRuntime: Send + Sync {
     /// Load a GLLM package — validate checksums, parse manifest.
-    fn load_package(&mut self, package: &GllmPackage) -> GllmResult<()>;
+    fn load_package(&mut self, package: &GllmPackageMeta) -> GllmResult<()>;
 
     /// Execute inference on the loaded package, returning logits.
     fn infer(&mut self, input_ids: &[u32]) -> GllmResult<Vec<f32>>;

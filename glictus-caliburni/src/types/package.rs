@@ -2,9 +2,13 @@ use std::path::PathBuf;
 use crate::error::{GllmError, GllmResult};
 use crate::types::manifest::GllmManifest;
 
-/// Represents a loaded GLLM package (directory or ZIP)
+/// Manifest-level description of a GLLM package (ARTX01).
+///
+/// Renamed from `GllmPackage` in ARTX02: the opened-package handle in
+/// [`crate::package`] now owns that name; this struct is the manifest's
+/// *description* of a package, with paths derived from it.
 #[derive(Debug, Clone)]
-pub struct GllmPackage {
+pub struct GllmPackageMeta {
     /// Root directory atau ZIP path
     pub root: PathBuf,
     /// Parsed manifest
@@ -13,13 +17,11 @@ pub struct GllmPackage {
     pub format: PackageFormat,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PackageFormat {
-    Directory,
-    Zip,
-}
+// PackageFormat moved to the package-level module in ARTX02 (Wave 1);
+// re-exported here so the ARTX01 path keeps working.
+pub use crate::package::PackageFormat;
 
-impl GllmPackage {
+impl GllmPackageMeta {
     pub fn manifest_path(&self) -> PathBuf {
         self.root.join("gllm.json")
     }
