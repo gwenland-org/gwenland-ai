@@ -14,6 +14,8 @@
 
 pub mod checksum;
 pub mod constants;
+#[cfg(feature = "converter")]
+pub mod converter;
 pub mod error;
 pub mod execution_unit;
 pub mod layer_io;

@@ -2493,8 +2493,9 @@ dependencies = [
 
 [[package]]
 name = "glictus-caliburni"
-version = "0.1.155"
+version = "0.1.161"
 dependencies = [
+ "glcore",
  "serde",
  "serde_json",
  "sha2",

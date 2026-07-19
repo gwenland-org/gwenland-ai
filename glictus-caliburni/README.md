@@ -42,7 +42,10 @@ model.gllm/
 ARTX01 (types/traits boilerplate) + ARTX02 (package-level abstractions) +
 ARTX03 (manifest parsing & validation) + ARTX04 (layer binary format:
 hybrid 16-byte header with tensor_count, tensor index codec,
-`LayerFile::read`, `write_unit_file`, manifest cross-check).
+`LayerFile::read`, `write_unit_file`, manifest cross-check) + ARTX07-lite
+(GGUF → GLLM converter: `converter` module + `glconv` bin behind the
+`converter` feature — the only feature that pulls a workspace dep,
+`glcore`, for GGUF parsing; the default build stays zero-workspace-dep).
 
 What exists today:
 

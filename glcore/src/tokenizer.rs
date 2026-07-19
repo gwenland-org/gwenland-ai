@@ -92,6 +92,9 @@ fn gpt2_byte_map() -> (Vec<char>, HashMap<char, u8>) {
 }
 
 impl Tokenizer {
+    // The argument list mirrors the fields parsed from tokenizer metadata;
+    // bundling them into a struct would just rename the problem.
+    #[allow(clippy::too_many_arguments)]
     fn build(
         id_to_token: Vec<String>,
         merges: Vec<(String, String)>,
@@ -306,11 +309,10 @@ impl Tokenizer {
                     }
                     match content {
                         "<s>" | "<|startoftext|>" | "<|begin_of_text|>" => bos_id = Some(id),
-                        "</s>" | "<|endoftext|>" | "<|end_of_text|>" | "<|im_end|>" => {
-                            if eos_id.is_none() {
+                        "</s>" | "<|endoftext|>" | "<|end_of_text|>" | "<|im_end|>"
+                            if eos_id.is_none() => {
                                 eos_id = Some(id);
                             }
-                        }
                         _ => {}
                     }
                 }
@@ -363,7 +365,7 @@ impl Tokenizer {
                         .copied()
                         // No scores? Prefer longer merges, then leftmost.
                         .unwrap_or(cat.chars().count() as f32);
-                    if best.map_or(true, |(_, s)| score > s) {
+                    if best.is_none_or(|(_, s)| score > s) {
                         best = Some((i, score));
                     }
                 }
@@ -409,7 +411,7 @@ impl Tokenizer {
                 for i in 0..symbols.len().saturating_sub(1) {
                     let key = (symbols[i].clone(), symbols[i + 1].clone());
                     if let Some(&rank) = self.merge_ranks.get(&key) {
-                        if best.map_or(true, |(_, r)| rank < r) {
+                        if best.is_none_or(|(_, r)| rank < r) {
                             best = Some((i, rank));
                         }
                     }
@@ -662,8 +664,8 @@ mod tests {
         // Byte-level vocab: every mapped single byte is a token; no merges.
         let (byte_to_char, _) = gpt2_byte_map();
         let mut tokens: Vec<String> = vec!["<|endoftext|>".into()];
-        for b in 0..=255usize {
-            tokens.push(byte_to_char[b].to_string());
+        for c in byte_to_char.iter().take(256) {
+            tokens.push(c.to_string());
         }
         // one merge: "H" + "i" -> "Hi"
         tokens.push("Hi".into());
@@ -705,8 +707,8 @@ mod tests {
         // points at <|endoftext|> but <|im_end|> must stop generation too.
         let (byte_to_char, _) = gpt2_byte_map();
         let mut tokens: Vec<String> = vec!["<|endoftext|>".into(), "<|im_end|>".into()];
-        for b in 0..=255usize {
-            tokens.push(byte_to_char[b].to_string());
+        for c in byte_to_char.iter().take(256) {
+            tokens.push(c.to_string());
         }
         let mut specials = HashSet::new();
         specials.insert(0);
@@ -733,8 +735,8 @@ mod tests {
         let (byte_to_char, _) = gpt2_byte_map();
         let mut tokens: Vec<String> =
             vec!["<|endoftext|>".into(), "<|im_start|>".into(), "<|im_end|>".into()];
-        for b in 0..=255usize {
-            tokens.push(byte_to_char[b].to_string());
+        for c in byte_to_char.iter().take(256) {
+            tokens.push(c.to_string());
         }
         let mut specials = HashSet::new();
         specials.insert(0);
