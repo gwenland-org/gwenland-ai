@@ -243,7 +243,7 @@ impl LayerManifest {
 /// Optional `projector.gllm` descriptor (multimodal models).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectorManifest {
-    /// Relative filename, normally `"projector.gllm"`.
+    /// Relative filename, normally `"GLLMProj.gllm"`.
     pub file: String,
     /// SHA-256 checksum, prefixed: `"sha256:<hex>"`.
     pub checksum: String,

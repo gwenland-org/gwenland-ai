@@ -3,6 +3,46 @@
 GLLM (GwenLand Language Model Format), codename *Ictus Caliburni*.
 All notable changes to this crate. Dates are WIB/SEAST.
 
+## [Unreleased] — ARTX08: layer-type extension registry
+
+- **`PluginRegistry`** maps extension URIs to [`LayerPlugin`]s, with exact
+  version matching (`@v2` never serves `@v1`, per ARTX8 §Plugin Versioning) and
+  refusal on duplicate registration — two plugins disagreeing about one layer
+  type is a wiring bug, and last-one-wins would make behaviour depend on
+  registration order.
+- **Five built-in types**: standard transformer, MoE, MLA, Mamba, linear
+  projector. `GllmPackage::validate_layer_types` checks every layer's binary
+  tensor index against its declared type and reports *all* findings.
+- MoE validation counts experts rather than naming them: experts `0..=max` must
+  each carry all three projections. A half-populated expert would otherwise
+  surface as silently wrong routing, not a load error. Verified up to 128
+  experts (Qwen3 MoE scale).
+
+**`LayerPlugin` no longer executes.** ARTX8's sketch gave plugins an
+`execute(inputs, outputs)` method; that is gone. A plugin now *describes* a
+layer type (required tensors, layout, memory, dtype support) and all
+computation stays on the single `ExecutionBackend` path into glproc/glcuda
+(ARTX05 AD-02). A plugin that could execute would be a second compute path
+inside a crate designed to have none.
+
+**Dynamic plugin loading is not implemented.** ARTX8 §Plugin Loading specifies
+`dlopen`-ing shared libraries from `/usr/lib/gllm/plugins/` via an
+`extern "C"` hook. That needs C bindings (`inference-first.md` rule 6) and
+loads arbitrary native code from a filesystem path into the inference process.
+Plugins are registered in-process from Rust instead; URI resolution,
+versioning, and layout validation all work without it.
+
+⚠️ **ARTX4's tensor names are wrong for real models.** The spec's prose calls
+the transformer norms `input_norm.weight` / `post_attn_norm.weight`. Real
+converted packages carry `attn_norm.weight` / `ffn_norm.weight` — the GGUF
+names the ARTX7 converter preserves. Transcribing the spec rejected all 24
+layers of a package that is byte-identical to its source. The plugin uses the
+real names; MLA and MoE layouts are still spec-transcribed and are flagged
+**unverified** in their doc comments, since no such model has been converted.
+
+Verified on the three real packages: 80 layers across Qwen2.5-0.5B, 1.5B and
+Qwen3-1.7B all validate, including Qwen3's bias-free attention.
+
 ## [0.1.162] — 2026-07-20 · ARTX05 + ARTX06: layer-sequential runtime
 
 > **Breaking**, despite the patch-level bump (pre-1.0, crate has no external
