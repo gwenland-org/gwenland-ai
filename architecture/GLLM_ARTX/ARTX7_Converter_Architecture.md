@@ -1,8 +1,8 @@
-﻿# ARTX7 â€” Converter Architecture
+# ARTX7 — Converter Architecture
 
 ## Architecture Specification
 
-**Document Name:** ARTX7_â€”_Converter_Architecture.md  
+**Document Name:** ARTX7_—_Converter_Architecture.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -173,6 +173,37 @@ The metadata replicator translates source format metadata into the GLLM manifest
 - **Architecture-specific metadata:** RoPE parameters, attention bias, sliding window.
 - **Quantization metadata:** Global quantization type, per-tensor quantization overrides.
 - **Tokenizer metadata:** Vocabulary size, special tokens, tokenizer model type.
+
+## Tokenizer Extraction
+
+The converter MUST package the source model's tokenizer as
+`GLLMTokenizer.gllm`; a conversion that silently drops it produces a package
+that cannot generate text.
+
+For GGUF sources every field is already present in the metadata header and maps
+directly:
+
+| GGUF key | GLLM destination |
+|----------|------------------|
+| `tokenizer.ggml.tokens` | unit entry `tokens` |
+| `tokenizer.ggml.merges` | unit entry `merges` |
+| `tokenizer.ggml.token_type` | unit entry `token_types` |
+| `tokenizer.chat_template` | unit entry `chat_template` |
+| `tokenizer.ggml.model` | manifest `tokenizer.model` |
+| `tokenizer.ggml.pre` | manifest `tokenizer.pre` |
+| `tokenizer.ggml.bos_token_id` | manifest `tokenizer.bos_id` |
+| `tokenizer.ggml.eos_token_id` | manifest `tokenizer.eos_id` |
+| `tokenizer.ggml.padding_token_id` | manifest `tokenizer.padding_id` |
+| `tokenizer.ggml.add_bos_token` | manifest `tokenizer.add_bos` |
+
+Token order and merge order MUST be preserved exactly; see ARTX4: Layer
+Specification, "Tokenizer File".
+
+A source that carries no tokenizer (an embedding-only or vision-encoder model)
+converts without the unit, and the manifest omits its `tokenizer` object. A
+source that carries a *partial* tokenizer — vocabulary but no merges for a BPE
+model, say — MUST fail conversion rather than emit a unit that tokenizes
+incorrectly.
 
 ## Custom Metadata Preservation
 
