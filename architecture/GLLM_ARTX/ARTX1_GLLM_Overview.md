@@ -203,6 +203,7 @@ Every execution unit (layer file, shared component, manifest) carries a checksum
 A GLLM package is a directory or archive containing:
 
 - `gllm.json` — The manifest
+- `GLLMTokenizer.gllm` — Tokenizer tables (vocabulary, merges, chat template)
 - `GLLMShared.gllm` — Shared components (embeddings, output head, norms)
 - `GLLMTensorLayer-NNNN.gllm` — Layer files, one per layer
 - `GLLMProj.gllm` — Optional multimodal projector
@@ -275,7 +276,24 @@ The following questions remain unresolved and require community input or impleme
 
 1. **Compression Trade-off:** Should layer files support optional compression? If so, which algorithm (ZSTD, LZ4)? How does this interact with mmap?
 2. **KV Cache Format:** Should the KV cache be stored in GLLM format for session persistence? What is the migration strategy for context window changes?
-3. **Tokenizer Packaging:** Should the tokenizer be embedded in the GLLM package or referenced externally? Embedding increases package size; external references break portability.
+3. ~~**Tokenizer Packaging**~~ — **RESOLVED (2026-07-20).** The tokenizer is
+   **embedded, as its own execution unit** `GLLMTokenizer.gllm`. See ARTX2:
+   Package Specification, "Tokenizer Unit".
+
+   The size objection did not survive measurement: on Qwen2.5-0.5B the full
+   tokenizer payload (151 936 vocabulary entries, BPE merges, token types,
+   chat template) is **~7.4 MB against a 463 MB package — 1.6 %**, versus
+   227 MB for shared components alone. There is no meaningful size trade-off
+   to weigh against portability.
+
+   External references were rejected outright: they reproduce the exact defect
+   Design Principle 3 criticises GGUF and safetensors for — a model file that
+   cannot be executed without a second, separately-sourced artifact.
+
+   Inlining into the manifest was rejected because ARTX3 requires the manifest
+   be parseable without loading tensors; a 152 000-entry vocabulary makes every
+   `open()` pay for it. As a unit, the tokenizer instead inherits the weights'
+   integrity path: per-file checksum, `checksums.sha256`, mmap.
 4. **Multi-Package References:** How should the manifest reference external packages (e.g., for pipeline parallelism)? By file path, URL, or content hash?
 5. **Security Model:** Should GLLM packages support code signing? What is the threat model for model distribution?
 

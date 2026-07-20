@@ -62,6 +62,16 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
     "rope_dims": 128,
     "rope_freq_base": 10000.0
   },
+  "tokenizer": {
+    "file": "GLLMTokenizer.gllm",
+    "checksum": "sha256:9f8e7d...",
+    "model": "bpe",
+    "pre": "qwen2",
+    "vocab_size": 32000,
+    "bos_id": 1,
+    "eos_id": 2,
+    "add_bos": true
+  },
   "shared": {
     "file": "GLLMShared.gllm",
     "checksum": "sha256:abc123...",
@@ -150,6 +160,38 @@ Optional fields:
 | `expert_used_count` | int | Number of active experts per token |
 | `sliding_window` | int | Sliding window attention size |
 | `attention_bias` | bool | Whether attention uses bias |
+
+## Tokenizer Descriptor
+
+The manifest's `tokenizer` object points at `GLLMTokenizer.gllm` and carries
+just enough to identify and verify it. The vocabulary, merges, token types and
+chat template live **in the unit, not here** — inlining a 152 000-entry
+vocabulary would defeat the manifest's guarantee of being parseable without
+loading tensors.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | string | Unit filename, normally `GLLMTokenizer.gllm` |
+| `checksum` | string | `"sha256:<hex>"` over the unit |
+| `model` | string | Tokenizer algorithm, e.g. `bpe`, `spm` |
+| `pre` | string | Pre-tokenizer dialect, e.g. `qwen2`, `llama3` |
+| `vocab_size` | int | Must equal `metadata.vocab_size` |
+| `bos_id`, `eos_id` | int | Special token ids |
+| `add_bos` | bool | Whether BOS is prepended by default |
+| `padding_id` | int | Optional padding token id |
+
+`tokenizer.vocab_size` duplicating `metadata.vocab_size` is intentional: the
+two are produced from different sources during conversion, and a mismatch
+between them is a converter bug worth failing on rather than a value worth
+deriving. Validators MUST reject a package where they disagree.
+
+The `tokenizer` object is REQUIRED for any package intended for text
+generation. A package MAY omit it — an embedding-only or vision-encoder
+package has no vocabulary — in which case the runtime MUST refuse tokenization
+requests rather than fall back to an external tokenizer.
+
+For the unit's contents and the rationale for embedding it, see ARTX2: Package
+Specification, "Tokenizer Unit".
 
 ## Custom Metadata
 
