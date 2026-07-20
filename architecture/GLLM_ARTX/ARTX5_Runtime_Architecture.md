@@ -1,8 +1,8 @@
-﻿# ARTX5 â€” Runtime Architecture
+# ARTX5 — Runtime Architecture
 
 ## Architecture Specification
 
-**Document Name:** ARTX5_â€”_Runtime_Architecture.md  
+**Document Name:** ARTX5_—_Runtime_Architecture.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  

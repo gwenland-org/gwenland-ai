@@ -1,4 +1,4 @@
-﻿# GwenLand Language Model Format (GLLM)
+# GwenLand Language Model Format (GLLM)
 
 ## Architecture Specification
 
@@ -263,11 +263,11 @@ Every execution unit (layer file, shared component, manifest) carries a checksum
 
 A GLLM package is a directory or archive containing:
 
-- `gllm.json` â€” The manifest
-- `GLLMShared.gllm` â€” Shared components (embeddings, output head, norms)
-- `GLLMTensorLayer-NNNN.gllm` â€” Layer files, one per layer
-- `GLLMProj.gllm` â€” Optional multimodal projector
-- `checksums.sha256` â€” Optional aggregated checksums
+- `gllm.json` — The manifest
+- `GLLMShared.gllm` — Shared components (embeddings, output head, norms)
+- `GLLMTensorLayer-NNNN.gllm` — Layer files, one per layer
+- `GLLMProj.gllm` — Optional multimodal projector
+- `checksums.sha256` — Optional aggregated checksums
 
 The runtime interacts with the package through the following pipeline:
 
@@ -295,14 +295,15 @@ flowchart LR
 
 ```
 model.gllm/
-â”œâ”€â”€ gllm.json
-â”œâ”€â”€ GLLMShared.gllm
-â”œâ”€â”€ GLLMTensorLayer-0000.gllm
-â”œâ”€â”€ GLLMTensorLayer-0001.gllm
-â”œâ”€â”€ ...
-â”œâ”€â”€ GLLMTensorLayer-0079.gllm
-â”œâ”€â”€ GLLMProj.gllm
-â””â”€â”€ checksums.sha256
+├── gllm.json
+├── GLLMTokenizer.gllm
+├── GLLMShared.gllm
+├── GLLMTensorLayer-0000.gllm
+├── GLLMTensorLayer-0001.gllm
+├── ...
+├── GLLMTensorLayer-0079.gllm
+├── GLLMProj.gllm
+└── checksums.sha256
 ```
 
 ### Archive Format
@@ -404,6 +405,43 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
 4. **Device Map Embedded.** The manifest may specify a default device per layer. The runtime may override this based on available hardware.
 5. **Extension Registry.** The manifest lists all layer type URIs used in the package. The runtime loads plugins for these URIs before execution.
 
+## Tokenizer Unit
+
+A GLLM package carries its own tokenizer, in `GLLMTokenizer.gllm`. A package
+that cannot turn text into tokens is not self-contained, and Design Principle 3
+criticises GGUF and safetensors for exactly that gap.
+
+The unit holds `tokens` (vocabulary, in token-id order), `token_types`,
+`merges` (BPE rules, in priority order), and `chat_template`. Scalar
+configuration — `model`, `pre`, `bos_id`, `eos_id`, `padding_id`, `add_bos` —
+lives in the manifest's `tokenizer` object so it can be read without opening
+the unit.
+
+Embedding was chosen over external references, and a separate unit over
+inlining in `gllm.json`:
+
+- **The size objection does not hold.** On Qwen2.5-0.5B the complete tokenizer
+  payload is ~7.4 MB against a 463 MB package — **1.6 %**, versus 227 MB for
+  shared components alone.
+- **The manifest must stay cheap.** It is required to be parseable without
+  loading tensors; inlining a 152 000-entry vocabulary defeats that.
+- **Integrity parity with weights.** As a unit the tokenizer gets a per-file
+  checksum, an entry in `checksums.sha256`, and can be mapped rather than
+  parsed. A substituted vocabulary silently changes what text *means* — the
+  model still runs and the logits still look plausible.
+
+Merge order and token-id order are both significant and must round-trip
+exactly: reordering either changes how text tokenizes while leaving every
+weight, shape, and tensor checksum untouched.
+
+> ⚠️ **Integrity is not authenticity.** Per-file SHA-256 detects corruption,
+> not substitution: anyone able to replace a unit can also rewrite its
+> checksum in the manifest. Package signing remains Open Question 5. This
+> applies to every execution unit; it is called out here because a forged
+> tokenizer is the one whose damage is hardest to notice.
+
+This resolves Open Question 3.
+
 ## Shared Components
 
 Shared components are tensors used by multiple layers or the final output projection. They are stored in `GLLMShared.gllm`.
@@ -424,6 +462,7 @@ Shared components are tensors used by multiple layers or the final output projec
 
 An execution unit is any file that the runtime can load, verify, and map independently. This includes:
 
+- `GLLMTokenizer.gllm`
 - `GLLMShared.gllm`
 - `GLLMTensorLayer-NNNN.gllm`
 - `GLLMProj.gllm`
@@ -1756,7 +1795,24 @@ The following questions remain unresolved and require community input or impleme
 
 1. **Compression Trade-off:** Should layer files support optional compression? If so, which algorithm (ZSTD, LZ4)? How does this interact with mmap?
 2. **KV Cache Format:** Should the KV cache be stored in GLLM format for session persistence? What is the migration strategy for context window changes?
-3. **Tokenizer Packaging:** Should the tokenizer be embedded in the GLLM package or referenced externally? Embedding increases package size; external references break portability.
+3. ~~**Tokenizer Packaging**~~ — **RESOLVED (2026-07-20).** The tokenizer is
+   **embedded, as its own execution unit** `GLLMTokenizer.gllm`. See ARTX2:
+   Package Specification, "Tokenizer Unit".
+
+   The size objection did not survive measurement: on Qwen2.5-0.5B the full
+   tokenizer payload (151 936 vocabulary entries, BPE merges, token types,
+   chat template) is **~7.4 MB against a 463 MB package — 1.6 %**, versus
+   227 MB for shared components alone. There is no meaningful size trade-off
+   to weigh against portability.
+
+   External references were rejected outright: they reproduce the exact defect
+   Design Principle 3 criticises GGUF and safetensors for — a model file that
+   cannot be executed without a second, separately-sourced artifact.
+
+   Inlining into the manifest was rejected because ARTX3 requires the manifest
+   be parseable without loading tensors; a 152 000-entry vocabulary makes every
+   `open()` pay for it. As a unit, the tokenizer instead inherits the weights'
+   integrity path: per-file checksum, `checksums.sha256`, mmap.
 4. **Multi-Package References:** How should the manifest reference external packages (e.g., for pipeline parallelism)? By file path, URL, or content hash?
 5. **Security Model:** Should GLLM packages support code signing? What is the threat model for model distribution?
 
