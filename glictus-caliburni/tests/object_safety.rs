@@ -1,9 +1,9 @@
-//! Wave 3 gate: the three public traits must stay object-safe.
+﻿//! Wave 3 gate: the three public traits must stay object-safe.
 //!
 //! `GllmInference` is held as `Box<dyn GllmInference>` by the runtime, and
 //! `LayerPlugin` lives in a `Box<dyn LayerPlugin>` registry. If a future
 //! change adds a generic method or `impl Trait` in argument/return position,
-//! this file stops compiling — which is the point.
+//! this file stops compiling â€” which is the point.
 
 use std::path::Path;
 
@@ -11,9 +11,9 @@ use glictus_caliburni::error::GllmResult;
 use glictus_caliburni::types::execution::Device;
 use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::{DType, TensorEntry};
-use glictus_caliburni::{GllmConverter, GllmInference, LayerPlugin};
+use glictus_caliburni::{ExtensionUri, GllmConverter, GllmInference, LayerPlugin};
 
-/// Minimal runtime that returns fixed logits — exercises the default `stream`.
+/// Minimal runtime that returns fixed logits â€” exercises the default `stream`.
 struct StubRuntime {
     logits: Vec<f32>,
     loaded: bool,
@@ -43,34 +43,33 @@ impl GllmInference for StubRuntime {
     }
 }
 
-struct StubPlugin;
+struct StubPlugin {
+    uri: ExtensionUri,
+}
+
+impl StubPlugin {
+    fn new() -> Self {
+        StubPlugin {
+            uri: ExtensionUri::parse("gllm:transformer/standard@v1").unwrap(),
+        }
+    }
+}
 
 impl LayerPlugin for StubPlugin {
-    fn parse_tensors(&self, index: &[TensorEntry]) -> GllmResult<Vec<TensorEntry>> {
-        Ok(index.to_vec())
+    fn uri(&self) -> &ExtensionUri {
+        &self.uri
+    }
+
+    fn required_tensors(&self) -> &[&'static str] {
+        &["attn_q.weight"]
     }
 
     fn memory_requirement_bytes(&self, tensors: &[TensorEntry], _device: &Device) -> u64 {
         tensors.iter().map(|t| t.size).sum()
     }
 
-    fn execute(
-        &self,
-        inputs: &[f32],
-        outputs: &mut Vec<f32>,
-        _tensors: &[TensorEntry],
-    ) -> GllmResult<()> {
-        outputs.clear();
-        outputs.extend_from_slice(inputs);
-        Ok(())
-    }
-
     fn supports_dtype(&self, dtype: DType) -> bool {
         matches!(dtype, DType::F32)
-    }
-
-    fn uri(&self) -> &str {
-        "gllm:transformer/standard@v1"
     }
 }
 
@@ -101,11 +100,11 @@ fn traits_are_object_safe() {
         loaded: false,
         devices: vec![Device::Cpu],
     });
-    let plugin: Box<dyn LayerPlugin> = Box::new(StubPlugin);
+    let plugin: Box<dyn LayerPlugin> = Box::new(StubPlugin::new());
     let converter: Box<dyn GllmConverter> = Box::new(StubConverter);
 
     assert_eq!(runtime.name(), "stub-runtime");
-    assert_eq!(plugin.uri(), "gllm:transformer/standard@v1");
+    assert_eq!(plugin.uri().0, "gllm:transformer/standard@v1");
     assert_eq!(converter.source_format(), "stub");
 }
 
@@ -131,7 +130,7 @@ fn default_stream_emits_argmax_token_through_dyn() {
 
 #[test]
 fn plugin_reports_dtype_support() {
-    let plugin: Box<dyn LayerPlugin> = Box::new(StubPlugin);
+    let plugin: Box<dyn LayerPlugin> = Box::new(StubPlugin::new());
     assert!(plugin.supports_dtype(DType::F32));
     assert!(!plugin.supports_dtype(DType::Q4K));
 }
