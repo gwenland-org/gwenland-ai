@@ -63,7 +63,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
     "rope_freq_base": 10000.0
   },
   "shared": {
-    "file": "shared.gllm",
+    "file": "GLLMShared.gllm",
     "checksum": "sha256:abc123...",
     "tensors": [
       {
@@ -78,7 +78,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
   "layers": [
     {
       "index": 0,
-      "file": "layer_000.gllm",
+      "file": "GLLMTensorLayer-0000.gllm",
       "checksum": "sha256:def456...",
       "type": "gllm:transformer/standard@v1",
       "tensors": [
@@ -101,7 +101,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
     }
   ],
   "projector": {
-    "file": "projector.gllm",
+    "file": "GLLMProj.gllm",
     "checksum": "sha256:ghi789...",
     "type": "gllm:projector/linear@v1"
   },

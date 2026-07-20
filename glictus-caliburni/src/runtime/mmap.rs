@@ -1,10 +1,10 @@
-//! Memory-mapped layer files.
+﻿//! Memory-mapped layer files.
 //!
-//! ARTX05 §"Memory Mapping Strategy": the runtime maps a layer, executes it,
+//! ARTX05 Â§"Memory Mapping Strategy": the runtime maps a layer, executes it,
 //! and unmaps it. The OS page cache does the actual I/O; the runtime only
 //! hints at the access pattern.
 //!
-//! A mapping is validated at open time — magic, version, and tensor index are
+//! A mapping is validated at open time â€” magic, version, and tensor index are
 //! parsed before any caller sees the bytes, so a corrupt file fails loud here
 //! rather than as garbage activations later.
 
@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use crate::error::{GllmError, GllmResult};
 use crate::types::layer::LayerFile;
 
-/// A read-only mapping of one execution-unit file (a layer, or `shared.gllm`).
+/// A read-only mapping of one execution-unit file (a layer, or `GLLMShared.gllm`).
 ///
 /// The mapping is released when this value drops.
 #[derive(Debug)]
@@ -35,7 +35,7 @@ pub struct LayerMapping {
 impl LayerMapping {
     /// Map and validate an execution-unit file.
     ///
-    /// Parses the header and tensor index eagerly (cheap — a few hundred
+    /// Parses the header and tensor index eagerly (cheap â€” a few hundred
     /// bytes) but touches no tensor data, so cost is independent of layer
     /// size. Returns [`GllmError::InvalidMagic`] / [`GllmError::InvalidHeader`]
     /// on a malformed file.
@@ -55,7 +55,7 @@ impl LayerMapping {
         // SAFETY: mapped read-only and never mutated through this handle. The
         // mapping outlives every slice handed out, because `as_bytes` borrows
         // from `self`. A concurrent truncation by another process could fault
-        // on access — the same accepted risk glcore takes for GGUF loading.
+        // on access â€” the same accepted risk glcore takes for GGUF loading.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| {
             GllmError::MapFailed {
                 path: path.display().to_string(),
@@ -90,7 +90,7 @@ impl LayerMapping {
     /// Bytes of one tensor, located via the tensor index.
     ///
     /// Returns `None` if the tensor is absent, or if its recorded range falls
-    /// outside the file — a truncated layer yields `None`, never a panic or a
+    /// outside the file â€” a truncated layer yields `None`, never a panic or a
     /// read past the mapping.
     pub fn tensor_bytes(&self, name: &str) -> Option<&[u8]> {
         let (offset, size) = self.layer.absolute_range(name)?;
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn open_maps_and_parses_a_valid_layer() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("layer_000.gllm");
+        let path = dir.path().join("GLLMTensorLayer-0000.gllm");
         write_test_layer(&path, &[("attn_q.weight", 64), ("attn_k.weight", 32)]);
 
         let m = LayerMapping::open(&path, Some(0), false).unwrap();
@@ -127,7 +127,7 @@ mod tests {
     #[test]
     fn open_reads_back_exact_tensor_bytes() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("layer_000.gllm");
+        let path = dir.path().join("GLLMTensorLayer-0000.gllm");
         write_test_layer(&path, &[("a", 16), ("b", 48)]);
 
         let m = LayerMapping::open(&path, Some(0), false).unwrap();
@@ -139,7 +139,7 @@ mod tests {
     #[test]
     fn open_rejects_a_file_with_bad_magic() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("layer_000.gllm");
+        let path = dir.path().join("GLLMTensorLayer-0000.gllm");
         write_test_layer(&path, &[("a", 8)]);
 
         // Corrupt the magic in place.
@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn prefetched_flag_is_carried_through() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("layer_003.gllm");
+        let path = dir.path().join("GLLMTensorLayer-0003.gllm");
         write_test_layer(&path, &[("a", 8)]);
 
         let m = LayerMapping::open(&path, Some(3), true).unwrap();
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn dropping_a_mapping_releases_the_file() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("layer_000.gllm");
+        let path = dir.path().join("GLLMTensorLayer-0000.gllm");
         write_test_layer(&path, &[("a", 8)]);
 
         let m = LayerMapping::open(&path, Some(0), false).unwrap();

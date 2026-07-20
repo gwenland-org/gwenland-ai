@@ -1,4 +1,4 @@
-//! Package discovery & layout (ARTX02 Wave 1).
+﻿//! Package discovery & layout (ARTX02 Wave 1).
 //!
 //! Resolves a package root (directory or uncompressed ZIP) into concrete
 //! paths for every execution unit, without reading any file contents.
@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use crate::checksum::{ChecksumEntry, ChecksumVerifier};
 use crate::constants::{
     CHECKSUMS_FILENAME, LAYER_FILE_EXTENSION, LAYER_FILE_PREFIX, MANIFEST_FILENAME,
-    SHARED_FILENAME,
+    PROJECTOR_FILENAME, SHARED_FILENAME,
 };
 use crate::error::GllmError;
 use crate::execution_unit::ExecutionUnit;
@@ -28,7 +28,7 @@ pub enum PackageFormat {
 /// A resolved layer file with its index.
 #[derive(Debug, Clone)]
 pub struct LayerPath {
-    /// Layer index parsed from the `layer_NNN.gllm` filename.
+    /// Layer index parsed from the `GLLMTensorLayer-NNNN.gllm` filename.
     pub index: u32,
     /// Absolute (or root-relative) path to the layer file.
     pub path: PathBuf,
@@ -43,18 +43,15 @@ pub struct PackageLayout {
     pub format: PackageFormat,
     /// Path to `gllm.json`.
     pub manifest_path: PathBuf,
-    /// Path to `shared.gllm`.
+    /// Path to `GLLMShared.gllm`.
     pub shared_path: PathBuf,
-    /// Paths to `layer_NNN.gllm`, sorted by layer index ascending.
+    /// Paths to `GLLMTensorLayer-NNNN.gllm`, sorted by layer index ascending.
     pub layer_paths: Vec<LayerPath>,
-    /// Optional `projector.gllm`.
+    /// Optional `GLLMProj.gllm`.
     pub projector_path: Option<PathBuf>,
     /// Optional `checksums.sha256`.
     pub checksums_path: Option<PathBuf>,
 }
-
-/// Filename for the optional multimodal projector unit.
-pub const PROJECTOR_FILENAME: &str = "projector.gllm";
 
 impl PackageLayout {
     /// Discover package layout from a root path.
@@ -145,16 +142,21 @@ impl PackageLayout {
     }
 
     /// Returns the layer entry for the given layer index (not the position
-    /// in the vec — indices need not be contiguous). `None` if absent.
+    /// in the vec â€” indices need not be contiguous). `None` if absent.
     pub fn layer_path(&self, index: u32) -> Option<&LayerPath> {
         self.layer_paths.iter().find(|lp| lp.index == index)
     }
 }
 
-/// Parse `layer_NNN.gllm` → `Some(NNN)`; non-layer filenames → `None`.
+/// Parse `GLLMTensorLayer-NNNN.gllm` â†’ `Some(NNNN)`; other filenames â†’ `None`.
 ///
-/// A filename that matches the `layer_*.gllm` pattern but whose middle part
-/// is not a number is an error, not a skip — Fail Fast, Fail Loud.
+/// Leading zeros are accepted and normalised away, so `-0007` and `-7` both
+/// yield 7 â€” discovery is tolerant of padding width even though
+/// [`format_layer_filename`](crate::manifest::format_layer_filename) always
+/// writes four digits.
+///
+/// A filename that matches the prefix/extension pattern but whose middle part
+/// is not a number is an error, not a skip â€” Fail Fast, Fail Loud.
 fn parse_layer_index(name: &str) -> Result<Option<u32>, GllmError> {
     let Some(rest) = name.strip_prefix(LAYER_FILE_PREFIX) else {
         return Ok(None);
@@ -183,14 +185,14 @@ pub struct GllmPackage {
     pub layout: PackageLayout,
     /// Parsed and semantically validated `gllm.json`.
     pub manifest: GllmManifest,
-    /// Header-validated, checksum-verified `shared.gllm`.
+    /// Header-validated, checksum-verified `GLLMShared.gllm`.
     pub shared: SharedComponents,
     /// Lazily opened layer units, parallel to `layout.layer_paths`.
     /// `None` = layer not yet opened.
     layer_units: Vec<Option<ExecutionUnit>>,
     /// Loaded from `checksums.sha256` when present.
     pub checksum_verifier: Option<ChecksumVerifier>,
-    /// Validation outcome from [`Self::open`] — errors are always empty
+    /// Validation outcome from [`Self::open`] â€” errors are always empty
     /// (fatal errors abort `open`), warnings are preserved.
     pub validation: ValidationResult,
 }
@@ -198,10 +200,10 @@ pub struct GllmPackage {
 impl GllmPackage {
     /// Open a GLLM package at `root`.
     ///
-    /// Steps: discover layout → parse `gllm.json` → run the semantic
+    /// Steps: discover layout â†’ parse `gllm.json` â†’ run the semantic
     /// validator (fatal findings abort with
-    /// [`GllmError::ManifestValidationError`]) → open `shared.gllm`
-    /// verifying it against the manifest's checksum → load
+    /// [`GllmError::ManifestValidationError`]) â†’ open `GLLMShared.gllm`
+    /// verifying it against the manifest's checksum â†’ load
     /// `checksums.sha256` when present. Layer files stay unopened (lazy).
     pub fn open(root: &Path) -> Result<Self, GllmError> {
         let layout = PackageLayout::discover(root)?;
@@ -255,7 +257,7 @@ impl GllmPackage {
     }
 
     /// Build a [`ChecksumVerifier`] from the manifest's per-file
-    /// checksums — the alternative when `checksums.sha256` is absent.
+    /// checksums â€” the alternative when `checksums.sha256` is absent.
     pub fn verifier_from_manifest(&self) -> Result<ChecksumVerifier, GllmError> {
         let mut entries = vec![ChecksumEntry {
             filename: self.manifest.shared.file.clone(),
@@ -278,7 +280,7 @@ impl GllmPackage {
 
     /// Open and header-validate the layer with the given index.
     ///
-    /// The result is cached — subsequent calls return the cached unit
+    /// The result is cached â€” subsequent calls return the cached unit
     /// without touching the filesystem.
     pub fn open_layer(&mut self, index: u32) -> Result<&ExecutionUnit, GllmError> {
         let pos = self
@@ -327,7 +329,7 @@ impl GllmPackage {
     /// Verify every entry of the checksum file against the package root.
     ///
     /// Returns all `(filename, error)` failures without short-circuiting;
-    /// empty when everything matches — or when no verifier was loaded
+    /// empty when everything matches â€” or when no verifier was loaded
     /// (check [`has_checksum_file`](Self::has_checksum_file) to tell the
     /// two apart).
     pub fn verify_integrity(&self) -> Vec<(String, GllmError)> {
@@ -358,7 +360,7 @@ mod tests {
         fs::write(dir.join(MANIFEST_FILENAME), b"{}").unwrap();
         fs::write(dir.join(SHARED_FILENAME), b"dummy").unwrap();
         for &i in layer_indices {
-            fs::write(dir.join(format!("layer_{i:03}.gllm")), b"dummy").unwrap();
+            fs::write(dir.join(crate::manifest::format_layer_filename(i)), b"dummy").unwrap();
         }
     }
 
@@ -416,7 +418,7 @@ mod tests {
         let layout = PackageLayout::discover(tmp.path()).unwrap();
         let lp = layout.layer_path(1).unwrap();
         assert_eq!(lp.index, 1);
-        assert!(lp.path.ends_with("layer_001.gllm"));
+        assert!(lp.path.ends_with("GLLMTensorLayer-0001.gllm"));
         assert!(layout.layer_path(99).is_none());
     }
 
@@ -506,10 +508,10 @@ mod tests {
         let mut pkg = GllmPackage::open(tmp.path()).unwrap();
         let unit = pkg.open_layer(0).unwrap();
         assert_eq!(unit.header.version, crate::execution_unit::GLLM_CURRENT_VERSION);
-        assert!(unit.path.ends_with("layer_000.gllm"));
+        assert!(unit.path.ends_with("GLLMTensorLayer-0000.gllm"));
 
         // Second call must serve the cache even if the file disappears.
-        fs::remove_file(tmp.path().join("layer_000.gllm")).unwrap();
+        fs::remove_file(tmp.path().join("GLLMTensorLayer-0000.gllm")).unwrap();
         assert!(pkg.open_layer(0).is_ok());
     }
 
@@ -544,22 +546,22 @@ mod tests {
 
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         assert!(pkg.has_checksum_file());
-        // shared.gllm's entry was found, so open() verified it.
+        // GLLMShared.gllm's entry was found, so open() verified it.
         assert!(pkg.shared.is_verified());
         assert!(pkg.verify_integrity().is_empty());
 
         // Corrupt one layer: verify_integrity must report exactly it.
-        fs::write(tmp.path().join("layer_001.gllm"), b"CORRUPT").unwrap();
+        fs::write(tmp.path().join("GLLMTensorLayer-0001.gllm"), b"CORRUPT").unwrap();
         let failures = pkg.verify_integrity();
         assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].0, "layer_001.gllm");
+        assert_eq!(failures[0].0, "GLLMTensorLayer-0001.gllm");
     }
 
     #[test]
     fn test_package_open_rejects_corrupt_shared_checksum() {
         let tmp = tempfile::tempdir().unwrap();
         make_valid_package_dir(tmp.path(), 1);
-        // Corrupt shared.gllm after the manifest recorded its checksum
+        // Corrupt GLLMShared.gllm after the manifest recorded its checksum
         // (keep a valid header so only the checksum check can catch it).
         let mut bytes = fs::read(tmp.path().join(SHARED_FILENAME)).unwrap();
         let last = bytes.len() - 1;
@@ -620,7 +622,7 @@ mod tests {
     fn test_package_warnings_accessible() {
         let tmp = tempfile::tempdir().unwrap();
         make_valid_package_dir(tmp.path(), 1);
-        // Same major, newer minor → loadable with a V02 warning.
+        // Same major, newer minor â†’ loadable with a V02 warning.
         let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
         fs::write(
             tmp.path().join(MANIFEST_FILENAME),
@@ -641,7 +643,7 @@ mod tests {
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         let lm = pkg.layer_manifest(1).unwrap();
         assert_eq!(lm.index, 1);
-        assert_eq!(lm.file, "layer_001.gllm");
+        assert_eq!(lm.file, "GLLMTensorLayer-0001.gllm");
         assert!(pkg.layer_manifest(3).is_none());
     }
 
@@ -668,7 +670,7 @@ mod tests {
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         let layer = pkg.read_layer_file(0).unwrap();
         assert!(layer.tensor_index.is_empty());
-        // Manifest fixture lists no layer tensors either → consistent.
+        // Manifest fixture lists no layer tensors either â†’ consistent.
         assert!(pkg.cross_check_layer(0).unwrap().is_empty());
 
         let err = pkg.read_layer_file(9).unwrap_err();
@@ -680,7 +682,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         make_valid_package_dir(tmp.path(), 1);
         // Swap the manifest's shared checksum for a wrong (but
-        // well-formed) digest — the file itself is untouched.
+        // well-formed) digest â€” the file itself is untouched.
         let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
         let shared_hex = crate::checksum::sha256_file(&tmp.path().join(SHARED_FILENAME)).unwrap();
         let wrong = crate::checksum::sha256_bytes(b"wrong");
@@ -701,12 +703,41 @@ mod tests {
     fn test_discover_rejects_non_numeric_layer_name() {
         let tmp = tempfile::tempdir().unwrap();
         make_package_dir(tmp.path(), &[0]);
-        fs::write(tmp.path().join("layer_abc.gllm"), b"dummy").unwrap();
+        fs::write(tmp.path().join("GLLMTensorLayer-abc.gllm"), b"dummy").unwrap();
 
         let err = PackageLayout::discover(tmp.path()).unwrap_err();
         assert!(
             matches!(err, GllmError::InvalidPackageFormat(_)),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_layer_index_round_trips_with_format_layer_filename() {
+        // The writer and the reader must agree, or a converted package
+        // becomes undiscoverable. This is the test that would have caught
+        // the naming change breaking discovery.
+        for index in [0u32, 1, 9, 10, 99, 100, 999, 1000, 9999, 10_000] {
+            let name = crate::manifest::format_layer_filename(index);
+            assert_eq!(
+                parse_layer_index(&name).unwrap(),
+                Some(index),
+                "round-trip failed for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_layer_index_ignores_foreign_filenames() {
+        for name in [
+            "gllm.json",
+            "GLLMShared.gllm",
+            "GLLMProj.gllm",
+            "checksums.sha256",
+            "layer_000.gllm", // the previous convention is no longer a layer
+            "GLLMTensorLayer-0000.zip",
+        ] {
+            assert_eq!(parse_layer_index(name).unwrap(), None, "{name}");
+        }
     }
 }

@@ -20,13 +20,18 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::constants::{LAYER_FILE_EXTENSION, LAYER_FILE_PREFIX, LAYER_INDEX_DIGITS};
 use crate::error::GllmError;
 use crate::types::execution::Device;
 
-/// Canonical layer filename for an index: zero-padded to 3 digits
-/// minimum, never truncated (`layer_000.gllm`, `layer_1000.gllm`).
+/// Canonical layer filename for an index: `GLLMTensorLayer-NNNN.gllm`,
+/// zero-padded to [`LAYER_INDEX_DIGITS`] digits minimum and never truncated
+/// (`GLLMTensorLayer-0000.gllm`, `GLLMTensorLayer-10000.gllm`).
 pub fn format_layer_filename(index: u32) -> String {
-    format!("layer_{index:03}.gllm")
+    format!(
+        "{LAYER_FILE_PREFIX}{index:0width$}{LAYER_FILE_EXTENSION}",
+        width = LAYER_INDEX_DIGITS
+    )
 }
 
 /// Extract the bare hex digest from a `"sha256:<64-hex>"` manifest
@@ -178,7 +183,7 @@ impl std::fmt::Display for DevicePlacement {
 pub struct LayerManifest {
     /// Layer index (0-based); must match the filename.
     pub index: u32,
-    /// Relative filename (e.g. `"layer_000.gllm"`).
+    /// Relative filename (e.g. `"GLLMTensorLayer-0000.gllm"`).
     pub file: String,
     /// SHA-256 checksum, prefixed: `"sha256:<hex>"`.
     pub checksum: String,
@@ -402,10 +407,31 @@ mod tests {
 
     #[test]
     fn test_layer_manifest_expected_filename() {
-        assert_eq!(format_layer_filename(0), "layer_000.gllm");
-        assert_eq!(format_layer_filename(10), "layer_010.gllm");
-        assert_eq!(format_layer_filename(100), "layer_100.gllm");
-        assert_eq!(format_layer_filename(1000), "layer_1000.gllm");
+        assert_eq!(format_layer_filename(0), "GLLMTensorLayer-0000.gllm");
+        assert_eq!(format_layer_filename(10), "GLLMTensorLayer-0010.gllm");
+        assert_eq!(format_layer_filename(100), "GLLMTensorLayer-0100.gllm");
+        assert_eq!(format_layer_filename(1000), "GLLMTensorLayer-1000.gllm");
+        // Past the padding width the index is written in full, never
+        // truncated — otherwise two layers could claim one filename.
+        assert_eq!(format_layer_filename(10_000), "GLLMTensorLayer-10000.gllm");
+    }
+
+    #[test]
+    fn unit_filenames_always_end_in_gllm() {
+        // A package directory never contains .zip members — the archive
+        // extension applies to the directory as a whole, never to a unit.
+        use crate::constants::{PROJECTOR_FILENAME, SHARED_FILENAME};
+        for name in [
+            format_layer_filename(0),
+            format_layer_filename(9999),
+            SHARED_FILENAME.to_string(),
+            PROJECTOR_FILENAME.to_string(),
+        ] {
+            assert!(name.ends_with(".gllm"), "{name} must end in .gllm");
+            assert!(!name.contains(".zip"), "{name} must not be a .zip");
+        }
+        assert_eq!(SHARED_FILENAME, "GLLMShared.gllm");
+        assert_eq!(PROJECTOR_FILENAME, "GLLMProj.gllm");
     }
 
     #[test]

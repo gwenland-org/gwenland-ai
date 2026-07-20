@@ -158,7 +158,7 @@ For each layer, the extractor:
 
 ## Shared Component Extraction
 
-Shared tensors are collected into `shared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
+Shared tensors are collected into `GLLMShared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
 
 For layer file binary format, see ARTX4: Layer Specification. For shared components, see ARTX2: Package Specification.
 

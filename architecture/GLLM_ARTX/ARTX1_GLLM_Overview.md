@@ -155,7 +155,7 @@ GLLM addresses the limitations above through five structural decisions:
 
 ### Storage Follows Execution
 
-The physical layout of a GLLM package mirrors the logical execution flow. If a model executes layers 0 through 79 sequentially, the package stores them as `layer_000.gllm` through `layer_079.gllm`. This alignment enables the runtime to prefetch layer N+1 while executing layer N.
+The physical layout of a GLLM package mirrors the logical execution flow. If a model executes layers 0 through 79 sequentially, the package stores them as `GLLMTensorLayer-0000.gllm` through `GLLMTensorLayer-0079.gllm`. This alignment enables the runtime to prefetch layer N+1 while executing layer N.
 
 ### Metadata Is Executable
 
@@ -203,9 +203,9 @@ Every execution unit (layer file, shared component, manifest) carries a checksum
 A GLLM package is a directory or archive containing:
 
 - `gllm.json` — The manifest
-- `shared.gllm` — Shared components (embeddings, output head, norms)
-- `layer_NNN.gllm` — Layer files, one per layer
-- `projector.gllm` — Optional multimodal projector
+- `GLLMShared.gllm` — Shared components (embeddings, output head, norms)
+- `GLLMTensorLayer-NNNN.gllm` — Layer files, one per layer
+- `GLLMProj.gllm` — Optional multimodal projector
 - `checksums.sha256` — Optional aggregated checksums
 
 The runtime interacts with the package through the following pipeline:
