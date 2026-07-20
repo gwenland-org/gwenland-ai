@@ -1,4 +1,4 @@
-use thiserror::Error;
+﻿use thiserror::Error;
 
 /// Unified error type for the GLLM format crate.
 ///
@@ -33,7 +33,7 @@ pub enum GllmError {
     #[error("Package is missing its manifest (gllm.json)")]
     MissingManifest,
 
-    #[error("Package is missing its shared component (shared.gllm)")]
+    #[error("Package is missing its shared component (GLLMShared.gllm)")]
     MissingSharedComponent,
 
     #[error("Invalid package format: {0}")]
@@ -87,7 +87,7 @@ pub enum GllmError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("No valid execution plan found (Pvalid = ∅)")]
+    #[error("No valid execution plan found (Pvalid = âˆ…)")]
     NoValidPlan,
 
     // --- ARTX05/06 runtime -------------------------------------------------

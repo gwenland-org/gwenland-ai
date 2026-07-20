@@ -1,8 +1,8 @@
-# ARTX4 — Layer Specification
+﻿# ARTX4 â€” Layer Specification
 
 ## Architecture Specification
 
-**Document Name:** ARTX4_—_Layer_Specification.md  
+**Document Name:** ARTX4_â€”_Layer_Specification.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -123,7 +123,7 @@ A projector is a tensor or set of tensors that maps layer outputs to a different
 - **Multimodal Projector:** Maps vision encoder outputs to the language model's embedding space.
 - **Classifier Head:** Maps hidden states to class probabilities.
 
-Projectors are stored in `projector.gllm` and referenced by the manifest. They follow the same layer file format but use a distinct layer type URI (e.g., `gllm:projector/linear@v1`).
+Projectors are stored in `GLLMProj.gllm` and referenced by the manifest. They follow the same layer file format but use a distinct layer type URI (e.g., `gllm:projector/linear@v1`).
 
 For manifest projector references, see ARTX3: Manifest Specification. For package structure, see ARTX2: Package Specification.
 

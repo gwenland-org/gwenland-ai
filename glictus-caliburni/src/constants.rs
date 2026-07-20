@@ -9,7 +9,10 @@ pub const GLLM_VERSION_MINOR: u8 = 0;
 pub const MANIFEST_FILENAME: &str = "gllm.json";
 
 /// Shared component filename
-pub const SHARED_FILENAME: &str = "shared.gllm";
+pub const SHARED_FILENAME: &str = "GLLMShared.gllm";
+
+/// Projector filename (optional execution unit)
+pub const PROJECTOR_FILENAME: &str = "GLLMProj.gllm";
 
 /// Checksums filename
 pub const CHECKSUMS_FILENAME: &str = "checksums.sha256";
@@ -17,9 +20,19 @@ pub const CHECKSUMS_FILENAME: &str = "checksums.sha256";
 /// Tensor data alignment (64 bytes for DMA efficiency)
 pub const TENSOR_ALIGNMENT: usize = 64;
 
-/// Layer file naming pattern: layer_NNN.gllm
-pub const LAYER_FILE_PREFIX: &str = "layer_";
+/// Layer file naming pattern: `GLLMTensorLayer-NNNN.gllm`.
+///
+/// Index is zero-padded to [`LAYER_INDEX_DIGITS`] digits and the extension is
+/// always `.gllm` — a package directory never contains `.zip` members, even
+/// when the directory itself is later archived.
+pub const LAYER_FILE_PREFIX: &str = "GLLMTensorLayer-";
 pub const LAYER_FILE_EXTENSION: &str = ".gllm";
+
+/// Zero-padding width for a layer index in its filename.
+///
+/// Four digits covers 10 000 layers; wider indices are still written in full
+/// rather than truncated, so ordering by index never silently collides.
+pub const LAYER_INDEX_DIGITS: usize = 4;
 
 /// Data type codes (dari ARTX spec)
 pub mod dtype_codes {

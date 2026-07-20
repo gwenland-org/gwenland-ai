@@ -1,4 +1,4 @@
-# GwenLand Language Model Format (GLLM)
+﻿# GwenLand Language Model Format (GLLM)
 
 ## Architecture Specification
 
@@ -214,7 +214,7 @@ GLLM addresses the limitations above through five structural decisions:
 
 ### Storage Follows Execution
 
-The physical layout of a GLLM package mirrors the logical execution flow. If a model executes layers 0 through 79 sequentially, the package stores them as `layer_000.gllm` through `layer_079.gllm`. This alignment enables the runtime to prefetch layer N+1 while executing layer N.
+The physical layout of a GLLM package mirrors the logical execution flow. If a model executes layers 0 through 79 sequentially, the package stores them as `GLLMTensorLayer-0000.gllm` through `GLLMTensorLayer-0079.gllm`. This alignment enables the runtime to prefetch layer N+1 while executing layer N.
 
 ### Metadata Is Executable
 
@@ -263,11 +263,11 @@ Every execution unit (layer file, shared component, manifest) carries a checksum
 
 A GLLM package is a directory or archive containing:
 
-- `gllm.json` — The manifest
-- `shared.gllm` — Shared components (embeddings, output head, norms)
-- `layer_NNN.gllm` — Layer files, one per layer
-- `projector.gllm` — Optional multimodal projector
-- `checksums.sha256` — Optional aggregated checksums
+- `gllm.json` â€” The manifest
+- `GLLMShared.gllm` â€” Shared components (embeddings, output head, norms)
+- `GLLMTensorLayer-NNNN.gllm` â€” Layer files, one per layer
+- `GLLMProj.gllm` â€” Optional multimodal projector
+- `checksums.sha256` â€” Optional aggregated checksums
 
 The runtime interacts with the package through the following pipeline:
 
@@ -295,14 +295,14 @@ flowchart LR
 
 ```
 model.gllm/
-├── gllm.json
-├── shared.gllm
-├── layer_000.gllm
-├── layer_001.gllm
-├── ...
-├── layer_079.gllm
-├── projector.gllm
-└── checksums.sha256
+â”œâ”€â”€ gllm.json
+â”œâ”€â”€ GLLMShared.gllm
+â”œâ”€â”€ GLLMTensorLayer-0000.gllm
+â”œâ”€â”€ GLLMTensorLayer-0001.gllm
+â”œâ”€â”€ ...
+â”œâ”€â”€ GLLMTensorLayer-0079.gllm
+â”œâ”€â”€ GLLMProj.gllm
+â””â”€â”€ checksums.sha256
 ```
 
 ### Archive Format
@@ -316,8 +316,8 @@ graph TD
     A[GLLM Package] --> B[Directory]
     A --> C[ZIP Archive]
     B --> D[gllm.json]
-    B --> E[shared.gllm]
-    B --> F[layer_*.gllm]
+    B --> E[GLLMShared.gllm]
+    B --> F[GLLMTensorLayer-*.gllm]
     C --> G[Local File Header]
     C --> H[Central Directory]
     C --> I[Stored Files]
@@ -347,7 +347,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
     "rope_freq_base": 10000.0
   },
   "shared": {
-    "file": "shared.gllm",
+    "file": "GLLMShared.gllm",
     "checksum": "sha256:abc123...",
     "tensors": [
       {
@@ -362,7 +362,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
   "layers": [
     {
       "index": 0,
-      "file": "layer_000.gllm",
+      "file": "GLLMTensorLayer-0000.gllm",
       "checksum": "sha256:def456...",
       "type": "gllm:transformer/standard@v1",
       "tensors": [
@@ -385,7 +385,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
     }
   ],
   "projector": {
-    "file": "projector.gllm",
+    "file": "GLLMProj.gllm",
     "checksum": "sha256:ghi789...",
     "type": "gllm:projector/linear@v1"
   },
@@ -406,7 +406,7 @@ The manifest is a JSON document with a strict schema. It is the only file the ru
 
 ## Shared Components
 
-Shared components are tensors used by multiple layers or the final output projection. They are stored in `shared.gllm`.
+Shared components are tensors used by multiple layers or the final output projection. They are stored in `GLLMShared.gllm`.
 
 ### Typical Shared Tensors
 
@@ -424,9 +424,9 @@ Shared components are tensors used by multiple layers or the final output projec
 
 An execution unit is any file that the runtime can load, verify, and map independently. This includes:
 
-- `shared.gllm`
-- `layer_NNN.gllm`
-- `projector.gllm`
+- `GLLMShared.gllm`
+- `GLLMTensorLayer-NNNN.gllm`
+- `GLLMProj.gllm`
 - Adapter layer files (future)
 
 Each execution unit has:
@@ -530,7 +530,7 @@ A projector is a tensor or set of tensors that maps layer outputs to a different
 - **Multimodal Projector:** Maps vision encoder outputs to the language model's embedding space.
 - **Classifier Head:** Maps hidden states to class probabilities.
 
-Projectors are stored in `projector.gllm` and referenced by the manifest. They follow the same layer file format but use a distinct layer type URI (e.g., `gllm:projector/linear@v1`).
+Projectors are stored in `GLLMProj.gllm` and referenced by the manifest. They follow the same layer file format but use a distinct layer type URI (e.g., `gllm:projector/linear@v1`).
 
 ## Metadata
 
@@ -583,18 +583,18 @@ sequenceDiagram
     participant M as Manifest
     participant F as File System
     R->>M: Parse manifest
-    R->>F: Open shared.gllm
+    R->>F: Open GLLMShared.gllm
     R->>R: Compute SHA-256
     R->>M: Compare with manifest
     alt Checksum Mismatch
         R->>R: Raise IntegrityError
     else Checksum Match
-        R->>F: mmap shared.gllm
+        R->>F: mmap GLLMShared.gllm
     end
-    R->>F: Open layer_000.gllm
+    R->>F: Open GLLMTensorLayer-0000.gllm
     R->>R: Compute SHA-256
     R->>M: Compare with manifest
-    R->>F: mmap layer_000.gllm
+    R->>F: mmap GLLMTensorLayer-0000.gllm
 ```
 
 > **Rationale:** Per-file checksums enable the runtime to detect corruption at the granularity of execution units. A corrupted layer file does not invalidate the entire package.
@@ -712,14 +712,14 @@ sequenceDiagram
     participant R as Runtime
     participant OS as OS Page Cache
     participant FS as File System
-    R->>FS: mmap(layer_000.gllm)
+    R->>FS: mmap(GLLMTensorLayer-0000.gllm)
     R->>OS: madvise(SEQUENTIAL)
     OS->>FS: Read-ahead pages
     R->>R: Execute Layer 0
-    R->>FS: mmap(layer_001.gllm)
+    R->>FS: mmap(GLLMTensorLayer-0001.gllm)
     R->>OS: madvise(SEQUENTIAL)
     R->>R: Execute Layer 1
-    R->>FS: munmap(layer_000.gllm)
+    R->>FS: munmap(GLLMTensorLayer-0000.gllm)
 ```
 
 > **Rationale:** Sequential loading reduces the working set size to approximately one layer plus shared components. For a 70B model quantized to Q4, this is ~4GB instead of ~40GB.
@@ -1233,7 +1233,7 @@ For each layer, the extractor:
 
 ### Shared Component Extraction
 
-Shared tensors are collected into `shared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
+Shared tensors are collected into `GLLMShared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
 
 ## Metadata Replication
 
