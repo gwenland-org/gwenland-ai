@@ -1,6 +1,6 @@
 [package]
 name = "glictus-caliburni"
-version = "0.1.161"
+version = "0.1.162"
 edition = "2024"
 description = "GLLM (GwenLand Language Model Format) — Ictus Caliburni"
 license = "MIT"
@@ -10,6 +10,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "1"
+# ARTX05/06 runtime: layer files are mapped, not read. Pinned to the same
+# version glcore uses. A thin OS wrapper (mmap/CreateFileMapping), not an ML
+# dependency — the zero-ML-deps rule is intact.
+memmap2 = "0.9"
 # Converter-only (ARTX07): the core format library stays zero-workspace-dep;
 # `glcore` is pulled in only when the `converter` feature is enabled.
 glcore = { path = "../glcore", optional = true }

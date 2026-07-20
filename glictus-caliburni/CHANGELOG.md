@@ -3,6 +3,71 @@
 GLLM (GwenLand Language Model Format), codename *Ictus Caliburni*.
 All notable changes to this crate. Dates are WIB/SEAST.
 
+## [0.1.162] — 2026-07-20 · ARTX05 + ARTX06: layer-sequential runtime
+
+> **Breaking**, despite the patch-level bump (pre-1.0, crate has no external
+> consumers yet): the ARTX01 trait `GllmRuntime` is now `GllmInference`;
+> `DevicePlacement::Cpu`/`Cuda0`/`Cuda1` are now constants (`::CPU`/`::CUDA0`/
+> `::CUDA1`) and the `Unknown` variant is gone; `KvCacheConfig::dtype_size` is
+> now `element_size` and `from_metadata` takes a `&RuntimeConfig`.
+
+New `runtime` module. The crate can now **execute** a package layer by layer
+(map → resolve device → backend → unmap), not only read and validate one.
+
+- **`GllmRuntime`** orchestrates one forward pass; **it computes nothing**.
+  All tensor math goes through the `ExecutionBackend` trait, implemented
+  outside this crate (an adapter over glproc/glcuda). No kernel lives here.
+- **`LayerMapping`** (memmap2, pinned to glcore's version) validates header +
+  tensor index at map time, so a corrupt layer fails loud before execution.
+  `LayerFile::parse(&[u8])` was added and now shares `read_from` with
+  `LayerFile::read`, so the two paths cannot drift.
+- **`AdaptivePrefetcher`** grows the window when mapping outruns execution and
+  shrinks it when it doesn't (hysteresis 1.2 / 0.5, 8-sample history).
+  ⚠️ Those constants are **carried from the spec, not measured** — the tests
+  prove the mechanism (grow/shrink/clamp/no-oscillation), not that the numbers
+  are optimal. Real values need a real backend + glbench.
+- **`KvCache`** is pre-allocated once and never realloc'd. Sizing comes from
+  the backend via `ExecutionBackend::kv_element_size()` → a *private*
+  `RuntimeConfig` field → `KvCacheConfig`; the cache never learns FP32 vs
+  FP16. `dtype_size` is gone from the public API.
+- **`DeviceMapResolver`** implements the AD-06 chain (layer manifest → range
+  assignment → map default → runtime default), then falls back to CPU when the
+  winner is absent — reporting *what* it overrode, not a bare "fell back".
+- **`DevicePlacement` no longer discards device strings**: `Known(..)` +
+  `Other(String)` replace the string-dropping `Unknown`, so `cuda:2` survives
+  and resolves. Wire-compatible with existing manifests (locked by test).
+  Closes `notes/gllm-deviceplacement-cuda-index.md`.
+- The ARTX01 trait `GllmRuntime` was renamed **`GllmInference`** (token-level:
+  infer/stream) to free the name for the layer-level orchestrator.
+
+**Deferred, deliberately:** the GPU runtime (ARTX05 Phase 5) and hybrid runtime
+(Phase 6). Both were specified against a build-time `cudarc` dependency, which
+contradicts glcuda's runtime dynamic-loading pattern and `inference-first.md`
+rules 2 and 6. They land once the pattern is aligned. `rayon` was likewise
+rejected: glproc already owns a persistent thread pool, and a second one would
+contend for the same cores on the reference i3.
+
+**KV cache is the memory trap, not the weights** (f32, verified against the
+runtime's own allocation):
+
+| Model | KV heads | @2048 | @full ctx |
+|---|---|---|---|
+| Qwen2.5-0.5B | 2 | 48 MiB | 768 MiB (32k) |
+| Qwen2.5-1.5B | 2 | 112 MiB | 1.75 GiB (32k) |
+| Qwen3-1.7B | 8 | **448 MiB** | **8.75 GiB** (41k) |
+
+Qwen3-1.7B carries 4x the KV heads of the 1.5B at a similar parameter count, so
+its full-context cache alone exceeds the 8 GB reference machine's total RAM.
+`max_seq_len` therefore defaults to 2048 and is only ever clamped *down* to
+`context_length` — sizing from the manifest, the obvious move, would turn a
+model that loads fine into an instant OOM.
+
+**Verified** with `examples/run_package.rs` on all three converted packages
+(24/28/28 layers): every layer executed, state `Completed`, 0 errors, 0
+fallbacks, and KV allocations matching the table exactly. That example runs
+`NullBackend`, so it proves **orchestration, not numerics** — there are still
+no logits, and no tokenizer (ARTX1 OQ3).
+
 ## [0.1.161] — 2026-07-19 · ARTX07-lite: GGUF → GLLM converter
 
 - **`converter` module + `glconv` binary**, feature-gated behind
