@@ -13,6 +13,61 @@ pub(crate) fn make_test_gllm_file(path: &Path) -> Vec<u8> {
     contents
 }
 
+/// Write a real unit file containing the named tensors, each filled with a
+/// distinct repeating byte so reads can be told apart.
+///
+/// Goes through [`write_unit_file`](crate::layer_io::write_unit_file) — the
+/// same writer the converter uses — so fixtures cannot drift from the real
+/// format. Each tensor is declared 1-D `[size]` of `Q8_0` (one byte per
+/// element), so `size` is both the element count and the exact byte count.
+/// These fixtures exercise layout only — the payload is filler, never decoded.
+pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
+    let payloads: Vec<Vec<u8>> = tensors
+        .iter()
+        .enumerate()
+        .map(|(i, (_, size))| vec![(i as u8).wrapping_add(1); *size as usize])
+        .collect();
+    let shapes: Vec<[u64; 1]> = tensors.iter().map(|(_, size)| [*size]).collect();
+
+    let specs: Vec<(&str, &[u64], crate::manifest::DType, &[u8])> = tensors
+        .iter()
+        .zip(&shapes)
+        .zip(&payloads)
+        .map(|(((name, _), shape), data)| {
+            (
+                *name,
+                shape.as_slice(),
+                crate::manifest::DType::Q8_0,
+                data.as_slice(),
+            )
+        })
+        .collect();
+
+    crate::layer_io::write_unit_file(path, &specs).expect("test layer writes");
+}
+
+/// Metadata for Qwen2.5-0.5B-Instruct — the reference model these crates are
+/// verified against. Values are the real ones read from its GGUF (dim 896,
+/// 14 query heads / 2 KV heads, head_dim 64, ctx 32768, rope base 1e6), so
+/// tests asserting on derived sizes are checking a shape that actually ships.
+pub(crate) fn qwen05b_metadata() -> crate::manifest::ModelMetadata {
+    crate::manifest::ModelMetadata {
+        vocab_size: 151_936,
+        context_length: 32_768,
+        embedding_length: 896,
+        num_layers: 24,
+        num_heads: 14,
+        head_count_kv: 2,
+        rope_dims: Some(64),
+        rope_freq_base: Some(1_000_000.0),
+        rope_scaling: None,
+        expert_count: None,
+        expert_used_count: None,
+        sliding_window: None,
+        attention_bias: None,
+    }
+}
+
 /// Reusable `gllm.json` fixtures (ARTX03).
 pub(crate) mod fixtures {
     use std::path::Path;
@@ -156,4 +211,77 @@ pub(crate) mod fixtures {
         let manifest = manifest_json_with_checksums(num_layers, &shared_hex, &layer_hex);
         std::fs::write(dir.join("gllm.json"), manifest).unwrap();
     }
+}
+
+/// Write a package the ARTX05 runtime can actually execute, in a fresh
+/// temporary directory.
+///
+/// Differs from [`fixtures::write_manifest_package`] in that every unit file
+/// carries a real tensor index, so `LayerFile::parse` succeeds on the mapped
+/// bytes — `make_test_gllm_file` writes only a header plus filler, which the
+/// runtime rejects. Checksums are computed from the bytes actually written.
+pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
+    use crate::checksum::sha256_file;
+
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let root = dir.path();
+
+    write_test_layer(&root.join("shared.gllm"), &[("token_embeddings", 128)]);
+    for i in 0..num_layers {
+        write_test_layer(
+            &root.join(crate::manifest::format_layer_filename(i)),
+            &[("attn_q.weight", 64), ("attn_k.weight", 32)],
+        );
+    }
+
+    let shared_hex = sha256_file(&root.join("shared.gllm")).unwrap();
+    let layer_hex: Vec<String> = (0..num_layers)
+        .map(|i| sha256_file(&root.join(crate::manifest::format_layer_filename(i))).unwrap())
+        .collect();
+
+    let layers: Vec<serde_json::Value> = (0..num_layers)
+        .map(|i| {
+            serde_json::json!({
+                "index": i,
+                "file": crate::manifest::format_layer_filename(i),
+                "checksum": format!("sha256:{}", layer_hex[i as usize]),
+                "type": "gllm:transformer/standard@v1",
+                "tensors": [
+                    { "name": "attn_q.weight", "shape": [64], "dtype": "Q8_0",
+                      "offset": 0, "size": 64 },
+                    { "name": "attn_k.weight", "shape": [32], "dtype": "Q8_0",
+                      "offset": 64, "size": 32 }
+                ]
+            })
+        })
+        .collect();
+
+    // Metadata is Qwen2.5-0.5B's shape scaled to this fixture's layer count,
+    // so KV cache sizing exercises a real GQA config (head_dim 896/14 = 64).
+    let manifest = serde_json::json!({
+        "gllm_version": "1.0.0",
+        "model_id": "org.gwenland.runtime-fixture",
+        "architecture": "transformer",
+        "metadata": {
+            "vocab_size": 151936,
+            "context_length": 32768,
+            "embedding_length": 896,
+            "num_layers": num_layers,
+            "num_heads": 14,
+            "head_count_kv": 2
+        },
+        "shared": {
+            "file": "shared.gllm",
+            "checksum": format!("sha256:{shared_hex}"),
+            "tensors": [
+                { "name": "token_embeddings", "shape": [128], "dtype": "Q8_0",
+                  "offset": 0, "size": 128 }
+            ]
+        },
+        "layers": layers,
+        "extensions": ["gllm:transformer/standard@v1"]
+    });
+
+    std::fs::write(root.join("gllm.json"), manifest.to_string()).unwrap();
+    dir
 }
