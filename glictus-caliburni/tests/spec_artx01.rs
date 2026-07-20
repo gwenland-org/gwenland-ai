@@ -1,4 +1,4 @@
-//! Wave 4: the ARTX01 spec's unit tests.
+﻿//! Wave 4: the ARTX01 spec's unit tests.
 //!
 //! These are the acceptance tests named in the boilerplate spec, kept in
 //! `tests/` alongside the other suites rather than as a `mod tests` inside
@@ -102,7 +102,7 @@ fn test_layer_header_validate() {
 
 #[test]
 fn test_layer_expected_filename() {
-    assert_eq!(GllmPackageMeta::expected_layer_filename(0), "layer_000.gllm");
-    assert_eq!(GllmPackageMeta::expected_layer_filename(42), "layer_042.gllm");
-    assert_eq!(GllmPackageMeta::expected_layer_filename(79), "layer_079.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(0), "GLLMTensorLayer-0000.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(42), "GLLMTensorLayer-0042.gllm");
+    assert_eq!(GllmPackageMeta::expected_layer_filename(79), "GLLMTensorLayer-0079.gllm");
 }

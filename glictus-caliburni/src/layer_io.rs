@@ -1,4 +1,4 @@
-//! Layer/unit file binary I/O (ARTX04 Waves 2–3): tensor index codec,
+﻿//! Layer/unit file binary I/O (ARTX04 Waves 2â€“3): tensor index codec,
 //! full-file reader, and a writer for converters/fixtures.
 //!
 //! File layout (hybrid header decision, see
@@ -197,7 +197,7 @@ impl LayerFile {
 /// region, with per-tensor alignment. Offsets are computed here; returns
 /// the index entries as written (region-relative offsets).
 ///
-/// This is the fixture/converter path — the runtime never writes.
+/// This is the fixture/converter path â€” the runtime never writes.
 pub fn write_unit_file(
     path: &Path,
     tensors: &[(&str, &[u64], DType, &[u8])],
@@ -243,7 +243,7 @@ pub fn write_unit_file(
 /// Cross-check a parsed layer file's binary index against its manifest
 /// entry (ARTX04 Wave 4). The package checksum already guarantees the
 /// bytes; this guarantees the *metadata* agrees. Returns human-readable
-/// mismatch descriptions — empty means fully consistent.
+/// mismatch descriptions â€” empty means fully consistent.
 pub fn cross_check_manifest(layer: &LayerFile, manifest: &LayerManifest) -> Vec<String> {
     let mut mismatches = Vec::new();
     if layer.tensor_index.len() != manifest.tensors.len() {
@@ -335,7 +335,7 @@ mod tests {
     #[test]
     fn unit_file_write_read_roundtrip_with_aligned_data() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("layer_000.gllm");
+        let path = tmp.path().join("GLLMTensorLayer-0000.gllm");
         let a = vec![1u8; 100];
         let b = vec![2u8; 64];
         let written = write_unit_file(
@@ -366,7 +366,7 @@ mod tests {
     fn unit_file_read_empty_index_ok() {
         // Pre-ARTX04 fixture files carry tensor_count = 0.
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         make_test_gllm_file(&path);
 
         let layer = LayerFile::read(&path).unwrap();
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn unit_file_read_rejects_tensor_beyond_eof() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("layer_000.gllm");
+        let path = tmp.path().join("GLLMTensorLayer-0000.gllm");
         let data = vec![7u8; 64];
         write_unit_file(&path, &[("t", &[16], DType::F32, &data)]).unwrap();
         // Truncate into the data region.
@@ -391,7 +391,7 @@ mod tests {
     fn layer_manifest_with(tensors: Vec<TensorEntry>) -> LayerManifest {
         LayerManifest {
             index: 0,
-            file: "layer_000.gllm".into(),
+            file: "GLLMTensorLayer-0000.gllm".into(),
             checksum: format!("sha256:{}", "0".repeat(64)),
             layer_type: crate::manifest::ExtensionUri(
                 "gllm:transformer/standard@v1".into(),
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn cross_check_passes_when_binary_matches_manifest() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("layer_000.gllm");
+        let path = tmp.path().join("GLLMTensorLayer-0000.gllm");
         let data = vec![0u8; 256];
         let written = write_unit_file(&path, &[("attn_q.weight", &[8, 8], DType::F32, &data)])
             .unwrap();
@@ -417,7 +417,7 @@ mod tests {
     #[test]
     fn cross_check_reports_shape_and_missing_mismatches() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("layer_000.gllm");
+        let path = tmp.path().join("GLLMTensorLayer-0000.gllm");
         let data = vec![0u8; 256];
         let mut written = write_unit_file(
             &path,

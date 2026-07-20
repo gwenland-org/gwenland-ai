@@ -1,8 +1,8 @@
-//! Shared components loader (ARTX02 Wave 4).
+﻿//! Shared components loader (ARTX02 Wave 4).
 //!
-//! `shared.gllm` holds the tensors every layer depends on: token
+//! `GLLMShared.gllm` holds the tensors every layer depends on: token
 //! embeddings, final norm, output head, and the RoPE tables. ARTX02 scope
-//! is structural validation only — header + optional checksum — actual
+//! is structural validation only â€” header + optional checksum â€” actual
 //! tensor loading is ARTX04+.
 
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub const SHARED_ROPE_COS: &str = "rope_cos";
 /// Precomputed RoPE sine table.
 pub const SHARED_ROPE_SIN: &str = "rope_sin";
 
-/// Metadata about a validated `shared.gllm` file.
+/// Metadata about a validated `GLLMShared.gllm` file.
 ///
 /// Does NOT load tensor data.
 #[derive(Debug, Clone)]
@@ -38,8 +38,8 @@ pub struct SharedComponents {
 }
 
 impl SharedComponents {
-    /// Open `shared.gllm`, validate its header, and — when
-    /// `expected_checksum` is given — verify the whole file's SHA-256
+    /// Open `GLLMShared.gllm`, validate its header, and â€” when
+    /// `expected_checksum` is given â€” verify the whole file's SHA-256
     /// against it before trusting the contents.
     pub fn open(path: &Path, expected_checksum: Option<&str>) -> Result<Self, GllmError> {
         let unit = ExecutionUnit::open(path)?;
@@ -83,7 +83,7 @@ mod tests {
     #[test]
     fn test_shared_open_valid() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         make_test_gllm_file(&path);
 
         let shared = SharedComponents::open(&path, None).unwrap();
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     fn test_shared_open_with_checksum() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         let contents = make_test_gllm_file(&path);
 
         let shared =
@@ -106,7 +106,7 @@ mod tests {
     #[test]
     fn test_shared_open_wrong_checksum() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         make_test_gllm_file(&path);
 
         let wrong = sha256_bytes(b"not the file");
@@ -120,7 +120,7 @@ mod tests {
     #[test]
     fn test_shared_open_invalid_header() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         let mut bad = make_test_gllm_file(&path);
         bad[0..4].copy_from_slice(b"XXXX");
         std::fs::write(&path, &bad).unwrap();

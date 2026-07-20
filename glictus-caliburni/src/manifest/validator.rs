@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn test_validator_layer_filename_mismatch() {
         let json = fixtures::minimal_manifest_json(2)
-            .replace("layer_001.gllm", "layer_042.gllm");
+            .replace("GLLMTensorLayer-0001.gllm", "GLLMTensorLayer-0042.gllm");
         let r = validate(&json);
         assert!(r.errors.iter().any(|e| e.starts_with("V08")), "{:?}", r.errors);
     }

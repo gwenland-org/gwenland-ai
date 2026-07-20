@@ -43,9 +43,12 @@ impl GllmPackageMeta {
         self.manifest.num_layers()
     }
 
-    /// Expected layer filename untuk index tertentu
+    /// Expected layer filename untuk index tertentu.
+    ///
+    /// Delegates to [`format_layer_filename`](crate::manifest::format_layer_filename)
+    /// so the naming convention has exactly one definition.
     pub fn expected_layer_filename(index: usize) -> String {
-        format!("layer_{index:03}.gllm")
+        crate::manifest::format_layer_filename(index as u32)
     }
 
     /// Total estimated size in bytes
