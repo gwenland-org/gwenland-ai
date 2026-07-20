@@ -1,4 +1,4 @@
-//! Shared helpers for in-module unit tests (compiled only under `cfg(test)`).
+﻿//! Shared helpers for in-module unit tests (compiled only under `cfg(test)`).
 
 use std::path::Path;
 
@@ -16,11 +16,11 @@ pub(crate) fn make_test_gllm_file(path: &Path) -> Vec<u8> {
 /// Write a real unit file containing the named tensors, each filled with a
 /// distinct repeating byte so reads can be told apart.
 ///
-/// Goes through [`write_unit_file`](crate::layer_io::write_unit_file) — the
-/// same writer the converter uses — so fixtures cannot drift from the real
+/// Goes through [`write_unit_file`](crate::layer_io::write_unit_file) â€” the
+/// same writer the converter uses â€” so fixtures cannot drift from the real
 /// format. Each tensor is declared 1-D `[size]` of `Q8_0` (one byte per
 /// element), so `size` is both the element count and the exact byte count.
-/// These fixtures exercise layout only — the payload is filler, never decoded.
+/// These fixtures exercise layout only â€” the payload is filler, never decoded.
 pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
     let payloads: Vec<Vec<u8>> = tensors
         .iter()
@@ -46,7 +46,7 @@ pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
     crate::layer_io::write_unit_file(path, &specs).expect("test layer writes");
 }
 
-/// Metadata for Qwen2.5-0.5B-Instruct — the reference model these crates are
+/// Metadata for Qwen2.5-0.5B-Instruct â€” the reference model these crates are
 /// verified against. Values are the real ones read from its GGUF (dim 896,
 /// 14 query heads / 2 KV heads, head_dim 64, ctx 32768, rope base 1e6), so
 /// tests asserting on derived sizes are checking a shape that actually ships.
@@ -92,7 +92,7 @@ pub(crate) mod fixtures {
                     .unwrap_or(DUMMY_SHA256);
                 serde_json::json!({
                     "index": i,
-                    "file": format!("layer_{i:03}.gllm"),
+                    "file": crate::manifest::format_layer_filename(i),
                     "checksum": format!("sha256:{hex}"),
                     "type": "gllm:transformer/standard@v1",
                     "tensors": []
@@ -112,7 +112,7 @@ pub(crate) mod fixtures {
                 "head_count_kv": 8
             },
             "shared": {
-                "file": "shared.gllm",
+                "file": crate::constants::SHARED_FILENAME,
                 "checksum": format!("sha256:{shared_hex}"),
                 "tensors": [
                     { "name": "token_embeddings", "shape": [1000, 64],
@@ -131,7 +131,7 @@ pub(crate) mod fixtures {
     }
 
     /// Full-featured manifest: GQA metadata, quantization, projector,
-    /// device hints, custom metadata — 2 layers.
+    /// device hints, custom metadata â€” 2 layers.
     pub(crate) fn full_manifest_json() -> String {
         serde_json::json!({
             "gllm_version": "1.0.0",
@@ -153,7 +153,7 @@ pub(crate) mod fixtures {
                 "attention_bias": false
             },
             "shared": {
-                "file": "shared.gllm",
+                "file": crate::constants::SHARED_FILENAME,
                 "checksum": format!("sha256:{DUMMY_SHA256}"),
                 "tensors": [
                     { "name": "token_embeddings", "shape": [128256, 8192],
@@ -163,21 +163,21 @@ pub(crate) mod fixtures {
                 ]
             },
             "layers": [
-                { "index": 0, "file": "layer_000.gllm",
+                { "index": 0, "file": "GLLMTensorLayer-0000.gllm",
                   "checksum": format!("sha256:{DUMMY_SHA256}"),
                   "type": "gllm:transformer/standard@v1",
                   "tensors": [
                       { "name": "attn_q.weight", "shape": [8192, 8192],
                         "dtype": "Q4_K_M", "offset": 0, "size": 37748736 }
                   ] },
-                { "index": 1, "file": "layer_001.gllm",
+                { "index": 1, "file": "GLLMTensorLayer-0001.gllm",
                   "checksum": format!("sha256:{DUMMY_SHA256}"),
                   "type": "gllm:transformer/standard@v1",
                   "tensors": [],
                   "device": "cuda:0" }
             ],
             "projector": {
-                "file": "projector.gllm",
+                "file": crate::constants::PROJECTOR_FILENAME,
                 "checksum": format!("sha256:{DUMMY_SHA256}"),
                 "type": "gllm:projector/linear@v1",
                 "tensors": []
@@ -200,13 +200,13 @@ pub(crate) mod fixtures {
         use crate::checksum::sha256_file;
         use crate::test_helpers::make_test_gllm_file;
 
-        make_test_gllm_file(&dir.join("shared.gllm"));
+        make_test_gllm_file(&dir.join(crate::constants::SHARED_FILENAME));
         for i in 0..num_layers {
-            make_test_gllm_file(&dir.join(format!("layer_{i:03}.gllm")));
+            make_test_gllm_file(&dir.join(crate::manifest::format_layer_filename(i)));
         }
-        let shared_hex = sha256_file(&dir.join("shared.gllm")).unwrap();
+        let shared_hex = sha256_file(&dir.join(crate::constants::SHARED_FILENAME)).unwrap();
         let layer_hex: Vec<String> = (0..num_layers)
-            .map(|i| sha256_file(&dir.join(format!("layer_{i:03}.gllm"))).unwrap())
+            .map(|i| sha256_file(&dir.join(crate::manifest::format_layer_filename(i))).unwrap())
             .collect();
         let manifest = manifest_json_with_checksums(num_layers, &shared_hex, &layer_hex);
         std::fs::write(dir.join("gllm.json"), manifest).unwrap();
@@ -218,7 +218,7 @@ pub(crate) mod fixtures {
 ///
 /// Differs from [`fixtures::write_manifest_package`] in that every unit file
 /// carries a real tensor index, so `LayerFile::parse` succeeds on the mapped
-/// bytes — `make_test_gllm_file` writes only a header plus filler, which the
+/// bytes â€” `make_test_gllm_file` writes only a header plus filler, which the
 /// runtime rejects. Checksums are computed from the bytes actually written.
 pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
     use crate::checksum::sha256_file;
@@ -226,7 +226,7 @@ pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
     let dir = tempfile::TempDir::new().expect("tempdir");
     let root = dir.path();
 
-    write_test_layer(&root.join("shared.gllm"), &[("token_embeddings", 128)]);
+    write_test_layer(&root.join(crate::constants::SHARED_FILENAME), &[("token_embeddings", 128)]);
     for i in 0..num_layers {
         write_test_layer(
             &root.join(crate::manifest::format_layer_filename(i)),
@@ -234,7 +234,7 @@ pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
         );
     }
 
-    let shared_hex = sha256_file(&root.join("shared.gllm")).unwrap();
+    let shared_hex = sha256_file(&root.join(crate::constants::SHARED_FILENAME)).unwrap();
     let layer_hex: Vec<String> = (0..num_layers)
         .map(|i| sha256_file(&root.join(crate::manifest::format_layer_filename(i))).unwrap())
         .collect();
@@ -271,7 +271,7 @@ pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
             "head_count_kv": 2
         },
         "shared": {
-            "file": "shared.gllm",
+            "file": crate::constants::SHARED_FILENAME,
             "checksum": format!("sha256:{shared_hex}"),
             "tensors": [
                 { "name": "token_embeddings", "shape": [128], "dtype": "Q8_0",

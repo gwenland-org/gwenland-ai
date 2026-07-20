@@ -1,4 +1,4 @@
-use glictus_caliburni::types::execution::Device;
+﻿use glictus_caliburni::types::execution::Device;
 
 #[test]
 fn fromstr_trait_does_not_recurse() {
@@ -21,11 +21,11 @@ fn manifest_json_roundtrip() {
             "embedding_length": 896, "num_layers": 24, "num_heads": 14,
             "head_count_kv": 2, "rope_dims": 64, "rope_freq_base": 1000000.0
         },
-        "shared": { "file": "shared.gllm", "checksum": "abc", "tensors": [
+        "shared": { "file": "GLLMShared.gllm", "checksum": "abc", "tensors": [
             { "name": "token_embd", "shape": [151936, 896], "dtype": "Q4_K", "offset": 0, "size": 68067328 }
         ]},
         "layers": [
-            { "index": 0, "file": "layer_000.gllm", "checksum": "def",
+            { "index": 0, "file": "GLLMTensorLayer-0000.gllm", "checksum": "def",
               "type": "gllm:transformer/standard@v1", "tensors": [], "device": "cpu" }
         ],
         "projector": null,

@@ -1,8 +1,8 @@
-# ARTX2 — Package Specification
+﻿# ARTX2 â€” Package Specification
 
 ## Architecture Specification
 
-**Document Name:** ARTX2_—_Package_Specification.md  
+**Document Name:** ARTX2_â€”_Package_Specification.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -40,15 +40,41 @@
 
 ```
 model.gllm/
-├── gllm.json
-├── shared.gllm
-├── layer_000.gllm
-├── layer_001.gllm
-├── ...
-├── layer_079.gllm
-├── projector.gllm
-└── checksums.sha256
+â”œâ”€â”€ gllm.json
+â”œâ”€â”€ GLLMShared.gllm
+â”œâ”€â”€ GLLMTensorLayer-0000.gllm
+â”œâ”€â”€ GLLMTensorLayer-0001.gllm
+â”œâ”€â”€ ...
+â”œâ”€â”€ GLLMTensorLayer-0079.gllm
+â”œâ”€â”€ GLLMProj.gllm
+â””â”€â”€ checksums.sha256
 ```
+
+## File Naming
+
+| Unit | Filename |
+|------|----------|
+| Manifest | `gllm.json` |
+| Shared components | `GLLMShared.gllm` |
+| Layer *N* | `GLLMTensorLayer-NNNN.gllm` |
+| Projector (optional) | `GLLMProj.gllm` |
+| Checksums | `checksums.sha256` |
+
+Layer indices are zero-padded to **four** digits, so a lexical sort of the
+directory matches execution order for any model up to 10 000 layers. An index
+beyond that is written in full rather than truncated â€” two layers must never
+resolve to one filename.
+
+Every execution unit ends in `.gllm`. The `.zip` extension never appears on a
+member file: archiving applies to the package *directory* as a whole (see
+Archive Format below), never to the units inside it.
+
+> **Revision (2026-07-20):** this replaces the original scheme of
+> `shared` / `layer_NNN` / `projector` (three-digit padding, lowercase, no
+> prefix). The `GLLM` prefix makes package members self-identifying when they
+> are extracted or copied next to unrelated files, and the wider padding
+> removes the 1 000-layer ordering cliff. Packages written under the old
+> scheme are **not** readable by the current runtime and must be re-converted.
 
 ## Archive Format
 
@@ -61,8 +87,8 @@ graph TD
     A[GLLM Package] --> B[Directory]
     A --> C[ZIP Archive]
     B --> D[gllm.json]
-    B --> E[shared.gllm]
-    B --> F[layer_*.gllm]
+    B --> E[GLLMShared.gllm]
+    B --> F[GLLMTensorLayer-*.gllm]
     C --> G[Local File Header]
     C --> H[Central Directory]
     C --> I[Stored Files]
@@ -76,9 +102,9 @@ For manifest schema details, see ARTX3: Manifest Specification. For layer file b
 
 An execution unit is any file that the runtime can load, verify, and map independently. This includes:
 
-- `shared.gllm`
-- `layer_NNN.gllm`
-- `projector.gllm`
+- `GLLMShared.gllm`
+- `GLLMTensorLayer-NNNN.gllm`
+- `GLLMProj.gllm`
 - Adapter layer files (future)
 
 Each execution unit has:
@@ -105,7 +131,7 @@ graph LR
 
 # Shared Components
 
-Shared components are tensors used by multiple layers or the final output projection. They are stored in `shared.gllm`.
+Shared components are tensors used by multiple layers or the final output projection. They are stored in `GLLMShared.gllm`.
 
 ## Typical Shared Tensors
 
@@ -139,18 +165,18 @@ sequenceDiagram
     participant M as Manifest
     participant F as File System
     R->>M: Parse manifest
-    R->>F: Open shared.gllm
+    R->>F: Open GLLMShared.gllm
     R->>R: Compute SHA-256
     R->>M: Compare with manifest
     alt Checksum Mismatch
         R->>R: Raise IntegrityError
     else Checksum Match
-        R->>F: mmap shared.gllm
+        R->>F: mmap GLLMShared.gllm
     end
-    R->>F: Open layer_000.gllm
+    R->>F: Open GLLMTensorLayer-0000.gllm
     R->>R: Compute SHA-256
     R->>M: Compare with manifest
-    R->>F: mmap layer_000.gllm
+    R->>F: mmap GLLMTensorLayer-0000.gllm
 ```
 
 > **Rationale:** Per-file checksums enable the runtime to detect corruption at the granularity of execution units. A corrupted layer file does not invalidate the entire package.
