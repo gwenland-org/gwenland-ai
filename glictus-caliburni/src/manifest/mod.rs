@@ -1,4 +1,4 @@
-//! `gllm.json` manifest — parsing, data types, and semantic validation
+﻿//! `gllm.json` manifest â€” parsing, data types, and semantic validation
 //! (ARTX03).
 //!
 //! The manifest is the single source of truth for a GLLM package: after
@@ -21,6 +21,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::GllmError;
+use crate::types::execution::Device;
 
 /// Canonical layer filename for an index: zero-padded to 3 digits
 /// minimum, never truncated (`layer_000.gllm`, `layer_1000.gllm`).
@@ -82,12 +83,27 @@ impl SharedManifest {
 
 /// Device placement hint for a layer, as written in manifests.
 ///
-/// Deliberately coarse (per ARTX03): the runtime's real device model is
-/// `types::execution::Device`; this is only the manifest's serialized
-/// hint, with unknown strings preserved as [`DevicePlacement::Unknown`].
+/// ARTX03 names only `cuda:0` and `cuda:1`, but ARTX06 device maps and ARTX10
+/// rank strings can carry any device. [`Other`](Self::Other) therefore keeps
+/// the raw string instead of discarding it, so a manifest asking for `cuda:2`
+/// stays recoverable â€” see `notes/gllm-deviceplacement-cuda-index.md`.
+///
+/// This is the manifest's serialized *hint*. The runtime's real device model
+/// is [`Device`](crate::types::execution::Device); convert with
+/// [`to_device`](Self::to_device).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(untagged)]
 pub enum DevicePlacement {
+    /// One of the placements ARTX03 names explicitly.
+    Known(KnownDevicePlacement),
+    /// Any other device string, preserved verbatim.
+    Other(String),
+}
+
+/// The placements ARTX03 spells out by name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KnownDevicePlacement {
     /// CPU execution (default).
     Cpu,
     /// First CUDA device.
@@ -100,9 +116,61 @@ pub enum DevicePlacement {
     Metal,
     /// Vulkan.
     Vulkan,
-    /// Unknown/custom device string (forward compat).
-    #[serde(other)]
-    Unknown,
+}
+
+impl DevicePlacement {
+    /// CPU placement â€” the default when a manifest says nothing.
+    pub const CPU: Self = DevicePlacement::Known(KnownDevicePlacement::Cpu);
+    /// First CUDA device.
+    pub const CUDA0: Self = DevicePlacement::Known(KnownDevicePlacement::Cuda0);
+    /// Second CUDA device.
+    pub const CUDA1: Self = DevicePlacement::Known(KnownDevicePlacement::Cuda1);
+
+    /// The device string as it appears in a manifest.
+    pub fn as_str(&self) -> &str {
+        match self {
+            DevicePlacement::Known(k) => k.as_str(),
+            DevicePlacement::Other(s) => s,
+        }
+    }
+
+    /// Convert to the runtime device model, `None` when unparseable.
+    ///
+    /// Parsing lives entirely in [`Device::from_str`], so `cuda:7` resolves
+    /// through the same path as `cuda:0` rather than a second dialect here.
+    pub fn to_device(&self) -> Option<Device> {
+        Device::from_str(self.as_str())
+    }
+
+    /// Whether this names a GPU (`None` for an unparseable string).
+    pub fn is_gpu(&self) -> Option<bool> {
+        self.to_device().map(|d| d.is_gpu())
+    }
+}
+
+impl KnownDevicePlacement {
+    /// The manifest spelling of this placement.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KnownDevicePlacement::Cpu => "cpu",
+            KnownDevicePlacement::Cuda0 => "cuda:0",
+            KnownDevicePlacement::Cuda1 => "cuda:1",
+            KnownDevicePlacement::Metal => "metal",
+            KnownDevicePlacement::Vulkan => "vulkan",
+        }
+    }
+}
+
+impl Default for DevicePlacement {
+    fn default() -> Self {
+        DevicePlacement::CPU
+    }
+}
+
+impl std::fmt::Display for DevicePlacement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Descriptor for a single `layer_NNN.gllm` file in the manifest.
@@ -163,7 +231,7 @@ impl LayerManifest {
 
     /// Effective device (CPU when unspecified).
     pub fn effective_device(&self) -> DevicePlacement {
-        self.device.clone().unwrap_or(DevicePlacement::Cpu)
+        self.device.clone().unwrap_or(DevicePlacement::CPU)
     }
 }
 
@@ -200,7 +268,7 @@ impl ProjectorManifest {
 }
 
 /// Free-form key-value metadata for tooling/provenance.
-/// Not interpreted by the runtime — preserved as-is.
+/// Not interpreted by the runtime â€” preserved as-is.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CustomMetadata(pub HashMap<String, serde_json::Value>);
 
@@ -216,7 +284,7 @@ impl CustomMetadata {
     }
 }
 
-/// The complete deserialized `gllm.json` manifest — the single source of
+/// The complete deserialized `gllm.json` manifest â€” the single source of
 /// truth for a GLLM package.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GllmManifest {
@@ -279,7 +347,7 @@ impl GllmManifest {
     }
 
     /// Layer entry by position (positions equal indices in a valid
-    /// manifest — rule V07).
+    /// manifest â€” rule V07).
     pub fn layer_file(&self, index: usize) -> Option<&LayerManifest> {
         self.layers.get(index)
     }
@@ -343,7 +411,47 @@ mod tests {
     #[test]
     fn test_layer_manifest_effective_device_fallback() {
         let m = GllmManifest::from_str(&fixtures::minimal_manifest_json(1)).unwrap();
-        assert_eq!(m.layers[0].effective_device(), DevicePlacement::Cpu);
+        assert_eq!(m.layers[0].effective_device(), DevicePlacement::CPU);
+    }
+
+    #[test]
+    fn device_placement_preserves_arbitrary_device_strings() {
+        // The bug this fixes: "cuda:2" used to deserialize to Unknown and the
+        // string was lost, leaving the runtime unable to honour the manifest.
+        let p: DevicePlacement = serde_json::from_str("\"cuda:2\"").unwrap();
+        assert_eq!(p, DevicePlacement::Other("cuda:2".into()));
+        assert_eq!(p.as_str(), "cuda:2");
+        assert_eq!(p.to_device(), Some(Device::Cuda(2)));
+        assert_eq!(p.is_gpu(), Some(true));
+
+        // Round-trips back to the same plain string.
+        assert_eq!(serde_json::to_string(&p).unwrap(), "\"cuda:2\"");
+    }
+
+    #[test]
+    fn device_placement_keeps_named_variants_wire_compatible() {
+        // Manifests written before this change must keep their meaning.
+        for (json, expected) in [
+            ("\"cpu\"", DevicePlacement::CPU),
+            ("\"cuda:0\"", DevicePlacement::CUDA0),
+            ("\"cuda:1\"", DevicePlacement::CUDA1),
+        ] {
+            let p: DevicePlacement = serde_json::from_str(json).unwrap();
+            assert_eq!(p, expected, "{json}");
+            assert_eq!(serde_json::to_string(&p).unwrap(), json);
+        }
+        assert_eq!(DevicePlacement::CUDA0.to_device(), Some(Device::Cuda(0)));
+    }
+
+    #[test]
+    fn unparseable_device_string_survives_but_resolves_to_nothing() {
+        // ARTX10's "rank:0/cuda:0" is not a Device yet. The string must
+        // survive so a later runtime can act on it, while to_device() admits
+        // it cannot resolve it rather than guessing CPU.
+        let p: DevicePlacement = serde_json::from_str("\"rank:0/cuda:0\"").unwrap();
+        assert_eq!(p.as_str(), "rank:0/cuda:0");
+        assert_eq!(p.to_device(), None);
+        assert_eq!(p.is_gpu(), None);
     }
 
     #[test]
@@ -364,7 +472,7 @@ mod tests {
         assert_eq!(m.extensions.len(), 2);
         assert_eq!(
             m.layers[1].effective_device(),
-            DevicePlacement::Cuda0,
+            DevicePlacement::CUDA0,
             "layer 1 carries an explicit cuda:0 hint"
         );
         assert!(m.quantization.is_some());

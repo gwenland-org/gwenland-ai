@@ -21,6 +21,7 @@ pub mod execution_unit;
 pub mod layer_io;
 pub mod manifest;
 pub mod package;
+pub mod runtime;
 pub mod shared;
 pub mod traits;
 pub mod types;
@@ -37,11 +38,17 @@ pub use execution_unit::{
 pub use layer_io::{cross_check_manifest, read_entry, write_entry, write_unit_file};
 pub use manifest::{
     CustomMetadata, DType, DevicePlacement, ExtensionUri, FormatVersion, GllmManifest,
-    LayerManifest, ManifestValidator, ModelMetadata, ProjectorManifest,
+    KnownDevicePlacement, LayerManifest, ManifestValidator, ModelMetadata, ProjectorManifest,
     RUNTIME_FORMAT_VERSION, RopeScaling, SharedManifest, TensorEntry, ValidationResult,
     VersionCompatibility,
 };
 pub use package::{GllmPackage, LayerPath, PackageFormat, PackageLayout};
+pub use runtime::{
+    ActivationBuffer, AdaptivePrefetcher, CpuRuntime, DeviceMapConfig, DeviceMapResolver,
+    DeviceSource, ExecutionBackend, ExecutionState, ExecutionStats, GllmRuntime, KvCache,
+    KvCacheConfig, KvCacheSlot, LayerMapping, LayerScheduleState, LogEntry, NullBackend,
+    ResolvedDevice, RuntimeConfig, RuntimeLogLevel, RuntimeLogger, Scheduler,
+};
 pub use shared::SharedComponents;
 pub use types::{
     execution::{Device, DeviceMap, ExecutionUnitMeta},
@@ -51,7 +58,7 @@ pub use types::{
 pub use traits::{
     converter::GllmConverter,
     plugin::LayerPlugin,
-    runtime::GllmRuntime,
+    inference::GllmInference,
 };
 
 /// GLLM format version string

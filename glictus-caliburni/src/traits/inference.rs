@@ -2,7 +2,14 @@ use crate::error::GllmResult;
 use crate::types::execution::Device;
 use crate::types::package::GllmPackageMeta;
 
-/// Core runtime trait — implemented by CPU/CUDA/Vulkan/Metal runtimes.
+/// Core inference trait — implemented by CPU/CUDA/Vulkan/Metal backends.
+///
+/// This is the *token-level* API: tokens in, logits out. It is distinct from
+/// [`GllmRuntime`](crate::runtime::GllmRuntime) (ARTX05), which orchestrates
+/// layer-sequential execution (map → execute → unmap) one forward pass at a
+/// time and knows nothing about tokens or sampling. A backend may eventually
+/// implement this trait *on top of* a `GllmRuntime`, once tokenizer packaging
+/// (ARTX1 OQ3) is settled.
 ///
 /// Philosophy: *"Correctness first. Load what you need. Execute what's valid."*
 ///
@@ -23,10 +30,10 @@ use crate::types::package::GllmPackageMeta;
 /// ## Object safety
 ///
 /// This trait MUST remain object-safe — runtimes are held as
-/// `Box<dyn GllmRuntime>`. That is why [`stream`](Self::stream) takes
+/// `Box<dyn GllmInference>`. That is why [`stream`](Self::stream) takes
 /// `&mut dyn FnMut` rather than a generic `F: FnMut`. Keep that pattern for
 /// any new callback-taking method.
-pub trait GllmRuntime: Send + Sync {
+pub trait GllmInference: Send + Sync {
     /// Load a GLLM package — validate checksums, parse manifest.
     fn load_package(&mut self, package: &GllmPackageMeta) -> GllmResult<()>;
 
