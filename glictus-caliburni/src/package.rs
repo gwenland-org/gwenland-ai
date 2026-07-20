@@ -326,6 +326,71 @@ impl GllmPackage {
         Ok(crate::layer_io::cross_check_manifest(&layer, manifest))
     }
 
+    /// Check every layer's tensor index against the plugin for its declared
+    /// type (ARTX8).
+    ///
+    /// Returns all `(unit, problem)` findings without short-circuiting; empty
+    /// means every layer is structurally valid for the type it claims to be.
+    /// Findings come in two kinds: a layer type no plugin implements, and a
+    /// layer whose tensors do not match its type's layout.
+    ///
+    /// This reads each layer's index from disk but never its tensor data, so
+    /// cost is independent of model size. It is deliberately **not** part of
+    /// [`open`](Self::open): resolving layer types needs a registry the
+    /// caller owns, and a package whose exotic layer types this build cannot
+    /// describe is still worth opening for inspection.
+    pub fn validate_layer_types(
+        &self,
+        registry: &crate::plugin::PluginRegistry,
+    ) -> Vec<(String, String)> {
+        let mut findings = Vec::new();
+
+        for layer in &self.manifest.layers {
+            let Some(plugin) = registry.resolve(&layer.layer_type) else {
+                findings.push((
+                    layer.file.clone(),
+                    format!("no plugin registered for layer type {}", layer.layer_type),
+                ));
+                continue;
+            };
+
+            // Prefer the binary index — it is what the runtime will actually
+            // map. Fall back to the manifest's copy when the file cannot be
+            // read, so a missing layer is reported as one finding rather than
+            // aborting the whole sweep.
+            let index = match self.read_layer_file(layer.index) {
+                Ok(file) => file.tensor_index,
+                Err(e) => {
+                    findings.push((layer.file.clone(), format!("unreadable: {e}")));
+                    continue;
+                }
+            };
+
+            if let Err(e) = plugin.validate_layout(&index) {
+                findings.push((layer.file.clone(), e.to_string()));
+            }
+        }
+
+        if let Some(projector) = &self.manifest.projector {
+            match registry.resolve(&projector.projector_type) {
+                Some(plugin) => {
+                    if let Err(e) = plugin.validate_layout(&projector.tensors) {
+                        findings.push((projector.file.clone(), e.to_string()));
+                    }
+                }
+                None => findings.push((
+                    projector.file.clone(),
+                    format!(
+                        "no plugin registered for projector type {}",
+                        projector.projector_type
+                    ),
+                )),
+            }
+        }
+
+        findings
+    }
+
     /// Verify every entry of the checksum file against the package root.
     ///
     /// Returns all `(filename, error)` failures without short-circuiting;
@@ -709,6 +774,46 @@ mod tests {
         assert!(
             matches!(err, GllmError::InvalidPackageFormat(_)),
             "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_layer_types_flags_a_layer_that_lies_about_its_type() {
+        use crate::plugin::PluginRegistry;
+        use crate::test_helpers::write_runtime_package;
+
+        // The fixture's layers declare gllm:transformer/standard@v1 but carry
+        // only attn_q/attn_k — exactly the shape of a converter that dropped
+        // a family of tensors.
+        let dir = write_runtime_package(2);
+        let pkg = GllmPackage::open(dir.path()).unwrap();
+
+        let findings = pkg.validate_layer_types(&PluginRegistry::with_builtins());
+        assert_eq!(findings.len(), 2, "one finding per layer: {findings:?}");
+        for (file, problem) in &findings {
+            assert!(file.starts_with("GLLMTensorLayer-"), "{file}");
+            assert!(
+                problem.contains("ffn_down.weight") && problem.contains("attn_v.weight"),
+                "every missing tensor should be listed: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_layer_types_reports_an_unregistered_type() {
+        use crate::plugin::PluginRegistry;
+        use crate::test_helpers::write_runtime_package;
+
+        let dir = write_runtime_package(1);
+        let pkg = GllmPackage::open(dir.path()).unwrap();
+
+        // An empty registry knows no types at all.
+        let findings = pkg.validate_layer_types(&PluginRegistry::new());
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0].1.contains("no plugin registered"),
+            "{:?}",
+            findings[0]
         );
     }
 
