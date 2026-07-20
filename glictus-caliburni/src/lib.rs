@@ -21,6 +21,7 @@ pub mod execution_unit;
 pub mod layer_io;
 pub mod manifest;
 pub mod package;
+pub mod plugin;
 pub mod runtime;
 pub mod shared;
 pub mod traits;
@@ -43,6 +44,10 @@ pub use manifest::{
     VersionCompatibility,
 };
 pub use package::{GllmPackage, LayerPath, PackageFormat, PackageLayout};
+pub use plugin::{
+    LinearProjectorPlugin, MambaPlugin, MlaPlugin, MoePlugin, PluginRegistry,
+    TransformerStandardPlugin,
+};
 pub use runtime::{
     ActivationBuffer, AdaptivePrefetcher, CpuRuntime, DeviceMapConfig, DeviceMapResolver,
     DeviceSource, ExecutionBackend, ExecutionState, ExecutionStats, GllmRuntime, KvCache,
