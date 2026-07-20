@@ -1,4 +1,4 @@
-//! SHA-256 integrity verification (ARTX02 Wave 3).
+﻿//! SHA-256 integrity verification (ARTX02 Wave 3).
 //!
 //! Fail Fast, Fail Loud: every execution unit carries a SHA-256 checksum
 //! (from `checksums.sha256` or the manifest) that is verified before the
@@ -52,7 +52,7 @@ pub fn sha256_bytes(data: &[u8]) -> String {
 /// Per-file checksum entry (from `checksums.sha256` or the manifest).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChecksumEntry {
-    /// Filename relative to the package root, e.g. `layer_000.gllm`.
+    /// Filename relative to the package root, e.g. `GLLMTensorLayer-0000.gllm`.
     pub filename: String,
     /// Expected digest: lowercase hex, 64 chars.
     pub expected_sha256: String,
@@ -68,7 +68,7 @@ pub struct ChecksumVerifier {
 impl ChecksumVerifier {
     /// Parse a `checksums.sha256` file in standard `sha256sum` output
     /// format: `<64-hex>  <filename>` per line (a leading `*` on the
-    /// filename — binary-mode marker — is stripped). Blank lines are
+    /// filename â€” binary-mode marker â€” is stripped). Blank lines are
     /// ignored; anything else is an [`GllmError::IntegrityError`].
     pub fn from_file(path: &Path) -> Result<Self, GllmError> {
         let text = std::fs::read_to_string(path)?;
@@ -146,7 +146,7 @@ impl ChecksumVerifier {
 
     /// Verify every entry against the files under `base_dir`.
     ///
-    /// Does NOT short-circuit — checks all files and returns every
+    /// Does NOT short-circuit â€” checks all files and returns every
     /// `(filename, error)` pair that failed, so a corrupted package reports
     /// the full damage in one pass.
     pub fn verify_all(&self, base_dir: &Path) -> Vec<(String, GllmError)> {
@@ -166,7 +166,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// SHA-256 of b"hello" — standard published test vector.
+    /// SHA-256 of b"hello" â€” standard published test vector.
     const SHA256_HELLO: &str =
         "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 
@@ -191,19 +191,19 @@ mod tests {
         fs::write(
             &path,
             format!(
-                "{SHA256_HELLO}  shared.gllm\n\
-                 {SHA256_HELLO}  layer_000.gllm\n\
-                 {SHA256_HELLO}  *layer_001.gllm\n"
+                "{SHA256_HELLO}  GLLMShared.gllm\n\
+                 {SHA256_HELLO}  GLLMTensorLayer-0000.gllm\n\
+                 {SHA256_HELLO}  *GLLMTensorLayer-0001.gllm\n"
             ),
         )
         .unwrap();
 
         let verifier = ChecksumVerifier::from_file(&path).unwrap();
         assert_eq!(verifier.entries.len(), 3);
-        assert_eq!(verifier.entries[0].filename, "shared.gllm");
+        assert_eq!(verifier.entries[0].filename, "GLLMShared.gllm");
         // Binary-mode marker '*' is stripped.
-        assert_eq!(verifier.entries[2].filename, "layer_001.gllm");
-        assert_eq!(verifier.expected_for("layer_000.gllm"), Some(SHA256_HELLO));
+        assert_eq!(verifier.entries[2].filename, "GLLMTensorLayer-0001.gllm");
+        assert_eq!(verifier.expected_for("GLLMTensorLayer-0000.gllm"), Some(SHA256_HELLO));
     }
 
     #[test]
@@ -220,7 +220,7 @@ mod tests {
     fn test_parse_checksums_file_malformed_hash() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("checksums.sha256");
-        fs::write(&path, "nothex  shared.gllm\n").unwrap();
+        fs::write(&path, "nothex  GLLMShared.gllm\n").unwrap();
 
         let err = ChecksumVerifier::from_file(&path).unwrap_err();
         assert!(matches!(err, GllmError::IntegrityError(_)), "got {err:?}");
@@ -229,27 +229,27 @@ mod tests {
     #[test]
     fn test_verify_file_match() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         fs::write(&path, b"hello").unwrap();
 
         let verifier = ChecksumVerifier::from_entries(vec![ChecksumEntry {
-            filename: "shared.gllm".into(),
+            filename: "GLLMShared.gllm".into(),
             expected_sha256: SHA256_HELLO.into(),
         }]);
-        verifier.verify_file("shared.gllm", &path).unwrap();
+        verifier.verify_file("GLLMShared.gllm", &path).unwrap();
     }
 
     #[test]
     fn test_verify_file_mismatch() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join("shared.gllm");
+        let path = tmp.path().join("GLLMShared.gllm");
         fs::write(&path, b"tampered").unwrap();
 
         let verifier = ChecksumVerifier::from_entries(vec![ChecksumEntry {
-            filename: "shared.gllm".into(),
+            filename: "GLLMShared.gllm".into(),
             expected_sha256: SHA256_HELLO.into(),
         }]);
-        let err = verifier.verify_file("shared.gllm", &path).unwrap_err();
+        let err = verifier.verify_file("GLLMShared.gllm", &path).unwrap_err();
         assert!(
             matches!(err, GllmError::ChecksumMismatch { .. }),
             "got {err:?}"

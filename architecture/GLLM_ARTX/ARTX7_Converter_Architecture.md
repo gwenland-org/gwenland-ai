@@ -1,8 +1,8 @@
-# ARTX7 — Converter Architecture
+﻿# ARTX7 â€” Converter Architecture
 
 ## Architecture Specification
 
-**Document Name:** ARTX7_—_Converter_Architecture.md  
+**Document Name:** ARTX7_â€”_Converter_Architecture.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -158,7 +158,7 @@ For each layer, the extractor:
 
 ## Shared Component Extraction
 
-Shared tensors are collected into `shared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
+Shared tensors are collected into `GLLMShared.gllm`. The extractor ensures that tied weights (e.g., input and output embeddings) are not duplicated.
 
 For layer file binary format, see ARTX4: Layer Specification. For shared components, see ARTX2: Package Specification.
 

@@ -1,8 +1,8 @@
-# ARTX5 — Runtime Architecture
+﻿# ARTX5 â€” Runtime Architecture
 
 ## Architecture Specification
 
-**Document Name:** ARTX5_—_Runtime_Architecture.md  
+**Document Name:** ARTX5_â€”_Runtime_Architecture.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -102,14 +102,14 @@ sequenceDiagram
     participant R as Runtime
     participant OS as OS Page Cache
     participant FS as File System
-    R->>FS: mmap(layer_000.gllm)
+    R->>FS: mmap(GLLMTensorLayer-0000.gllm)
     R->>OS: madvise(SEQUENTIAL)
     OS->>FS: Read-ahead pages
     R->>R: Execute Layer 0
-    R->>FS: mmap(layer_001.gllm)
+    R->>FS: mmap(GLLMTensorLayer-0001.gllm)
     R->>OS: madvise(SEQUENTIAL)
     R->>R: Execute Layer 1
-    R->>FS: munmap(layer_000.gllm)
+    R->>FS: munmap(GLLMTensorLayer-0000.gllm)
 ```
 
 > **Rationale:** Sequential loading reduces the working set size to approximately one layer plus shared components. For a 70B model quantized to Q4, this is ~4GB instead of ~40GB.

@@ -1,16 +1,16 @@
-//! GGUF → GLLM converter (ARTX07-lite). Feature-gated behind
+﻿//! GGUF â†’ GLLM converter (ARTX07-lite). Feature-gated behind
 //! `converter` so the core format library stays zero-workspace-dep.
 //!
-//! Pipeline (per ARTX7): parse GGUF → group tensors into shared/layers →
-//! write unit files via [`crate::layer_io::write_unit_file`] → generate
-//! `gllm.json` + `checksums.sha256` → re-open with [`GllmPackage`] and
+//! Pipeline (per ARTX7): parse GGUF â†’ group tensors into shared/layers â†’
+//! write unit files via [`crate::layer_io::write_unit_file`] â†’ generate
+//! `gllm.json` + `checksums.sha256` â†’ re-open with [`GllmPackage`] and
 //! cross-check every layer as the final validation gate.
 //!
 //! Declared deviations from the ARTX7 spec text (lite scope):
-//! - RoPE tables are NOT materialized into `shared.gllm` — they are
+//! - RoPE tables are NOT materialized into `GLLMShared.gllm` â€” they are
 //!   derivable (Minimalism principle); the runtime computes them.
-//! - Unmapped non-`blk.*` tensors go to `shared.gllm` under their
-//!   original names (with a warning), not to `projector.gllm`.
+//! - Unmapped non-`blk.*` tensors go to `GLLMShared.gllm` under their
+//!   original names (with a warning), not to `GLLMProj.gllm`.
 //! - Tokenizer is NOT packaged (the spec's own open question #3); a
 //!   warning is emitted. Runtimes must source the tokenizer elsewhere
 //!   until that question is settled.
@@ -48,9 +48,9 @@ pub struct ConvertReport {
     pub model_id: String,
     /// Number of layer files written.
     pub num_layers: u32,
-    /// Tensors placed in `shared.gllm`.
+    /// Tensors placed in `GLLMShared.gllm`.
     pub shared_tensors: usize,
-    /// Non-fatal notes (unmapped tensors, tokenizer skip, …).
+    /// Non-fatal notes (unmapped tensors, tokenizer skip, â€¦).
     pub warnings: Vec<String>,
 }
 
@@ -59,7 +59,7 @@ fn convert_err(msg: impl Into<String>) -> GllmError {
 }
 
 /// Map a GGUF/GGML dtype onto the GLLM dtype table. Loud error on types
-/// the format cannot represent — never a silent fallback.
+/// the format cannot represent â€” never a silent fallback.
 fn map_dtype(dtype: GgufDType, tensor: &str) -> Result<DType, GllmError> {
     match dtype {
         GgufDType::F32 => Ok(DType::F32),
@@ -84,9 +84,9 @@ fn row_major_shape(gguf_dims: &[u64]) -> Vec<u64> {
 /// Where a GGUF tensor lands in the GLLM package.
 #[derive(Debug, PartialEq, Eq)]
 enum Dest {
-    /// `shared.gllm`, under the given GLLM tensor name.
+    /// `GLLMShared.gllm`, under the given GLLM tensor name.
     Shared(String),
-    /// `layer_NNN.gllm`, under the given (stripped) tensor name.
+    /// `GLLMTensorLayer-NNNN.gllm`, under the given (stripped) tensor name.
     Layer(u32, String),
     /// Non-standard tensor routed to shared under its original name.
     SharedUnmapped(String),
@@ -120,9 +120,9 @@ fn arch_meta_u64(gguf: &GgufFile, arch: &str, key: &str) -> Option<u64> {
 
 /// Convert a GGUF file into a GLLM package directory.
 ///
-/// Writes `gllm.json`, `shared.gllm`, `layer_NNN.gllm`, and
+/// Writes `gllm.json`, `GLLMShared.gllm`, `GLLMTensorLayer-NNNN.gllm`, and
 /// `checksums.sha256` into `out_dir` (created if absent), then re-opens
-/// the result with [`GllmPackage::open`] and cross-checks every layer —
+/// the result with [`GllmPackage::open`] and cross-checks every layer â€”
 /// the converter validates its own output rather than trusting the write
 /// path (ARTX7).
 pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertReport, GllmError> {
@@ -132,7 +132,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     let gguf = GgufFile::open(input_str).map_err(|e| convert_err(format!("{input_str}: {e}")))?;
     let mut warnings = Vec::new();
 
-    // --- Metadata mapping (ARTX7 §Metadata Extraction) ---
+    // --- Metadata mapping (ARTX7 Â§Metadata Extraction) ---
     let arch = gguf
         .get_meta("general.architecture")
         .and_then(|v| v.as_str())
@@ -193,7 +193,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         .or_else(|| input.file_stem().and_then(|s| s.to_str()).map(str::to_string))
         .ok_or_else(|| convert_err("cannot determine model_id; pass --model-id"))?;
 
-    // --- Tensor grouping (ARTX7 §Layer Extraction), preserving GGUF file order ---
+    // --- Tensor grouping (ARTX7 Â§Layer Extraction), preserving GGUF file order ---
     struct Planned {
         gllm_name: String,
         shape: Vec<u64>,
@@ -215,7 +215,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
             Dest::Shared(name) => shared_plan.push(planned(name)),
             Dest::SharedUnmapped(name) => {
                 warnings.push(format!(
-                    "tensor {name:?} has no standard GLLM mapping; stored in shared.gllm as-is"
+                    "tensor {name:?} has no standard GLLM mapping; stored in GLLMShared.gllm as-is"
                 ));
                 shared_plan.push(planned(name));
             }
@@ -239,7 +239,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     }
     if gguf.get_meta("tokenizer.ggml.tokens").is_some() {
         warnings.push(
-            "tokenizer metadata present in GGUF but NOT packaged — GLLM tokenizer \
+            "tokenizer metadata present in GGUF but NOT packaged â€” GLLM tokenizer \
              packaging is an open spec question (ARTX1 OQ3)"
                 .into(),
         );
@@ -322,7 +322,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     }
     std::fs::write(out_dir.join(CHECKSUMS_FILENAME), checksum_lines)?;
 
-    // --- Final gate: re-open + cross-check own output (ARTX7 §Validation) ---
+    // --- Final gate: re-open + cross-check own output (ARTX7 Â§Validation) ---
     let pkg = GllmPackage::open(out_dir)?;
     for idx in 0..num_layers {
         let mismatches = pkg.cross_check_layer(idx)?;
@@ -477,9 +477,9 @@ mod tests {
         convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
 
         // blk.0.attn_q.weight data = f32 values 0..64 by construction.
-        let layer = crate::types::layer::LayerFile::read(&out.join("layer_000.gllm")).unwrap();
+        let layer = crate::types::layer::LayerFile::read(&out.join("GLLMTensorLayer-0000.gllm")).unwrap();
         let (off, size) = layer.absolute_range("attn_q.weight").unwrap();
-        let bytes = std::fs::read(out.join("layer_000.gllm")).unwrap();
+        let bytes = std::fs::read(out.join("GLLMTensorLayer-0000.gllm")).unwrap();
         let data = &bytes[off as usize..(off + size) as usize];
         let vals: Vec<f32> = data
             .chunks_exact(4)
