@@ -89,6 +89,36 @@ pub enum GllmError {
 
     #[error("No valid execution plan found (Pvalid = ∅)")]
     NoValidPlan,
+
+    // --- ARTX05/06 runtime -------------------------------------------------
+    #[error("Failed to map {path}: {source}")]
+    MapFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("Runtime not ready: {0}")]
+    RuntimeNotReady(String),
+
+    #[error("Execution failed at layer {layer}: {reason}")]
+    ExecutionFailed { layer: u32, reason: String },
+
+    #[error(
+        "KV cache allocation of {requested} bytes failed \
+         ({num_layers} layers x {per_layer} bytes/layer)"
+    )]
+    KvCacheAllocFailed {
+        requested: u64,
+        num_layers: u32,
+        per_layer: u64,
+    },
+
+    #[error("No backend available for device {device}")]
+    NoBackendAvailable { device: String },
+
+    #[error("Invalid layer range {0:?}: expected \"START-END\" with START <= END")]
+    InvalidLayerRange(String),
 }
 
 pub type GllmResult<T> = Result<T, GllmError>;

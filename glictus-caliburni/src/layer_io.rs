@@ -124,8 +124,28 @@ impl LayerFile {
     /// Tensor data is located, bounds-checked, but never read.
     pub fn read(path: &Path) -> Result<Self, GllmError> {
         let file_size = std::fs::metadata(path)?.len();
-        let mut reader = BufReader::new(std::fs::File::open(path)?);
+        let reader = BufReader::new(std::fs::File::open(path)?);
+        Self::read_from(reader, file_size, &path.display().to_string())
+    }
 
+    /// Parse a unit file's header + tensor index from bytes already in memory
+    /// (typically a mapping). Tensor data is located and bounds-checked
+    /// against `bytes.len()`, but never read.
+    ///
+    /// This is the mmap path: it reads only the header and index, so its cost
+    /// does not scale with layer size.
+    pub fn parse(bytes: &[u8]) -> Result<Self, GllmError> {
+        Self::read_from(bytes, bytes.len() as u64, "<mapping>")
+    }
+
+    /// Shared implementation behind [`read`](Self::read) and
+    /// [`parse`](Self::parse). `unit_size` is the total size of the unit, used
+    /// to bounds-check every tensor's region; `source` names it in errors.
+    fn read_from<R: Read>(
+        mut reader: R,
+        unit_size: u64,
+        source: &str,
+    ) -> Result<Self, GllmError> {
         let header = ExecutionUnitHeader::parse(&read_array::<GLLM_HEADER_SIZE, _>(
             &mut reader,
         )?)?;
@@ -148,15 +168,11 @@ impl LayerFile {
                 .checked_add(entry.offset)
                 .and_then(|s| s.checked_add(entry.size));
             match end {
-                Some(end) if end <= file_size => {}
+                Some(end) if end <= unit_size => {}
                 _ => {
                     return Err(GllmError::IntegrityError(format!(
                         "{}: tensor {} (region offset {}, size {}) exceeds file size {}",
-                        path.display(),
-                        entry.name,
-                        entry.offset,
-                        entry.size,
-                        file_size
+                        source, entry.name, entry.offset, entry.size, unit_size
                     )));
                 }
             }

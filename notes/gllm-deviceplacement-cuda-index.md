@@ -1,8 +1,10 @@
 ---
 title: DevicePlacement manifest cuma kenal cuda:0 dan cuda:1
-status: open
+status: resolved
 severity: medium
 found: 2026-07-19
+resolved: 2026-07-20
+resolution: opsi 2 (varian Other(String)) — dipilih JinXSuper saat ARTX05 Phase 4
 blocking: ARTX05 (runtime execution) kalau mau multi-GPU > 2
 files:
   - glictus-caliburni/src/manifest/mod.rs
@@ -45,3 +47,28 @@ memperkuat usulan newtype string transparan + satu parser terpusat
 3. Sampai diputuskan: JANGAN pakai `effective_device()` untuk placement
    multi-GPU nyata; treat `Unknown` sebagai "tanya manifest string mentah"
    (yang sekarang belum disimpan — makanya ini masalah).
+
+# Resolusi (2026-07-20, ARTX05 Phase 4)
+
+Diambil **opsi 2**: `DevicePlacement` jadi enum `#[serde(untagged)]` dengan dua
+varian — `Known(KnownDevicePlacement)` untuk yang ARTX03 sebut eksplisit, dan
+`Other(String)` yang menyimpan string apa pun secara verbatim. Varian
+`Unknown` yang membuang string **dihapus**.
+
+- `"cuda:2"` → `Other("cuda:2")` → `to_device()` = `Some(Device::Cuda(2))`.
+  Selamat, dan resolusinya lewat parser yang sama dengan `cuda:0`.
+- `"rank:0/cuda:0"` (ARTX10) → string selamat, `to_device()` = `None`. Runtime
+  fallback ke CPU dengan `overridden: Some(...)` supaya bisa dilaporkan apa
+  yang di-drop — bukan menebak.
+- Wire-compatible: `"cpu"`, `"cuda:0"`, `"cuda:1"`, `"metal"`, `"vulkan"`
+  deserialize dan serialize persis seperti sebelumnya (ada test).
+- Satu-satunya parser device tetap `Device::from_str` — `to_device()` cuma
+  delegasi, tidak ada dialek kedua.
+
+Konstanta `DevicePlacement::CPU/CUDA0/CUDA1` disediakan supaya call site tidak
+perlu menulis `Known(KnownDevicePlacement::Cpu)`.
+
+Usulan newtype transparan (opsi 1) **tidak** diambil: lebih bersih secara
+teori tapi mengubah tipe publik yang sudah dipakai ARTX02–04 di tengah
+implementasi runtime. Kalau spec ARTX03 nanti direvisi, migrasi ke newtype
+masih terbuka — `as_str()`/`to_device()` sudah jadi permukaan yang sama.

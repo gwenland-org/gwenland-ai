@@ -1,6 +1,6 @@
 //! Wave 3 gate: the three public traits must stay object-safe.
 //!
-//! `GllmRuntime` is held as `Box<dyn GllmRuntime>` by the runtime, and
+//! `GllmInference` is held as `Box<dyn GllmInference>` by the runtime, and
 //! `LayerPlugin` lives in a `Box<dyn LayerPlugin>` registry. If a future
 //! change adds a generic method or `impl Trait` in argument/return position,
 //! this file stops compiling — which is the point.
@@ -11,7 +11,7 @@ use glictus_caliburni::error::GllmResult;
 use glictus_caliburni::types::execution::Device;
 use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::{DType, TensorEntry};
-use glictus_caliburni::{GllmConverter, GllmRuntime, LayerPlugin};
+use glictus_caliburni::{GllmConverter, GllmInference, LayerPlugin};
 
 /// Minimal runtime that returns fixed logits — exercises the default `stream`.
 struct StubRuntime {
@@ -20,7 +20,7 @@ struct StubRuntime {
     devices: Vec<Device>,
 }
 
-impl GllmRuntime for StubRuntime {
+impl GllmInference for StubRuntime {
     fn load_package(&mut self, _package: &GllmPackageMeta) -> GllmResult<()> {
         self.loaded = true;
         Ok(())
@@ -96,7 +96,7 @@ impl GllmConverter for StubConverter {
 fn traits_are_object_safe() {
     // The coercions themselves are the assertion: a non-object-safe trait
     // fails to compile here.
-    let runtime: Box<dyn GllmRuntime> = Box::new(StubRuntime {
+    let runtime: Box<dyn GllmInference> = Box::new(StubRuntime {
         logits: vec![0.0],
         loaded: false,
         devices: vec![Device::Cpu],
@@ -111,7 +111,7 @@ fn traits_are_object_safe() {
 
 #[test]
 fn default_stream_emits_argmax_token_through_dyn() {
-    let mut runtime: Box<dyn GllmRuntime> = Box::new(StubRuntime {
+    let mut runtime: Box<dyn GllmInference> = Box::new(StubRuntime {
         // argmax is index 3
         logits: vec![0.1, -2.0, 0.9, 4.2, 1.5],
         loaded: false,
