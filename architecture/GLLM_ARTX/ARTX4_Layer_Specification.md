@@ -1,8 +1,8 @@
-﻿# ARTX4 â€” Layer Specification
+# ARTX4 — Layer Specification
 
 ## Architecture Specification
 
-**Document Name:** ARTX4_â€”_Layer_Specification.md  
+**Document Name:** ARTX4_—_Layer_Specification.md  
 **Codename:** Mensa Rotunda  
 **Tagline:** Designed for the Impossible.  
 **Version:** 1.0.0-draft  
@@ -28,6 +28,7 @@
   - [Storage Order](#storage-order)
   - [Quantization Layout](#quantization-layout)
 - [Projectors](#projectors)
+- [Tokenizer File](#tokenizer-file)
 - [Extension Layer Types](#extension-layer-types)
   - [MLA (Multi-Head Latent Attention)](#mla-multi-head-latent-attention)
   - [Mamba](#mamba)
@@ -126,6 +127,39 @@ A projector is a tensor or set of tensors that maps layer outputs to a different
 Projectors are stored in `GLLMProj.gllm` and referenced by the manifest. They follow the same layer file format but use a distinct layer type URI (e.g., `gllm:projector/linear@v1`).
 
 For manifest projector references, see ARTX3: Manifest Specification. For package structure, see ARTX2: Package Specification.
+
+---
+
+# Tokenizer File
+
+`GLLMTokenizer.gllm` is an execution unit like any other: the same header, the
+same tensor index, the same per-file checksum. What differs is that its
+"tensors" are tokenizer tables rather than weights, so a runtime can map it,
+verify it, and read one table without parsing the others.
+
+| Entry | dtype | Contents |
+|-------|-------|----------|
+| `tokens` | `U8` | Vocabulary, NUL-separated UTF-8, in token-id order |
+| `token_types` | `I32` | One type code per token, parallel to `tokens` |
+| `merges` | `U8` | BPE merge rules, NUL-separated, in priority order |
+| `chat_template` | `U8` | Chat template, verbatim UTF-8 |
+
+Scalar configuration — `model`, `pre`, `bos_id`, `eos_id`, `padding_id`,
+`add_bos` — lives in the manifest's `tokenizer` object rather than here, so it
+can be read without opening the unit (ARTX3).
+
+**Ordering is load-bearing.** `tokens` is indexed by token id and `merges` is
+in priority order; both must round-trip exactly. Reordering either changes how
+text tokenizes while leaving every weight, shape, and tensor checksum
+untouched — a corruption that is invisible to all other integrity checks in
+this format.
+
+Tables are stored as byte blobs rather than typed tensors because they are
+variable-length strings, and because no backend ever computes on them: the
+tokenizer runs before the first layer and after the last.
+
+For the containing package and the decision to embed rather than reference,
+see ARTX2: Package Specification, "Tokenizer Unit".
 
 ---
 
