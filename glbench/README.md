@@ -73,6 +73,23 @@ Compare two archived runs (regression check at a 5% threshold by default):
 glbench compare benchmarks/qwen-glcuda-001.json benchmarks/qwen-glproc-001.json
 ```
 
+Check numerical parity against an oracle engine (default `glproc`) — runs
+both under forced greedy decoding on the identical prompt and reports the
+matching token-id prefix length; exits non-zero on divergence, so it composes
+as a CI gate:
+
+```sh
+glbench validate --engine glcuda --model model.gguf --against glproc
+```
+
+Sweep decode throughput across a set of token budgets and classify how it
+scales (linear / sub-linear / saturating), sequentially — same
+bandwidth-contention reasoning as `ab`:
+
+```sh
+glbench scale --engine glproc --model model.gguf --sweep 32,64,128,256,512
+```
+
 Re-render an archive, or convert it:
 
 ```sh
@@ -97,6 +114,11 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--out`         | —       | archive the session as JSON                      |
 
+`validate` additionally takes `--against <oracle>` (default `glproc`); `scale`
+additionally takes `--sweep N,N,N,...` (at least two token budgets) in place
+of `--tokens`. Both otherwise accept the same `--engine`/`--model`/`--prompt`
+flags as `run`.
+
 ### What a report contains (v2)
 
 Beyond throughput statistics, a report carries — each section only when its
@@ -107,15 +129,41 @@ inputs were actually measured, absent otherwise:
 - **roofline** — engine stage telemetry bucketed into attention / ffn /
   lm_head, each classified against the *measured* bandwidth ceiling
   (bandwidth-bound / not-bandwidth-bound / indeterminate).
-- **behavior** — entropy (with a CoT-aware flag: low entropy on a
-  thinking-capable model is expected, on a plain model it is an anomaly),
-  repetition, perplexity, confidence, stall, and intra-session drift
-  (per-quarter inter-token latency plus the worst OOD perplexity window).
+- **behavior** — every signal is computed from facts the engine already
+  produced (token ids, raw per-token distributions, stage timings) and is a
+  number, never a verdict:
+  - `repetition` — n-gram reuse in the output (needs only token ids).
+  - `entropy` — per-step distribution uncertainty, with a CoT-aware flag
+    (low entropy on a thinking-capable model is expected; on a plain model
+    it is an anomaly).
+  - `stall` — inter-token latency spikes.
+  - `ood` — perplexity, and its gap vs. a baseline.
+  - `hallucination` — confidence/rank divergence, a **proxy** for
+    confabulation, not a detector: a model can be confidently wrong (low
+    divergence, false statement) or uncertain and right (high divergence,
+    true statement). Read it as "how sure was the model," never as "how
+    much did it make up."
+  - `anomaly` — intra-session drift: per-quarter inter-token latency plus
+    the worst OOD perplexity window, by position.
+  - `performance` / `drift` — ms/call, share, layer variance, and Δ ms/call
+    between sessions, from engine telemetry rather than traces.
+  - **`toxicity` is deliberately not implemented** (see
+    `src/behavior/toxicity.rs`): every metric considered measures affinity
+    to a flagged word list, not toxicity, and is wrong in both directions
+    (a model discussing "carcinoma" or "exploit" in a legitimate medical/
+    security context scores high for saying nothing wrong; implicit bias
+    or confident misinformation in ordinary vocabulary scores zero). A
+    profiler number carries authority it would not have earned here.
 - **hypotheses** — cross-signal root-cause patterns, phrased as what the data
   is *consistent with*, never as verdicts.
 - **energy** — Joules/token via Linux RAPL (powercap sysfs) when readable;
   never estimated from TDP. Not available on Windows/macOS (RAPL needs a
   kernel driver there, and glbench will not pretend otherwise).
+- **parity** (`validate` only) — matching-prefix token length against the
+  oracle engine under forced-greedy decoding, plus a pass/fail exit code.
+- **scaling** (`scale` only) — `linear` / `sub-linear` / `saturating` /
+  `insufficient data`, classified from the sweep's decode-tps-vs-tokens
+  slope.
 
 ## Architecture
 
@@ -143,6 +191,7 @@ Module map (one crate, internal module folders — no sub-crates):
 | `engine`       | the **only** boundary to the engines; runs via `Runtime` (`glproc`/`glcuda`) or directly against a `Box<dyn GlEngine>` (`gllm` — see [Benchmarking GLLM](#benchmarking-gllm)) |
 | `runner`       | orchestrate a run: warmup → measured iterations → phases   |
 | `measurement`  | store raw facts, convert counts+durations to rates         |
+| `behavior`     | per-token signals from traces: repetition, entropy, stall, ood, hallucination (proxy), anomaly, cot, drift, performance |
 | `analysis`     | facts → insight, always as recommendations, never actions  |
 | `comparison`   | run/engine/quant/hardware deltas, regression, trend, stats |
 | `validation`   | integrity, determinism, numerical parity vs glproc oracle  |
