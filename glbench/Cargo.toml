@@ -1,6 +1,6 @@
 [package]
 name = "glbench"
-version = "0.1.155"
+version = "0.1.163"
 edition = "2021"
 description = "GwenLand AI benchmark framework (Mensura Veritatis) — measure truth about engine performance"
 license-file = "../LICENSE"
@@ -21,6 +21,17 @@ glproc = { path = "../glproc" }
 # capabilities().available, so linking it on a CPU-only machine is harmless —
 # the adapter simply reports the engine as unavailable.
 glcuda = { path = "../glcuda" }
+
+# ARTX11: GLLM as a benchmarkable engine (--engine gllm). Optional — a GLLM
+# package has no embedded tokenizer yet, so this path bypasses glcore::Runtime
+# entirely (see engine/adapter.rs's module docs); pulling it in unconditionally
+# would make every glbench build depend on glictus-caliburni's glproc-backend
+# feature even when nobody benchmarks GLLM.
+glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend"], optional = true }
+
+[features]
+default = []
+gllm-bench = ["dep:glictus-caliburni"]
 
 [[bin]]
 name = "glbench"

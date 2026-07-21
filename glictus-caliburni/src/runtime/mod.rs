@@ -29,6 +29,8 @@ pub mod cpu;
 pub mod device;
 pub mod distributed;
 #[cfg(feature = "glproc-backend")]
+pub mod gllm_engine;
+#[cfg(feature = "glproc-backend")]
 pub mod glproc_backend;
 pub mod kv_cache;
 pub mod logger;
@@ -40,6 +42,8 @@ pub mod types;
 
 pub use backend::{ExecutionBackend, NullBackend, KV_ELEMENT_SIZE_F16, KV_ELEMENT_SIZE_F32};
 pub use cpu::CpuRuntime;
+#[cfg(feature = "glproc-backend")]
+pub use gllm_engine::GllmEngine;
 #[cfg(feature = "glproc-backend")]
 pub use glproc_backend::GlprocBackend;
 pub use device::{

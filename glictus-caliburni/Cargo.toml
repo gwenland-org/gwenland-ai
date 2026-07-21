@@ -1,6 +1,6 @@
 [package]
 name = "glictus-caliburni"
-version = "0.1.162"
+version = "0.1.163"
 edition = "2024"
 description = "GLLM (GwenLand Language Model Format) — Ictus Caliburni"
 license = "MIT"
