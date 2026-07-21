@@ -26,13 +26,28 @@ pub enum DeviceSource {
     RuntimeDefault,
     /// CPU, substituted because the resolved device was unavailable.
     CpuFallback,
+    /// CPU, substituted because the placement named a distributed rank
+    /// (ARTX10 `"rank:N/cuda:M"`) and no distributed runtime exists yet
+    /// (NCCL/RCCL/Gloo are deferred — see the `runtime::distributed` module
+    /// docs). Distinguished from [`Self::CpuFallback`] so the caller can log
+    /// *why* precisely: "no such device" and "no distributed runtime" are
+    /// different operational situations, and conflating them would send
+    /// someone chasing a missing GPU driver instead of standing up a
+    /// multi-node runtime.
+    DistributedUnavailable,
 }
 
 impl DeviceSource {
     /// Whether this source represents a fallback rather than an honoured
     /// request.
     pub fn is_fallback(self) -> bool {
-        matches!(self, DeviceSource::CpuFallback)
+        matches!(self, DeviceSource::CpuFallback | DeviceSource::DistributedUnavailable)
+    }
+
+    /// Whether this fallback was specifically a distributed placement the
+    /// runtime cannot yet honour (as opposed to a plain missing device).
+    pub fn is_distributed_unavailable(self) -> bool {
+        matches!(self, DeviceSource::DistributedUnavailable)
     }
 }
 
@@ -45,8 +60,9 @@ pub struct ResolvedDevice {
     pub source: DeviceSource,
     /// The placement that was requested but could not be honoured, if any.
     ///
-    /// `Some` exactly when `source` is [`DeviceSource::CpuFallback`], so a
-    /// caller can log *what* was overridden instead of a bare "fell back".
+    /// `Some` exactly when `source` is [`DeviceSource::CpuFallback`] or
+    /// [`DeviceSource::DistributedUnavailable`], so a caller can log *what*
+    /// was overridden instead of a bare "fell back".
     pub overridden: Option<DevicePlacement>,
 }
 
@@ -54,6 +70,12 @@ impl ResolvedDevice {
     /// Whether this placement is a CPU fallback from something else.
     pub fn is_fallback(&self) -> bool {
         self.source.is_fallback()
+    }
+
+    /// Whether the fallback was specifically a distributed rank placement
+    /// (see [`DeviceSource::DistributedUnavailable`]).
+    pub fn is_distributed_unavailable(&self) -> bool {
+        self.source.is_distributed_unavailable()
     }
 }
 
@@ -210,8 +232,18 @@ impl DeviceMapResolver {
                 source,
                 overridden: None,
             },
+            // A distributed rank placement (ARTX10 "rank:N/cuda:M") parses
+            // fine — Device::Remote exists as a forward-compat shape — but no
+            // distributed runtime is available to honour it (Wave 2: no
+            // NCCL/RCCL/Gloo). Tagged distinctly from a plain missing device
+            // so the caller logs the right cause.
+            Some(Device::Remote { .. }) => ResolvedDevice {
+                device: Device::Cpu,
+                source: DeviceSource::DistributedUnavailable,
+                overridden: Some(placement.clone()),
+            },
             // Named a real device we don't have, or a string we can't parse
-            // (ARTX10's "rank:0/cuda:0"). Both are recoverable: run on CPU.
+            // at all. Both are recoverable: run on CPU.
             _ => ResolvedDevice {
                 device: Device::Cpu,
                 source: DeviceSource::CpuFallback,
@@ -382,15 +414,44 @@ mod tests {
 
     #[test]
     fn an_unparseable_device_string_falls_back_rather_than_guessing() {
-        // ARTX10 rank strings don't resolve to a Device yet.
         let resolver = DeviceMapResolver::cpu_only();
-        let placement = DevicePlacement::Other("rank:0/cuda:0".into());
+        let placement = DevicePlacement::Other("not-a-device".into());
         let layer = layer_with_device(0, Some(placement.clone()));
         let r = resolver.resolve(0, Some(&layer), &DeviceMapConfig::default(), &DevicePlacement::CPU);
 
         assert_eq!(r.device, Device::Cpu);
         assert_eq!(r.source, DeviceSource::CpuFallback);
         assert_eq!(r.overridden, Some(placement));
+    }
+
+    #[test]
+    fn a_rank_placement_falls_back_to_cpu_tagged_as_distributed_unavailable() {
+        // ARTX10 Wave 2: "rank:N/cuda:M" now parses to Device::Remote, but no
+        // distributed runtime exists to run on it — the resolver must still
+        // fall back to CPU, distinguishably from "device not present".
+        let resolver = DeviceMapResolver::cpu_only();
+        let placement = DevicePlacement::Other("rank:0/cuda:0".into());
+        let layer = layer_with_device(0, Some(placement.clone()));
+        let r = resolver.resolve(0, Some(&layer), &DeviceMapConfig::default(), &DevicePlacement::CPU);
+
+        assert_eq!(r.device, Device::Cpu);
+        assert_eq!(r.source, DeviceSource::DistributedUnavailable);
+        assert!(r.is_fallback());
+        assert!(r.is_distributed_unavailable());
+        assert_eq!(r.overridden, Some(placement));
+    }
+
+    #[test]
+    fn a_rank_placement_falls_back_even_when_the_local_gpu_it_names_is_present() {
+        // Having cuda:0 locally does not make rank:0/cuda:0 runnable — that
+        // GPU is on a *different* rank in the topology, not this process's.
+        let resolver = DeviceMapResolver::new([Device::Cuda(0)]);
+        let placement = DevicePlacement::Other("rank:0/cuda:0".into());
+        let layer = layer_with_device(0, Some(placement.clone()));
+        let r = resolver.resolve(0, Some(&layer), &DeviceMapConfig::default(), &DevicePlacement::CPU);
+
+        assert_eq!(r.device, Device::Cpu);
+        assert_eq!(r.source, DeviceSource::DistributedUnavailable);
     }
 
     #[test]

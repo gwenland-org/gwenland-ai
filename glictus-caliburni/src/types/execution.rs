@@ -16,6 +16,15 @@ impl Device {
     /// Kept as an inherent method (shadowing `FromStr::from_str`) because the
     /// ARTX01 spec calls `Device::from_str(..) -> Option<Device>`; the
     /// `FromStr` impl below delegates here for idiomatic `str::parse()` use.
+    ///
+    /// ARTX10's `"rank:N/cuda:M"` device-map strings parse to
+    /// [`Self::Remote`] — recognised as a *shape*, not something this crate
+    /// can execute on: no runtime here opens a rank connection, so a caller
+    /// getting `Some(Device::Remote { .. })` back still cannot schedule work
+    /// on it. See [`DeviceMapResolver`](crate::runtime::device::DeviceMapResolver),
+    /// which resolves a `Remote` placement to a CPU fallback specifically
+    /// tagged as a distributed one, rather than a generic "device
+    /// unavailable" fallback.
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         if s == "cpu" { return Some(Self::Cpu); }
@@ -26,11 +35,22 @@ impl Device {
         if let Some(idx) = s.strip_prefix("vulkan:") {
             return idx.parse().ok().map(Self::Vulkan);
         }
+        if let Some(rest) = s.strip_prefix("rank:") {
+            let (rank_str, device_str) = rest.split_once('/')?;
+            let rank = rank_str.parse().ok()?;
+            let device = Self::from_str(device_str)?;
+            return Some(Self::Remote { rank, device: Box::new(device) });
+        }
         None
     }
 
     pub fn is_gpu(&self) -> bool {
         matches!(self, Self::Cuda(_) | Self::Vulkan(_) | Self::Metal)
+    }
+
+    /// Whether this device names a remote rank (ARTX10 distributed device map).
+    pub fn is_remote(&self) -> bool {
+        matches!(self, Self::Remote { .. })
     }
 }
 

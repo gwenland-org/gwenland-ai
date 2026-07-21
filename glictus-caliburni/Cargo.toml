@@ -17,10 +17,17 @@ memmap2 = "0.9"
 # Converter-only (ARTX07): the core format library stays zero-workspace-dep;
 # `glcore` is pulled in only when the `converter` feature is enabled.
 glcore = { path = "../glcore", optional = true }
+# CPU execution backend (ARTX10 Wave 1): forwards ExecutionBackend::execute_layer
+# to glproc's per-op kernels. Optional so the format/runtime crate stays
+# engine-agnostic by default — only a caller that wants to actually run
+# inference pulls glproc in.
+glproc = { path = "../glproc", optional = true }
 
 [features]
 default = []
 converter = ["dep:glcore"]
+# glproc adapter needs glcore's tensor decoder (ARTX10 Wave 1's gllm.rs) too.
+glproc-backend = ["dep:glproc", "dep:glcore"]
 
 [[bin]]
 name = "glconv"
