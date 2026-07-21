@@ -1,6 +1,6 @@
 [package]
 name = "glcore"
-version = "0.1.155"
+version = "0.1.163"
 edition = "2021"
 description = "GwenLand AI core: shared types, traits, format parsers, tokenizer"
 license-file = "../LICENSE"

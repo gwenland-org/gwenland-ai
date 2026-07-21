@@ -2,6 +2,55 @@
 
 The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
+## 0.1.163 — 2026-07-21
+
+### glictus-caliburni — ARTX09 versioning hardening + ARTX10 glproc runtime backend
+
+- **ARTX09 (Compatibility & Versioning)**: audited `FormatVersion`'s
+  same-major-loadable / minor-mismatch-warns / major-mismatch-hard-errors
+  logic (already correct from ARTX03), added end-to-end version negotiation
+  tests through `GllmPackage::open`, and corrected the stale "Windows
+  untested" note across the ARTX docs — Windows 11 (i3-1115G4) is the
+  verified reference platform.
+- **ARTX10 Wave 1**: `GlprocBackend` implements `ExecutionBackend` for a real
+  dense transformer block (RMSNorm → QKV → RoPE → attention → output proj →
+  SwiGLU), entirely via `glproc::kernels`/`glproc::attention` — zero tensor
+  math added to glictus-caliburni. F32 only; quantized layers fail loud
+  rather than mis-compute. Verified end-to-end: a real on-disk GLLM package
+  driven through `GllmRuntime::run` produces a sampled token.
+- **ARTX10 Wave 2**: `Device::from_str` parses ARTX10's `"rank:N/cuda:M"`
+  device-map strings into `Device::Remote`; the runtime falls back to CPU
+  with a WARN naming *why* (distributed placement, no distributed runtime —
+  distinct from a plain missing device). `runtime::distributed::RankTopology`
+  derives rank → layer-range groupings for visibility; no NCCL/RCCL/Gloo.
+
+### glbench — ARTX11 fulfilled: GLLM as a benchmarkable engine
+
+ARTX11 (Benchmarks) is fulfilled by glbench (Mensura Veritatis), which
+already covered glproc/glcuda end to end — session/stats/environment
+/workload/measurement/analysis/comparison/validation/export/storage. The gap
+this release closes is GLLM having no benchmark path at all.
+
+- New `glictus-caliburni::runtime::GllmEngine` implements `glcore::GlEngine`
+  on top of `GllmRuntime` + `GlprocBackend` (embedding lookup, final norm +
+  LM head, sampling — the three pieces `GllmRuntime` deliberately does not
+  own). No tokenizer exists for GLLM packages yet, so this is token-ids
+  in/out, not text in/out.
+- `glbench --features gllm-bench` adds `--engine gllm`, bypassing
+  `glcore::Runtime`'s tokenizer requirement with deterministic synthetic
+  token ids (seeded, reproducible — never random). `--model` for `gllm` is a
+  package directory; `StorageInfo::probe` now sums a directory's files
+  instead of reporting the directory inode's own (meaningless) size.
+- README documents both the Windows Defender exclusion requirement (2–4×
+  measurement pollution when unexcluded — worse than most real regressions)
+  and GLLM's specific caveats (directory model path, synthetic tokens, F32
+  only).
+
+Verified live: `glbench run|scale|inspect|export --engine gllm` against a
+real F32 GLLM package produced correct sessions, throughput sweeps, and
+JSON/Markdown/CSV exports; a real Q4_K_M-converted package fails loudly with
+`Unsupported dtype` rather than silently computing wrong numbers.
+
 ## 0.1.155 — 2026-07-18
 
 ### glictus-caliburni — GLLM format crate, boilerplate
