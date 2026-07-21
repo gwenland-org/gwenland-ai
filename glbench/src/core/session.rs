@@ -390,11 +390,13 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
     use crate::environment::memory::MemoryInfo;
     use crate::environment::runtime::RuntimeInfo;
     use crate::environment::storage::StorageInfo;
+    use crate::environment::thermal::ThermalSnapshot;
 
     let hw = v.get("hardware");
     let cpu = hw.and_then(|h| h.get("cpu"));
     let gpu = hw.and_then(|h| h.get("gpu"));
     let storage = hw.and_then(|h| h.get("storage"));
+    let thermal = hw.and_then(|h| h.get("thermal"));
     let rt = v.get("runtime");
 
     let hardware = HardwareSnapshot {
@@ -450,6 +452,13 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
                 .and_then(|n| n.as_f64())
                 .map(|n| n as u64),
         },
+        // Read back, not re-probed: like the ISA flags above, throttling is a
+        // fact about the machine that RAN the benchmark.
+        thermal: ThermalSnapshot {
+            start_mhz: thermal.and_then(|t| t.get("start_mhz")).and_then(|n| n.as_f64()),
+            end_mhz: thermal.and_then(|t| t.get("end_mhz")).and_then(|n| n.as_f64()),
+            avg_mhz: thermal.and_then(|t| t.get("avg_mhz")).and_then(|n| n.as_f64()),
+        },
     };
 
     let runtime = RuntimeInfo {
@@ -464,4 +473,80 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
     };
 
     Ok(EnvironmentSnapshot { hardware, runtime })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::analysis::bottleneck::Bottleneck;
+    use crate::analysis::ceiling::CeilingBasis;
+    use crate::analysis::summary::AnalysisReport;
+    use crate::comparison::statistics::Stats;
+    use crate::core::metrics::{IterationMetrics, MeasurementSet};
+    use crate::core::workload::WorkloadSpec;
+    use crate::engine::metadata::EngineMetadata;
+    use crate::environment::hardware::EnvironmentSnapshot;
+
+    /// The cardinal rule this crate's own docs state (metrics.rs: "measurement
+    /// stores raw numbers, never conclusions"): `measurements` and `analysis`
+    /// must be two genuinely separate JSON objects, neither leaking into the
+    /// other. This asserts it holds, rather than trusting the doc comment.
+    #[test]
+    fn measurements_and_analysis_are_separate_objects_with_no_cross_contamination() {
+        let mut m = MeasurementSet::default();
+        m.iterations.push(IterationMetrics {
+            prompt_tokens: 10,
+            generated_tokens: 20,
+            prefill_ms: 5.0,
+            decode_ms: 100.0,
+            total_ms: 105.0,
+        });
+        let session = BenchmarkSession {
+            metadata: SessionMetadata::new("test"),
+            environment: EnvironmentSnapshot::probe(""),
+            engine: EngineMetadata {
+                name: "glproc".into(),
+                backend: "cpu".into(),
+                available: true,
+                model_arch: None,
+                quantization: None,
+                thinking_capable: None,
+            },
+            workload: WorkloadSpec::default(),
+            measurements: m,
+            telemetry: None,
+            behavior: None,
+            analysis: Some(AnalysisReport {
+                decode_tps: Stats::from_samples(&[200.0]),
+                prefill_tps: Stats::from_samples(&[2000.0]),
+                health: 0.9,
+                bottleneck: Bottleneck::MemoryBound,
+                ceiling_efficiency: Some(0.8),
+                ceiling_basis: CeilingBasis::Measured,
+                roofline: None,
+                hypotheses: vec!["consistent with X".to_string()],
+                notes: vec!["an observation".to_string()],
+            }),
+            comparison: None,
+            validation: None,
+        };
+
+        let json = session.to_json();
+        let measurements = json.get("measurements").unwrap().as_obj().unwrap();
+        let analysis = json.get("analysis").unwrap().as_obj().unwrap();
+
+        // Facts a reader must find under `measurements`, never under `analysis`.
+        for raw_field in ["iterations", "peak_memory_bytes", "model_bytes", "cold", "energy_joules"] {
+            assert!(measurements.contains_key(raw_field), "measurements missing {raw_field}");
+            assert!(!analysis.contains_key(raw_field), "analysis leaked raw field {raw_field}");
+        }
+        // Conclusions a reader must find under `analysis`, never under
+        // `measurements` — a health score or a bottleneck verdict inside the
+        // raw facts would be exactly the fact/conclusion mixing DESIGN.md
+        // forbids.
+        for derived_field in ["health", "bottleneck", "ceiling_efficiency", "ceiling_basis", "hypotheses"] {
+            assert!(analysis.contains_key(derived_field), "analysis missing {derived_field}");
+            assert!(!measurements.contains_key(derived_field), "measurements leaked derived field {derived_field}");
+        }
+    }
 }
