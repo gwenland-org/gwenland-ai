@@ -22,12 +22,18 @@ glcore = { path = "../glcore", optional = true }
 # engine-agnostic by default — only a caller that wants to actually run
 # inference pulls glproc in.
 glproc = { path = "../glproc", optional = true }
+# BPE tokenizer (ARTX-OQ3): Unicode property escapes (\p{L}, \p{N}) are
+# mandatory for Qwen2 pre-tokenizer correctness. A text-processing utility,
+# not an ML dependency — same category as memmap2/serde. Feature-gated so
+# the zero-dep default build (ARTX01 guardrail) is untouched.
+regex = { version = "1", optional = true, default-features = false, features = ["unicode"] }
 
 [features]
 default = []
 converter = ["dep:glcore"]
 # glproc adapter needs glcore's tensor decoder (ARTX10 Wave 1's gllm.rs) too.
 glproc-backend = ["dep:glproc", "dep:glcore"]
+tokenizer = ["dep:regex"]
 
 [[bin]]
 name = "glconv"

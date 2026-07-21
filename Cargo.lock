@@ -2499,6 +2499,7 @@ dependencies = [
  "glcore",
  "glproc",
  "memmap2",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

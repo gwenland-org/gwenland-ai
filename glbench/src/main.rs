@@ -54,10 +54,16 @@ usage:
                   [--cold-iters N] [--warmup N] [--iters N] [--temperature F]
                   [--seed N] [--kind prefill|decode|end_to_end|stress]
                   [--cot on|off] [--verify-against <oracle>] [--out <file.json>]
+                  [--tokenizer <path.gguf>]
                   (--verify-against loads a second engine and cross-checks the
                    first 50 generated tokens against it, folding the result into
                    the validation report; skipped, not just trivial, when the
                    oracle equals --engine)
+                  (--tokenizer builds a real tokenizer from the given .gguf
+                   file's metadata so --prompt's TEXT is actually encoded;
+                   engines with their own tokenizer ignore it — it exists for
+                   --engine gllm, whose .gllm package has none of its own. Without
+                   it, gllm still runs but --prompt only sets synthetic token count)
   glbench ab      --engine <name> --model <baseline> --model <candidate> [...]
                   (same options as run; each extra --model is benchmarked with
                    the identical workload, sequentially, and diffed against the
@@ -131,6 +137,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--out" => out_path = Some(PathBuf::from(value(&mut i)?)),
             "--verify-against" => spec.verify_against = Some(value(&mut i)?),
+            "--tokenizer" => spec.tokenizer_path = Some(value(&mut i)?),
             other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
         }
         i += 1;

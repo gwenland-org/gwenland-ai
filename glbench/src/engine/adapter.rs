@@ -46,12 +46,26 @@ enum Backend {
     /// plus a small `Option<usize>`), and an unboxed variant would size every
     /// `Backend` — including every `RawTokens` — to the bigger one.
     Tokenized(Box<Runtime>),
-    /// No tokenizer exists (GLLM). Token ids are synthesized deterministically
+    /// No embedded tokenizer (GLLM's `.gllm` package format carries none —
+    /// see the module docs). When `spec.tokenizer_path` names a source
+    /// `.gguf` file, `tokenizer` holds a real [`GllmTokenizer`] built from
+    /// its metadata and `--prompt`'s TEXT is actually encoded. When absent
+    /// (the pre-ARTX-OQ3 default), token ids are synthesized deterministically
     /// from the workload's seed and the model's real vocabulary size — see
-    /// [`synthetic_token_ids`]. Never a stand-in for a real prompt: this
-    /// benchmarks throughput and correctness-of-computation, not
+    /// [`synthetic_token_ids`] — never a stand-in for a real prompt, since
+    /// that path benchmarks throughput and correctness-of-computation, not
     /// prompt-conditioned generation quality.
-    RawTokens { engine: Box<dyn GlEngine>, vocab_size: Option<usize> },
+    ///
+    /// `tokenizer` is boxed for the same reason `Tokenized` is: `GllmTokenizer`
+    /// carries its full vocab/merge tables by value, which would otherwise
+    /// make it (not `Tokenized(Box<Runtime>)`) the variant that sizes the
+    /// whole enum for every `Backend`, including ones that never load GLLM.
+    RawTokens {
+        engine: Box<dyn GlEngine>,
+        vocab_size: Option<usize>,
+        #[cfg(feature = "gllm-bench")]
+        tokenizer: Box<Option<glictus_caliburni::GllmTokenizer>>,
+    },
 }
 
 /// A loaded engine ready to run workloads, plus the facts it reported about
@@ -89,9 +103,12 @@ impl EngineAdapter {
         Ok(EngineAdapter { backend: Backend::Tokenized(Box::new(runtime)), metadata, gpu })
     }
 
-    /// The GLLM path: no `Runtime`, no tokenizer — see the module docs.
-    /// `spec.model_path` is a GLLM package root (a directory, or the
-    /// `gllm.json` inside one).
+    /// The GLLM path: no `Runtime`, no embedded tokenizer — see the module
+    /// docs. `spec.model_path` is a GLLM package root (a directory, or the
+    /// `gllm.json` inside one). `spec.tokenizer_path`, when given, names the
+    /// source `.gguf` file to build a real [`glictus_caliburni::GllmTokenizer`]
+    /// from — the `.gllm` package itself carries no tokenizer metadata
+    /// (ARTX1 OQ3; `glictus_caliburni::converter` drops it on conversion).
     #[cfg(feature = "gllm-bench")]
     fn load_gllm(spec: &WorkloadSpec) -> Result<EngineAdapter, GlError> {
         let mut engine = glictus_caliburni::runtime::GllmEngine::new();
@@ -99,6 +116,15 @@ impl EngineAdapter {
         engine.load_model(&spec.model_path)?;
         let spec_meta = engine.capabilities();
         let vocab_size = engine.vocab_size();
+
+        let tokenizer = match &spec.tokenizer_path {
+            Some(path) => Some(
+                glictus_caliburni::GllmTokenizer::from_gguf(std::path::Path::new(path))
+                    .map_err(|e| GlError::Parse(format!("loading tokenizer from {path}: {e}")))?,
+            ),
+            None => None,
+        };
+
         let metadata = EngineMetadata {
             name: spec_meta.name.to_string(),
             backend: spec_meta.backend.to_string(),
@@ -108,7 +134,7 @@ impl EngineAdapter {
             thinking_capable: None,
         };
         Ok(EngineAdapter {
-            backend: Backend::RawTokens { engine: Box::new(engine), vocab_size },
+            backend: Backend::RawTokens { engine: Box::new(engine), vocab_size, tokenizer: Box::new(tokenizer) },
             metadata,
             gpu: GpuInfo::default(),
         })
@@ -205,6 +231,27 @@ impl EngineAdapter {
                 // A no-op sink: glbench measures, it does not consume the text stream.
                 rt.stream(&spec.prompt, config, |_text| {})
             }
+            #[cfg(feature = "gllm-bench")]
+            Backend::RawTokens { engine, vocab_size, tokenizer } => {
+                let mut config = config;
+                config.token_ids = match &**tokenizer {
+                    // No add_eos: this is a prefill prompt the engine then
+                    // continues decoding past, not a complete turn — forcing
+                    // an end-of-text token into the prompt would be measuring
+                    // a different (and stranger) workload than --prompt asked
+                    // for. No add_bos either: Qwen2/Qwen3 never default it on
+                    // (GllmTokenizer::add_bos_default() is false for them),
+                    // and glbench has no reason to override the model's own
+                    // convention just because it's benchmarking.
+                    Some(tok) => tok.encode(
+                        &spec.prompt,
+                        &glictus_caliburni::TokenizerConfig { add_bos: false, add_eos: false },
+                    ),
+                    None => synthetic_token_ids(spec, *vocab_size),
+                };
+                engine.stream(config, &|_id, _text| {})
+            }
+            #[cfg(not(feature = "gllm-bench"))]
             Backend::RawTokens { engine, vocab_size } => {
                 let mut config = config;
                 config.token_ids = synthetic_token_ids(spec, *vocab_size);

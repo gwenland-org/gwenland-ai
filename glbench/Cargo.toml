@@ -27,7 +27,7 @@ glcuda = { path = "../glcuda" }
 # entirely (see engine/adapter.rs's module docs); pulling it in unconditionally
 # would make every glbench build depend on glictus-caliburni's glproc-backend
 # feature even when nobody benchmarks GLLM.
-glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend"], optional = true }
+glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend", "tokenizer"], optional = true }
 
 [features]
 default = []

@@ -24,6 +24,8 @@ pub mod package;
 pub mod plugin;
 pub mod runtime;
 pub mod shared;
+#[cfg(feature = "tokenizer")]
+pub mod tokenizer;
 pub mod traits;
 pub mod types;
 
@@ -55,6 +57,8 @@ pub use runtime::{
     ResolvedDevice, RuntimeConfig, RuntimeLogLevel, RuntimeLogger, Scheduler,
 };
 pub use shared::SharedComponents;
+#[cfg(feature = "tokenizer")]
+pub use tokenizer::{GllmTokenizer, TokenizerConfig};
 pub use types::{
     execution::{Device, DeviceMap, ExecutionUnitMeta},
     layer::LayerFile,

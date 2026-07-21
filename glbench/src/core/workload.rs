@@ -88,6 +88,13 @@ pub struct WorkloadSpec {
     /// when equal to `engine`: comparing an engine's output to itself always
     /// matches and would report a check that verified nothing.
     pub verify_against: Option<String>,
+    /// Source `.gguf` file to build a tokenizer from, for engines whose
+    /// model path has no embedded tokenizer of its own (GLLM: a `.gllm`
+    /// package directory). `None` (default) means the engine falls back to
+    /// its own no-tokenizer behavior — for GLLM, synthesized token ids
+    /// (see `engine::adapter::synthetic_token_ids`) rather than an error,
+    /// so existing `--engine gllm` invocations keep working unchanged.
+    pub tokenizer_path: Option<String>,
 }
 
 impl Default for WorkloadSpec {
@@ -105,6 +112,7 @@ impl Default for WorkloadSpec {
             kind: WorkloadKind::EndToEnd,
             cot_mode: None,
             verify_against: None,
+            tokenizer_path: None,
         }
     }
 }
@@ -132,6 +140,13 @@ impl ToJson for WorkloadSpec {
             (
                 "verify_against",
                 match &self.verify_against {
+                    Some(s) => Json::s(s.clone()),
+                    None => Json::Null,
+                },
+            ),
+            (
+                "tokenizer_path",
+                match &self.tokenizer_path {
                     Some(s) => Json::s(s.clone()),
                     None => Json::Null,
                 },
@@ -164,6 +179,10 @@ impl FromJson for WorkloadSpec {
             // means "no cross-check was requested", not "was requested and
             // is now missing".
             verify_against: v.get("verify_against").and_then(|s| s.as_str()).map(String::from),
+            // Optional and absent from archives predating this field: absent
+            // means "no tokenizer source was given", the same as a fresh
+            // default — not an error.
+            tokenizer_path: v.get("tokenizer_path").and_then(|s| s.as_str()).map(String::from),
         })
     }
 }
@@ -217,5 +236,27 @@ mod tests {
         map.remove("verify_against");
         let back = WorkloadSpec::from_json(&Json::Obj(map)).unwrap();
         assert_eq!(back.verify_against, None);
+    }
+
+    #[test]
+    fn tokenizer_path_defaults_to_none() {
+        assert_eq!(WorkloadSpec::default().tokenizer_path, None);
+    }
+
+    #[test]
+    fn tokenizer_path_round_trips_through_json() {
+        let mut spec = WorkloadSpec::default();
+        spec.tokenizer_path = Some("model.gguf".to_string());
+        let back = WorkloadSpec::from_json(&spec.to_json()).unwrap();
+        assert_eq!(back.tokenizer_path, Some("model.gguf".to_string()));
+    }
+
+    #[test]
+    fn an_archive_with_no_tokenizer_path_field_reads_as_none() {
+        let json = WorkloadSpec::default().to_json();
+        let Json::Obj(mut map) = json else { unreachable!() };
+        map.remove("tokenizer_path");
+        let back = WorkloadSpec::from_json(&Json::Obj(map)).unwrap();
+        assert_eq!(back.tokenizer_path, None);
     }
 }

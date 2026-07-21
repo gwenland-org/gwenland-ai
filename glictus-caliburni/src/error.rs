@@ -119,6 +119,31 @@ pub enum GllmError {
 
     #[error("Invalid layer range {0:?}: expected \"START-END\" with START <= END")]
     InvalidLayerRange(String),
+
+    // --- ARTX-OQ3 tokenizer (GGUF metadata reader + BPE) --------------------
+    #[cfg(feature = "tokenizer")]
+    #[error("Invalid GGUF magic bytes: expected 0x46554747 (\"GGUF\"), got 0x{got:08X}")]
+    GgufInvalidMagic { got: u32 },
+
+    #[cfg(feature = "tokenizer")]
+    #[error("Unsupported GGUF version: {got} (supported: 2, 3)")]
+    GgufUnsupportedVersion { got: u32 },
+
+    #[cfg(feature = "tokenizer")]
+    #[error("Malformed GGUF metadata: {detail}")]
+    GgufMalformedMetadata { detail: String },
+
+    #[cfg(feature = "tokenizer")]
+    #[error("Missing required tokenizer field: {field}")]
+    TokenizerMissingField { field: &'static str },
+
+    #[cfg(feature = "tokenizer")]
+    #[error("Vocab/token_type length mismatch: {tokens} tokens, {types} types")]
+    TokenizerVocabMismatch { tokens: usize, types: usize },
+
+    #[cfg(feature = "tokenizer")]
+    #[error("Malformed BPE merge entry: {entry:?} (expected \"LEFT RIGHT\")")]
+    TokenizerMalformedMerge { entry: String },
 }
 
 pub type GllmResult<T> = Result<T, GllmError>;
