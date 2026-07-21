@@ -25,6 +25,13 @@ pub fn session(session: &BenchmarkSession) -> String {
         session.engine.backend,
         session.workload.model_path,
     ));
+    s.push_str(&format!(
+        "run at unix {} | {} {} | glbench {}\n",
+        session.metadata.created_unix,
+        session.environment.runtime.os,
+        session.environment.runtime.arch,
+        session.environment.runtime.glbench_version,
+    ));
     let hw = &session.environment.hardware;
     if let Some(name) = &hw.gpu.name {
         s.push_str(&format!(
@@ -49,6 +56,15 @@ pub fn session(session: &BenchmarkSession) -> String {
     let isa = hw.cpu.isa.names();
     if !isa.is_empty() {
         s.push_str(&format!("isa {}\n", isa.join(" ")));
+    }
+    match (hw.memory.total_bytes, hw.memory.available_bytes) {
+        (Some(total), Some(avail)) => s.push_str(&format!(
+            "ram {:.1} GiB total, {:.1} GiB available\n",
+            bytes_to_gib(total),
+            bytes_to_gib(avail),
+        )),
+        (Some(total), None) => s.push_str(&format!("ram {:.1} GiB total\n", bytes_to_gib(total))),
+        (None, _) => s.push_str("ram not available (no /proc/meminfo on this OS)\n"),
     }
     if let Some(bytes) = hw.storage.model_file_bytes {
         s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
@@ -78,12 +94,17 @@ pub fn session(session: &BenchmarkSession) -> String {
             dec.median,
         ));
     }
-    if let Some(jpt) = m.joules_per_token() {
-        s.push_str(&format!(
+    match m.joules_per_token() {
+        Some(jpt) => s.push_str(&format!(
             "energy: {:.2} J/token ({:.1} J total, RAPL package-level)\n",
             jpt,
             m.energy_joules.unwrap_or(0.0),
-        ));
+        )),
+        // `None` here is unambiguous: RAPL is Linux-only and the meter never
+        // estimates from TDP, so absence always means "not available", never
+        // "zero". Say so — a missing line reads as "forgot to check", not as
+        // "not applicable on this OS".
+        None => s.push_str("energy: not available (RAPL is Linux-only; not estimated from TDP)\n"),
     }
     s.push('\n');
 
@@ -122,14 +143,20 @@ pub fn session(session: &BenchmarkSession) -> String {
     }
 
     if let Some(v) = &session.validation {
-        if !v.passed() || !v.findings.is_empty() {
-            s.push_str(&format!(
-                "\nvalidation: {}\n",
-                if v.passed() { "passed (with notes)" } else { "FAILED" }
-            ));
-            for f in &v.findings {
-                s.push_str(&format!("  [{}] {}: {}\n", f.severity.as_str(), f.check, f.message));
+        // Always printed, including the all-clear case: an absent validation
+        // line reads as "nobody checked", not as "checked and clean" — those
+        // are different facts and only one of them is what a silent omission
+        // would actually mean.
+        s.push_str(&format!(
+            "\nvalidation: {}\n",
+            match (v.passed(), v.findings.is_empty()) {
+                (true, true) => "passed (no findings)".to_string(),
+                (true, false) => "passed (with notes)".to_string(),
+                (false, _) => "FAILED".to_string(),
             }
+        ));
+        for f in &v.findings {
+            s.push_str(&format!("  [{}] {}: {}\n", f.severity.as_str(), f.check, f.message));
         }
     }
     s
@@ -492,4 +519,83 @@ fn stat_cells(label: &str, s: &Stats) -> Vec<String> {
         format!("{:.1}", s.p95),
         format!("{:.1}", s.std_dev),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::metrics::{IterationMetrics, MeasurementSet};
+    use crate::core::result::SessionMetadata;
+    use crate::core::workload::WorkloadSpec;
+    use crate::engine::metadata::EngineMetadata;
+    use crate::environment::hardware::EnvironmentSnapshot;
+    use crate::validation::integrity::{Severity, ValidationReport};
+
+    fn sample() -> BenchmarkSession {
+        let mut m = MeasurementSet::default();
+        m.iterations.push(IterationMetrics {
+            prompt_tokens: 100,
+            generated_tokens: 128,
+            prefill_ms: 100.0,
+            decode_ms: 4000.0,
+            total_ms: 4100.0,
+        });
+        BenchmarkSession::new(
+            SessionMetadata::new("test-run"),
+            EnvironmentSnapshot::probe(""),
+            EngineMetadata {
+                name: "glproc".into(),
+                backend: "cpu".into(),
+                available: true,
+                model_arch: Some("qwen2".into()),
+                quantization: Some("Q8_0".into()),
+                thinking_capable: Some(false),
+            },
+            WorkloadSpec::default(),
+            m,
+        )
+    }
+
+    #[test]
+    fn session_report_always_shows_os_arch_and_timestamp() {
+        let s = session(&sample());
+        assert!(s.contains(&crate::core::schema::GLBENCH_VERSION.to_string()));
+        // RuntimeInfo::probe() always fills os/arch from std::env::consts, so
+        // these are never empty on any platform this crate builds on.
+        assert!(!std::env::consts::OS.is_empty());
+        assert!(s.contains(std::env::consts::OS));
+        assert!(s.contains(std::env::consts::ARCH));
+        assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn energy_prints_not_available_rather_than_being_omitted() {
+        // energy_joules is None on every machine without readable RAPL
+        // (every non-Linux CI runner, and most Linux ones without
+        // permissions) — force it explicitly so the assertion holds
+        // regardless of what happens to probe true here.
+        let mut sess = sample();
+        sess.measurements.energy_joules = None;
+        let s = session(&sess);
+        assert!(s.contains("energy: not available"), "{s}");
+    }
+
+    #[test]
+    fn validation_prints_even_when_it_all_passed_with_no_findings() {
+        let mut sess = sample();
+        sess.validation = Some(ValidationReport::default());
+        let s = session(&sess);
+        assert!(s.contains("validation: passed (no findings)"), "{s}");
+    }
+
+    #[test]
+    fn validation_distinguishes_passed_with_notes_from_clean() {
+        let mut sess = sample();
+        let mut v = ValidationReport::default();
+        v.push(Severity::Warning, "integrity", "noisy run");
+        sess.validation = Some(v);
+        let s = session(&sess);
+        assert!(s.contains("validation: passed (with notes)"), "{s}");
+        assert!(s.contains("noisy run"), "{s}");
+    }
 }
