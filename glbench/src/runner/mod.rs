@@ -5,5 +5,6 @@
 pub mod decode;
 pub mod planner;
 pub mod prefill;
+pub mod scale;
 pub mod stress;
 pub mod warmup;

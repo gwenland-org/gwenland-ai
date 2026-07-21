@@ -6,6 +6,8 @@
 pub mod deterministic;
 pub mod integrity;
 pub mod numerical;
+pub mod parity;
 pub mod reproducibility;
 
 pub use integrity::{validate, ValidationReport};
+pub use parity::{validate_against_oracle, ParityReport};

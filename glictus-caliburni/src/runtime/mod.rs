@@ -27,6 +27,9 @@
 pub mod backend;
 pub mod cpu;
 pub mod device;
+pub mod distributed;
+#[cfg(feature = "glproc-backend")]
+pub mod glproc_backend;
 pub mod kv_cache;
 pub mod logger;
 pub mod mmap;
@@ -37,9 +40,12 @@ pub mod types;
 
 pub use backend::{ExecutionBackend, NullBackend, KV_ELEMENT_SIZE_F16, KV_ELEMENT_SIZE_F32};
 pub use cpu::CpuRuntime;
+#[cfg(feature = "glproc-backend")]
+pub use glproc_backend::GlprocBackend;
 pub use device::{
     DeviceMapConfig, DeviceMapResolver, DeviceSource, ResolvedDevice, parse_range,
 };
+pub use distributed::{RankAssignment, RankTopology};
 pub use kv_cache::{KvCache, KvCacheConfig, KvCacheSlot};
 pub use logger::{LogEntry, RuntimeLogger};
 pub use mmap::LayerMapping;

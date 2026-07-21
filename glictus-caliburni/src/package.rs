@@ -845,4 +845,101 @@ mod tests {
             assert_eq!(parse_layer_index(name).unwrap(), None, "{name}");
         }
     }
+
+    /// Writes a complete on-disk package like
+    /// [`crate::test_helpers::fixtures::write_manifest_package`], but with
+    /// `gllm_version` overridden — for exercising ARTX09 version negotiation
+    /// through the real `GllmPackage::open` path (not just the validator
+    /// unit tests in `manifest::metadata`).
+    fn write_package_with_version(dir: &Path, version: &str) {
+        use crate::checksum::sha256_file;
+        use crate::test_helpers::make_test_gllm_file;
+
+        make_test_gllm_file(&dir.join(SHARED_FILENAME));
+        let shared_hex = sha256_file(&dir.join(SHARED_FILENAME)).unwrap();
+
+        let manifest = serde_json::json!({
+            "gllm_version": version,
+            "model_id": "org.gwenland.test-model",
+            "architecture": "transformer",
+            "metadata": {
+                "vocab_size": 1000,
+                "context_length": 2048,
+                "embedding_length": 64,
+                "num_layers": 0,
+                "num_heads": 8,
+                "head_count_kv": 8
+            },
+            "shared": {
+                "file": SHARED_FILENAME,
+                "checksum": format!("sha256:{shared_hex}"),
+                "tensors": [
+                    { "name": "token_embeddings", "shape": [1000, 64],
+                      "dtype": "F32", "offset": 0, "size": 256000 }
+                ]
+            },
+            "layers": [],
+            "extensions": []
+        });
+        fs::write(dir.join(MANIFEST_FILENAME), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn open_rejects_major_version_mismatch() {
+        use crate::manifest::{FormatVersion, RUNTIME_FORMAT_VERSION};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (major, minor, patch) = FormatVersion(RUNTIME_FORMAT_VERSION.to_string())
+            .parts()
+            .unwrap();
+        write_package_with_version(tmp.path(), &format!("{}.{minor}.{patch}", major + 1));
+
+        let err = GllmPackage::open(tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, GllmError::ManifestValidationError(_)),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("Format version mismatch"), "{msg}");
+    }
+
+    #[test]
+    fn open_warns_on_minor_version_mismatch() {
+        use crate::manifest::{FormatVersion, RUNTIME_FORMAT_VERSION};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (major, minor, patch) = FormatVersion(RUNTIME_FORMAT_VERSION.to_string())
+            .parts()
+            .unwrap();
+        write_package_with_version(tmp.path(), &format!("{major}.{}.{patch}", minor + 1));
+
+        let pkg = GllmPackage::open(tmp.path()).expect("minor mismatch must still load");
+        assert!(pkg.validation.has_warnings());
+        assert!(
+            pkg.validation
+                .warnings
+                .iter()
+                .any(|w| w.contains("minor mismatch")),
+            "{:?}",
+            pkg.validation.warnings
+        );
+    }
+
+    #[test]
+    fn open_is_silent_on_patch_only_difference() {
+        use crate::manifest::{FormatVersion, RUNTIME_FORMAT_VERSION};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let (major, minor, patch) = FormatVersion(RUNTIME_FORMAT_VERSION.to_string())
+            .parts()
+            .unwrap();
+        write_package_with_version(tmp.path(), &format!("{major}.{minor}.{}", patch + 1));
+
+        let pkg = GllmPackage::open(tmp.path()).expect("patch difference must load");
+        assert!(
+            !pkg.validation.has_warnings(),
+            "patch-only difference must not warn: {:?}",
+            pkg.validation.warnings
+        );
+    }
 }

@@ -2496,6 +2496,7 @@ name = "glictus-caliburni"
 version = "0.1.162"
 dependencies = [
  "glcore",
+ "glproc",
  "memmap2",
  "serde",
  "serde_json",
