@@ -37,8 +37,10 @@ cargo build --release -p glbench
 
 The binary is `glbench`. It has **zero external dependencies** — only the Rust
 standard library and existing GwenLand workspace crates (`glcore`, `glproc`,
-`glcuda`). It works fully offline; the only network access anywhere in the stack
-is model fetching, which is GwenLand AI's job, not glbench's.
+`glcuda`, and optionally `glictus-caliburni` behind `--features gllm-bench`,
+see [Benchmarking GLLM](#benchmarking-gllm)). It works fully offline; the only
+network access anywhere in the stack is model fetching, which is GwenLand
+AI's job, not glbench's.
 
 ## Usage
 
@@ -83,8 +85,8 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 
 | flag            | default | meaning                                          |
 |-----------------|---------|--------------------------------------------------|
-| `--engine`      | glproc  | engine to run through (`glproc`, `glcuda`)       |
-| `--model`       | —       | path to a `.gguf` / `.safetensors` (**required**)|
+| `--engine`      | glproc  | engine to run through (`glproc`, `glcuda`, `gllm`) |
+| `--model`       | —       | path to a `.gguf` / `.safetensors`, or (for `gllm`) a package directory (**required**) |
 | `--prompt`      | builtin | prompt text (default is long enough for prefill) |
 | `--tokens`      | 128     | tokens to generate in the measured decode phase  |
 | `--warmup`      | 1       | untimed warmup iterations                        |
@@ -138,7 +140,7 @@ Module map (one crate, internal module folders — no sub-crates):
 |----------------|------------------------------------------------------------|
 | `core`         | the data model (session, metrics, workload, schema)        |
 | `environment`  | probe the machine (std + OS files only)                    |
-| `engine`       | the **only** boundary to the engines; runs via `Runtime`   |
+| `engine`       | the **only** boundary to the engines; runs via `Runtime` (`glproc`/`glcuda`) or directly against a `Box<dyn GlEngine>` (`gllm` — see [Benchmarking GLLM](#benchmarking-gllm)) |
 | `runner`       | orchestrate a run: warmup → measured iterations → phases   |
 | `measurement`  | store raw facts, convert counts+durations to rates         |
 | `analysis`     | facts → insight, always as recommendations, never actions  |
