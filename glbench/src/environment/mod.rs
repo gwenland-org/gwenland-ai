@@ -10,3 +10,4 @@ pub mod memory;
 pub mod power;
 pub mod runtime;
 pub mod storage;
+pub mod thermal;

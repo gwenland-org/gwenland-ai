@@ -16,12 +16,12 @@ pub const HEADER: &str = "label,iteration,prompt_tokens,generated_tokens,prefill
 
 /// Render a session's iterations as CSV (including the header).
 ///
-/// The cold (first-ever) iteration, when present, is emitted as its own row
-/// with `iteration` = `cold` rather than folded into the numbered warm rows
-/// or omitted — it is a real measurement (see `MeasurementSet::cold`'s
-/// docs), and a spreadsheet reader filtering on that literal can separate it
-/// from the warm statistics exactly as the terminal/Markdown reports already
-/// do visually.
+/// Every cold-start iteration, when present, is emitted as its own row with
+/// `iteration` = `cold-N` rather than folded into the numbered warm rows or
+/// omitted — each is a real measurement (see `MeasurementSet::cold`'s docs),
+/// and a spreadsheet reader filtering on the `cold-` prefix can separate all
+/// of them from the warm statistics exactly as the terminal/Markdown reports
+/// already do visually.
 pub fn render(session: &BenchmarkSession) -> String {
     let mut s = String::new();
     s.push_str(HEADER);
@@ -31,8 +31,8 @@ pub fn render(session: &BenchmarkSession) -> String {
         Some(jpt) => format!("{jpt:.4}"),
         None => String::new(),
     };
-    if let Some(c) = &session.measurements.cold {
-        push_row(&mut s, label, "cold", c, &energy_field);
+    for (i, c) in session.measurements.cold.iter().enumerate() {
+        push_row(&mut s, label, &format!("cold-{i}"), c, &energy_field);
     }
     for (i, it) in session.measurements.iterations.iter().enumerate() {
         push_row(&mut s, label, &i.to_string(), it, &energy_field);
@@ -113,26 +113,36 @@ mod tests {
     }
 
     #[test]
-    fn cold_iteration_gets_its_own_labeled_row() {
+    fn cold_iterations_each_get_their_own_labeled_row() {
         let mut sess = sample();
-        sess.measurements.cold = Some(IterationMetrics {
-            prompt_tokens: 100,
-            generated_tokens: 128,
-            prefill_ms: 500.0,
-            decode_ms: 6000.0,
-            total_ms: 6500.0,
-        });
+        sess.measurements.cold = vec![
+            IterationMetrics {
+                prompt_tokens: 100,
+                generated_tokens: 128,
+                prefill_ms: 500.0,
+                decode_ms: 6000.0,
+                total_ms: 6500.0,
+            },
+            IterationMetrics {
+                prompt_tokens: 100,
+                generated_tokens: 128,
+                prefill_ms: 300.0,
+                decode_ms: 5000.0,
+                total_ms: 5300.0,
+            },
+        ];
         let out = render(&sess);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "header + cold row + one warm row: {out}");
-        assert!(lines[1].starts_with("test-run,cold,"), "{}", lines[1]);
-        assert!(lines[2].starts_with("test-run,0,"), "{}", lines[2]);
+        assert_eq!(lines.len(), 4, "header + 2 cold rows + one warm row: {out}");
+        assert!(lines[1].starts_with("test-run,cold-0,"), "{}", lines[1]);
+        assert!(lines[2].starts_with("test-run,cold-1,"), "{}", lines[2]);
+        assert!(lines[3].starts_with("test-run,0,"), "{}", lines[3]);
     }
 
     #[test]
-    fn no_cold_iteration_means_no_cold_row() {
+    fn no_cold_iterations_means_no_cold_rows() {
         let out = render(&sample());
-        assert!(!out.contains(",cold,"), "{out}");
+        assert!(!out.contains(",cold-"), "{out}");
     }
 
     #[test]

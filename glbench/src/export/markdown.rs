@@ -60,17 +60,30 @@ pub fn render(session: &BenchmarkSession) -> String {
 
     // Throughput table.
     s.push_str("## Throughput (tokens/second)\n\n");
-    s.push_str("| Phase | mean | median | min | max | p95 | std |\n");
-    s.push_str("|-------|-----:|-------:|----:|----:|----:|----:|\n");
+    s.push_str("| Phase | mean | median | min | max | p95 | std | ±95% CI |\n");
+    s.push_str("|-------|-----:|-------:|----:|----:|----:|----:|--------:|\n");
     s.push_str(&stat_row("prefill", &pre));
     s.push_str(&stat_row("decode", &dec));
     s.push('\n');
+    if pre.count < 3 || dec.count < 3 {
+        s.push_str(
+            "_±95% CI needs at least 3 measured iterations; below that a confidence \
+             interval has too few degrees of freedom to mean anything, so it reads `n/a`.\
+             _\n\n",
+        );
+    }
 
-    if let Some(c) = &session.measurements.cold {
+    if !session.measurements.cold.is_empty() {
+        let cold_pre = Stats::from_samples(&session.measurements.cold_prefill_tps_samples());
+        let cold_dec = Stats::from_samples(&session.measurements.cold_decode_tps_samples());
         s.push_str(&format!(
-            "**Cold first run:** prefill {:.1} tok/s · decode {:.1} tok/s (excluded from the warm statistics above)\n\n",
-            c.prefill_tps(),
-            c.decode_tps(),
+            "**Cold start** ({} iterations, excluded from the warm statistics above):\n",
+            session.measurements.cold.len()
+        ));
+        s.push_str(&format!(
+            "prefill median {:.1} tok/s (range {:.1}-{:.1}) · decode median {:.1} tok/s (range {:.1}-{:.1})\n\n",
+            cold_pre.median, cold_pre.min, cold_pre.max,
+            cold_dec.median, cold_dec.min, cold_dec.max,
         ));
     }
     match session.measurements.joules_per_token() {
@@ -86,7 +99,13 @@ pub fn render(session: &BenchmarkSession) -> String {
         s.push_str(&format!("- **Health:** {:.0}%\n", a.health * 100.0));
         s.push_str(&format!("- **Bottleneck:** {}\n", a.bottleneck.as_str()));
         if let Some(eff) = a.ceiling_efficiency {
-            s.push_str(&format!("- **Ceiling efficiency:** {:.0}%\n", eff * 100.0));
+            use crate::analysis::ceiling::CeilingBasis;
+            let basis_note = match a.ceiling_basis {
+                CeilingBasis::Measured => " (measured on this machine)",
+                CeilingBasis::EstimatedFromTable => " (estimated from the device's published spec, not measured)",
+                CeilingBasis::Undetermined => "",
+            };
+            s.push_str(&format!("- **Ceiling efficiency:** {:.0}%{basis_note}\n", eff * 100.0));
         }
         if !a.notes.is_empty() {
             s.push_str("\n**Observations:**\n\n");
@@ -137,7 +156,7 @@ pub fn render(session: &BenchmarkSession) -> String {
     // Behavior signals: what the model did, in pure numbers (see glbench's
     // README "What a report contains" for what each one can honestly claim).
     if let Some(b) = &session.behavior {
-        s.push_str(&behavior_section(b));
+        s.push_str(&behavior_section(b, session.workload.engine == "gllm"));
     }
 
     // Validation.
@@ -158,8 +177,12 @@ pub fn render(session: &BenchmarkSession) -> String {
 }
 
 fn stat_row(label: &str, s: &Stats) -> String {
+    let ci = match s.ci95 {
+        Some(ci) => format!("{ci:.1}"),
+        None => "n/a".to_string(),
+    };
     format!(
-        "| {label} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} |\n",
+        "| {label} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {:.1} | {ci} |\n",
         s.mean, s.median, s.min, s.max, s.p95, s.std_dev
     )
 }
@@ -256,9 +279,21 @@ fn telemetry_section(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option
 /// Behavior signals as Markdown — mirrors `render::text::behavior`'s content
 /// and honesty rules (`hallucination` named as a proxy, `toxicity` never
 /// implied to exist).
-fn behavior_section(b: &crate::behavior::BehaviorReport) -> String {
+///
+/// `synthetic_prompt` is true exactly for the `gllm` engine (no tokenizer
+/// yet, so `--prompt` is never actually encoded — see
+/// `glictus_caliburni::runtime::GllmEngine`'s docs); the section is labeled
+/// so these numbers are never mistaken for a real prompt's behavior.
+fn behavior_section(b: &crate::behavior::BehaviorReport, synthetic_prompt: bool) -> String {
     let mut s = String::new();
     s.push_str("## Behavior\n\n_From a separate traced run — tracing perturbs timing._\n\n");
+    if synthetic_prompt {
+        s.push_str(
+            "> **FOR SYNTHETIC PROMPT ONLY** — gllm has no tokenizer yet; these numbers \
+             describe the model's reaction to a deterministic filler sequence, not to any \
+             real prompt text.\n\n",
+        );
+    }
 
     if let Some(r) = &b.repetition {
         s.push_str(&format!(
@@ -412,5 +447,39 @@ mod tests {
     fn telemetry_section_is_absent_without_telemetry() {
         let s = render(&sample());
         assert!(!s.contains("## Engine Telemetry"), "{s}");
+    }
+
+    #[test]
+    fn gllm_behavior_section_is_labeled_synthetic() {
+        let mut sess = sample();
+        sess.workload.engine = "gllm".to_string();
+        sess.behavior = Some(BehaviorReport {
+            repetition: Some(RepetitionSignal::compute(&[1, 2, 3, 1, 2, 3]).unwrap()),
+            entropy: None,
+            stall: None,
+            ood: None,
+            hallucination: None,
+            anomaly: None,
+            cot: None,
+        });
+        let s = render(&sess);
+        assert!(s.contains("FOR SYNTHETIC PROMPT ONLY"), "{s}");
+    }
+
+    #[test]
+    fn non_gllm_behavior_section_is_not_labeled_synthetic() {
+        let mut sess = sample();
+        sess.workload.engine = "glproc".to_string();
+        sess.behavior = Some(BehaviorReport {
+            repetition: Some(RepetitionSignal::compute(&[1, 2, 3, 1, 2, 3]).unwrap()),
+            entropy: None,
+            stall: None,
+            ood: None,
+            hallucination: None,
+            anomaly: None,
+            cot: None,
+        });
+        let s = render(&sess);
+        assert!(!s.contains("SYNTHETIC PROMPT"), "{s}");
     }
 }

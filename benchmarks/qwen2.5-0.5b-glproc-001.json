@@ -1,0 +1,183 @@
+{
+  "analysis": {
+    "bottleneck": "launch_overhead",
+    "ceiling_efficiency": 0.19690624424016753,
+    "decode_tps": {
+      "count": 1,
+      "max": 6.946829401934432,
+      "mean": 6.946829401934432,
+      "median": 6.946829401934432,
+      "min": 6.946829401934432,
+      "p95": 6.946829401934432,
+      "p99": 6.946829401934432,
+      "std_dev": 0
+    },
+    "health": 0.4378343709681173,
+    "hypotheses": [],
+    "notes": [
+      "Decode 6.9 tok/s vs bandwidth ceiling 35.3 tok/s (17 GB/s over 0.49 GB weights) = 20% of peak.",
+      "The device appears idle much of the time; kernel-launch overhead or serialization is the suspect — fusing or batching launches is the lever."
+    ],
+    "prefill_tps": {
+      "count": 1,
+      "max": 56.93347651930152,
+      "mean": 56.93347651930152,
+      "median": 56.93347651930152,
+      "min": 56.93347651930152,
+      "p95": 56.93347651930152,
+      "p99": 56.93347651930152,
+      "std_dev": 0
+    },
+    "roofline": null
+  },
+  "behavior": {
+    "anomaly": null,
+    "confidence_divergence": {
+      "max_rank": 0,
+      "mean_confidence_gap": 0.00000000815131318693263,
+      "mean_rank": 0,
+      "top_choice_rate": 1,
+      "uncertain_offpick_rate": 0
+    },
+    "cot": {
+      "flag": "NORMAL",
+      "thinking_capable": false,
+      "threshold_nats": 0.5,
+      "threshold_top_prob": 0.9
+    },
+    "entropy": {
+      "max": 2.8832356929779053,
+      "mean_nats": 1.7715662382543087,
+      "mean_top_prob": 0.5596389435231686,
+      "min": 0.3906960189342499,
+      "p50": 2.2541539669036865,
+      "p95": 2.8832356929779053,
+      "std_dev": 0.9673818283878733
+    },
+    "ood": {
+      "mean_logprob": -0.6910414062440395,
+      "min_logprob": -1.3826711177825928,
+      "p95_surprise": 1.3826711177825928,
+      "perplexity": 1.995792882542761
+    },
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 8,
+      "unique_1gram_ratio": 1,
+      "unique_2gram_ratio": 1,
+      "unique_3gram_ratio": 1
+    },
+    "stall": {
+      "jitter": 0.20234775831583665,
+      "max_ms": 183.2056,
+      "mean_ms": 142.60347142857145,
+      "p50_ms": 124.3612,
+      "p99_ms": 183.2056,
+      "stall_count": 0,
+      "std_dev_ms": 28.855492771627894
+    },
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q4_K_M",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": null,
+        "model": null,
+        "physical_cores": null,
+        "read_bandwidth_gbs": 17.336535992456632
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": null,
+        "total_bytes": null
+      },
+      "storage": {
+        "model_file_bytes": 491400032
+      }
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": {
+      "decode_ms": 1374.3218,
+      "generated_tokens": 8,
+      "prefill_ms": 4424.2439,
+      "prompt_tokens": 220,
+      "total_ms": 5798
+    },
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 1151.6045,
+        "generated_tokens": 8,
+        "prefill_ms": 3864.1589,
+        "prompt_tokens": 220,
+        "total_ms": 5015
+      }
+    ],
+    "model_bytes": 491400032,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": null
+  },
+  "metadata": {
+    "created_unix": 1784603365,
+    "glbench_version": "0.1.163",
+    "label": "glproc-qwen2.5-0.5b-instruct-q4_k_m",
+    "schema_version": 1
+  },
+  "telemetry": null,
+  "validation": {
+    "findings": [
+      {
+        "check": "deterministic",
+        "message": "only one measured iteration: run-to-run variance is unknown",
+        "severity": "info"
+      }
+    ],
+    "passed": true
+  },
+  "workload": {
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "decode",
+    "max_new_tokens": 8,
+    "measure_iters": 1,
+    "model_path": "C:/Users/reyha/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "prompt": "Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads.",
+    "seed": 42,
+    "temperature": 0,
+    "warmup_iters": 1
+  }
+}

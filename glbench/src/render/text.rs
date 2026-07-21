@@ -66,30 +66,50 @@ pub fn session(session: &BenchmarkSession) -> String {
         (Some(total), None) => s.push_str(&format!("ram {:.1} GiB total\n", bytes_to_gib(total))),
         (None, _) => s.push_str("ram not available (no /proc/meminfo on this OS)\n"),
     }
+    match hw.thermal.avg_mhz {
+        Some(avg) => {
+            s.push_str(&format!("clock avg {avg:.0} MHz during run"));
+            if let (Some(start), Some(end)) = (hw.thermal.start_mhz, hw.thermal.end_mhz) {
+                s.push_str(&format!(" (start {start:.0}, end {end:.0}"));
+                if hw.thermal.throttled() {
+                    s.push_str(", THROTTLED");
+                }
+                s.push(')');
+            }
+            s.push('\n');
+        }
+        None => s.push_str("clock avg not available (no readable clock speed on this OS)\n"),
+    }
     if let Some(bytes) = hw.storage.model_file_bytes {
         s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
     }
     s.push('\n');
 
     // Throughput table.
-    let mut t = Table::new(&["phase", "mean", "median", "min", "max", "p95", "std"])
+    let mut t = Table::new(&["phase", "mean", "median", "min", "max", "p95", "std", "±95% CI"])
         .right_align(1)
         .right_align(2)
         .right_align(3)
         .right_align(4)
         .right_align(5)
-        .right_align(6);
+        .right_align(6)
+        .right_align(7);
     t.row(&stat_cells("prefill", &pre));
     t.row(&stat_cells("decode", &dec));
     s.push_str(&t.render());
-    // The cold (first-ever) iteration, kept out of the warm statistics: it is
-    // what a deployment's first request pays. Printed next to the warm P50 so
-    // the page-in/cache-fill cost is one glance.
-    if let Some(c) = &m.cold {
+    // Cold-start iterations, kept out of the warm statistics: they are what
+    // a deployment's first few requests pay. Reported as median + range
+    // rather than one sample — "always ~500ms" and "usually 90ms but once
+    // 900ms" both average to the same number, and only the range tells them
+    // apart (the same reasoning `stall_count` uses for inter-token gaps).
+    if !m.cold.is_empty() {
+        let cold_pre = Stats::from_samples(&m.cold_prefill_tps_samples());
+        let cold_dec = Stats::from_samples(&m.cold_decode_tps_samples());
         s.push_str(&format!(
-            "cold first run: prefill {:.1} tok/s | decode {:.1} tok/s (warm median {:.1} / {:.1})\n",
-            c.prefill_tps(),
-            c.decode_tps(),
+            "cold start ({} iters): prefill median {:.1} tok/s (range {:.1}-{:.1}) | decode median {:.1} tok/s (range {:.1}-{:.1}) | warm median {:.1} / {:.1}\n",
+            m.cold.len(),
+            cold_pre.median, cold_pre.min, cold_pre.max,
+            cold_dec.median, cold_dec.min, cold_dec.max,
             pre.median,
             dec.median,
         ));
@@ -115,7 +135,12 @@ pub fn session(session: &BenchmarkSession) -> String {
             a.bottleneck.as_str()
         ));
         if let Some(eff) = a.ceiling_efficiency {
-            s.push_str(&format!("  |  {:.0}% of ceiling", eff * 100.0));
+            let basis_tag = match a.ceiling_basis {
+                crate::analysis::ceiling::CeilingBasis::Measured => "",
+                crate::analysis::ceiling::CeilingBasis::EstimatedFromTable => " (est.)",
+                crate::analysis::ceiling::CeilingBasis::Undetermined => "",
+            };
+            s.push_str(&format!("  |  {:.0}% of ceiling{basis_tag}", eff * 100.0));
         }
         s.push_str("\n\n");
         for note in &a.notes {
@@ -139,7 +164,7 @@ pub fn session(session: &BenchmarkSession) -> String {
     }
 
     if let Some(b) = &session.behavior {
-        s.push_str(&behavior(b));
+        s.push_str(&behavior(b, uses_synthetic_prompts(session)));
     }
 
     if let Some(v) = &session.validation {
@@ -340,14 +365,33 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
     s
 }
 
+/// Whether `session` ran against synthetic (not real-prompt) token ids —
+/// true exactly for the `gllm` engine, which has no tokenizer yet and
+/// generates a deterministic filler sequence instead of encoding
+/// `--prompt` (see `glictus_caliburni::runtime::GllmEngine`'s docs and
+/// `engine::adapter::synthetic_token_ids`). Behavior signals computed over
+/// that sequence describe the model's reaction to filler, not to the prompt
+/// text a reader might assume was used.
+fn uses_synthetic_prompts(session: &BenchmarkSession) -> bool {
+    session.workload.engine == "gllm"
+}
+
 /// The behavior sections: what the model did, in pure numbers.
 ///
 /// Every line is a measurement. None of it is a verdict — where a threshold is
 /// applied (`degenerate`, `stalls`), it is flagged as a hint and the raw number
 /// is printed next to it so the reader can disagree.
-fn behavior(b: &crate::behavior::BehaviorReport) -> String {
+fn behavior(b: &crate::behavior::BehaviorReport, synthetic_prompt: bool) -> String {
     let mut s = String::new();
-    s.push_str("\nbehavior (from a separate traced run — tracing perturbs timing)\n");
+    s.push_str("\nbehavior (from a separate traced run — tracing perturbs timing)");
+    if synthetic_prompt {
+        s.push_str(
+            "\n  *** FOR SYNTHETIC PROMPT ONLY *** — gllm has no tokenizer yet; these numbers \
+             describe the model's reaction to a deterministic filler sequence, not to any \
+             real prompt text.",
+        );
+    }
+    s.push('\n');
 
     if let Some(r) = &b.repetition {
         s.push_str(&format!(
@@ -518,6 +562,13 @@ fn stat_cells(label: &str, s: &Stats) -> Vec<String> {
         format!("{:.1}", s.max),
         format!("{:.1}", s.p95),
         format!("{:.1}", s.std_dev),
+        // Below 3 samples a t-interval has 0-1 degrees of freedom and is not
+        // a claim worth making — say so rather than leaving the column blank
+        // (which would read as "0", not as "not computed").
+        match s.ci95 {
+            Some(ci) => format!("{ci:.1}"),
+            None => "n/a".to_string(),
+        },
     ]
 }
 
@@ -597,5 +648,60 @@ mod tests {
         let s = session(&sess);
         assert!(s.contains("validation: passed (with notes)"), "{s}");
         assert!(s.contains("noisy run"), "{s}");
+    }
+
+    #[test]
+    fn gllm_behavior_section_is_labeled_synthetic() {
+        let mut sess = sample();
+        sess.workload.engine = "gllm".to_string();
+        sess.behavior = Some(crate::behavior::BehaviorReport {
+            repetition: crate::behavior::repetition::RepetitionSignal::compute(&[1, 2, 3]),
+            entropy: None,
+            stall: None,
+            ood: None,
+            hallucination: None,
+            anomaly: None,
+            cot: None,
+        });
+        let s = session(&sess);
+        assert!(s.contains("FOR SYNTHETIC PROMPT ONLY"), "{s}");
+    }
+
+    #[test]
+    fn non_gllm_behavior_section_is_not_labeled_synthetic() {
+        let mut sess = sample();
+        sess.workload.engine = "glproc".to_string();
+        sess.behavior = Some(crate::behavior::BehaviorReport {
+            repetition: crate::behavior::repetition::RepetitionSignal::compute(&[1, 2, 3]),
+            entropy: None,
+            stall: None,
+            ood: None,
+            hallucination: None,
+            anomaly: None,
+            cot: None,
+        });
+        let s = session(&sess);
+        assert!(!s.contains("SYNTHETIC PROMPT"), "{s}");
+    }
+
+    #[test]
+    fn avg_clock_prints_the_reading_and_throttle_flag() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal = crate::environment::thermal::ThermalSnapshot {
+            start_mhz: Some(3000.0),
+            end_mhz: Some(2500.0),
+            avg_mhz: Some(2750.0),
+        };
+        let s = session(&sess);
+        assert!(s.contains("clock avg 2750 MHz"), "{s}");
+        assert!(s.contains("THROTTLED"), "{s}");
+    }
+
+    #[test]
+    fn no_clock_reading_says_not_available() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal = crate::environment::thermal::ThermalSnapshot::default();
+        let s = session(&sess);
+        assert!(s.contains("clock avg not available"), "{s}");
     }
 }

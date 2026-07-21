@@ -46,18 +46,26 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // Attach the engine's GPU facts to the hardware snapshot.
     environment.hardware = environment.hardware.clone().with_gpu(adapter.gpu().clone());
 
-    // 3. Warmup — kept out of the statistics, to pay JIT/cold-cache costs
-    //    before measuring. The FIRST warmup pass is still timed and recorded
-    //    separately as the cold figure: it is the one iteration that shows
-    //    page-in and cache-fill costs, and discarding it entirely (as pre-v2
-    //    glbench did) threw away the number a deployment's first request pays.
-    let mut cold = None;
+    // 3a. Cold-start phase — a dedicated, timed phase before warmup, every
+    //     iteration recorded (not just the first): a single cold sample
+    //     cannot tell "this model always pays ~500ms to page in" apart from
+    //     "the OS happened to schedule something else during this one run".
+    //     A median + range over several can. Runs before warmup precisely
+    //     because warmup's job is to WARM the cache — running it first would
+    //     make every "cold" reading after it not actually cold.
+    let mut cold = Vec::with_capacity(spec.cold_iters);
+    for i in 0..spec.cold_iters {
+        progress("cold", i, spec.cold_iters);
+        cold.push(adapter.run_once(spec)?);
+    }
+
+    // 3b. Warmup — kept out of the statistics, to pay JIT/cache-warming costs
+    //     before measuring. Distinct from cold-start: warmup's numbers are
+    //     never recorded at all, because its entire purpose is to leave the
+    //     machine in the warm state the measured phase assumes.
     for i in 0..spec.warmup_iters {
         progress("warmup", i, spec.warmup_iters);
-        let iter = adapter.run_once(spec)?;
-        if i == 0 {
-            cold = Some(iter);
-        }
+        adapter.run_once(spec)?;
     }
 
     // 4. Measured iterations, bracketed by the energy meter so Joules cover
@@ -66,13 +74,31 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     //    simply carries no energy figure (never a TDP estimate).
     let meter = EnergyMeter::start();
     let mut measurements = MeasurementSet::default();
+    // One clock reading per measured iteration, for `avg_mhz` below — coarser
+    // than continuous sampling would be, but representative of the run
+    // without needing a background thread, and it costs one `probe_mhz` call
+    // (a file read or a `wmic` process, both cheap) per iteration rather than
+    // per token.
+    let mut mhz_readings = Vec::with_capacity(spec.measure_iters.max(1));
     for i in 0..spec.measure_iters.max(1) {
         progress("measure", i, spec.measure_iters.max(1));
         let iter = adapter.run_once(spec)?;
         measurements.iterations.push(iter);
+        if let Some(mhz) = crate::environment::cpu::probe_mhz() {
+            mhz_readings.push(mhz);
+        }
     }
     measurements.energy_joules = meter.and_then(EnergyMeter::stop);
     measurements.cold = cold;
+
+    // 4b. End-of-run CPU clock, for thermal-throttle detection. A second,
+    //     cheap reading (not a full CpuInfo::probe) — the start reading was
+    //     already taken by EnvironmentSnapshot::probe in step 1.
+    let end_mhz = crate::environment::cpu::probe_mhz();
+    environment.hardware = environment
+        .hardware
+        .with_end_mhz(end_mhz)
+        .with_avg_mhz(crate::environment::thermal::average_mhz(&mhz_readings));
 
     // 5. Fill in facts known only after the run: the model footprint decode
     //    streams. Prefer the file size the environment probe already captured.
@@ -119,7 +145,64 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     }
 
     session.analysis = Some(summary::analyze(&session));
-    session.validation = Some(integrity::validate(&session));
+    let mut validation = integrity::validate(&session);
+
+    // 9. Automatic token-stream cross-check against an oracle engine, if the
+    //    workload asked for one. Opt-in (see WorkloadSpec::verify_against's
+    //    docs on why): it loads and runs a second full engine, so this is not
+    //    part of the default `run` cost. Skipped — not merely reported as
+    //    trivial — when the oracle IS the candidate: glproc vs glproc always
+    //    matches and would report a check that verified nothing.
+    if let Some(oracle) = &spec.verify_against {
+        if oracle == &spec.engine {
+            validation.push(
+                crate::validation::integrity::Severity::Info,
+                "parity",
+                format!(
+                    "--verify-against '{oracle}' is the same as --engine; skipped (comparing an \
+                     engine to itself proves nothing)"
+                ),
+            );
+        } else {
+            progress("verify", 0, 1);
+            match crate::validation::parity::validate_against_oracle_capped(
+                spec,
+                oracle,
+                &spec.engine,
+                crate::validation::parity::AUTO_VERIFY_TOKEN_CAP,
+            ) {
+                Ok(report) => {
+                    let severity = if report.passed() {
+                        crate::validation::integrity::Severity::Info
+                    } else {
+                        crate::validation::integrity::Severity::Error
+                    };
+                    validation.push(
+                        severity,
+                        "parity",
+                        format!(
+                            "{}/{} tokens match oracle '{oracle}' ({:.0}% agreement)",
+                            report.check.matching_prefix,
+                            report.check.compared,
+                            report.check.agreement() * 100.0,
+                        ),
+                    );
+                }
+                Err(e) => {
+                    // Not fatal: the benchmark's own numbers are already
+                    // collected and valid. An oracle that fails to load
+                    // (e.g. this platform has no glcuda device) is reported,
+                    // not treated as a reason to discard the whole run.
+                    validation.push(
+                        crate::validation::integrity::Severity::Warning,
+                        "parity",
+                        format!("could not cross-check against oracle '{oracle}': {e}"),
+                    );
+                }
+            }
+        }
+    }
+    session.validation = Some(validation);
     Ok(session)
 }
 
