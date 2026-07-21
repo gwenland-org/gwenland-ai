@@ -58,13 +58,31 @@ pub fn validate_against_oracle(
     oracle_engine: &str,
     candidate_engine: &str,
 ) -> Result<ParityReport, GlError> {
+    validate_against_oracle_capped(spec, oracle_engine, candidate_engine, spec.max_new_tokens)
+}
+
+/// As [`validate_against_oracle`], but bounded to at most `max_tokens`
+/// generated tokens regardless of what `spec.max_new_tokens` asks for.
+///
+/// Exists for the automatic in-`run` cross-check (`WorkloadSpec::verify_against`):
+/// that check's purpose is "did the two engines diverge at all", which the
+/// first several dozen tokens already answer, so there is no reason to pay
+/// for a full-length second generation on every benchmark that opts in.
+pub fn validate_against_oracle_capped(
+    spec: &WorkloadSpec,
+    oracle_engine: &str,
+    candidate_engine: &str,
+    max_tokens: usize,
+) -> Result<ParityReport, GlError> {
     let mut oracle_spec = spec.clone();
     oracle_spec.engine = oracle_engine.to_string();
     oracle_spec.temperature = 0.0;
+    oracle_spec.max_new_tokens = max_tokens;
 
     let mut candidate_spec = spec.clone();
     candidate_spec.engine = candidate_engine.to_string();
     candidate_spec.temperature = 0.0;
+    candidate_spec.max_new_tokens = max_tokens;
 
     let oracle = EngineAdapter::load(&oracle_spec)?;
     let oracle_tokens = oracle.run_tokens(&oracle_spec)?;
@@ -82,6 +100,10 @@ pub fn validate_against_oracle(
         check,
     })
 }
+
+/// The token budget the automatic in-`run` cross-check uses — the plan's
+/// "first 50 tokens" — regardless of the run's own `--tokens`.
+pub const AUTO_VERIFY_TOKEN_CAP: usize = 50;
 
 #[cfg(test)]
 mod tests {
@@ -109,5 +131,10 @@ mod tests {
         assert_eq!(j.get("matching_prefix").unwrap().as_f64(), Some(1.0));
         assert_eq!(j.get("compared").unwrap().as_f64(), Some(3.0));
         assert_eq!(j.get("passed").unwrap().as_bool(), Some(false));
+    }
+
+    #[test]
+    fn auto_verify_token_cap_matches_the_plan() {
+        assert_eq!(AUTO_VERIFY_TOKEN_CAP, 50);
     }
 }

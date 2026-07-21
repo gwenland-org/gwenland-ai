@@ -8,6 +8,7 @@
 //! recommendation, never an action — glbench observes, it does not optimize.
 
 use crate::analysis::bottleneck::Bottleneck;
+use crate::analysis::ceiling::CeilingBasis;
 use crate::analysis::roofline::RooflineReport;
 use crate::comparison::statistics::Stats;
 use crate::core::schema::ToJson;
@@ -28,6 +29,10 @@ pub struct AnalysisReport {
     /// Achieved fraction of the relevant hardware ceiling, 0.0..=1.0, if a
     /// ceiling could be established.
     pub ceiling_efficiency: Option<f64>,
+    /// Where the ceiling number came from — measured on this machine, a
+    /// vendor's published spec, or undetermined. Decides how literally
+    /// `ceiling_efficiency` should be read (see [`CeilingBasis`]'s docs).
+    pub ceiling_basis: CeilingBasis,
     /// Per-bucket roofline (Attention / FFN / lm_head vs the bandwidth
     /// ceiling), when the engine reported stage telemetry.
     pub roofline: Option<RooflineReport>,
@@ -53,6 +58,7 @@ impl ToJson for AnalysisReport {
                     None => Json::Null,
                 },
             ),
+            ("ceiling_basis", Json::s(self.ceiling_basis.as_str())),
             (
                 "roofline",
                 self.roofline.as_ref().map(roofline_json).unwrap_or(Json::Null),
@@ -117,6 +123,12 @@ pub fn stats_json(s: &Stats) -> Json {
         ("std_dev", Json::n(s.std_dev)),
         ("p95", Json::n(s.p95)),
         ("p99", Json::n(s.p99)),
+        // null below 3 samples — a t-interval on 1-2 points is not a claim
+        // worth making, never fabricated as a number that looks precise.
+        ("ci95", match s.ci95 {
+            Some(ci) => Json::n(ci),
+            None => Json::Null,
+        }),
     ])
 }
 
@@ -159,6 +171,7 @@ pub fn analyze(session: &BenchmarkSession) -> AnalysisReport {
         health,
         bottleneck,
         ceiling_efficiency: ceiling.efficiency,
+        ceiling_basis: ceiling.basis,
         roofline,
         hypotheses,
         notes,

@@ -85,11 +85,15 @@ pub struct MeasurementSet {
     /// Model file size on disk, bytes — the weight footprint that decode must
     /// stream. Used later as the numerator for a bandwidth-efficiency estimate.
     pub model_bytes: Option<u64>,
-    /// The very first (cold) iteration, timed but kept out of `iterations`:
-    /// it pays page-in and cache-fill costs the warm numbers deliberately
-    /// exclude, and mixing it in would corrupt both figures. `None` when the
-    /// run had no warmup phase to observe.
-    pub cold: Option<IterationMetrics>,
+    /// Every cold-start iteration, timed but kept out of `iterations`: each
+    /// pays page-in and cache-fill costs the warm numbers deliberately
+    /// exclude, and mixing them in would corrupt both figures. Multiple
+    /// iterations (not just the first) because a single cold sample cannot
+    /// distinguish "this model always pays ~500ms to page in" from "the OS
+    /// happened to schedule something else during this one run" — a
+    /// median-and-range over several tells them apart. Empty when the run's
+    /// `cold_iters` was 0.
+    pub cold: Vec<IterationMetrics>,
     /// Package energy consumed across the measured iterations, Joules —
     /// measured via RAPL, never estimated from TDP. `None` when no energy
     /// counter was readable (non-Linux, missing permissions, no RAPL).
@@ -124,6 +128,19 @@ impl MeasurementSet {
         let j = self.energy_joules?;
         (tokens > 0).then(|| j / tokens as f64)
     }
+
+    /// Decode throughput samples across every cold-start iteration,
+    /// tokens/second — the input to a median/range summary of "what a
+    /// deployment's first few requests actually pay."
+    pub fn cold_decode_tps_samples(&self) -> Vec<f64> {
+        self.cold.iter().map(|m| m.decode_tps()).collect()
+    }
+
+    /// Prefill throughput samples across every cold-start iteration,
+    /// tokens/second.
+    pub fn cold_prefill_tps_samples(&self) -> Vec<f64> {
+        self.cold.iter().map(|m| m.prefill_tps()).collect()
+    }
 }
 
 impl ToJson for MeasurementSet {
@@ -144,10 +161,7 @@ impl ToJson for MeasurementSet {
             ("model_bytes", opt_num(self.model_bytes.map(|b| b as f64))),
             (
                 "cold",
-                match &self.cold {
-                    Some(c) => c.to_json(),
-                    None => Json::Null,
-                },
+                Json::Arr(self.cold.iter().map(|c| c.to_json()).collect()),
             ),
             ("energy_joules", opt_num(self.energy_joules)),
         ])
@@ -168,8 +182,21 @@ impl FromJson for MeasurementSet {
             peak_memory_bytes: v.get("peak_memory_bytes").and_then(|n| n.as_f64()).map(|n| n as u64),
             observed_bandwidth_gbs: v.get("observed_bandwidth_gbs").and_then(|n| n.as_f64()),
             model_bytes: v.get("model_bytes").and_then(|n| n.as_f64()).map(|n| n as u64),
-            // Both absent from pre-v2 archives: absent reads as "not measured".
-            cold: v.get("cold").and_then(|c| IterationMetrics::from_json(c).ok()),
+            // Both shapes accepted: pre-multi-cold-start archives wrote a
+            // single object (or null), current ones write an array. Either
+            // way, absent reads as "no cold-start phase was run" rather than
+            // a parse failure — reading an old archive must not become an
+            // error just because this crate learned to record more of them.
+            cold: match v.get("cold") {
+                Some(c) if c.as_arr().is_some() => c
+                    .as_arr()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|i| IterationMetrics::from_json(i).ok())
+                    .collect(),
+                Some(c) => IterationMetrics::from_json(c).ok().into_iter().collect(),
+                None => Vec::new(),
+            },
             energy_joules: v.get("energy_joules").and_then(|n| n.as_f64()),
         })
     }
@@ -226,13 +253,13 @@ mod tests {
             peak_memory_bytes: Some(1 << 30),
             observed_bandwidth_gbs: Some(240.5),
             model_bytes: Some(4_400_000_000),
-            cold: Some(IterationMetrics {
+            cold: vec![IterationMetrics {
                 prompt_tokens: 10,
                 generated_tokens: 20,
                 prefill_ms: 50.0, // cold prefill pays page-in: 10x the warm one
                 decode_ms: 150.0,
                 total_ms: 200.0,
-            }),
+            }],
             energy_joules: Some(41.5),
         };
         let back = MeasurementSet::from_json(&set.to_json()).unwrap();
@@ -242,6 +269,46 @@ mod tests {
         assert_eq!(back.model_bytes, set.model_bytes);
         assert_eq!(back.cold, set.cold);
         assert_eq!(back.energy_joules, set.energy_joules);
+    }
+
+    #[test]
+    fn a_pre_multi_cold_start_archive_with_a_bare_cold_object_still_parses() {
+        // Archives written before cold became a Vec stored a single object
+        // (or null). Reading one must not become an error.
+        let json = Json::obj([
+            ("iterations", Json::Arr(vec![])),
+            ("peak_memory_bytes", Json::Null),
+            ("observed_bandwidth_gbs", Json::Null),
+            ("model_bytes", Json::Null),
+            (
+                "cold",
+                IterationMetrics {
+                    prompt_tokens: 1,
+                    generated_tokens: 2,
+                    prefill_ms: 3.0,
+                    decode_ms: 4.0,
+                    total_ms: 5.0,
+                }
+                .to_json(),
+            ),
+            ("energy_joules", Json::Null),
+        ]);
+        let back = MeasurementSet::from_json(&json).unwrap();
+        assert_eq!(back.cold.len(), 1);
+        assert_eq!(back.cold[0].generated_tokens, 2);
+    }
+
+    #[test]
+    fn an_archive_with_no_cold_field_at_all_parses_to_an_empty_vec() {
+        let json = Json::obj([
+            ("iterations", Json::Arr(vec![])),
+            ("peak_memory_bytes", Json::Null),
+            ("observed_bandwidth_gbs", Json::Null),
+            ("model_bytes", Json::Null),
+            ("energy_joules", Json::Null),
+        ]);
+        let back = MeasurementSet::from_json(&json).unwrap();
+        assert!(back.cold.is_empty());
     }
 
     #[test]
