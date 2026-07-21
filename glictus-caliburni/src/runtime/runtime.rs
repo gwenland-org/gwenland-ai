@@ -221,10 +221,26 @@ impl GllmRuntime {
             if resolved.is_fallback() {
                 // Recoverable per AD-07: the layer still runs, on CPU.
                 self.stats.recoverable_errors += 1;
-                self.logger.warn(
-                    format!("layer {index}: falling back to CPU"),
-                    resolved.overridden.as_ref().map(|p| format!("requested {p}")),
-                );
+                if resolved.is_distributed_unavailable() {
+                    // ARTX10 Wave 2: the manifest names a rank placement, but
+                    // this build has no distributed runtime (no NCCL/RCCL/
+                    // Gloo — deferred to Sanctum Visibilia). Worded
+                    // differently from a plain missing-device fallback so
+                    // this doesn't read as "install a GPU driver" when the
+                    // real gap is "stand up multi-node execution".
+                    self.logger.warn(
+                        format!(
+                            "layer {index}: distributed placement requested but no \
+                             distributed runtime is available — running on CPU"
+                        ),
+                        resolved.overridden.as_ref().map(|p| format!("requested {p}")),
+                    );
+                } else {
+                    self.logger.warn(
+                        format!("layer {index}: falling back to CPU"),
+                        resolved.overridden.as_ref().map(|p| format!("requested {p}")),
+                    );
+                }
             }
 
             // --- execute -----------------------------------------------
@@ -614,6 +630,37 @@ mod tests {
                 .iter()
                 .any(|e| e.message.contains("falling back to CPU")),
             "the fallback must be visible"
+        );
+    }
+
+    #[test]
+    fn a_rank_placement_warns_distinctly_and_still_completes_on_cpu() {
+        // ARTX10 Wave 2: a manifest naming "rank:N/cuda:M" must run (on CPU —
+        // no distributed runtime exists) and must say *why* it isn't a plain
+        // missing-device fallback.
+        let dir = write_runtime_package(2);
+        let (mut rt, logger) = open_runtime(&dir, Arc::new(NullBackend::new())).unwrap();
+
+        let mut map = DeviceMapConfig::default();
+        map.assign_range("0-1", crate::manifest::DevicePlacement::Other("rank:0/cuda:0".into()))
+            .unwrap();
+        rt.set_device_map(map);
+
+        let mut act = ActivationBuffer::zeros(vec![2]);
+        let stats = rt.run(&mut act).unwrap();
+
+        assert_eq!(stats.layers_executed, 2, "the pass still completes on CPU");
+        assert_eq!(stats.recoverable_errors, 2, "one fallback per layer");
+        assert!(
+            logger
+                .entries()
+                .iter()
+                .any(|e| e.message.contains("distributed runtime is available")),
+            "the distributed-specific reason must be visible, not a generic fallback"
+        );
+        assert!(
+            logger.entries().iter().all(|e| !e.message.contains("falling back to CPU")),
+            "a rank placement must not also log the generic message"
         );
     }
 }

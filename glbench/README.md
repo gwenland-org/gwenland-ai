@@ -151,6 +151,55 @@ Module map (one crate, internal module folders — no sub-crates):
 See [`DESIGN.md`](DESIGN.md) for the responsibility boundaries and data flow,
 and [`ROADMAP.md`](ROADMAP.md) for planned features and non-goals.
 
+## Benchmarking GLLM
+
+`--engine gllm` runs a `.gllm` package through `glictus-caliburni`'s
+`GllmRuntime` + `GlprocBackend` (ARTX10). It needs the `gllm-bench` feature:
+
+```sh
+cargo build --release -p glbench --features gllm-bench
+glbench run --engine gllm --model path/to/package/ --kind decode --tokens 128
+```
+
+Two things are different from every other engine, and both are load-bearing,
+not bugs:
+
+- **`--model` is a directory** (the package root — `gllm.json` plus its
+  `GLLMShared.gllm` and `GLLMTensorLayer-*.gllm` files), not a single file.
+- **`--prompt` cannot be encoded.** GLLM packages carry no tokenizer yet
+  (ARTX1 OQ3's `GLLMTokenizer.gllm` unit is decided but not emitted by the
+  converter). The `gllm` engine synthesizes deterministic token ids from
+  `--seed` and the prompt's word count instead of real text — this measures
+  real throughput and real per-layer computation, not prompt-conditioned
+  generation quality. Fine for `run`/`ab`/`scale`; do not read behavior
+  signals (entropy, perplexity, repetition) as if they described the model's
+  reaction to your prompt — they describe its reaction to a synthetic one.
+- **F32 tensors only** (`GlprocBackend`'s ARTX10 Wave 1 scope). A package
+  converted from a quantized GGUF (Q4_K_M, Q8_0, ...) fails loudly with
+  `Unsupported dtype` rather than computing wrong numbers — this is an
+  honest limitation, not a bug to work around.
+
+## Windows: Defender exclusions required
+
+Windows Defender rescans large files on rebuild and on first `mmap` — this is
+not a rare edge case on this project's own reference machine (i3-1115G4 /
+Windows 11). Measured pollution: **2–4× on affected runs**, worse than most
+real regressions glbench exists to catch. An un-excluded benchmark is not
+noisy, it is *wrong*.
+
+Add exclusions before benchmarking:
+
+```powershell
+Add-MpPreference -ExclusionPath "C:\path\to\gwenland-ai\target"
+Add-MpPreference -ExclusionPath "C:\path\to\models"
+Get-MpPreference | Select-Object -ExpandProperty ExclusionPath
+```
+
+Verify the exclusions are actually active before every session (the `Get-MpPreference`
+line above). Never archive a result taken without them — a session file has no
+field for "Defender was scanning during this run," so the number would look
+identical to a clean one while being 2–4× off.
+
 ## The one rule
 
 glbench observes. It may say *"performance is memory-bandwidth bound"* or

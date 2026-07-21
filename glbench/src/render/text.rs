@@ -435,6 +435,53 @@ pub fn comparison(c: &ComparisonReport) -> String {
     s
 }
 
+/// Render a numerical-parity report for the terminal.
+pub fn parity(r: &crate::validation::parity::ParityReport) -> String {
+    let mut s = String::new();
+    s.push_str(&format!(
+        "glbench validate :: {} vs oracle {} | model {}\n\n",
+        r.candidate_engine, r.oracle_engine, r.model_path
+    ));
+    s.push_str(&format!(
+        "matching prefix: {}/{} tokens ({:.1}% agreement)\n",
+        r.check.matching_prefix,
+        r.check.compared,
+        r.check.agreement() * 100.0,
+    ));
+    s.push_str(&format!(
+        "verdict: {}\n",
+        if r.passed() {
+            "PASS — exact match under greedy decoding"
+        } else {
+            "FAIL — candidate diverges from the oracle"
+        }
+    ));
+    s
+}
+
+/// Render a scaling sweep report for the terminal.
+pub fn sweep(r: &crate::runner::scale::SweepReport) -> String {
+    let mut s = String::new();
+    s.push_str("glbench scale :: decode throughput vs. token budget\n\n");
+
+    let mut t = Table::new(&["tokens", "decode tps (mean)", "median", "std"])
+        .right_align(1)
+        .right_align(2)
+        .right_align(3);
+    for p in &r.points {
+        let dec = Stats::from_samples(&p.session.measurements.decode_tps_samples());
+        t.row(&[
+            format!("{:.0}", p.axis),
+            format!("{:.1}", dec.mean),
+            format!("{:.1}", dec.median),
+            format!("{:.1}", dec.std_dev),
+        ]);
+    }
+    s.push_str(&t.render());
+    s.push_str(&format!("\nverdict: {}\n", r.scaling.as_str()));
+    s
+}
+
 fn stat_cells(label: &str, s: &Stats) -> Vec<String> {
     vec![
         label.to_string(),
