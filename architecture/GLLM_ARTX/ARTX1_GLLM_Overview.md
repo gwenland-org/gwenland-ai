@@ -303,7 +303,7 @@ The following questions remain unresolved and require community input or impleme
 2. **Limited GPU Kernel Fusion:** Only basic fusion (norm+GEMM) is implemented. Full attention fusion is pending.
 3. **No Dynamic Batching:** The runtime processes one sequence at a time. Batch inference requires multiple runtime instances.
 4. **Converter Coverage:** The converter only supports GGUF as a primary source. Safetensors and PyTorch support require manual metadata specification.
-5. **Windows Support:** The runtime is developed and tested on Linux. Windows support is untested.
+5. **Windows Support:** Windows is a supported and tested platform — verified on Windows 11 (i3-1115G4) against all 3 real reference models.
 
 ## Future Work
 
@@ -312,7 +312,6 @@ The following questions remain unresolved and require community input or impleme
 - Implement MLA, Mamba, and MoE runtime plugins.
 - Implement Safetensors and PyTorch converters with automatic architecture detection.
 - Add comprehensive benchmark suite with reproducible results.
-- Implement Windows mmap and path handling.
 
 ### Medium Term (12 months)
 

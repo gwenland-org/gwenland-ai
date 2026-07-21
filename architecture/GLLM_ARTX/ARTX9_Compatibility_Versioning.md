@@ -82,7 +82,7 @@ For converter architecture details, see ARTX7: Converter Architecture, Section 7
 2. **Limited GPU Kernel Fusion:** Only basic fusion (norm+GEMM) is implemented. Full attention fusion is pending.
 3. **No Dynamic Batching:** The runtime processes one sequence at a time. Batch inference requires multiple runtime instances.
 4. **Converter Coverage:** The converter only supports GGUF as a primary source. Safetensors and PyTorch support require manual metadata specification.
-5. **Windows Support:** The runtime is developed and tested on Linux. Windows support is untested.
+5. **Windows Support:** Windows is a supported and tested platform — verified on Windows 11 (i3-1115G4) against all 3 real reference models. `mmap` uses `CreateFileMapping` on Windows (see ARTX6: Memory Model).
 
 For future work addressing these limitations, see ARTX1: GLLM Overview, Section 3.4.
 

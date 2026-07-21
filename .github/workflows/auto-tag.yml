@@ -1,0 +1,78 @@
+# Auto-tag main on a version bump.
+#
+# Manual tagging was the only path to a release before this: build.yml has
+# always listened for `v*` tags and published a GitHub Release the moment one
+# lands, but nothing ever *created* that tag except a human remembering to run
+# `git tag && git push --tags`. In practice that happened exactly once
+# (v0.1.48-alpha) across 248+ commits and many crate version bumps since. This
+# workflow closes that gap: every push to main, if glictus-caliburni's
+# Cargo.toml version has no matching tag yet, it creates and pushes one.
+#
+# glictus-caliburni is the version source because it is the crate that has
+# actually been bumped on every ARTX release so far (0.1.155 -> ... -> 0.1.163);
+# there is no `[workspace.package] version` field this repo agrees on yet.
+#
+# Idempotent by construction: if `v<version>` already exists as a tag, this is
+# a no-op. It never deletes or moves a tag, and it never tags anything other
+# than the exact commit that changed the version — so a push that does not
+# touch the version number does not produce a release.
+name: Auto-tag release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-tag-main
+  # Never cancel a tag-push in flight — two runs racing to tag the same
+  # version is exactly the failure mode this workflow exists to avoid.
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag main if the version changed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full tag history to check for an existing tag
+
+      - name: Read glictus-caliburni's version
+        id: version
+        run: |
+          version=$(grep -m1 '^version' glictus-caliburni/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          if [ -z "$version" ]; then
+            echo "::error::could not read version from glictus-caliburni/Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether the tag already exists
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push the tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+          echo "### Tagged $tag :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "build.yml will publish the GitHub Release from this tag." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Already tagged
+        if: steps.check.outputs.exists == 'true'
+        run: echo "${{ steps.version.outputs.tag }} already exists — nothing to do."

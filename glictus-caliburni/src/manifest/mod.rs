@@ -470,12 +470,22 @@ mod tests {
     }
 
     #[test]
-    fn unparseable_device_string_survives_but_resolves_to_nothing() {
-        // ARTX10's "rank:0/cuda:0" is not a Device yet. The string must
-        // survive so a later runtime can act on it, while to_device() admits
-        // it cannot resolve it rather than guessing CPU.
+    fn rank_device_string_survives_and_resolves_to_a_remote_device() {
+        // ARTX10 Wave 2: "rank:0/cuda:0" now parses to Device::Remote — a
+        // recognised *shape*, not something any runtime here can execute on.
+        // The string still survives verbatim in the manifest either way.
         let p: DevicePlacement = serde_json::from_str("\"rank:0/cuda:0\"").unwrap();
         assert_eq!(p.as_str(), "rank:0/cuda:0");
+        assert_eq!(
+            p.to_device(),
+            Some(Device::Remote { rank: 0, device: Box::new(Device::Cuda(0)) })
+        );
+        assert_eq!(p.is_gpu(), Some(false), "Remote itself is not is_gpu — its inner device is");
+    }
+
+    #[test]
+    fn a_truly_unparseable_device_string_still_resolves_to_nothing() {
+        let p: DevicePlacement = serde_json::from_str("\"not-a-device\"").unwrap();
         assert_eq!(p.to_device(), None);
         assert_eq!(p.is_gpu(), None);
     }

@@ -86,6 +86,31 @@ fn test_device_from_str() {
 }
 
 #[test]
+fn test_device_from_str_parses_artx10_rank_strings() {
+    assert_eq!(
+        Device::from_str("rank:0/cuda:0"),
+        Some(Device::Remote { rank: 0, device: Box::new(Device::Cuda(0)) })
+    );
+    assert_eq!(
+        Device::from_str("rank:3/cuda:1"),
+        Some(Device::Remote { rank: 3, device: Box::new(Device::Cuda(1)) })
+    );
+    assert_eq!(
+        Device::from_str("rank:1/vulkan:0"),
+        Some(Device::Remote { rank: 1, device: Box::new(Device::Vulkan(0)) })
+    );
+    assert!(Device::from_str("rank:0/cuda:0").unwrap().is_remote());
+    assert!(!Device::Cuda(0).is_remote());
+}
+
+#[test]
+fn test_device_from_str_rejects_malformed_rank_strings() {
+    for bad in ["rank:", "rank:x/cuda:0", "rank:0/", "rank:0/nonsense", "rank:0"] {
+        assert_eq!(Device::from_str(bad), None, "{bad:?} should not parse");
+    }
+}
+
+#[test]
 fn test_layer_header_validate() {
     // ARTX04 hybrid: the ARTX01 12-byte LayerHeader was retired; every
     // unit file shares the 16-byte ExecutionUnitHeader, whose bytes 8..12

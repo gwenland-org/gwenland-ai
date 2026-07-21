@@ -29,6 +29,18 @@ pub enum Scaling {
     Insufficient,
 }
 
+impl Scaling {
+    /// Stable identifier for rendering.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scaling::Linear => "linear",
+            Scaling::SubLinear => "sub-linear",
+            Scaling::Saturating => "saturating",
+            Scaling::Insufficient => "insufficient data",
+        }
+    }
+}
+
 /// Classify how `points` scale. Expects points sorted ascending by axis; needs
 /// at least two to say anything.
 pub fn classify(points: &[ScalePoint]) -> Scaling {

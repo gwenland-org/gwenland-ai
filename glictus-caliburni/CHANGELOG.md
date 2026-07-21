@@ -3,6 +3,42 @@
 GLLM (GwenLand Language Model Format), codename *Ictus Caliburni*.
 All notable changes to this crate. Dates are WIB/SEAST.
 
+## [Unreleased] — ARTX09/ARTX10/ARTX11: versioning, glproc runtime backend, benchmarking
+
+- **ARTX09 (Compatibility & Versioning)** audited and hardened: `FormatVersion`
+  same-major-loadable / minor-mismatch-warns / major-mismatch-hard-errors was
+  already correct from ARTX03; added end-to-end negotiation tests through
+  `GllmPackage::open` (not just unit-level checks) and corrected the stale
+  "Windows untested" note in the ARTX docs — Windows 11 is the verified
+  reference platform, not an unverified afterthought.
+- **ARTX10 Wave 1 — `GlprocBackend`**: `ExecutionBackend` implemented for a real
+  `gllm:transformer/standard@v1` block (RMSNorm → QKV → RoPE → attention →
+  output proj → SwiGLU), entirely via `glproc::kernels`/`glproc::attention`
+  calls — zero tensor math in this crate. F32 only for Wave 1; quantized
+  layers return `ExecutionFailed` rather than silently mis-computing. Gated
+  behind the `glproc-backend` feature so the default build stays
+  dependency-free. Verified end-to-end: a real 2-layer on-disk GLLM package
+  driven through `GllmRuntime::run` produces a sampled token.
+- **ARTX10 Wave 2 — distributed stubs**: `Device::from_str` parses
+  `"rank:N/cuda:M"` into `Device::Remote`; `DeviceMapResolver` falls back to
+  CPU tagged `DistributedUnavailable` (distinct from a plain missing device),
+  logged with its own WARN. New `runtime::distributed::RankTopology` derives
+  rank → layer-range groupings from a manifest's device map, for visibility
+  only — no NCCL/RCCL/Gloo, deferred.
+- **ARTX11 (Benchmarks) is fulfilled by glbench (Mensura Veritatis), not a
+  benchmark harness in this crate.** New `runtime::gllm_engine::GllmEngine`
+  implements `glcore::GlEngine` on top of `GllmRuntime` + `GlprocBackend` —
+  embedding lookup, final norm + LM head, and sampling are the three pieces
+  `GllmRuntime` deliberately does not own, so this supplies exactly those and
+  delegates every layer's math to the already-verified `GlprocBackend`. No
+  tokenizer exists for GLLM packages yet (ARTX1 OQ3's `GLLMTokenizer.gllm`
+  unit is decided but not emitted by the converter), so this is a token-ids
+  in/out engine, not text in/out — see `glbench/README.md`'s "Benchmarking
+  GLLM" section for what that means in practice (`glbench run --engine gllm
+  --features gllm-bench`). The illustrative hardware config in ARTX11 (EPYC
+  9654, 512GB DDR5) is aspirational; the reference machine is i3-1115G4 /
+  8GB DDR4-2667 / Windows 11.
+
 ## [Unreleased] — ARTX08: layer-type extension registry
 
 - **`PluginRegistry`** maps extension URIs to [`LayerPlugin`]s, with exact

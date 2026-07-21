@@ -4,6 +4,8 @@
 //!   glbench run     --engine <name> --model <path> [options]   run a benchmark
 //!   glbench ab      --engine <name> --model <A> --model <B>    A/B N models in one command
 //!   glbench compare <baseline.json> <candidate.json>           diff two runs
+//!   glbench validate --engine <name> --model <path> --against <oracle>
+//!                                                               numerical parity vs an oracle engine
 //!   glbench inspect <session.json>                             re-render an archive
 //!   glbench export  <session.json> --format <json|md|csv>       convert an archive
 //!
@@ -17,7 +19,7 @@ use glbench::comparison::runs;
 use glbench::core::workload::{WorkloadKind, WorkloadSpec};
 use glbench::export::{csv, markdown};
 use glbench::render::text;
-use glbench::runner::planner;
+use glbench::runner::{planner, scale};
 use glbench::storage::archive;
 
 fn main() -> ExitCode {
@@ -26,6 +28,8 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[1..]),
         Some("ab") => cmd_ab(&args[1..]),
         Some("compare") => cmd_compare(&args[1..]),
+        Some("validate") => cmd_validate(&args[1..]),
+        Some("scale") => cmd_scale(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -56,6 +60,14 @@ usage:
                    first — sequential on purpose: parallel runs would contend
                    for bandwidth and corrupt every number)
   glbench compare <baseline.json> <candidate.json> [--threshold F]
+  glbench validate --engine <name> --model <path> --against <oracle>
+                  [--prompt <text>] [--tokens N]
+                  (runs <engine> and <oracle> on the identical prompt under
+                   greedy decoding and reports the matching token prefix;
+                   default oracle is 'glproc')
+  glbench scale   --engine <name> --model <path> --sweep N,N,N,...
+                  (runs the identical prompt at each token budget in --sweep,
+                   sequentially, and classifies how decode throughput scales)
   glbench inspect <session.json>
   glbench export  <session.json> --format <json|md|csv> [--out <file>]
 
@@ -215,6 +227,82 @@ fn cmd_compare(args: &[String]) -> Result<(), String> {
     let candidate = archive::read(Path::new(positional[1]))?;
     let report = runs::compare(&baseline, &candidate, threshold);
     print!("{}", text::comparison(&report));
+    Ok(())
+}
+
+/// `glbench validate` — numerical parity of `--engine` against `--against`
+/// (default `glproc`, DESIGN.md's oracle) on the identical prompt.
+fn cmd_validate(args: &[String]) -> Result<(), String> {
+    let mut against = "glproc".to_string();
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--against" => {
+                i += 1;
+                against = args.get(i).ok_or("--against needs a value")?.clone();
+            }
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let mut a = parse_run_args(&rest)?;
+    let candidate = match a.models.len() {
+        0 => return Err("--model is required".into()),
+        1 => a.models.remove(0),
+        _ => return Err("validate takes one --model".into()),
+    };
+    a.spec.model_path = candidate;
+
+    if a.spec.engine == against {
+        return Err(format!("--engine and --against are both '{against}'"));
+    }
+
+    let report = glbench::validation::validate_against_oracle(&a.spec, &against, &a.spec.engine)
+        .map_err(|e| e.to_string())?;
+    print!("{}", text::parity(&report));
+
+    if !report.passed() {
+        return Err("numerical parity check failed".into());
+    }
+    Ok(())
+}
+
+/// `glbench scale` — decode-throughput sweep over `--sweep`'s token budgets.
+fn cmd_scale(args: &[String]) -> Result<(), String> {
+    let mut sweep_arg: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sweep" => {
+                i += 1;
+                sweep_arg = Some(args.get(i).ok_or("--sweep needs a value")?.clone());
+            }
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let sweep_arg = sweep_arg.ok_or("scale needs --sweep N,N,N,...")?;
+    let mut axis_values = Vec::new();
+    for part in sweep_arg.split(',') {
+        axis_values.push(parse_num::<usize>(part.trim(), "--sweep")?);
+    }
+    if axis_values.len() < 2 {
+        return Err("--sweep needs at least two values to say anything about scaling".into());
+    }
+
+    let mut a = parse_run_args(&rest)?;
+    match a.models.len() {
+        0 => return Err("--model is required".into()),
+        1 => a.spec.model_path = a.models.remove(0),
+        _ => return Err("scale takes one --model".into()),
+    }
+
+    let report = scale::run_sweep(&a.spec, &axis_values, &progress).map_err(|e| e.to_string())?;
+    print!("{}", text::sweep(&report));
     Ok(())
 }
 

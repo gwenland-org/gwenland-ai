@@ -42,16 +42,20 @@ the PRD's two-crate sketch (DESIGN.md §10: split only under real pressure):
 
 - **Richer rendering.** Sparkline/bar throughput visualizations in the terminal;
   a self-contained HTML report export (still zero-dependency, inlined).
-- **Scaling sweeps as a first-class command.** `glbench scale` over a set of
-  prompt lengths / token budgets, driving `analysis::scaling` and rendering the
-  curve. The analysis primitive exists; the CLI orchestration does not yet.
+- ~~**Scaling sweeps as a first-class command.**~~ ✅ done —
+  `runner::scale::run_sweep` drives `planner::run` once per `--sweep` token
+  budget (sequentially, same bandwidth-contention reasoning as `ab`), then
+  feeds the per-point decode-tps means to `analysis::scaling::classify`.
+  `glbench scale --engine <name> --model <path> --sweep N,N,N,...`.
 - **Roofline plot.** `analysis::roofline` computes arithmetic intensity and the
   ridge point; a textual/HTML roofline chart would make the memory-vs-compute
   verdict visual.
-- **Numerical parity command.** Wire `validation::numerical` into a
-  `glbench validate --against glproc` flow that runs both engines through the
-  adapter and reports the matching-prefix length. The comparison primitive is
-  done; the two-engine driver is the remaining piece.
+- ~~**Numerical parity command.**~~ ✅ done — `validation::parity` drives
+  both engines through `EngineAdapter` (forcing greedy decoding on both,
+  since parity is only meaningful at temperature 0) and reports the
+  matching-prefix length via `glbench validate --engine <name> --model <path>
+  --against <oracle>` (default oracle `glproc`). Exit code is non-zero on
+  divergence, so it composes as a CI gate.
 - **Per-phase timeline capture.** `measurement::timeline` models prefill /
   decode / overhead; surfacing a per-token decode timeline would need an engine
   hook that streams per-token timestamps (an engine-side change, coordinated —
