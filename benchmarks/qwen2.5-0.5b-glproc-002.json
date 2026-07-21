@@ -1,0 +1,189 @@
+{
+  "analysis": {
+    "bottleneck": "compute_bound",
+    "ceiling_efficiency": 0.6302650407404604,
+    "decode_tps": {
+      "count": 1,
+      "max": 33.62825311313553,
+      "mean": 33.62825311313553,
+      "median": 33.62825311313553,
+      "min": 33.62825311313553,
+      "p95": 33.62825311313553,
+      "p99": 33.62825311313553,
+      "std_dev": 0
+    },
+    "health": 0.7411855285183222,
+    "hypotheses": [],
+    "notes": [
+      "Decode 33.6 tok/s vs bandwidth ceiling 53.4 tok/s (26 GB/s over 0.49 GB weights) = 63% of peak.",
+      "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+    ],
+    "prefill_tps": {
+      "count": 1,
+      "max": 114.70594921362816,
+      "mean": 114.70594921362816,
+      "median": 114.70594921362816,
+      "min": 114.70594921362816,
+      "p95": 114.70594921362816,
+      "p99": 114.70594921362816,
+      "std_dev": 0
+    },
+    "roofline": null
+  },
+  "behavior": {
+    "anomaly": null,
+    "confidence_divergence": {
+      "max_rank": 0,
+      "mean_confidence_gap": 0.00000000815131318693263,
+      "mean_rank": 0,
+      "top_choice_rate": 1,
+      "uncertain_offpick_rate": 0
+    },
+    "cot": {
+      "flag": "NORMAL",
+      "thinking_capable": false,
+      "threshold_nats": 0.5,
+      "threshold_top_prob": 0.9
+    },
+    "entropy": {
+      "max": 2.8832356929779053,
+      "mean_nats": 1.7715662382543087,
+      "mean_top_prob": 0.5596389435231686,
+      "min": 0.3906960189342499,
+      "p50": 2.2541539669036865,
+      "p95": 2.8832356929779053,
+      "std_dev": 0.9673818283878733
+    },
+    "ood": {
+      "mean_logprob": -0.6910414062440395,
+      "min_logprob": -1.3826711177825928,
+      "p95_surprise": 1.3826711177825928,
+      "perplexity": 1.995792882542761
+    },
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 8,
+      "unique_1gram_ratio": 1,
+      "unique_2gram_ratio": 1,
+      "unique_3gram_ratio": 1
+    },
+    "stall": {
+      "jitter": 0.024412919330431323,
+      "max_ms": 28.2655,
+      "mean_ms": 26.793585714285715,
+      "p50_ms": 26.663,
+      "p99_ms": 28.2655,
+      "stall_count": 0,
+      "std_dev_ms": 0.6541096466158542
+    },
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q4_K_M",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2995,
+        "model": "11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 26.21900881014241
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": 2431856640,
+        "total_bytes": 8382472192
+      },
+      "storage": {
+        "model_file_bytes": 491400032
+      },
+      "thermal": {
+        "end_mhz": 2995,
+        "start_mhz": 2995,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": {
+      "decode_ms": 219.86159999999998,
+      "generated_tokens": 8,
+      "prefill_ms": 1959.0629000000001,
+      "prompt_tokens": 220,
+      "total_ms": 2178
+    },
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 237.8952,
+        "generated_tokens": 8,
+        "prefill_ms": 1917.9476,
+        "prompt_tokens": 220,
+        "total_ms": 2155
+      }
+    ],
+    "model_bytes": 491400032,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": null
+  },
+  "metadata": {
+    "created_unix": 1784604856,
+    "glbench_version": "0.1.163",
+    "label": "glproc-qwen2.5-0.5b-instruct-q4_k_m",
+    "schema_version": 1
+  },
+  "telemetry": null,
+  "validation": {
+    "findings": [
+      {
+        "check": "deterministic",
+        "message": "only one measured iteration: run-to-run variance is unknown",
+        "severity": "info"
+      }
+    ],
+    "passed": true
+  },
+  "workload": {
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "decode",
+    "max_new_tokens": 8,
+    "measure_iters": 1,
+    "model_path": "C:/Users/reyha/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "prompt": "Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads.",
+    "seed": 42,
+    "temperature": 0,
+    "warmup_iters": 1
+  }
+}

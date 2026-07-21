@@ -24,6 +24,11 @@ pub struct Stats {
     pub p95: f64,
     /// 99th percentile.
     pub p99: f64,
+    /// 95% confidence interval half-width for the mean, `mean ± ci95`.
+    /// `None` below 3 samples — a t-interval on 1-2 points is not a claim
+    /// worth making (0 or 1 degrees of freedom), and this crate will not
+    /// print a number that looks precise but is not.
+    pub ci95: Option<f64>,
 }
 
 impl Stats {
@@ -49,6 +54,7 @@ impl Stats {
             std_dev,
             p95: percentile(&sorted, 95.0),
             p99: percentile(&sorted, 99.0),
+            ci95: confidence_interval_95(samples, mean, count),
         }
     }
 
@@ -60,6 +66,54 @@ impl Stats {
         } else {
             self.std_dev / self.mean
         }
+    }
+}
+
+/// 95% confidence-interval half-width for the mean of `samples`, via a
+/// Student's-t interval (`mean ± t(0.975, df) * sample_std / sqrt(n)`).
+/// `None` below 3 samples.
+///
+/// Uses the **sample** standard deviation (Bessel-corrected, divide by
+/// `n - 1`) here — distinct from [`Stats::std_dev`], which is the
+/// population form (divide by `n`) that the rest of this module reports.
+/// The correction matters exactly because `n` is always small in a
+/// benchmark (a handful of `--iters`): population std dev systematically
+/// understates the true spread for a CI, and the difference is largest
+/// precisely where it would otherwise be invisible.
+///
+/// The t critical value has no closed form; this looks it up from a small
+/// table of the common small-`df` cases (an ordinary practice for
+/// dependency-free small-sample stats, not an approximation of anything
+/// this module could compute exactly). `df` beyond the table's range uses
+/// 1.96 (the normal-distribution limit as `df -> infinity`), which
+/// undershoots the true multiplier by under 5% even at `df = 30` — an
+/// acceptable trade against carrying a full t-table.
+fn confidence_interval_95(samples: &[f64], mean: f64, count: usize) -> Option<f64> {
+    if count < 3 {
+        return None;
+    }
+    let df = count - 1;
+    let sample_variance =
+        samples.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / (count - 1) as f64;
+    let sample_std = sample_variance.sqrt();
+    let t = t_critical_975(df);
+    Some(t * sample_std / (count as f64).sqrt())
+}
+
+/// Two-tailed 97.5th-percentile Student's-t critical value (i.e. the
+/// multiplier for a 95% confidence interval) at `df` degrees of freedom.
+/// Standard table values for small `df`; the normal-distribution limit
+/// (1.96) beyond the table.
+fn t_critical_975(df: usize) -> f64 {
+    const TABLE: [f64; 30] = [
+        12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228, 2.201, 2.179,
+        2.160, 2.145, 2.131, 2.120, 2.110, 2.101, 2.093, 2.086, 2.080, 2.074, 2.069, 2.064,
+        2.060, 2.056, 2.052, 2.048, 2.045, 2.042,
+    ];
+    match df {
+        0 => f64::NAN, // unreachable: from_samples already refuses count < 3 (df < 2)
+        d if d <= TABLE.len() => TABLE[d - 1],
+        _ => 1.96,
     }
 }
 
@@ -114,5 +168,51 @@ mod tests {
     fn cv_guards_zero_mean() {
         let s = Stats::from_samples(&[0.0, 0.0]);
         assert_eq!(s.coefficient_of_variation(), 0.0);
+    }
+
+    #[test]
+    fn ci95_is_none_below_three_samples() {
+        assert_eq!(Stats::from_samples(&[]).ci95, None);
+        assert_eq!(Stats::from_samples(&[1.0]).ci95, None);
+        assert_eq!(Stats::from_samples(&[1.0, 2.0]).ci95, None);
+    }
+
+    #[test]
+    fn ci95_matches_a_textbook_example() {
+        // n=5, mean=10, deviations [-2,-1,0,1,2]: sample variance (sum-sq /
+        // (n-1)) = 10/4 = 2.5, sample std = sqrt(2.5). df=4 -> t=2.776.
+        let samples = [8.0, 9.0, 10.0, 11.0, 12.0];
+        let s = Stats::from_samples(&samples);
+        assert!((s.mean - 10.0).abs() < 1e-9);
+        let ci = s.ci95.expect("n=5 must produce a CI");
+        let expected = 2.776 * 2.5_f64.sqrt() / (5.0_f64).sqrt();
+        assert!((ci - expected).abs() < 1e-3, "got {ci}, expected {expected}");
+    }
+
+    #[test]
+    fn ci95_uses_sample_not_population_std_dev() {
+        // For n=3, population std (divide by n) and sample std (divide by
+        // n-1) differ by sqrt(3/2) ≈ 1.2247 — the CI must use the larger
+        // (sample) figure, or it silently understates the true interval.
+        let samples = [1.0, 2.0, 3.0];
+        let s = Stats::from_samples(&samples);
+        let sample_std = (1.0_f64).sqrt(); // variance = ((1)^2+(0)^2+(1)^2)/2 = 1
+        let expected = t_critical_975(2) * sample_std / (3.0_f64).sqrt();
+        assert!((s.ci95.unwrap() - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn t_critical_falls_back_to_the_normal_limit_past_the_table() {
+        assert_eq!(t_critical_975(1), 12.706);
+        assert_eq!(t_critical_975(30), 2.042);
+        assert_eq!(t_critical_975(31), 1.96);
+        assert_eq!(t_critical_975(1000), 1.96);
+    }
+
+    #[test]
+    fn wider_spread_gives_a_wider_interval() {
+        let tight = Stats::from_samples(&[10.0, 10.1, 9.9, 10.0, 10.05]);
+        let loose = Stats::from_samples(&[10.0, 15.0, 5.0, 12.0, 8.0]);
+        assert!(loose.ci95.unwrap() > tight.ci95.unwrap());
     }
 }

@@ -51,9 +51,13 @@ fn main() -> ExitCode {
 const USAGE: &str = "\
 usage:
   glbench run     --engine <name> --model <path> [--prompt <text>] [--tokens N]
-                  [--warmup N] [--iters N] [--temperature F] [--seed N]
-                  [--kind prefill|decode|end_to_end|stress] [--cot on|off]
-                  [--out <file.json>]
+                  [--cold-iters N] [--warmup N] [--iters N] [--temperature F]
+                  [--seed N] [--kind prefill|decode|end_to_end|stress]
+                  [--cot on|off] [--verify-against <oracle>] [--out <file.json>]
+                  (--verify-against loads a second engine and cross-checks the
+                   first 50 generated tokens against it, folding the result into
+                   the validation report; skipped, not just trivial, when the
+                   oracle equals --engine)
   glbench ab      --engine <name> --model <baseline> --model <candidate> [...]
                   (same options as run; each extra --model is benchmarked with
                    the identical workload, sequentially, and diffed against the
@@ -107,6 +111,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 prompt_set = true;
             }
             "--tokens" => spec.max_new_tokens = parse_num(&value(&mut i)?, &flag)?,
+            "--cold-iters" => spec.cold_iters = parse_num(&value(&mut i)?, &flag)?,
             "--warmup" => spec.warmup_iters = parse_num(&value(&mut i)?, &flag)?,
             "--iters" => spec.measure_iters = parse_num(&value(&mut i)?, &flag)?,
             "--temperature" => spec.temperature = parse_f32(&value(&mut i)?, &flag)?,
@@ -125,6 +130,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 };
             }
             "--out" => out_path = Some(PathBuf::from(value(&mut i)?)),
+            "--verify-against" => spec.verify_against = Some(value(&mut i)?),
             other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
         }
         i += 1;

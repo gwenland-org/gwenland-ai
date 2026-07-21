@@ -11,6 +11,7 @@ use crate::environment::gpu::GpuInfo;
 use crate::environment::memory::MemoryInfo;
 use crate::environment::runtime::RuntimeInfo;
 use crate::environment::storage::StorageInfo;
+use crate::environment::thermal::ThermalSnapshot;
 use crate::export::json::Json;
 
 /// A snapshot of the physical machine at benchmark time.
@@ -24,23 +25,45 @@ pub struct HardwareSnapshot {
     pub memory: MemoryInfo,
     /// Model-file storage facts.
     pub storage: StorageInfo,
+    /// CPU clock at the start and (once [`Self::with_end_mhz`] is called)
+    /// end of the session, for thermal-throttle detection.
+    pub thermal: ThermalSnapshot,
 }
 
 impl HardwareSnapshot {
     /// Probe CPU/memory/storage now. GPU facts are attached separately by the
     /// engine adapter (only the engine knows its device), via [`Self::with_gpu`].
     pub fn probe(model_path: &str) -> HardwareSnapshot {
+        let cpu = CpuInfo::probe();
+        let thermal = ThermalSnapshot { start_mhz: cpu.mhz, end_mhz: None, avg_mhz: None };
         HardwareSnapshot {
-            cpu: CpuInfo::probe(),
+            cpu,
             gpu: GpuInfo::default(),
             memory: MemoryInfo::probe(),
             storage: StorageInfo::probe(model_path),
+            thermal,
         }
     }
 
     /// Attach GPU facts reported by the active engine.
     pub fn with_gpu(mut self, gpu: GpuInfo) -> Self {
         self.gpu = gpu;
+        self
+    }
+
+    /// Record the end-of-session CPU clock reading. Called once, after the
+    /// measured iterations finish — a second, independent
+    /// [`crate::environment::cpu::probe_mhz`] call, not a re-run of the
+    /// (expensive) full [`CpuInfo::probe`].
+    pub fn with_end_mhz(mut self, end_mhz: Option<f64>) -> Self {
+        self.thermal.end_mhz = end_mhz;
+        self
+    }
+
+    /// Record the mean of the per-iteration clock readings taken during the
+    /// measured phase (see [`crate::environment::thermal::average_mhz`]).
+    pub fn with_avg_mhz(mut self, avg_mhz: Option<f64>) -> Self {
+        self.thermal.avg_mhz = avg_mhz;
         self
     }
 }
@@ -111,6 +134,19 @@ impl ToJson for HardwareSnapshot {
                     opt_num(self.storage.model_file_bytes.map(|b| b as f64)),
                 )]),
             ),
+            (
+                "thermal",
+                Json::obj([
+                    ("start_mhz", opt_num(self.thermal.start_mhz)),
+                    ("end_mhz", opt_num(self.thermal.end_mhz)),
+                    ("avg_mhz", opt_num(self.thermal.avg_mhz)),
+                    ("throttled", Json::Bool(self.thermal.throttled())),
+                ]),
+            ),
+            // Forward-compat placeholder for gljax / Sanctum Visibilia.
+            // Always null: no TPU detection exists yet, and this field must
+            // never read as "checked, none found" until it actually is.
+            ("tpu", Json::Null),
         ])
     }
 }

@@ -93,9 +93,36 @@ impl ToJson for ValidationReport {
 pub fn validate(session: &BenchmarkSession) -> ValidationReport {
     let mut report = ValidationReport::default();
     check_integrity(session, &mut report);
+    check_thermal(session, &mut report);
     super::deterministic::check(session, &mut report);
     super::reproducibility::check(session, &mut report);
     report
+}
+
+/// Flag a CPU clock drop between the start and end of the session — glbench
+/// has no thermal sensor, so a falling clock under sustained load is the one
+/// indirect, honestly-measured throttle signal available (see
+/// `environment::thermal`'s module docs). `Warning`, not `Error`: the numbers
+/// are still real measurements, just possibly measuring a machine that
+/// slowed down partway through.
+fn check_thermal(session: &BenchmarkSession, report: &mut ValidationReport) {
+    let t = &session.environment.hardware.thermal;
+    if !t.throttled() {
+        return;
+    }
+    let (start, end) = match (t.start_mhz, t.end_mhz) {
+        (Some(s), Some(e)) => (s, e),
+        _ => return, // throttled() already guards this, but avoid a panic on a future change
+    };
+    report.push(
+        Severity::Warning,
+        "thermal",
+        format!(
+            "thermal throttling detected: CPU clock dropped from {start:.0} MHz to {end:.0} MHz \
+             ({:.0}% of start) during the run",
+            end / start * 100.0
+        ),
+    );
 }
 
 /// Structural integrity: the session must actually contain measurements, and
@@ -145,5 +172,85 @@ fn check_integrity(session: &BenchmarkSession, report: &mut ValidationReport) {
                 dec.coefficient_of_variation() * 100.0
             ),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::metrics::{IterationMetrics, MeasurementSet};
+    use crate::core::result::SessionMetadata;
+    use crate::core::workload::WorkloadSpec;
+    use crate::engine::metadata::EngineMetadata;
+    use crate::environment::hardware::EnvironmentSnapshot;
+    use crate::environment::thermal::ThermalSnapshot;
+
+    fn sample() -> BenchmarkSession {
+        let mut m = MeasurementSet::default();
+        m.iterations.push(IterationMetrics {
+            prompt_tokens: 100,
+            generated_tokens: 128,
+            prefill_ms: 100.0,
+            decode_ms: 4000.0,
+            total_ms: 4100.0,
+        });
+        BenchmarkSession::new(
+            SessionMetadata::new("test-run"),
+            EnvironmentSnapshot::probe(""),
+            EngineMetadata {
+                name: "glproc".into(),
+                backend: "cpu".into(),
+                available: true,
+                model_arch: None,
+                quantization: None,
+                thinking_capable: None,
+            },
+            WorkloadSpec::default(),
+            m,
+        )
+    }
+
+    #[test]
+    fn a_clock_drop_past_threshold_warns() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal =
+            ThermalSnapshot { start_mhz: Some(3000.0), end_mhz: Some(2500.0), avg_mhz: None };
+        let mut report = ValidationReport::default();
+        check_thermal(&sess, &mut report);
+        assert_eq!(report.findings.len(), 1);
+        assert_eq!(report.findings[0].severity, Severity::Warning);
+        assert_eq!(report.findings[0].check, "thermal");
+        assert!(report.findings[0].message.contains("3000"), "{}", report.findings[0].message);
+        assert!(report.findings[0].message.contains("2500"), "{}", report.findings[0].message);
+        // A warning must not fail the session — the numbers are still real.
+        assert!(report.passed());
+    }
+
+    #[test]
+    fn no_readings_produces_no_thermal_finding() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal = ThermalSnapshot::default();
+        let mut report = ValidationReport::default();
+        check_thermal(&sess, &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn a_small_drop_under_threshold_produces_no_finding() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal =
+            ThermalSnapshot { start_mhz: Some(3000.0), end_mhz: Some(2900.0), avg_mhz: None };
+        let mut report = ValidationReport::default();
+        check_thermal(&sess, &mut report);
+        assert!(report.findings.is_empty());
+    }
+
+    #[test]
+    fn validate_includes_the_thermal_check() {
+        let mut sess = sample();
+        sess.environment.hardware.thermal =
+            ThermalSnapshot { start_mhz: Some(3000.0), end_mhz: Some(2000.0), avg_mhz: None };
+        let report = validate(&sess);
+        assert!(report.findings.iter().any(|f| f.check == "thermal"));
     }
 }

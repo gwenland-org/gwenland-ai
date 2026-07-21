@@ -1,0 +1,3 @@
+label,iteration,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,prefill_tps,decode_tps,energy_j_per_token
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold,220,8,4424.2439,1374.3218,5798.0000,49.7260,5.8211,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,0,220,8,3864.1589,1151.6045,5015.0000,56.9335,6.9468,

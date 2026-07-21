@@ -144,14 +144,92 @@ impl CpuInfo {
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "windows")]
     fn probe_os(&mut self) {
-        // Windows/macOS expose model/MHz only via APIs outside std, and the
-        // crate's dependency rule forbids pulling those in — so they stay None.
-        // Physical cores are left None rather than guessed: halving the logical
-        // count assumes SMT, and a wrong number here would be reported as an
-        // observed fact. glbench records what it can see and is honest about
-        // the rest.
+        // `wmic` is deprecated (and absent on some stripped-down Windows
+        // installs), but it is still present on the reference machine
+        // (Windows 11) and every other Windows box this crate has been run
+        // on. `wmic_field` returns None on any failure — missing binary,
+        // non-zero exit, empty output — so a machine without it degrades to
+        // exactly the "not observed" state this module already uses for
+        // macOS, rather than a hard error.
+        self.model = wmic_field("cpu", "Name");
+        self.physical_cores = wmic_field("cpu", "NumberOfCores").and_then(|s| s.parse().ok());
+        self.mhz = wmic_field("cpu", "CurrentClockSpeed").and_then(|s| s.parse().ok());
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    fn probe_os(&mut self) {
+        // macOS and anything else expose model/MHz only via APIs outside std
+        // (or, on macOS, a `sysctl` binary this crate has not been asked to
+        // shell out to), and the crate's dependency rule forbids pulling
+        // libraries in — so they stay None. Physical cores are left None
+        // rather than guessed: halving the logical count assumes SMT, and a
+        // wrong number here would be reported as an observed fact. glbench
+        // records what it can see and is honest about the rest.
         let _ = &self.model;
     }
+}
+
+/// The current CPU clock, MHz, without a full [`CpuInfo::probe`] (which pays
+/// for `IsaSupport::probe` and the ~1s bandwidth measurement neither the
+/// start nor end thermal reading needs). Cheap enough to call twice in one
+/// session — once before the measured iterations, once after — to detect a
+/// clock drop between them. `None` wherever [`CpuInfo::mhz`] would be `None`.
+pub fn probe_mhz() -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        for line in text.lines() {
+            if let Some((key, val)) = line.split_once(':') {
+                if key.trim() == "cpu MHz" {
+                    return val.trim().parse().ok();
+                }
+            }
+        }
+        None
+    }
+    #[cfg(target_os = "windows")]
+    {
+        wmic_field("cpu", "CurrentClockSpeed").and_then(|s| s.parse().ok())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    {
+        None
+    }
+}
+
+/// Run `wmic <class> get <field> /format:list` and pull `field`'s value out
+/// of the `KEY=VALUE` output. `None` on any failure — `wmic` missing, a
+/// non-zero exit, or a field absent from the output — never a guessed value.
+///
+/// `wmic`'s `/format:list` output is plain ASCII when captured through
+/// `std::process::Command` (verified against the real binary: no UTF-16
+/// decoding needed, unlike what a console might display), with stray blank
+/// lines and doubled `\r` around each `KEY=VALUE` line.
+///
+/// `pub(crate)` and shared: [`super::memory`] queries the `OS` wmic class
+/// through the same helper rather than duplicating the process-spawning and
+/// parsing logic for one more class.
+#[cfg(target_os = "windows")]
+pub(crate) fn wmic_field(class: &str, field: &str) -> Option<String> {
+    let output = std::process::Command::new("wmic")
+        .args([class, "get", field, "/format:list"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let prefix = format!("{field}=");
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(value) = line.strip_prefix(&prefix) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
