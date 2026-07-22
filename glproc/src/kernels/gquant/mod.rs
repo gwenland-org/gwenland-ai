@@ -14,6 +14,7 @@
 pub mod scalar;
 pub mod avx2;
 pub mod gq2a_scalar;
+pub mod gq2a_avx2;
 
 use crate::simd_strategy::SimdStrategy;
 
@@ -143,12 +144,11 @@ pub fn dequant_gq2a(block: &GQ2ABlock, out: &mut [f32; 256]) {
 /// `data.len()` must be a multiple of [`GQ2ABlock::BYTES`]; a short trailing
 /// remainder is dropped (same corrupt-package rationale as
 /// [`dequant_gq4a_stream`]).
-///
-/// Scalar-only for now (Wave 3) — an AVX2 fast path lands in Wave 4, at
-/// which point this dispatches on [`SimdStrategy::detect`] the same way
-/// [`dequant_gq4a_stream`] does.
 pub fn dequant_gq2a_stream(data: &[u8]) -> Vec<f32> {
-    gq2a_scalar::run_stream(data)
+    match SimdStrategy::detect() {
+        SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { gq2a_avx2::run_stream(data) },
+        SimdStrategy::Scalar => gq2a_scalar::run_stream(data),
+    }
 }
 
 #[cfg(test)]

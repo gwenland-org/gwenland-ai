@@ -93,7 +93,7 @@ mod tests {
         let super_min_f16 = {
             // 5.0 in f16: sign=0, exp=15+2=17=0b10001, frac = (5.0/4.0 - 1.0)*1024 = 256
             // 5.0 = 1.25 * 2^2, mantissa frac = 0.25*1024 = 256 = 0x100
-            0b0_10001_0100000000u16
+            0x4500u16
         };
         // Don't trust the hand-derived bit pattern above without checking —
         // verify it actually decodes to 5.0 via the same f16_to_f32 the
