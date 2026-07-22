@@ -446,3 +446,26 @@ a non-issue in practice, but this is an expectation, not yet a
 measurement. To be checked empirically via calibration-run tensor
 statistics once Phase 2's PPL validation work happens (v5 §12), not
 before. Ready to proceed with Wave 3 (scalar dequant kernel).
+
+---
+
+[2026-07-22T21:10:00Z] [TYPE: DECISION]
+Description: Wave 3 (GQ2A scalar dequant kernel) complete. Added
+glproc::kernels::gquant::gq2a_scalar (run/run_stream), using GQ2ABlock's
+scale_delta_at/min_delta_at/weight_at accessors from Wave 1 rather than
+re-deriving the unpack logic — kept the kernel itself short (correctness
+already lives in GQ2ABlock's own unit-tested unpacking). Wired
+dequant_gq2a/dequant_gq2a_stream dispatchers into gquant::mod.rs,
+scalar-only for now (AVX2 fast path is Wave 4 — the stream dispatcher
+will switch on SimdStrategy::detect() the same way dequant_gq4a_stream
+already does once that lands).
+One test-authoring lesson applied from the tokenizer session's own
+memory (GAAP/GDTQP hand-derived-math pitfalls): a test asserting against
+a hand-derived f16 bit pattern for 5.0 includes a self-check (asserts
+f16_to_f32(pattern) == 5.0) before using that pattern in the real
+assertion — so a wrong bit-math derivation fails loudly at the sanity
+check, not silently by passing a broken kernel test with a
+coincidentally-matching wrong number on both sides.
+7 new glproc tests passing (96 total, was 92), clippy clean, 0 new
+warnings. Ready to proceed with Wave 4 (AVX2 dequant kernel + parity
+test).
