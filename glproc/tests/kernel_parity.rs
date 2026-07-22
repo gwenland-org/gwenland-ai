@@ -755,3 +755,111 @@ fn dequant_gq4a_max_code_via_dispatcher() {
         assert!((w - 7.0).abs() < 1e-6, "w={w}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pridwen Phase 2 — GQ2A dequant parity (Pridwen v5 §10.2, §Testing)
+// ---------------------------------------------------------------------------
+
+use glproc::kernels::gquant::GQ2ABlock;
+
+/// Force a finite, well-defined f16 exponent (avoid NaN/Inf at 0x1f and the
+/// subnormal edge at 0x00) — same rationale as `random_gq4a_block`'s
+/// super_scale handling.
+fn random_finite_f16(rng: &mut Lcg) -> u16 {
+    let mut bits = [0u8; 2];
+    rng.fill(&mut bits);
+    let mut bits = u16::from_le_bytes(bits);
+    let exp = (bits >> 10) & 0x1f;
+    if exp == 0 || exp == 0x1f {
+        bits = (bits & !0x7c00) | (0x10 << 10);
+    }
+    bits
+}
+
+fn random_gq2a_block(rng: &mut Lcg) -> GQ2ABlock {
+    let super_scale = random_finite_f16(rng);
+    let super_min = random_finite_f16(rng);
+
+    // scale_delta/min_delta are already packed (2 raw i4 nibbles per byte,
+    // Pridwen v5 §3.2's bit-packing addendum) — any byte value is a valid
+    // packed pair, so a plain random fill exercises every nibble combination
+    // without needing to pack scalars first.
+    let mut scale_delta = [0u8; 8];
+    let mut min_delta = [0u8; 8];
+    rng.fill(&mut scale_delta);
+    rng.fill(&mut min_delta);
+
+    let mut weights = [0u8; 64];
+    rng.fill(&mut weights);
+
+    GQ2ABlock { super_scale, super_min, scale_delta, min_delta, weights }
+}
+
+#[test]
+fn dequant_gq2a_avx2_matches_scalar() {
+    if !has_avx2() {
+        eprintln!("SKIP: no AVX2+FMA on this host");
+        return;
+    }
+    let mut rng = Lcg::new(5678);
+    for trial in 0..100 {
+        let block = random_gq2a_block(&mut rng);
+
+        let mut scalar_out = [0.0f32; 256];
+        glproc::kernels::gquant::gq2a_scalar::run(&block, &mut scalar_out);
+
+        let mut avx2_out = [0.0f32; 256];
+        unsafe { glproc::kernels::gquant::gq2a_avx2::run(&block, &mut avx2_out) };
+
+        for (i, (a, s)) in avx2_out.iter().zip(scalar_out.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                s.to_bits(),
+                "trial {trial} element {i}: avx2={a} scalar={s} (bit-exact mismatch)"
+            );
+        }
+    }
+}
+
+#[test]
+fn dequant_gq2a_zero_block_via_dispatcher() {
+    let block = GQ2ABlock {
+        super_scale: 0,
+        super_min: 0,
+        scale_delta: [0; 8],
+        min_delta: [0; 8],
+        weights: [0xFF; 64], // all codes = 3 (max) — still must decode to 0
+    };
+    let mut out = [1.0f32; 256];
+    glproc::kernels::gquant::dequant_gq2a(&block, &mut out);
+    assert!(out.iter().all(|&w| w == 0.0));
+}
+
+#[test]
+fn dequant_gq2a_stream_dispatcher_matches_scalar_and_avx2() {
+    // Exercises dequant_gq2a_stream's SimdStrategy dispatch (whichever
+    // backend the host actually has) against the scalar reference directly.
+    let mut rng = Lcg::new(9012);
+    let mut raw = Vec::new();
+    let mut blocks = Vec::new();
+    for _ in 0..4 {
+        let block = random_gq2a_block(&mut rng);
+        raw.extend_from_slice(&block.super_scale.to_le_bytes());
+        raw.extend_from_slice(&block.super_min.to_le_bytes());
+        raw.extend_from_slice(&block.scale_delta);
+        raw.extend_from_slice(&block.min_delta);
+        raw.extend_from_slice(&block.weights);
+        blocks.push(block);
+    }
+
+    let dispatched = glproc::kernels::gquant::dequant_gq2a_stream(&raw);
+    assert_eq!(dispatched.len(), 4 * 256);
+
+    for (bi, block) in blocks.iter().enumerate() {
+        let mut expected = [0.0f32; 256];
+        glproc::kernels::gquant::gq2a_scalar::run(block, &mut expected);
+        for (i, (&got, &want)) in dispatched[bi * 256..(bi + 1) * 256].iter().zip(expected.iter()).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "block {bi} element {i}: dispatcher diverged from scalar");
+        }
+    }
+}
