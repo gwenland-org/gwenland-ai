@@ -18,6 +18,8 @@ pub mod constants;
 pub mod converter;
 pub mod error;
 pub mod execution_unit;
+#[cfg(feature = "gquant")]
+pub mod gquant;
 pub mod layer_io;
 pub mod manifest;
 pub mod package;

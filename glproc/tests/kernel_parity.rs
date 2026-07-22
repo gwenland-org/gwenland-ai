@@ -679,3 +679,79 @@ fn swiglu_fused_matches_reference() {
         assert!((g - w).abs() <= tol, "row {i}: got {g}, want {w}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pridwen Phase 1 — GQ4A dequant parity (Pridwen v5 §10.2, §Testing)
+// ---------------------------------------------------------------------------
+
+use glproc::kernels::gquant::GQ4ABlock;
+
+fn random_gq4a_block(rng: &mut Lcg) -> GQ4ABlock {
+    let mut super_scale_bytes = [0u8; 2];
+    rng.fill(&mut super_scale_bytes);
+    // Force a well-defined finite, nonzero-typical exponent range by masking
+    // the f16 exponent field into [1, 30] (avoids NaN/Inf at 0x1f and the
+    // subnormal edge at 0x00, neither of which the encoder ever produces for
+    // a real max(|w|) super_scale).
+    let mut bits = u16::from_le_bytes(super_scale_bytes);
+    let exp = (bits >> 10) & 0x1f;
+    if exp == 0 || exp == 0x1f {
+        bits = (bits & !0x7c00) | (0x10 << 10); // mid-range exponent
+    }
+
+    let mut scale_delta = [0i8; 8];
+    for d in scale_delta.iter_mut() {
+        // Full i8 range except -128 (spec excludes it, see encoder notes).
+        let raw = (rng.next_u32() % 255) as i16 - 127; // [-127, 127]
+        *d = raw as i8;
+    }
+
+    let mut weights = [0u8; 128];
+    rng.fill(&mut weights);
+
+    GQ4ABlock { super_scale: bits, scale_delta, weights }
+}
+
+#[test]
+fn dequant_gq4a_avx2_matches_scalar() {
+    if !has_avx2() {
+        eprintln!("SKIP: no AVX2+FMA on this host");
+        return;
+    }
+    let mut rng = Lcg::new(1234);
+    for trial in 0..100 {
+        let block = random_gq4a_block(&mut rng);
+
+        let mut scalar_out = [0.0f32; 256];
+        glproc::kernels::gquant::scalar::run(&block, &mut scalar_out);
+
+        let mut avx2_out = [0.0f32; 256];
+        unsafe { glproc::kernels::gquant::avx2::run(&block, &mut avx2_out) };
+
+        for (i, (a, s)) in avx2_out.iter().zip(scalar_out.iter()).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                s.to_bits(),
+                "trial {trial} element {i}: avx2={a} scalar={s} (bit-exact mismatch)"
+            );
+        }
+    }
+}
+
+#[test]
+fn dequant_gq4a_zero_block_via_dispatcher() {
+    let block = GQ4ABlock { super_scale: 0, scale_delta: [0; 8], weights: [0x55; 128] };
+    let mut out = [1.0f32; 256];
+    glproc::kernels::gquant::dequant_gq4a(&block, &mut out);
+    assert!(out.iter().all(|&w| w == 0.0));
+}
+
+#[test]
+fn dequant_gq4a_max_code_via_dispatcher() {
+    let block = GQ4ABlock { super_scale: 0x3C00, scale_delta: [127; 8], weights: [0xFF; 128] };
+    let mut out = [0.0f32; 256];
+    glproc::kernels::gquant::dequant_gq4a(&block, &mut out);
+    for &w in out.iter() {
+        assert!((w - 7.0).abs() < 1e-6, "w={w}");
+    }
+}
