@@ -158,20 +158,56 @@ scheme in §3.4 which deliberately uses only 3 of 4 states).
 
 **Reconstruction (asymmetric, min + scale per block):**
 ```
-scale_i    = super_scale × (1.0 + scale_delta_i / 7.0)   // scale_delta_i ∈ [-8,7] (i4)
-min_i      = super_min   × (1.0 + min_delta_i   / 7.0)   // min_delta_i   ∈ [-8,7] (i4)
+scale_i    = super_scale × (1.0 + scale_delta_i / 7.0)         // scale_delta_i ∈ [-8,7] (i4)
+min_i      = super_min + super_scale × (min_delta_i / 7.0)     // min_delta_i   ∈ [-8,7] (i4)
 weight_f32 = min_i + scale_i × (weight_int2 / 3.0)
 ```
 `scale_delta_i` and `min_delta_i` are each a **signed 4-bit** value in `[-8, 7]`,
 normalized by `7.0` (the max positive `i4` magnitude — mirroring GQ4A's `i8`/`127.0`
-convention at 4-bit width) to a `[-1.14, 1.0]` multiplicative adjustment around
-`super_scale`/`super_min` respectively. `weight_int2 / 3.0` maps the 2-bit code linearly
-onto `[0.0, 1.0]` (4 evenly spaced fractions: 0, 1/3, 2/3, 1), so the fully-reconstructed
-weight ranges over `[min_i, min_i + scale_i]` per block — this is what makes GQ2A
-asymmetric: unlike GQ4A's zero-centered `dequant(c) = c − 8`, GQ2A's 2-bit codes do not
-need to represent negative values directly, because `min_i` (which can itself be
-negative, since `super_min` and `min_delta_i` are signed/unconstrained) supplies the
-lower bound of the block's actual weight range.
+convention at 4-bit width). `scale_delta_i` is a multiplicative adjustment around
+`super_scale` (scale is a non-negative magnitude, so a relative adjustment is natural).
+
+**`min_delta_i` is additive, not multiplicative, unlike an earlier draft of this
+section** — deriving the encoder surfaced a real bug in a multiplicative form
+(`min_i = super_min × (1 + delta/7)`): whenever `super_min` is exactly `0` (any
+superblock whose weights are all non-negative — common for bias-adjacent and
+post-norm tensors, i.e. not a rare edge case), that formula collapses `min_i` to `0`
+for *every* block regardless of `min_delta_i`, silently discarding the per-block min
+adjustment for the whole superblock. Multiplying a delta onto a base that can
+legitimately be zero (or pass through zero) doesn't work — the same reason GQ4A's own
+`scale_delta` is normalized *and added* to a base rather than used as a multiplier on
+something that can vanish. `min_delta_i`'s unit step is `super_scale / 7.0` — reusing
+`super_scale` as the step size (rather than adding a fourth per-superblock field) keeps
+the step in the same physical units as the weights themselves, and keeps the 84-byte
+layout unchanged.
+
+**`super_scale`'s own definition is consequently widened beyond "the widest per-block
+range" — a second, related fix found in the same derivation pass.** Naively defining
+`super_scale = max(local_scale_i)` (mirroring GQ4A's `max(|w|)`) is not enough: it
+bounds how well `scale_delta` can express *how wide each sub-block's own range is*, but
+`min_delta`'s `±7` step budget separately needs `super_scale` large enough to *reach
+every sub-block's local_min* from `super_min`, which is a different quantity — the
+spread of local minimums across sub-blocks, not the width of any one sub-block. GQ2A's
+84-byte layout gives `scale_delta` and `min_delta` only one shared f16 basis
+(`super_scale`) for both step sizes, so the encoder takes
+`super_scale = max(max(local_scale_i), max(local_min_i) − min(local_min_i))` — the raw
+spread of local minimums (not the spread pre-divided by 7 — `min_delta`'s own formula
+already multiplies by 7, so dividing here too would double-count it and under-widen
+`super_scale`) — whichever requirement is larger. In the common case (weight magnitudes vary smoothly
+across a tensor's sub-blocks, which real trained weights do) the first term already
+dominates and this is a no-op; it only costs `scale_delta` precision in the
+deliberately-pathological case where sub-block minimums swing far more than any single
+sub-block's own range. Documented as an accepted design trade-off of the shared-basis
+layout, not a silent bug — §12 tracks re-checking it empirically once real calibration
+data exists.
+
+`weight_int2 / 3.0` maps the 2-bit code linearly onto `[0.0, 1.0]` (4 evenly spaced
+fractions: 0, 1/3, 2/3, 1), so the fully-reconstructed weight ranges over
+`[min_i, min_i + scale_i]` per block — this is what makes GQ2A asymmetric: unlike
+GQ4A's zero-centered `dequant(c) = c − 8`, GQ2A's 2-bit codes do not need to represent
+negative values directly, because `min_i` (which can itself be negative, since
+`super_min` is signed/unconstrained) supplies the lower bound of the block's actual
+weight range.
 
 **Bit-packing (added in this revision — the byte diagram above states field sizes but
 not internal bit layout, which an implementation cannot derive on its own without
@@ -642,6 +678,7 @@ These are open questions that will be answered through empirical work — not as
 | GQ1A PTQ collapse severity on <3B models | Phase 4 | calibration run, PPL vs QAT baseline (§3.4 currently states this as an expectation from general research, not a GwenLand-measured result) |
 | 2.8 bpw cliff threshold validity | Phase 2 | PPL sweep across bpw values on Qwen2.5-0.5B (§5 currently uses this only as a rough target, not a validated cutoff) |
 | GQ2A-R `rotation_seed` storage location (manifest field vs binary header) | Phase 2, before GQ2A-R ships | design decision, not empirical — see §15 Q2 |
+| GQ2A's shared-basis `super_scale` precision trade-off (does real weight data ever make sub-block minimums swing more than local ranges, forcing `scale_delta` to lose precision?) | Phase 2 | measure `scale_delta`/`min_delta` saturation rates on real calibration tensors |
 
 ---
 
