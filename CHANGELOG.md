@@ -2,6 +2,93 @@
 
 The notable changes, newest first. The blow-by-blow per-session notes live in [`changelog/`](changelog/).
 
+## 0.1.164 — 2026-07-22
+
+**Pridwen** — a co-designed mixed-precision quantization framework for `.gllm`, separating
+the *Quantization Architecture* (binary block format) from the *Assignment Policy*
+(per-tensor precision selection). Full design in
+[`architecture/Pridwen-proposal-v5.md`](architecture/Pridwen-proposal-v5.md); the
+wave-by-wave build log (including two spec bugs found and fixed mid-implementation) is
+[`notes/pridwen-p1-notes.md`](notes/pridwen-p1-notes.md). PR: [#15](https://github.com/gwenland-org/gwenland-ai/pull/15).
+
+glictus-caliburni, glproc — Phase 1: GQ4A foundation
+
+- `DType::GQ4A` (code `0x0200`): 4-bit, 256-weight superblock, `f16` super-scale +
+  8×`i8` per-sub-block scale deltas + 128 bytes packed 4-bit codes — 138 bytes/superblock,
+  4.3125 bpw. Not byte-compatible with GGUF's `Q4_K_M` (144 bytes/4.5 bpw) — a deliberate
+  simplification, not an oversight.
+- `glictus-caliburni::gquant`: `GQ4ABlock` storage struct + F32→GQ4A encoder (conversion-time
+  only, behind the `converter` feature). `glproc::kernels::gquant`: scalar reference dequant
+  + an AVX2 fast path, bit-exact (0 ULP) against scalar across 100 random trials.
+- `glconv --quant GQ4A --policy CPP`: CPP Stage 1 hardcoded sensitivity table
+  (`gquant_policy::assign_gq4a_cpp`) — degenerate by design (every quantized tensor gets
+  GQ4A; only the norm rows diverge), since GQ4A is a single-format baseline. Heterogeneous
+  assignment starts with GQ2A below.
+- Verified against a real `qwen2.5-0.5b-instruct-q4_k_m.gguf`: conversion completes without
+  error and the package self-validates. Real-model coverage was initially only 25/291
+  tensors (8.6%) — see the dequant fix below for why, and the fix that followed.
+
+glictus-caliburni — Q4_K/Q5_0 dequant via glproc (architecture decision)
+
+- `glcore::GgufFile::dequantize` deliberately excludes `Q4_K`/`Q5_0` ("dequant lives in
+  glproc"), so a real Q4_K_M model's GQ4A coverage was capped at whatever GGUF didn't
+  already quantize with those two formats. Per
+  [`architecture/Pridwen-P2-ADR-glproc-dequant.md`](architecture/Pridwen-P2-ADR-glproc-dequant.md):
+  `converter` now falls back to `glproc`'s already-proven scalar dequant kernels for those
+  two dtypes, rather than duplicating the logic in `glcore` — the same directional
+  dependency (`glictus-caliburni → glproc`) the existing `glproc-backend` feature already
+  uses for the runtime path, applied here to the conversion path instead.
+- Real-model result: GQ4A_CPP coverage on the same Qwen2.5-0.5B model rose from 25/291
+  tensors (8.6%) to **170/291 (58.4%)**; warnings dropped from 219 to 73 (all now the
+  pre-existing "not a multiple of 256" case for small attention bias tensors, not a
+  dequant gap). Package size: 398 MB → **340 MB (30.8% smaller than the 491 MB source)**.
+- The remaining 121 non-GQ4A tensors are accounted for, not an open gap: 49 are the CPP
+  policy's intentional norm-layer assignments, and the other 72 (bias vectors) were
+  deliberately left at F32 — quantizing them would recover at most ~94 KiB out of a
+  340 MB package, and bias values are unusually precision-sensitive (added directly to
+  pre-activations rather than passed through an error-averaging matmul).
+
+glictus-caliburni, glproc — Phase 2: GQ2A, the "Primary Innovation"
+
+- `DType::GQ2A` (code `0x0201`): 2-bit, 256-weight superblock with **asymmetric**
+  min+scale reconstruction — `f16` super-scale + `f16` super-min + 16×packed `i4` scale
+  deltas + 16×packed `i4` min deltas + 64 bytes packed 2-bit codes — 84 bytes/superblock,
+  2.625 bpw. `super_min` (absent from GGML's `Q2_K`) lets an unsigned 2-bit code represent
+  any per-block value range, not just a zero-centered one.
+- Deriving the encoder surfaced two real bugs in the original spec formula (fixed in both
+  the spec and the code, not silently patched around): (1) `min_delta` was multiplicative
+  against `super_min`, which collapses to 0 for every sub-block whenever `super_min == 0`
+  (any superblock with non-negative weights — not a rare case); fixed to additive. (2) once
+  additive, `super_scale = max(local_scale)` alone wasn't necessarily wide enough for
+  `min_delta`'s ±7-step budget to reach every sub-block's minimum, since cross-block min
+  spread is independent of any single block's own width; fixed by widening `super_scale` to
+  cover whichever requirement is larger — an accepted, documented precision trade-off, not
+  asserted away.
+- `glproc::kernels::gquant::gq2a_avx2`: sequential (not interleaved) 4-codes-per-byte
+  packing needs no lane-interleave step, unlike GQ4A. Two bit-exactness pitfalls were
+  identified by reasoning about floating-point rounding order *before* running the parity
+  test — FMA fuses a rounding step the scalar reference doesn't, and a reciprocal-multiply
+  for `/3.0` isn't guaranteed bit-exact with a real division — so the 100-trial parity test
+  passed on the first attempt.
+- `gquant_policy::assign_gq2a_cpp`: the first CPP assignment that's genuinely
+  heterogeneous — `token_embd`/`output`/`attn_q`/`attn_k` (EXTREME/HIGH sensitivity) escape
+  to GQ4A, `attn_v`/`attn_output`/`ffn_gate`/`ffn_up`/`ffn_down` get GQ2A, norm rows keep
+  GQ4A_CPP's F32/F16 "always" assignment. `glconv --quant GQ2A --policy CPP`.
+- Real-model result (same Qwen2.5-0.5B model, first measured demonstration of Pridwen's
+  core premise — per-tensor heterogeneous precision beating a single-format baseline):
+
+  | | GQ4A_CPP | GQ2A_CPP |
+  |---|---|---|
+  | dtype tally | GQ4A=170 | GQ4A=50, GQ2A=120 |
+  | Package size | 340 MB (30.8% smaller) | **269 MB (45.2% smaller)** |
+  | Warnings | 73 | 73 (identical category) |
+
+  GQ2A_CPP is smaller than GQ4A_CPP while still protecting the same sensitivity-critical
+  tensors on the higher-precision GQ4A escape hatch.
+- Not yet done, explicitly deferred (Pridwen v5 §6/§7, not silently skipped): the
+  incoherence-processing (FHT/GQ2A-R) decision gate, and Stage 2 empirical calibration for
+  the Assignment Engine.
+
 ## 0.1.163 — 2026-07-21
 
 ### glictus-caliburni — ARTX09 versioning hardening + ARTX10 glproc runtime backend
