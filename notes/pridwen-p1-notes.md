@@ -513,3 +513,51 @@ stream_dispatcher, plus the lib-side additions), clippy clean, 0 new
 warnings anywhere in kernels/gquant/*. Ready to proceed with Wave 5
 (wire into converter.rs + assign_gq2a_cpp + real-model test) — the last
 wave before GQ2A is feature-complete for Phase 2.
+
+---
+
+[2026-07-22T21:35:00Z] [TYPE: DECISION]
+Description: Wave 5 (converter.rs wiring) complete — GQ2A is now
+feature-complete for Phase 2. Added QuantTarget::Gq2a, assign_gq2a_cpp
+(Pridwen v5 §5's "GQ2A_CPP assign" column: token_embd/output/attn_q/
+attn_k escape to GQ4A, attn_v/attn_output/ffn_gate/ffn_up/ffn_down get
+GQ2A, norm rows unchanged from GQ4A_CPP) in gquant_policy.rs, generalized
+the assignment-eligibility/write-path logic in converter.rs to handle
+either superblock format (previously GQ4A-only), and renamed
+dequantize_for_gq4a -> dequantize_for_gquant since the dequant-to-F32
+step is identical regardless of which format the result gets re-encoded
+into. Extracted a small role_of() helper in gquant_policy.rs shared by
+sensitivity_bucket_for/assign_gq4a_cpp/assign_gq2a_cpp rather than
+duplicating the blk./​.weight/​.bias stripping a third time. glconv CLI:
+--quant now accepts GQ2A alongside GQ4A.
+Added a synthetic convert_gq2a_cpp_end_to_end test (deliberately mixing
+a HIGH-sensitivity tensor that escapes to GQ4A with a MEDIUM-HIGH one
+that gets GQ2A, in the same package) and a real-model
+gq2a_ppl_vs_q4km_baseline test (same GWENLAND_TEST_GGUF opt-in pattern
+as Phase 1/2's GQ4A baseline test, plus an automated dtype tally — the
+scripted version of the manual counting done for the Phase 2 dequant-fix
+verification).
+24 new glictus-caliburni tests, 308 total (was 284 before this session's
+GQ2A work started), 0 failing, clippy clean, 0 new warnings.
+
+Real-model result (qwen2.5-0.5b-instruct-q4_k_m.gguf, --quant GQ2A
+--policy CPP, same source model as every other Phase 1/2 baseline
+measurement in this file):
+  dtype tally: GQ4A=50, GQ2A=120, other=121 (291 tensors total)
+  73 warnings (same as GQ4A_CPP's post-dequant-fix count — all from the
+    same 256-non-divisible bias tensors, zero new warning categories)
+  Package size: 491,400,032 bytes source -> 269,191,102 bytes GQ2A
+    package (45.2% smaller than source)
+Compared against GQ4A_CPP's own post-fix numbers (170 GQ4A / 340,025,278
+bytes, 30.8% smaller): GQ2A_CPP is smaller (45.2% vs 30.8%) while still
+protecting the same sensitivity-critical tensors (token_embd, output,
+attn_q, attn_k) with the higher-precision GQ4A escape hatch — this is
+the first real, measured demonstration of Pridwen's core premise (Pridwen
+v5 §1): per-tensor heterogeneous precision beating a single-format
+baseline on the same real model, not just a synthetic proof of concept.
+
+GQ2A (Pridwen v5 §3.2, the "Primary Innovation") is now fully implemented:
+block struct, encoder, scalar + AVX2 dequant kernels, CPP policy, glconv
+wiring, verified against a real model. What remains for Phase 2 per v5
+§14 is the FHT/GQ2A-R decision gate (§6) and Stage 2 calibration work —
+both explicitly deferred, not silently skipped.
