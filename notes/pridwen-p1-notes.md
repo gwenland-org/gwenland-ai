@@ -306,3 +306,42 @@ divides 256 is now actually GQ4A. Follow-up (2) is closed. Follow-up (1)
 (glbench GLLM/quantized-dtype support) remains open, unchanged, out of
 scope for this fix.
 Ready to proceed with GQ2A implementation.
+
+---
+
+[2026-07-22T16:45:00Z] [TYPE: DECISION]
+Description: User asked whether the remaining 121 non-GQ4A tensors (out of
+291, per the 16:15:00Z FINDING) are worth closing further. Broke down the
+121 by exact role via gllm.json:
+  - 49 are the CPP policy's intentional "always" assignments (Pridwen v5
+    §5): 24x attn_norm.weight + 24x ffn_norm.weight -> F16, 1x
+    output_norm.weight -> F32. These are not a gap — this is the policy
+    working as designed, and would only change if the policy itself
+    changed (out of scope for a "cover more tensors" ask).
+  - 72 are attn_q.bias (896 elem) / attn_k.bias (128 elem) / attn_v.bias
+    (128 elem) x 24 layers each, all rejected by GQ4A's 256-element
+    superblock requirement (none of 896/128 are multiples of 256). This
+    IS a real technical gap, distinct from the 49 above.
+Measured the actual cost of leaving the 72 bias tensors at F32: 896*4*24
++ 128*4*24 + 128*4*24 = 110,592 bytes (~108 KiB) out of the 340,025,278-byte
+package (~0.0325%). Quantizing them to GQ4A would only ever recover this
+same ~108 KiB (converted to ~4.3125/32 of it, i.e. saving roughly 94 KiB
+at best) — not measurable against a 340 MB package.
+Weighed against that near-zero size benefit: bias vectors are added
+directly to pre-activation/logit values rather than passed through a
+matmul (where quantization error partially averages out across the
+contraction dimension), making them one of the more precision-sensitive
+tensor roles in the model — the opposite of a good quantization target.
+Closing this gap would also require new machinery not in the current
+spec: either a smaller sub-256 block variant (new architecture surface)
+or padding-to-256 (deviates from Pridwen v5 §3.1, which explicitly does
+not define ragged/padded tensors, and stores dummy padding bytes
+permanently on disk for a net-negative trade).
+Action taken: User confirmed — leave the 72 bias tensors at F32, do not
+build padding or a sub-block format for them. This is a deliberate
+decision, not a deferred gap: the cost of closing it (new format surface,
+quality risk to precision-sensitive bias values) measurably exceeds the
+benefit (~94 KiB out of 340 MB). Combined with the 49 policy-intentional
+tensors above, all 121 non-GQ4A tensors in a Qwen2.5-0.5B GQ4A_CPP
+conversion are now accounted for and closed — none are an open follow-up.
+Ready to proceed with GQ2A implementation.
