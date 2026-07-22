@@ -14,6 +14,14 @@ under a single "Phase" label used inconsistently across §4/§6/§7/§9/§12. Ev
 cross-reference below has been re-verified against this split. See §17 for the full
 changelog.
 
+**Addendum (2026-07-22, before GQ2A implementation):** §3.2 gained an explicit
+bit-packing subsection (scale_delta/min_delta/weights byte layout) that the original
+v5 text omitted — it stated field *sizes* but not internal bit order, which Phase 1's
+GQ4A AVX2 kernel showed cannot be safely assumed by an implementer (a mismatched
+guess there produced a real, silently-wrong-answer bug before being caught by
+parity testing). Written before any GQ2A code exists, so there is no implementation
+to reconcile against — this is filling a spec gap, not fixing a discovered bug.
+
 ---
 
 ## 1. Positioning
@@ -164,6 +172,47 @@ asymmetric: unlike GQ4A's zero-centered `dequant(c) = c − 8`, GQ2A's 2-bit cod
 need to represent negative values directly, because `min_i` (which can itself be
 negative, since `super_min` and `min_delta_i` are signed/unconstrained) supplies the
 lower bound of the block's actual weight range.
+
+**Bit-packing (added in this revision — the byte diagram above states field sizes but
+not internal bit layout, which an implementation cannot derive on its own without
+risking the same interleaved-vs-split-nibble ambiguity GQ4A's AVX2 kernel hit in
+Phase 1):**
+
+GQ2A has three independently-packed streams per superblock, each with its own natural
+packing density — they are **not** packed the same way as each other or as GQ4A:
+
+```
+scale_delta (16 x i4 -> 8 bytes):
+  Same convention as GQ4A's 4-bit weight packing (Pridwen v5 §3.1): byte k holds
+  block 2k in bits [0:4) (low nibble) and block 2k+1 in bits [4:8) (high nibble).
+  i.e. scale_delta_byte[k] = (scale_delta[2k] & 0xF) | (scale_delta[2k+1] << 4)
+  scale_delta[i] is stored as its raw i4 two's-complement bit pattern (not offset
+  like GQ4A's u4 weight codes) — decode by sign-extending the nibble: a nibble
+  value >= 8 (bit 3 set) represents -16 + nibble, matching a standard 4-bit
+  two's-complement range of [-8, 7].
+
+min_delta (16 x i4 -> 8 bytes):
+  Identical packing to scale_delta above, in a separate 8-byte region immediately
+  following scale_delta's 8 bytes (per the block diagram's field order).
+
+weights (256 x u2 -> 64 bytes):
+  Four 2-bit codes per byte, low-to-high, sequential (not interleaved like GQ4A's
+  4-bit weights, since GQ4A interleaves exactly 2 values per byte — with 4 values
+  per byte here, sequential low-to-high is both the natural bit layout and the one
+  that keeps a whole 16-weight block's codes contiguous across exactly 4 bytes,
+  which the AVX2 kernel needs for a clean per-block load):
+  byte k holds weight 4k in bits [0:2), weight 4k+1 in bits [2:4), weight 4k+2 in
+  bits [4:6), weight 4k+3 in bits [6:8). i.e.
+    weights_byte[k] = weight_int2[4k] | (weight_int2[4k+1] << 2)
+                    | (weight_int2[4k+2] << 4) | (weight_int2[4k+3] << 6)
+  Block b's 16 weights therefore occupy weights_byte[4b .. 4b+4) (4 contiguous
+  bytes per block, 16 blocks x 4 bytes = 64 bytes total, matching the block
+  diagram).
+```
+
+Field order within the 84-byte superblock (offsets, matching the diagram above):
+`super_scale` (0..2), `super_min` (2..4), `scale_delta` (4..12), `min_delta`
+(12..20), `weights` (20..84).
 
 ### 3.3 GQ2A-R — Incoherence-Processed Sub-Variant (Architecture-level, Phase 2 candidate)
 
