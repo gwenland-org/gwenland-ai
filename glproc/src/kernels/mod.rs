@@ -1,5 +1,6 @@
 pub mod bridge;
 pub mod dequant;
+pub mod gquant;
 pub mod matmul;
 pub mod ops;
 pub mod qdot;

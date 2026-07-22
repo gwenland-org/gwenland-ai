@@ -54,4 +54,9 @@ pub mod dtype_codes {
     pub const Q8_0: u16 = 0x0020;
     pub const Q8_K: u16 = 0x0021;
     pub const I32: u16 = 0x0030;
+
+    // G-Quant native (Pridwen proposal v5, §8) — well above the highest
+    // existing code (I32 = 0x0030), no collision. Architecture B/C reserved:
+    // 0x0300, 0x0400.
+    pub const GQ4A: u16 = 0x0200;
 }

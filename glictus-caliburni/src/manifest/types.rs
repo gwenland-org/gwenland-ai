@@ -51,6 +51,12 @@ pub enum DType {
     Q8K,
     /// 32-bit integer
     I32,
+    /// GwenLand-native 4-bit quantization, Architecture A (Pridwen proposal
+    /// v5, §3.1): 256-weight superblock, `f16` super_scale + 8×`i8`
+    /// scale_delta + 128 bytes packed 4-bit codes, 138 bytes/superblock,
+    /// 4.3125 bpw. Not byte-compatible with GGUF's `Q4_K_M`.
+    #[serde(rename = "GQ4A")]
+    GQ4A,
     /// Unknown dtype (forward compat — newer packages keep parsing)
     #[serde(other)]
     Unknown,
@@ -79,6 +85,7 @@ impl DType {
             dtype_codes::Q8_0 => Ok(Self::Q8_0),
             dtype_codes::Q8_K => Ok(Self::Q8K),
             dtype_codes::I32 => Ok(Self::I32),
+            dtype_codes::GQ4A => Ok(Self::GQ4A),
             code => Err(GllmError::UnsupportedDtype(code)),
         }
     }
@@ -101,6 +108,7 @@ impl DType {
             Self::Q8_0 => dtype_codes::Q8_0,
             Self::Q8K => dtype_codes::Q8_K,
             Self::I32 => dtype_codes::I32,
+            Self::GQ4A => dtype_codes::GQ4A,
             Self::Unknown => DTYPE_CODE_UNKNOWN,
         }
     }
@@ -128,6 +136,8 @@ impl DType {
             Self::Q5_0 => 22.0 / 32.0,  // GGML block: 22 bytes / 32 elements
             Self::Q6K => 210.0 / 256.0, // GGML super-block: 210 bytes / 256 elements
             Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::Q4Km | Self::Q4Ks => 0.5,
+            // 138 bytes / 256 weights (Pridwen v5 §3.1).
+            Self::GQ4A => 138.0 / 256.0,
             // Pessimistic guess for estimation; exact size must come from
             // the tensor entry's `size` field.
             Self::Unknown => 4.0,
@@ -139,7 +149,7 @@ impl DType {
         matches!(
             self,
             Self::Q4_0 | Self::Q4_1 | Self::Q4K | Self::Q4Km | Self::Q4Ks
-                | Self::Q5_0 | Self::Q6K | Self::Q8_0 | Self::Q8K
+                | Self::Q5_0 | Self::Q6K | Self::Q8_0 | Self::Q8K | Self::GQ4A
         )
     }
 }
@@ -323,6 +333,26 @@ mod tests {
         assert_eq!(DType::Q4_0.bytes_per_element(), None);
         assert_eq!(DType::Q8_0.bytes_per_element(), None);
         assert_eq!(DType::Unknown.bytes_per_element(), None);
+    }
+
+    #[test]
+    fn test_dtype_serde_gq4a() {
+        assert_eq!(serde_json::to_string(&DType::GQ4A).unwrap(), "\"GQ4A\"");
+        let back: DType = serde_json::from_str("\"GQ4A\"").unwrap();
+        assert_eq!(back, DType::GQ4A);
+    }
+
+    #[test]
+    fn test_dtype_gq4a_code_roundtrip() {
+        assert_eq!(DType::GQ4A.to_code(), 0x0200);
+        assert_eq!(DType::from_code(0x0200).unwrap(), DType::GQ4A);
+    }
+
+    #[test]
+    fn test_dtype_gq4a_is_quantized_with_block_bpe() {
+        assert!(DType::GQ4A.is_quantized());
+        assert_eq!(DType::GQ4A.bytes_per_element(), None);
+        assert!((DType::GQ4A.approx_bytes_per_element() - 138.0 / 256.0).abs() < 1e-9);
     }
 
     fn entry(shape: Vec<u64>, size: u64) -> TensorEntry {

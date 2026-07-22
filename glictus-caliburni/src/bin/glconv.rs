@@ -1,15 +1,18 @@
-//! `glconv` — GGUF → GLLM package converter CLI (ARTX07-lite).
+//! `glconv` — GGUF → GLLM package converter CLI (ARTX07-lite + Pridwen v5
+//! Phase 1 `--quant`/`--policy`).
 //!
-//! Usage: `glconv <input.gguf> <output_dir> [--model-id ID]`
+//! Usage: `glconv <input.gguf> <output_dir> [--model-id ID] [--quant GQ4A] [--policy CPP]`
 //! Build with: `cargo build -p glictus-caliburni --features converter --bin glconv`
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use glictus_caliburni::converter::{ConvertOptions, convert};
+use glictus_caliburni::converter::{ConvertOptions, QuantPolicy, QuantTarget, convert};
 
 fn usage() -> ! {
-    eprintln!("usage: glconv <input.gguf> <output_dir> [--model-id ID]");
+    eprintln!(
+        "usage: glconv <input.gguf> <output_dir> [--model-id ID] [--quant GQ4A] [--policy CPP]"
+    );
     std::process::exit(2);
 }
 
@@ -23,6 +26,20 @@ fn main() -> ExitCode {
             "--model-id" => match args.next() {
                 Some(id) => opts.model_id = Some(id),
                 None => usage(),
+            },
+            "--quant" => match args.next().as_deref() {
+                Some("GQ4A") => opts.quant = QuantTarget::Gq4a,
+                _ => {
+                    eprintln!("--quant only supports GQ4A in Phase 1 (Pridwen v5 §14)");
+                    usage();
+                }
+            },
+            "--policy" => match args.next().as_deref() {
+                Some("CPP") => opts.policy = QuantPolicy::Cpp,
+                _ => {
+                    eprintln!("--policy only supports CPP in Phase 1 (Pridwen v5 §7 Stage 1)");
+                    usage();
+                }
             },
             _ => usage(),
         }
