@@ -345,3 +345,104 @@ benefit (~94 KiB out of 340 MB). Combined with the 49 policy-intentional
 tensors above, all 121 non-GQ4A tensors in a Qwen2.5-0.5B GQ4A_CPP
 conversion are now accounted for and closed — none are an open follow-up.
 Ready to proceed with GQ2A implementation.
+
+---
+
+[2026-07-22T20:10:00Z] [TYPE: DECISION]
+Description: Started Pridwen Phase 2's second half: GQ2A (v5 §3.2), after
+confirming with the user this is next in spec order (Phase 3 = Assignment
+Engine research, which needs GQ2A calibration data that doesn't exist
+yet — GQ2A itself comes first). Before writing code: identified that
+v5 §3.2's byte diagram gave field sizes but not internal bit-packing
+(same class of gap that caused GQ4A's AVX2 interleaved-vs-split-nibble
+bug in Phase 1). Wrote the packing convention into v5 §3.2 first
+(scale_delta/min_delta: 2 raw i4 two's-complement nibbles per byte,
+same convention as GQ4A's weight packing; weights: 4 u2 codes per byte,
+sequential low-to-high, unlike GQ4A's 2-per-byte interleave) before any
+GQ2A implementation existed to reconcile against.
+
+Wave plan agreed with user: (1) GQ2ABlock struct, (2) encoder, (3) scalar
+dequant kernel, (4) AVX2 dequant kernel + parity test, (5) wire into
+converter.rs + assign_gq2a_cpp + real-model test. Gate after each wave,
+same as Phase 1.
+
+---
+
+[2026-07-22T20:15:00Z] [TYPE: DECISION]
+Description: Wave 1 (GQ2ABlock struct) complete. Added GQ2ABlock (84
+bytes: super_scale/super_min f16, scale_delta/min_delta packed i4 x16,
+weights packed u2 x256) to both glictus-caliburni::gquant and glproc's
+local mirror, plus DType::GQ2A (code 0x0201) in constants.rs/
+manifest/types.rs following the exact DType::GQ4A pattern. 293
+glictus-caliburni tests passing (was 284, +9), 92 glproc tests passing
+(was 89, +3), clippy clean on both, 0 warnings in kernels/gquant/*.
+
+---
+
+[2026-07-22T20:30:00Z] [TYPE: BLOCKER]
+Description: Deriving the GQ2A encoder (Wave 2) surfaced a real bug in
+v5 §3.2's own reconstruction formula, not an implementation mistake:
+`min_i = super_min × (1.0 + min_delta_i / 7.0)` is MULTIPLICATIVE. Any
+superblock whose weights are all non-negative (common — bias-adjacent
+and post-norm tensors, not a rare edge case) has `super_min == 0`, and
+multiplying a delta onto a base that's exactly 0 collapses `min_i` to 0
+for every sub-block regardless of `min_delta_i`, silently discarding the
+per-block min adjustment for the entire superblock.
+Action taken: Escalated to user rather than silently picking a fix
+(this changes the spec's own formula, not just code). User chose:
+additive delta, stepped by `super_scale / 7.0` — keeps the 84-byte
+layout unchanged (no new field), matches the physical units of the
+weights. v5 §3.2 updated with the corrected formula and an inline
+explanation of why the multiplicative form was wrong.
+
+---
+
+[2026-07-22T20:40:00Z] [TYPE: BLOCKER]
+Description: Writing a regression test for the bug above
+(`gq2a_encode_all_non_negative_does_not_collapse_min_delta`: 16 sub-blocks
+occupying disjoint ranges 0-1.5, 10-11.5, ..., 150-151.5) surfaced a
+SECOND bug: `super_scale = max(local_scale_i)` (mirroring GQ4A's
+`max(|w|)`) is not necessarily wide enough for `min_delta`'s ±7-step
+budget to reach every sub-block's `local_min` — the spread of minimums
+across sub-blocks (up to 150 in the test) is a different, independent
+quantity from any single sub-block's own width (~1.5 in the test), and
+GQ2A's 84-byte layout gives both deltas only one shared f16 basis
+(`super_scale`).
+User considered GGML Q4_K's `d`/`dmin` two-independent-basis pattern
+(verified against the real, proven glproc Q4_K kernel: `w = d*sc*q -
+dmin*m`, unsigned per-block magnitudes, not signed deltas) but explicitly
+rejected copying it — Pridwen is its own architecture, not a GGML port.
+Chose instead: widen `super_scale` to cover whichever of the two
+requirements (scale_delta's local width, or min_delta's cross-block min
+spread) is larger — `super_scale = max(max(local_scale_i), max(local_min_i)
+- min(local_min_i))`. No new field, stays in the additive/signed-delta
+design already chosen. Documented as an accepted precision trade-off
+(scale_delta loses resolution in the pathological case where minimums
+swing more than any block's own width) rather than asserting it away —
+added as a new row to v5 §12 Known Unknowns, to be checked against real
+calibration data once it exists, not assumed benign.
+First attempted fix still divided the spread by 7 an extra time
+(double-counting — min_delta's own formula already multiplies by 7),
+caught by the same regression test still failing (21.4 instead of the
+expected >100 for the outlier block) before the correct fix (raw spread,
+not spread/7) made it pass.
+
+---
+
+[2026-07-22T20:55:00Z] [TYPE: DECISION]
+Description: Wave 2 (GQ2A encoder) complete after both bugs above were
+fixed and verified. encode_gq2a/encode_gq2a_tensor added to
+glictus-caliburni::gquant::encoder with 8 new tests including the two
+regression tests. 301 glictus-caliburni tests passing (was 293, +8),
+clippy clean, 0 new warnings.
+Open question (not blocking, tracked in v5 §12): does the super_scale
+widening's precision trade-off (scale_delta loses resolution when
+per-block minimums vary more than any block's own local range) actually
+occur on real trained model weights, or only in adversarial/synthetic
+data like the regression test's disjoint ranges? Real neural network
+weights per tensor are typically unimodal and don't have sub-blocks
+occupying wildly separated ranges the way the test does — expected to be
+a non-issue in practice, but this is an expectation, not yet a
+measurement. To be checked empirically via calibration-run tensor
+statistics once Phase 2's PPL validation work happens (v5 §12), not
+before. Ready to proceed with Wave 3 (scalar dequant kernel).
