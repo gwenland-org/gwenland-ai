@@ -110,25 +110,48 @@ fn row_major_shape(gguf_dims: &[u64]) -> Vec<u64> {
     gguf_dims.iter().rev().copied().collect()
 }
 
-/// Whether `glcore::GgufFile::dequantize` can actually decode this GGUF
-/// source dtype to F32 today. Mirrors glcore's own match arms rather than
-/// calling `dequantize` speculatively, so the assignment step can decide
-/// *before* committing to `DType::GQ4A` (and thus before any warning/error
-/// bookkeeping gets tangled with the write pass).
-///
-/// Q4_K and Q5_0 are real GGUF quant types glcore deliberately punts to
-/// glproc's kernels (see glcore/src/format/gguf.rs) — `converter`'s only
-/// dependency is glcore, not glproc, so a real Q4_K_M model's Q4_K/Q5_0
-/// tensors cannot be re-encoded to GQ4A without either extending glcore's
-/// dequantize or adding a glproc dependency to this crate's `converter`
-/// feature (an architecture decision, not a Phase 1 default — see
-/// notes/pridwen-p1-notes.md).
+/// Whether this GGUF source dtype can be decoded to F32 for GQ4A
+/// re-encoding, considering both `glcore::GgufFile::dequantize` and the
+/// glproc fallback added by the Pridwen Phase 2 ADR
+/// (architecture/Pridwen-P2-ADR-glproc-dequant.md). Mirrors
+/// [`dequantize_for_gq4a`]'s own match arms rather than calling it
+/// speculatively, so the assignment step can decide *before* committing to
+/// `DType::GQ4A` (and thus before any warning/error bookkeeping gets
+/// tangled with the write pass).
 fn gguf_dtype_is_dequantizable(dtype: GgufDType) -> bool {
     matches!(
         dtype,
         GgufDType::F32 | GgufDType::F16 | GgufDType::BF16
             | GgufDType::Q4_0 | GgufDType::Q8_0 | GgufDType::Q6_K
+            | GgufDType::Q4_K | GgufDType::Q5_0
     )
+}
+
+/// Dequantize a tensor to F32 for GQ4A re-encoding, using `glcore`'s path
+/// for everything it supports and falling back to `glproc`'s scalar dequant
+/// kernels for `Q4_K`/`Q5_0` (which `glcore::GgufFile::dequantize`
+/// deliberately rejects — see its own doc comment: "dequant lives in
+/// glproc"). This is the one place `converter` crosses into `glproc`; every
+/// other tensor still goes through `glcore` unchanged (Pridwen Phase 2 ADR).
+fn dequantize_for_gq4a(gguf: &GgufFile, info: &glcore::format::gguf::GgufTensorInfo) -> Result<Vec<f32>, GllmError> {
+    match info.dtype {
+        GgufDType::Q4_K | GgufDType::Q5_0 => {
+            let raw = gguf
+                .tensor_data(info)
+                .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
+            let dequant = match info.dtype {
+                GgufDType::Q4_K => glproc::kernels::dequant::q4_k::scalar::run(raw),
+                GgufDType::Q5_0 => glproc::kernels::dequant::q5_0::scalar::run(raw),
+                _ => unreachable!(),
+            };
+            dequant.map_err(|e| {
+                convert_err(format!("tensor {}: glproc dequant failed: {e}", info.name))
+            })
+        }
+        _ => gguf
+            .dequantize(info)
+            .map_err(|e| convert_err(format!("tensor {}: dequant for GQ4A encode failed: {e}", info.name))),
+    }
 }
 
 /// Where a GGUF tensor lands in the GLLM package.
@@ -275,9 +298,8 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
                         ));
                     } else if !gguf_dtype_is_dequantizable(info.dtype) {
                         warnings.push(format!(
-                            "tensor {:?}: CPP assigned GQ4A but source dtype {:?} has no glcore \
-                             dequant path (Q4_K/Q5_0 dequant lives in glproc, which `converter` \
-                             does not depend on); keeping original dtype {:?}",
+                            "tensor {:?}: CPP assigned GQ4A but source dtype {:?} has no dequant \
+                             path (glcore or glproc); keeping original dtype {:?}",
                             info.name, info.dtype, dtype
                         ));
                     } else {
@@ -340,9 +362,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         for p in plans {
             let info = &gguf.tensors[p.gguf_index];
             if p.dtype == DType::GQ4A {
-                let f32_weights = gguf
-                    .dequantize(info)
-                    .map_err(|e| convert_err(format!("tensor {}: dequant for GQ4A encode failed: {e}", info.name)))?;
+                let f32_weights = dequantize_for_gq4a(&gguf, info)?;
                 let blocks = encode_gq4a_tensor(&f32_weights).ok_or_else(|| {
                     convert_err(format!(
                         "tensor {}: numel {} not a multiple of 256 (assignment step should have caught this)",

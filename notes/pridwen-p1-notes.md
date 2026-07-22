@@ -248,3 +248,61 @@ deferred: (1) glbench GLLM/quantized-dtype support (blocks real PPL/tok-s
 comparison for ANY dtype, not GQ4A-specific), (2) Q4_K/Q5_0 dequant-source
 gap (blocks GQ4A from reaching the bulk of a real Q4_K_M model's weights).
 Both are real, both are Phase-2-scale, neither is started here.
+
+---
+
+[2026-07-22T16:00:00Z] [TYPE: DECISION]
+Description: Follow-up (2) from the entry above is resolved. Per
+architecture/Pridwen-P2-ADR-glproc-dequant.md (user-authored, 2026-07-22):
+Option B chosen — `glictus-caliburni`'s `converter` feature now depends on
+`glproc` (`Cargo.toml`: `converter = ["dep:glcore", "dep:glproc",
+"gquant"]`), reusing glproc's already-proven scalar dequant kernels for
+Q4_K/Q5_0 instead of reimplementing them in glcore. Same directional
+pattern as the existing `glproc-backend` feature (glictus-caliburni ->
+glproc, never the reverse) — no dependency cycle
+(glproc depends only on glcore + num_cpus/libc, confirmed via Cargo.toml
+inspection before implementing).
+Action taken: Added `dequantize_for_gq4a(gguf, info)` in converter.rs —
+tries glcore's `dequantize()` first (unchanged for F32/F16/BF16/Q4_0/
+Q8_0/Q6_K), and for Q4_K/Q5_0 falls back to
+`glproc::kernels::dequant::{q4_k,q5_0}::scalar::run(raw_bytes)` (both
+`&[u8] -> Result<Vec<f32>, GlError>`, no numel needed, block count
+computed internally). `gguf_dtype_is_dequantizable` extended to accept
+Q4_K/Q5_0 as eligible. The old "Q4_K/Q5_0 has no dequant path" warning
+message is now unreachable for those two dtypes specifically (kept for
+any genuinely unhandled dtype). Build/test/clippy: 284 glictus-caliburni
+tests pass (including convert_gq4a_cpp_end_to_end), clippy clean on
+glictus-caliburni (0 new warnings; glproc's 52 pre-existing warnings in
+threading.rs/loader.rs/runner.rs untouched, none in kernels/gquant/*).
+
+---
+
+[2026-07-22T16:15:00Z] [TYPE: FINDING]
+Description: Re-ran `glconv qwen2.5-0.5b-instruct-q4_k_m.gguf out/
+--quant GQ4A --policy CPP` against the real model (release build, TMP
+redirected to D: per the disk-space memory note) with the glproc-dequant
+fix in place. Results, directly comparable to Phase 1's 2026-07-22T03:30
+FINDING entry (same model, same flags):
+  Warnings: 219 -> 73 (all 73 are the pre-existing "numel not a multiple
+    of 256" ragged-tensor case for small attn_q/k/v.bias tensors — this
+    model has attention biases, which Phase 1's earlier tally didn't
+    separately call out — plus 1 tokenizer-not-packaged warning; ZERO
+    Q4_K/Q5_0 dequant warnings remain)
+  Dtype tally across all 291 tensors: GQ4A: 170, F32: 73, F16: 48
+    (was: F32: 73, F16: 48, Q5_0: 133, Q4_K: 12, GQ4A: 25)
+  GQ4A coverage: 25/291 (8.6%) -> 170/291 (58.4%)
+  Package size: 491,400,032 bytes source GGUF -> 340,025,278 bytes GLLM
+    package (30.8% smaller; was 398,843,198 bytes / 18.8% smaller in
+    Phase 1)
+  Package opened and self-validated (GllmPackage::open + checksum/
+  cross-check) without error.
+Action taken: The remaining 121 non-GQ4A tensors (73 F32 + 48 F16) are
+NOT a residual dequant gap — they are exactly the CPP policy's intended
+"always" assignments (output_norm -> F32, attn_norm/ffn_norm -> F16, per
+Pridwen v5 §5) plus the small bias tensors correctly excluded by the
+256-element superblock constraint (out of spec scope, not a bug). Every
+tensor whose source dtype the CPP table assigns to GQ4A AND whose numel
+divides 256 is now actually GQ4A. Follow-up (2) is closed. Follow-up (1)
+(glbench GLLM/quantized-dtype support) remains open, unchanged, out of
+scope for this fix.
+Ready to proceed with GQ2A implementation.
