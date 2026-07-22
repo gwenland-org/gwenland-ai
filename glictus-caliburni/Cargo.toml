@@ -25,7 +25,13 @@ glproc = { path = "../glproc", optional = true }
 
 [features]
 default = []
-converter = ["dep:glcore"]
+# G-Quant (Pridwen v5, §8): DType::GQ4A + GQ4ABlock struct definitions only —
+# no encoder, no glcore dep. Pulled in automatically by `converter`, since the
+# encoder needs the block struct, but can be enabled standalone for anything
+# that only needs to read/describe the format (e.g. a future dequant-only
+# consumer that doesn't want glcore).
+gquant = []
+converter = ["dep:glcore", "gquant"]
 # glproc adapter needs glcore's tensor decoder (ARTX10 Wave 1's gllm.rs) too.
 glproc-backend = ["dep:glproc", "dep:glcore"]
 

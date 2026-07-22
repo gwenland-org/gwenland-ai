@@ -17,6 +17,8 @@
 //! - GGUF dims are fastest-moving-first; manifest/binary shapes are
 //!   written row-major (reversed).
 
+pub mod gquant_policy;
+
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -25,6 +27,8 @@ use glcore::format::gguf::{GgufDType, GgufFile};
 use crate::checksum::sha256_file;
 use crate::constants::{CHECKSUMS_FILENAME, MANIFEST_FILENAME, SHARED_FILENAME};
 use crate::error::GllmError;
+use crate::gquant::GQ4ABlock;
+use crate::gquant::encoder::encode_gq4a_tensor;
 use crate::layer_io::write_unit_file;
 use crate::manifest::{
     CustomMetadata, DType, ExtensionUri, FormatVersion, GllmManifest, LayerManifest,
@@ -33,12 +37,37 @@ use crate::manifest::{
 };
 use crate::package::GllmPackage;
 
+/// G-Quant target format for `--quant` (Pridwen v5 §2). Phase 1 scope: GQ4A
+/// only — GQ2A/GQ1A are later phases and have no encoder yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuantTarget {
+    /// No G-Quant conversion — tensors keep their original GGUF dtype
+    /// (existing ARTX7-lite behavior).
+    #[default]
+    None,
+    /// GQ4A, Architecture A 4-bit foundation (Pridwen v5 §3.1).
+    Gq4a,
+}
+
+/// Assignment policy for `--policy` (Pridwen v5 §4). Phase 1 scope: CPP
+/// Stage 1 (hardcoded sensitivity table) only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuantPolicy {
+    /// Combined Precision Policy, Stage 1 (Pridwen v5 §5, §7).
+    #[default]
+    Cpp,
+}
+
 /// Options for a conversion run.
 #[derive(Debug, Default)]
 pub struct ConvertOptions {
     /// Override for the manifest `model_id` (default: GGUF `general.name`,
     /// falling back to the input file stem).
     pub model_id: Option<String>,
+    /// `--quant` target (default: no G-Quant conversion).
+    pub quant: QuantTarget,
+    /// `--policy` assignment strategy (only consulted when `quant` is set).
+    pub policy: QuantPolicy,
 }
 
 /// Summary of a successful conversion.
@@ -79,6 +108,27 @@ fn map_dtype(dtype: GgufDType, tensor: &str) -> Result<DType, GllmError> {
 /// GGUF stores dims fastest-moving first; GLLM shapes are row-major.
 fn row_major_shape(gguf_dims: &[u64]) -> Vec<u64> {
     gguf_dims.iter().rev().copied().collect()
+}
+
+/// Whether `glcore::GgufFile::dequantize` can actually decode this GGUF
+/// source dtype to F32 today. Mirrors glcore's own match arms rather than
+/// calling `dequantize` speculatively, so the assignment step can decide
+/// *before* committing to `DType::GQ4A` (and thus before any warning/error
+/// bookkeeping gets tangled with the write pass).
+///
+/// Q4_K and Q5_0 are real GGUF quant types glcore deliberately punts to
+/// glproc's kernels (see glcore/src/format/gguf.rs) — `converter`'s only
+/// dependency is glcore, not glproc, so a real Q4_K_M model's Q4_K/Q5_0
+/// tensors cannot be re-encoded to GQ4A without either extending glcore's
+/// dequantize or adding a glproc dependency to this crate's `converter`
+/// feature (an architecture decision, not a Phase 1 default — see
+/// notes/pridwen-p1-notes.md).
+fn gguf_dtype_is_dequantizable(dtype: GgufDType) -> bool {
+    matches!(
+        dtype,
+        GgufDType::F32 | GgufDType::F16 | GgufDType::BF16
+            | GgufDType::Q4_0 | GgufDType::Q8_0 | GgufDType::Q6_K
+    )
 }
 
 /// Where a GGUF tensor lands in the GLLM package.
@@ -203,8 +253,42 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     let mut shared_plan: Vec<Planned> = Vec::new();
     let mut layer_plan: BTreeMap<u32, Vec<Planned>> = BTreeMap::new();
     for (i, info) in gguf.tensors.iter().enumerate() {
-        let dtype = map_dtype(info.dtype, &info.name)?;
+        let mut dtype = map_dtype(info.dtype, &info.name)?;
         let shape = row_major_shape(&info.dimensions);
+
+        // G-Quant assignment (Pridwen v5 Â§9 step 3): CPP Stage 1 hardcoded
+        // sensitivity table overrides the GGUF-native dtype. Only tensors
+        // whose element count divides evenly into GQ4A's 256-weight
+        // superblock are eligible â€” same constraint GGUF's own Q4_K/Q6_K
+        // already impose; anything else keeps its original dtype and gets a
+        // warning rather than a padded/truncated block the spec doesn't
+        // define (see notes/pridwen-p1-notes.md ragged-dim deviation).
+        if opts.quant == QuantTarget::Gq4a {
+            debug_assert_eq!(opts.policy, QuantPolicy::Cpp, "Phase 1 only implements CPP");
+            if let Some(assigned) = gquant_policy::assign_gq4a_cpp(&info.name) {
+                if assigned == DType::GQ4A {
+                    if !info.numel().is_multiple_of(GQ4ABlock::WEIGHTS) {
+                        warnings.push(format!(
+                            "tensor {:?}: CPP assigned GQ4A but numel {} is not a multiple of 256; \
+                             keeping original dtype {:?}",
+                            info.name, info.numel(), dtype
+                        ));
+                    } else if !gguf_dtype_is_dequantizable(info.dtype) {
+                        warnings.push(format!(
+                            "tensor {:?}: CPP assigned GQ4A but source dtype {:?} has no glcore \
+                             dequant path (Q4_K/Q5_0 dequant lives in glproc, which `converter` \
+                             does not depend on); keeping original dtype {:?}",
+                            info.name, info.dtype, dtype
+                        ));
+                    } else {
+                        dtype = DType::GQ4A;
+                    }
+                } else {
+                    dtype = assigned;
+                }
+            }
+        }
+
         let planned = |gllm_name: String| Planned {
             gllm_name,
             shape: shape.clone(),
@@ -248,18 +332,43 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     // --- Write unit files ---
     std::fs::create_dir_all(out_dir)?;
     let write_group = |plans: &[Planned], path: &Path| -> Result<Vec<TensorEntry>, GllmError> {
-        let mut datas: Vec<&[u8]> = Vec::with_capacity(plans.len());
+        // Owned buffer per tensor: GQ4A-assigned tensors are re-encoded from
+        // a freshly dequantized F32 buffer (not a borrow of the mmap'd GGUF
+        // bytes), so every entry needs to own its bytes uniformly rather
+        // than mixing borrowed-vs-owned across the same Vec.
+        let mut datas: Vec<Vec<u8>> = Vec::with_capacity(plans.len());
         for p in plans {
             let info = &gguf.tensors[p.gguf_index];
-            let bytes = gguf
-                .tensor_data(info)
-                .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
-            datas.push(bytes);
+            if p.dtype == DType::GQ4A {
+                let f32_weights = gguf
+                    .dequantize(info)
+                    .map_err(|e| convert_err(format!("tensor {}: dequant for GQ4A encode failed: {e}", info.name)))?;
+                let blocks = encode_gq4a_tensor(&f32_weights).ok_or_else(|| {
+                    convert_err(format!(
+                        "tensor {}: numel {} not a multiple of 256 (assignment step should have caught this)",
+                        info.name, f32_weights.len()
+                    ))
+                })?;
+                let mut bytes = Vec::with_capacity(blocks.len() * GQ4ABlock::BYTES);
+                for block in &blocks {
+                    bytes.extend_from_slice(&block.super_scale.to_le_bytes());
+                    for d in block.scale_delta {
+                        bytes.push(d as u8);
+                    }
+                    bytes.extend_from_slice(&block.weights);
+                }
+                datas.push(bytes);
+            } else {
+                let bytes = gguf
+                    .tensor_data(info)
+                    .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
+                datas.push(bytes.to_vec());
+            }
         }
         let spec: Vec<(&str, &[u64], DType, &[u8])> = plans
             .iter()
             .zip(&datas)
-            .map(|(p, d)| (p.gllm_name.as_str(), p.shape.as_slice(), p.dtype, *d))
+            .map(|(p, d)| (p.gllm_name.as_str(), p.shape.as_slice(), p.dtype, d.as_slice()))
             .collect();
         write_unit_file(path, &spec)
     };
@@ -570,5 +679,98 @@ mod tests {
         let pkg = GllmPackage::open(&out).unwrap();
         assert_eq!(pkg.layer_count() as u32, report.num_layers);
         assert!(pkg.verify_integrity().is_empty());
+    }
+
+    /// GQ4A-eligible fixture: `attn_q` at 256 elements (one GQ4A superblock
+    /// exactly) so the CPP assignment's divisible-by-256 path is actually
+    /// exercised end-to-end, not just skipped with a warning.
+    fn gq4a_tensors() -> Vec<(&'static str, &'static [u64])> {
+        vec![
+            ("token_embd.weight", &[8, 16][..]),
+            ("output_norm.weight", &[8][..]),
+            ("blk.0.attn_norm.weight", &[8][..]),
+            ("blk.0.attn_q.weight", &[16, 16][..]), // 256 elements
+            ("blk.0.ffn_up.weight", &[8, 4][..]),   // 32 elements: NOT eligible
+        ]
+    }
+
+    #[test]
+    fn convert_gq4a_cpp_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&gq4a_tensors(), &[("llama.block_count", 1)]));
+        let out = tmp.path().join("out");
+
+        let opts = ConvertOptions { quant: QuantTarget::Gq4a, policy: QuantPolicy::Cpp, ..Default::default() };
+        let report = convert(&gguf_path, &out, &opts).unwrap();
+
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert!(pkg.verify_integrity().is_empty());
+
+        // attn_q (256 elements, sensitivity HIGH -> GQ4A escape) is assigned GQ4A.
+        let l0 = pkg.layer_manifest(0).unwrap();
+        let attn_q = l0.tensor("attn_q.weight").unwrap();
+        assert_eq!(attn_q.dtype, DType::GQ4A);
+        assert_eq!(attn_q.size, GQ4ABlock::BYTES as u64, "one 256-elem tensor = one superblock");
+
+        // ffn_up (32 elements, not divisible by 256) keeps its original
+        // dtype despite being CPP-eligible by sensitivity bucket, with a
+        // warning explaining why.
+        let ffn_up = l0.tensor("ffn_up.weight").unwrap();
+        assert_eq!(ffn_up.dtype, DType::F32);
+        assert!(report.warnings.iter().any(|w| w.contains("ffn_up") && w.contains("not a multiple of 256")));
+
+        // attn_norm (HIGH bucket, "F16 always" in the GQ4A_CPP column) is
+        // F16, not GQ4A, even though quant=Gq4a is active.
+        let attn_norm = l0.tensor("attn_norm.weight").unwrap();
+        assert_eq!(attn_norm.dtype, DType::F16);
+
+        // output_norm (Extreme, "F32 always") stays F32.
+        assert_eq!(pkg.manifest().shared.tensor("output_norm.weight").unwrap().dtype, DType::F32);
+    }
+
+    /// GQ4A vs Q4_K_M baseline: opt-in via GWENLAND_TEST_GGUF (Pridwen v5
+    /// §14 Phase 1's `gq4a_ppl_vs_q4km_baseline`, as scoped in
+    /// notes/pridwen-p1-notes.md — glbench cannot load `.gllm` packages or
+    /// decode any quantized GLLM dtype today (pre-existing gap, not part of
+    /// this phase), so this test's bar is the spec's own fallback: "passes
+    /// if conversion completes without error; PPL delta is recorded to
+    /// notes, not gated." Records package size only (a reachable proxy for
+    /// the "Size" row in Pridwen v5 §13's Expected Results table).
+    #[test]
+    fn gq4a_ppl_vs_q4km_baseline() {
+        let Ok(path) = std::env::var("GWENLAND_TEST_GGUF") else {
+            eprintln!("SKIP: GWENLAND_TEST_GGUF not set (no real GGUF available)");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out_gq4a");
+        let opts = ConvertOptions { quant: QuantTarget::Gq4a, policy: QuantPolicy::Cpp, ..Default::default() };
+        let report = convert(Path::new(&path), &out, &opts).unwrap();
+
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert!(pkg.verify_integrity().is_empty());
+
+        let package_bytes: u64 = walk_dir_size(&out);
+        let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "GQ4A_CPP baseline: {} ({} layers, {} shared tensors, {} warnings)\n\
+             source GGUF: {source_bytes} bytes, GLLM+GQ4A package: {package_bytes} bytes\n\
+             NOTE: PPL/decode comparison vs Q4_K_M requires glbench .gllm support, \
+             which does not exist yet (see notes/pridwen-p1-notes.md) — size is the \
+             only number this test can measure.",
+            report.model_id, report.num_layers, report.shared_tensors, report.warnings.len()
+        );
+    }
+
+    fn walk_dir_size(dir: &Path) -> u64 {
+        let mut total = 0u64;
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata() {
+                    total += if meta.is_dir() { walk_dir_size(&entry.path()) } else { meta.len() };
+                }
+            }
+        }
+        total
     }
 }
