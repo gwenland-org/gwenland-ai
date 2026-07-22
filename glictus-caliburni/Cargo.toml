@@ -1,6 +1,6 @@
 [package]
 name = "glictus-caliburni"
-version = "0.1.163"
+version = "0.1.164"
 edition = "2024"
 description = "GLLM (GwenLand Language Model Format) — Ictus Caliburni"
 license = "MIT"
@@ -31,7 +31,13 @@ default = []
 # that only needs to read/describe the format (e.g. a future dequant-only
 # consumer that doesn't want glcore).
 gquant = []
-converter = ["dep:glcore", "gquant"]
+# Pridwen Phase 2 ADR (architecture/Pridwen-P2-ADR-glproc-dequant.md): glcore's
+# dequantize() deliberately excludes Q4_K/Q5_0 ("dequant lives in glproc").
+# converter needs those two dtypes decoded to F32 to re-encode them as GQ4A,
+# so it pulls in glproc's already-proven scalar dequant kernels rather than
+# duplicating that logic in glcore. Same directional pattern as
+# glproc-backend (glictus-caliburni -> glproc, never the reverse).
+converter = ["dep:glcore", "dep:glproc", "gquant"]
 # glproc adapter needs glcore's tensor decoder (ARTX10 Wave 1's gllm.rs) too.
 glproc-backend = ["dep:glproc", "dep:glcore"]
 
