@@ -469,3 +469,47 @@ coincidentally-matching wrong number on both sides.
 7 new glproc tests passing (96 total, was 92), clippy clean, 0 new
 warnings. Ready to proceed with Wave 4 (AVX2 dequant kernel + parity
 test).
+
+---
+
+[2026-07-22T21:20:00Z] [TYPE: DECISION]
+Description: Wave 4 (GQ2A AVX2 dequant kernel) complete — the highest-risk
+wave, given GQ4A's own AVX2 bug in Phase 1. Designed the extraction
+algorithm on paper before writing any intrinsics: GQ2A's sequential (not
+interleaved) 4-codes-per-byte packing (v5 §3.2 addendum) means, unlike
+GQ4A, NO lane-interleave step is needed — 2 input bytes widen directly
+via _mm256_cvtepu8_epi32 (after staging [A,A,A,A,B,B,B,B] so each byte
+lands in the 4 lanes that will extract its own 4 codes), then a per-lane
+variable right-shift (_mm256_srlv_epi32, confirmed available under plain
+AVX2, not AVX-512, via a standalone rustc compile check before relying
+on it) with shift amounts [0,2,4,6,0,2,4,6] plus a 0b11 mask extracts the
+four 2-bit codes directly in final output order.
+Two bit-exactness risks identified and avoided BEFORE writing the
+dequant math, from reasoning about floating point rounding rather than
+from a failing test: (1) _mm256_fmadd_ps (FMA) fuses multiply+add into
+one rounding step, but the scalar reference does two separate f32 ops
+(mul, then add) — using FMA would silently diverge by up to 1 ULP on
+some inputs, so plain mul+add was used instead; (2) code * (1.0/3.0)
+(reciprocal precompute) rounds twice (building the reciprocal, then
+multiplying) and is not guaranteed bit-exact with the scalar's single
+`code / 3.0` division — used _mm256_div_ps (real division) instead.
+Both of these would have been easy to get wrong silently (the values
+would look "close enough" without a bit-exact assertion), which is
+exactly why testing-standards.md's to_bits() comparison exists.
+Result: dequant_gq2a_avx2_matches_scalar (100 random trials, bit-exact)
+passed on the FIRST attempt with no debugging needed — a contrast with
+GQ4A's Phase 1 AVX2 kernel, which needed a rewrite after failing its own
+parity test at trial 0. Attributed to reasoning through the rounding-
+order risks on paper first rather than porting a superficially-similar
+pattern (GQ4A's own kernel, or GGML's) and testing after the fact.
+dequant_gq2a_stream wired to dispatch on SimdStrategy::detect(), matching
+dequant_gq4a_stream's existing pattern.
+One clippy warning (unusual_byte_groupings on a hand-derived f16 binary
+literal in a test) fixed by switching to the equivalent hex literal —
+cosmetic, not a correctness issue.
+100 glproc lib tests + kernel_parity tests passing (was 96 lib / 17
+kernel_parity, +4 kernel_parity: avx2_matches_scalar, zero_block,
+stream_dispatcher, plus the lib-side additions), clippy clean, 0 new
+warnings anywhere in kernels/gquant/*. Ready to proceed with Wave 5
+(wire into converter.rs + assign_gq2a_cpp + real-model test) — the last
+wave before GQ2A is feature-complete for Phase 2.
