@@ -59,4 +59,7 @@ pub mod dtype_codes {
     // existing code (I32 = 0x0030), no collision. Architecture B/C reserved:
     // 0x0300, 0x0400.
     pub const GQ4A: u16 = 0x0200;
+    pub const GQ2A: u16 = 0x0201;
+    // 0x0202 (GQ2A-R, incoherence-processing sub-variant) and 0x0203 (GQ1A)
+    // are reserved per v5 §8 but not yet implemented as DType variants.
 }
