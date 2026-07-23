@@ -10,10 +10,11 @@ The repo is a single Cargo workspace rooted at the repository root — run cargo
 - `glproc` — the CPU inference engine (pure Rust, SIMD). This is the **numerical ground truth** the GPU backends are validated against.
 - `glcuda`, `glvulkan`, `glmetal` — the GPU backends (CUDA is the furthest along; see `architecture/ArchGLML_X2.md`).
 - `glcli` — the `gwen` binary: `cargo run -p glcli` runs local inference through the engines.
+- `glictus-caliburni` — the `.gllm` package format and GLLM runtime (Pridwen quantization research: GQ4A/GQ2A superblock formats, CPP assignment policy). Experimental and separate from the GGUF path `glcli` uses today — see `architecture/Pridwen-proposal-v5.md`.
 
-There is also a `packages/` group (`packages/core`, `packages/gltui`, `packages/mcp`) — the `gltui` terminal UI and MCP server. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+There is also a `packages/` group (`packages/core`, `packages/mcp`) — an in-progress training-arm crate and an MCP server. `gltui` (the former terminal UI) was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL engines, its `CoreBridge` was a stub — and is no longer a workspace member; don't build against it. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
 
-Note the workspace mixes editions: `glcore`/`glproc`/`glcli` are edition 2021, `packages/gltui` is edition 2024.
+Note the workspace mixes editions: `glcore`/`glproc`/`glcli`/`glbench`/`glcuda`/`glvulkan`/`glmetal` are edition 2021; `glictus-caliburni` and `packages/*` are edition 2024.
 
 ## What you'll need
 
@@ -28,19 +29,13 @@ cargo build --release -p glcli          # produces target/release/gwen
 cargo run -p glcli -- --help            # see the available commands
 ```
 
-The terminal UI:
-
-```bash
-cargo run -p gltui
-```
-
 GPU support is opt-in. The CUDA backend (`glcuda`) loads the NVIDIA driver at runtime — no CUDA toolkit needed to build — and reports itself unavailable on machines without a driver, so the runtime falls back to the CPU engine.
 
 ## Running the checks
 
 ```bash
 cargo test -p glcore -p glproc -p glcuda
-cargo test -p gltui
+cargo test -p glictus-caliburni --features converter,glproc-backend
 
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
@@ -78,9 +73,8 @@ The current dependency budget, so you know the baseline you're changing:
   `byteorder`, `serde`/`serde_json` (metadata only — never on the hot path);
   `glproc` adds `num_cpus`; `glcuda` has *zero* external deps (the driver is
   `dlopen`ed, not linked); `glbench` is workspace-only **by charter**.
-- **Interface crates get more latitude** — `glcli` uses `clap`; `gltui` uses
-  `ratatui`/`crossterm`/`tokio`/`reqwest`. More latitude is not a free pass:
-  the same questions below apply.
+- **Interface crates get more latitude** — `glcli` uses `clap`. More
+  latitude is not a free pass: the same questions below apply.
 - **ML dependencies are never acceptable in any crate** — no torch/candle/ort
   bindings, no ggml FFI, no "just for reference" inference crates. That's the
   project.
