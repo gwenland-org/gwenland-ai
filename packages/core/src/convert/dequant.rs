@@ -792,32 +792,36 @@ fn dequant_q4_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 ///   [scales: i8 × 16 (16 bytes)] — per-sub-block signed scale (16 sub-blocks of 16)
 ///   [d:   f16 (2 bytes)]         — superblock scale factor
 ///
-/// Bit reconstruction (GGML dequantize_row_q6_K):
+/// Bit reconstruction (GGML `dequantize_row_q6_K`) — **NOT** a linear scan over
+/// `i in 0..256`. The block is two independent 128-weight halves; within a half,
+/// byte `l` of `ql` contributes weight `l` (low nibble) and weight `l + 64` (high
+/// nibble), while `qh[l]` packs the 2 high bits of weights `l`, `l+32`, `l+64`,
+/// `l+96`. An earlier version of this function used the naive sequential-`i`
+/// reading above — that formula disagrees with real GGML/llama.cpp files and was
+/// found, via cross-checking against `glproc::kernels::dequant::q6_k::scalar`
+/// (GwenLand's separately-validated `glproc` crate, itself validated against a
+/// real Q4_K_M model end-to-end), to silently corrupt every Q6_K tensor decoded
+/// through it — see `architecture/mensura-veritatis-v3/ARTX2-Quant.md` for the
+/// full audit that found this the same bug class, in a different crate:
 ///
 /// ```text
-/// For element i (0..255):
-///     ql_byte = ql[i / 2]
-///     qh_byte = qh[i / 4]
-///
-///     low4  = (ql_byte >> ((i & 1) * 4)) & 0x0F
-///     high2 = (qh_byte >> ((i & 3) * 2)) & 0x03
-///
-///     q6_raw = low4 | (high2 << 4)          — unsigned [0, 63]
-///     q      = q6_raw as i8 - 32            — signed   [-32, 31]
+/// For half in 0..2 (128 weights each):
+///     ql_half = ql[half*64 .. half*64+64]   (64 bytes)
+///     qh_half = qh[half*32 .. half*32+32]   (32 bytes)
+///     sc_half = scales[half*8 .. half*8+8]  (8 bytes)
+///     for l in 0..32:
+///         is = l / 16   (sub-block selector within the half, 0 or 1)
+///         q1 = (ql_half[l]      & 0x0F) | ((qh_half[l] & 0x03) << 4)  - 32  -> out[l]
+///         q2 = (ql_half[l + 32] & 0x0F) | (((qh_half[l]>>2)&0x03)<<4) - 32  -> out[l+32]
+///         q3 = (ql_half[l] >> 4)        | (((qh_half[l]>>4)&0x03)<<4) - 32  -> out[l+64]
+///         q4 = (ql_half[l + 32] >> 4)   | (((qh_half[l]>>6)&0x03)<<4) - 32  -> out[l+96]
+///         W[out_idx] = d * sc_half[is + {0,2,4,6}] * q{1,2,3,4}
 /// ```
 ///
-/// Sub-block structure: 16 sub-blocks × 16 elements each.
-/// Each sub-block has one signed i8 scale stored in `scales[j]`.
-///
-/// Dequant formula:
-///   W[i] = d * scales[j] * q[i]
-///
-/// where j = i / 16 is the sub-block index.
+/// Sub-block structure: 16 sub-blocks × 16 elements each, but the sub-block a
+/// given output index belongs to follows the interleave above, not `i / 16`.
 fn dequant_q6_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
     const SUPERBLOCK_ELEMENTS: usize = 256;
-    const N_SUBBLOCKS: usize = 16;
-    const SUBBLOCK_ELEMENTS: usize = SUPERBLOCK_ELEMENTS / N_SUBBLOCKS; // 16
-
     // Layout: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210 bytes.
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
 
@@ -834,37 +838,31 @@ fn dequant_q6_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
 
     for b in 0..n_blocks {
         let base = b * BLOCK_BYTES;
+        let d = read_f16_as_f32(&raw[base + 208..]);
 
-        // Region offsets within the superblock.
-        let ql_base     = base;           // 128 bytes: low 4 bits
-        let qh_base     = base + 128;     // 64 bytes:  high 2 bits
-        let scales_base = base + 192;     // 16 bytes:  i8 sub-block scales
-        let d_base      = base + 208;     // 2 bytes:   f16 superblock scale
-
-        let d = read_f16_as_f32(&raw[d_base..]);
-
-        let block_elem_count =
-            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
-
-        for i in 0..block_elem_count {
-            // ── Reconstruct 6-bit value ───────────────────────────────────────
-            // ql stores two 4-bit low halves per byte (low nibble = even index).
-            let ql_byte = raw[ql_base + i / 2];
-            let low4    = (ql_byte >> ((i & 1) * 4)) & 0x0F;
-
-            // qh stores four 2-bit high parts per byte.
-            let qh_byte = raw[qh_base + i / 4];
-            let high2   = (qh_byte >> ((i & 3) * 2)) & 0x03;
-
-            let q6_raw = low4 | (high2 << 4);          // unsigned [0, 63]
-            let q      = (q6_raw as i32) - 32;         // signed   [-32, 31]
-
-            // ── Sub-block scale ───────────────────────────────────────────────
-            let j       = i / SUBBLOCK_ELEMENTS;
-            let scale_j = raw[scales_base + j] as i8 as f32;
-
-            out.push(d * scale_j * q as f32);
+        // Full superblock is always 256 weights (fixed GGML block size); only
+        // the tail block of a tensor may need fewer than that copied out below.
+        let mut block = [0f32; SUPERBLOCK_ELEMENTS];
+        for half in 0..2 {
+            let ql = &raw[base + half * 64..base + half * 64 + 64];
+            let qh = &raw[base + 128 + half * 32..base + 128 + half * 32 + 32];
+            let sc = &raw[base + 192 + half * 8..base + 192 + half * 8 + 8];
+            let out_half = &mut block[half * 128..half * 128 + 128];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32 - 32;
+                let q2 = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32 - 32;
+                let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32 - 32;
+                let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i32 - 32;
+                out_half[l] = d * (sc[is] as i8 as f32) * q1 as f32;
+                out_half[l + 32] = d * (sc[is + 2] as i8 as f32) * q2 as f32;
+                out_half[l + 64] = d * (sc[is + 4] as i8 as f32) * q3 as f32;
+                out_half[l + 96] = d * (sc[is + 6] as i8 as f32) * q4 as f32;
+            }
         }
+
+        let block_elem_count = SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+        out.extend_from_slice(&block[..block_elem_count]);
     }
     Ok(out)
 }
@@ -873,9 +871,14 @@ fn dequant_q6_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
 
 /// Q6_K Euler cosine-projection dequantisation.
 ///
-/// Reconstructs the signed 6-bit integers identically to Standard mode, then
-/// passes them through `euler_dequant_block` using the superblock `d` as δ_b.
-/// Sub-block scales are not applied — the cosine projection absorbs magnitude.
+/// Reconstructs the signed 6-bit integers using the same two-half interleaved
+/// GGML layout as `dequant_q6_k_standard` (see that function's doc comment for
+/// the full derivation — the naive sequential-`i` reading used here previously
+/// produced correctly-valued but wrongly-POSITIONED integers, which would have
+/// scrambled weights across the output tensor even though each individual value
+/// was internally consistent), then passes them through `euler_dequant_block`
+/// in correct weight-index order using the superblock `d` as δ_b. Sub-block
+/// scales are not applied — the cosine projection absorbs magnitude.
 fn dequant_q6_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String> {
     const SUPERBLOCK_ELEMENTS: usize = 256;
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
@@ -890,31 +893,26 @@ fn dequant_q6_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     }
 
     let mut out = Vec::with_capacity(n_elements);
-    let mut ivalues = Vec::with_capacity(SUPERBLOCK_ELEMENTS);
 
     for b in 0..n_blocks {
-        let base        = b * BLOCK_BYTES;
-        let ql_base     = base;
-        let qh_base     = base + 128;
-        let d_base      = base + 208;
+        let base = b * BLOCK_BYTES;
+        let delta_b = read_f16_as_f32(&raw[base + 208..]);
 
-        let delta_b = read_f16_as_f32(&raw[d_base..]);
-
-        let block_elem_count =
-            SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
-
-        ivalues.clear();
-        for i in 0..block_elem_count {
-            let ql_byte = raw[ql_base + i / 2];
-            let low4    = (ql_byte >> ((i & 1) * 4)) & 0x0F;
-            let qh_byte = raw[qh_base + i / 4];
-            let high2   = (qh_byte >> ((i & 3) * 2)) & 0x03;
-            let q6_raw  = low4 | (high2 << 4);
-            let q       = (q6_raw as i32) - 32;
-            ivalues.push(q);
+        let mut ivalues = [0i32; SUPERBLOCK_ELEMENTS];
+        for half in 0..2 {
+            let ql = &raw[base + half * 64..base + half * 64 + 64];
+            let qh = &raw[base + 128 + half * 32..base + 128 + half * 32 + 32];
+            let out_half = &mut ivalues[half * 128..half * 128 + 128];
+            for l in 0..32 {
+                out_half[l] = ((ql[l] & 0x0F) | ((qh[l] & 0x03) << 4)) as i32 - 32;
+                out_half[l + 32] = ((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 0x03) << 4)) as i32 - 32;
+                out_half[l + 64] = ((ql[l] >> 4) | (((qh[l] >> 4) & 0x03) << 4)) as i32 - 32;
+                out_half[l + 96] = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 0x03) << 4)) as i32 - 32;
+            }
         }
 
-        let weights = euler_dequant_block(&ivalues, delta_b);
+        let block_elem_count = SUPERBLOCK_ELEMENTS.min(n_elements - b * SUPERBLOCK_ELEMENTS);
+        let weights = euler_dequant_block(&ivalues[..block_elem_count], delta_b);
         out.extend_from_slice(&weights);
     }
     Ok(out)
@@ -1308,6 +1306,41 @@ mod tests {
     fn test_q6k_truncated_data_error() {
         let raw = vec![0u8; 50];
         assert!(dequant_q6_k_standard(&raw, 256).is_err());
+    }
+
+    /// Regression test for the naive-linear-nibble-order bug (found via
+    /// GwenLand's `glproc` crate — see `architecture/mensura-veritatis-v3/
+    /// ARTX2-Quant.md`): the uniform-fill tests above (`_zero_ql_zero_qh`,
+    /// `_max_value`, `_signed_range`) can't distinguish the correct GGML
+    /// two-half interleave from the old sequential-`i` bug, because every
+    /// byte in those fixtures is identical — reordering *which* byte feeds
+    /// *which* output position is invisible when all bytes agree. This test
+    /// uses distinct, non-uniform bytes at two source positions the two
+    /// formulas disagree on (`ql[32]` vs `ql[16]` for output index 32) so a
+    /// regression to the old order changes the asserted value, not just
+    /// silently passes.
+    #[test]
+    fn test_q6k_standard_output_index_32_uses_correct_ggml_interleave() {
+        let mut raw = vec![0u8; 210];
+        raw[32] = 0x05; // ql[32] low nibble = 5 — feeds correct output[32]
+        raw[16] = 0x0F; // ql[16] low nibble = 15 — old (wrong) formula would use this instead
+        raw[192 + 2] = 1; // scales[2] = 1 (sub-block index the correct formula selects)
+        let d_bits = le16(f32_to_f16_bits(1.0));
+        raw[208] = d_bits[0];
+        raw[209] = d_bits[1];
+
+        let out = dequant_q6_k_standard(&raw, 256).unwrap();
+        // Correct: q2 = (ql[32]&0x0F | (qh[0]>>2 & 0x03)<<4) - 32 = (5|0) - 32 = -27;
+        // W[32] = d * scales[2] * q2 = 1.0 * 1 * -27.0 = -27.0.
+        // The old sequential-`i` formula would instead read ql[16]=0x0F and
+        // scales[2] the same way, giving (15-32) * 1 = -17.0 — a different,
+        // wrong value, which is exactly what this test guards against.
+        assert!(
+            (out[32] - (-27.0)).abs() < 1e-4,
+            "output[32] should be -27.0 (correct GGML interleave), got {} \
+             (-17.0 would mean the old buggy sequential-i formula came back)",
+            out[32]
+        );
     }
 
     // ── Q5_K tests ────────────────────────────────────────────────────────────

@@ -70,9 +70,12 @@ graph TD
 | `glmetal` | Metal backend (Apple Silicon) | ◻ planned |
 | `glbench` | Profiler & benchmark harness — engine telemetry, roofline, A/B runs | ✅ |
 | `glcli` | The `gwen` command-line interface | ✅ |
+| `glictus-caliburni` | The `.gllm` package format + GLLM runtime (Pridwen quantization research: GQ4A/GQ2A). Separate from the GGUF path `gwen run` uses — see `architecture/Pridwen-proposal-v5.md` | 🧪 experimental |
 
-There is also a `packages/` group (`packages/core`, `packages/gltui`,
-`packages/mcp`) holding the `gltui` terminal UI and an MCP server.
+There is also a `packages/` group (`packages/core`, `packages/mcp`) — an
+in-progress training-arm crate and an MCP server. `gltui` (the terminal UI)
+was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL
+engines — and is no longer a workspace member.
 
 ## Building
 
@@ -98,9 +101,6 @@ gwen run model.gguf
 
 # model metadata
 gwen info model.gguf
-
-# terminal UI
-cargo run -p gltui
 ```
 
 `gwen run` flags: `--prompt`, `--max-tokens` (256), `--temperature` (0.8),
@@ -141,7 +141,7 @@ The whole validation is reproducible on a free Colab T4 via
 ```bash
 cargo build --workspace
 cargo test  -p glcore -p glproc
-cargo test  -p gltui
+cargo test  -p glictus-caliburni --features converter,glproc-backend
 
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings

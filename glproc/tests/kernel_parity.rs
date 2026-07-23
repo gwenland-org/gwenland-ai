@@ -280,6 +280,67 @@ fn dequant_q5_0_known_values_and_simd_parity() {
     }
 }
 
+/// `qdot::q5_0::row_dot` (the integer-dot kernel `glproc::runner::Runner`
+/// actually uses at inference) re-derives Q5_0's nibble/qh-bit unpack inline
+/// rather than importing `dequant::q5_0::scalar`'s implementation — unlike
+/// Q4_K, where `qdot::q4_k::scalar` imports `dequant::q4_k::scalar::{scale_min,
+/// decode_scales}` directly. Two independent implementations of the same bit
+/// layout, currently agreeing only because both happen to be correct — this
+/// is exactly the shape of bug that corrupted `glcore`'s Q6_K path (see
+/// `architecture/mensura-veritatis-v3/ARTX2-Quant.md`). This test cross-checks
+/// `row_dot`'s integer-domain result against a plain f32 dot product computed
+/// from `dequant_block`'s output, on random (non-degenerate) data, so a future
+/// edit to either implementation that breaks their agreement fails loudly here
+/// instead of silently, the way the Q6_K divergence did for months.
+///
+/// Not bit-exact: `row_dot` quantizes the activation to int8 first (the whole
+/// point of the kernel), which the module's own doc comment (`qdot/mod.rs`)
+/// states costs ~1e-3 relative error per dot — the tolerance below is set
+/// generously above that (1%) so it catches a real nibble/offset-formula
+/// divergence without being sensitive to ordinary int8 rounding.
+#[test]
+fn qdot_q5_0_row_dot_matches_f32_dot_of_dequant_block() {
+    use glproc::kernels::dequant::q5_0;
+    use glproc::kernels::qdot::{q5_0 as qdot_q5_0, QuantizedActivation};
+
+    let mut rng = Lcg::new(2026);
+    let n_blocks = 4;
+    let mut row = vec![0u8; 22 * n_blocks];
+    rng.fill(&mut row);
+    // Keep every block's f16 scale finite and reasonably sized (avoid NaN/inf
+    // and avoid a degenerate all-zero scale that would trivially pass).
+    for block in row.chunks_mut(22) {
+        block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+    }
+
+    // Ground truth: dequantize every block to f32 (already-verified-correct
+    // scalar kernel), then compute a plain f32 dot against a random activation.
+    let mut weights = vec![0f32; 32 * n_blocks];
+    for (b, block) in row.chunks_exact(22).enumerate() {
+        let mut w = [0f32; 32];
+        q5_0::scalar::dequant_block(block, &mut w);
+        weights[b * 32..b * 32 + 32].copy_from_slice(&w);
+    }
+    let mut x = vec![0f32; 32 * n_blocks];
+    let mut xbytes = vec![0u8; 32 * n_blocks];
+    rng.fill(&mut xbytes);
+    for (xi, &b) in x.iter_mut().zip(&xbytes) {
+        *xi = (b as i8) as f32 / 16.0; // spread roughly [-8, 8), no huge outliers
+    }
+    let reference_dot: f32 = weights.iter().zip(&x).map(|(w, xi)| w * xi).sum();
+
+    let mut act = QuantizedActivation::with_capacity(32 * n_blocks);
+    act.quantize(&x);
+    let got = qdot_q5_0::scalar::row_dot(&row, &act);
+
+    let tol = reference_dot.abs().max(1.0) * 0.01;
+    assert!(
+        (got - reference_dot).abs() <= tol,
+        "qdot::q5_0::row_dot diverged from dequant_block+f32-dot beyond int8 \
+         quantization noise: got {got}, reference {reference_dot} (tol {tol})"
+    );
+}
+
 /// Q8_0 block dequant must agree with the existing whole-tensor kernel.
 #[test]
 fn dequant_q8_0_block_matches_tensor_path() {
