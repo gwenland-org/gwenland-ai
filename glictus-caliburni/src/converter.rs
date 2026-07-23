@@ -28,7 +28,7 @@ use crate::checksum::sha256_file;
 use crate::constants::{CHECKSUMS_FILENAME, MANIFEST_FILENAME, SHARED_FILENAME};
 use crate::error::GllmError;
 use crate::gquant::{GQ2ABlock, GQ4ABlock};
-use crate::gquant::encoder::{encode_gq2a_tensor, encode_gq4a_tensor};
+use crate::gquant::encoder::{encode_gq2a_tensor, encode_gq4a_tensor, f32_to_f16};
 use crate::layer_io::write_unit_file;
 use crate::manifest::{
     CustomMetadata, DType, ExtensionUri, FormatVersion, GllmManifest, LayerManifest,
@@ -51,6 +51,16 @@ pub enum QuantTarget {
     /// heterogeneous with GQ4A as an escape hatch for EXTREME/HIGH
     /// sensitivity tensors under CPP (see `gquant_policy::assign_gq2a_cpp`).
     Gq2a,
+    /// Diagnostic only. Every tensor is dequantized to real F32 bytes,
+    /// regardless of its original GGUF dtype — no GQ4A/GQ2A encoder is
+    /// touched. This is NOT `None` (which keeps each tensor's original GGUF
+    /// dtype, including Q4_K/Q5_0/Q6_K/etc — dtypes the GLLM runtime cannot
+    /// read at all today). `F32` exists to isolate whether a garbage-output
+    /// bug is in G-Quant dequantization or somewhere deeper (attention,
+    /// RoPE, embedding lookup): a package with zero quantized tensors is the
+    /// cleanest possible control group. Packages are uncompressed and huge
+    /// (~4x a Q4_K_M source) — never a shipping format.
+    F32,
 }
 
 /// Assignment policy for `--policy` (Pridwen v5 §4). Phase 1 scope: CPP
@@ -135,20 +145,30 @@ fn gguf_dtype_is_dequantizable(dtype: GgufDType) -> bool {
 /// `glcore`'s path for everything it supports and falling back to
 /// `glproc`'s scalar dequant kernels for `Q4_K`/`Q5_0` (which
 /// `glcore::GgufFile::dequantize` deliberately rejects — see its own doc
-/// comment: "dequant lives in glproc"). This is the one place `converter`
+/// comment: "dequant lives in glproc") and for `Q6_K` (which `glcore` DOES
+/// accept but gets wrong: `glcore::format::gguf::dequant_q6_k` assumes a
+/// naive linear nibble order, while `glproc::kernels::dequant::q6_k::scalar`
+/// implements GGML's real two-half interleaved layout — see that module's
+/// own doc comment, which flags the disagreement explicitly. Confirmed via
+/// `diff_dump.rs` on a real Q4_K_M model: every layer's Q6_K-sourced
+/// `ffn_down.weight` was silently corrupted by the wrong nibble order,
+/// which is what produced garbage `.gllm` output while
+/// `glproc::runner::Runner` (which never calls `glcore`'s Q6_K path) stayed
+/// coherent on the identical GGUF. This is the one place `converter`
 /// crosses into `glproc`; every other tensor still goes through `glcore`
 /// unchanged (Pridwen Phase 2 ADR). Shared by both GQ4A and GQ2A encoding —
 /// the dequant-to-F32 step is identical regardless of which superblock
 /// format the F32 buffer then gets re-encoded into.
 fn dequantize_for_gquant(gguf: &GgufFile, info: &glcore::format::gguf::GgufTensorInfo) -> Result<Vec<f32>, GllmError> {
     match info.dtype {
-        GgufDType::Q4_K | GgufDType::Q5_0 => {
+        GgufDType::Q4_K | GgufDType::Q5_0 | GgufDType::Q6_K => {
             let raw = gguf
                 .tensor_data(info)
                 .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
             let dequant = match info.dtype {
                 GgufDType::Q4_K => glproc::kernels::dequant::q4_k::scalar::run(raw),
                 GgufDType::Q5_0 => glproc::kernels::dequant::q5_0::scalar::run(raw),
+                GgufDType::Q6_K => glproc::kernels::dequant::q6_k::scalar::run(raw),
                 _ => unreachable!(),
             };
             dequant.map_err(|e| {
@@ -260,6 +280,10 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         expert_used_count: arch_meta_u64(&gguf, &arch, "expert_used_count").map(|v| v as u32),
         sliding_window: arch_meta_u64(&gguf, &arch, "attention.sliding_window").map(|v| v as u32),
         attention_bias: None,
+        rms_eps: gguf
+            .get_meta(&format!("{arch}.attention.layer_norm_rms_epsilon"))
+            .and_then(|v| v.as_f32())
+            .map(f64::from),
     };
 
     let model_id = opts
@@ -286,22 +310,32 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         let mut dtype = map_dtype(info.dtype, &info.name)?;
         let shape = row_major_shape(&info.dimensions);
 
-        // G-Quant assignment (Pridwen v5 Â§9 step 3): CPP Stage 1 hardcoded
-        // sensitivity table overrides the GGUF-native dtype. Both GQ4A and
-        // GQ2A are 256-weight-superblock formats, so the same eligibility
-        // constraints apply to whichever one the policy assigns: only
-        // tensors whose element count divides evenly into 256 are eligible
-        // (same constraint GGUF's own Q4_K/Q6_K already impose), and the
-        // source dtype must have an available dequant path. Anything that
-        // fails either check keeps its original dtype and gets a warning
-        // rather than a padded/truncated block the spec doesn't define (see
-        // notes/pridwen-p1-notes.md ragged-dim deviation).
-        if opts.quant != QuantTarget::None {
+        // Diagnostic F32 passthrough (see `QuantTarget::F32`'s doc comment):
+        // every tensor becomes real F32, unconditionally — no sensitivity
+        // table, no superblock eligibility check (F32 has no block size),
+        // no CPP policy involved at all. Checked before the G-Quant branch
+        // below so a `--quant F32` run never consults `gquant_policy`.
+        if opts.quant == QuantTarget::F32 {
+            dtype = DType::F32;
+        } else if opts.quant != QuantTarget::None {
+            // G-Quant assignment (Pridwen v5 Â§9 step 3): CPP Stage 1
+            // hardcoded sensitivity table overrides the GGUF-native dtype.
+            // Both GQ4A and GQ2A are 256-weight-superblock formats, so the
+            // same eligibility constraints apply to whichever one the
+            // policy assigns: only tensors whose element count divides
+            // evenly into 256 are eligible (same constraint GGUF's own
+            // Q4_K/Q6_K already impose), and the source dtype must have an
+            // available dequant path. Anything that fails either check
+            // keeps its original dtype and gets a warning rather than a
+            // padded/truncated block the spec doesn't define (see
+            // notes/pridwen-p1-notes.md ragged-dim deviation).
             debug_assert_eq!(opts.policy, QuantPolicy::Cpp, "only CPP is implemented so far");
             let assigned = match opts.quant {
                 QuantTarget::Gq4a => gquant_policy::assign_gq4a_cpp(&info.name),
                 QuantTarget::Gq2a => gquant_policy::assign_gq2a_cpp(&info.name),
-                QuantTarget::None => unreachable!("guarded by the outer if"),
+                QuantTarget::None | QuantTarget::F32 => {
+                    unreachable!("guarded by the outer if/else-if")
+                }
             };
             if let Some(assigned) = assigned {
                 if assigned == DType::GQ4A || assigned == DType::GQ2A {
@@ -415,6 +449,35 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
                     bytes.extend_from_slice(&block.weights);
                 }
                 datas.push(bytes);
+            } else if p.dtype == DType::F32 && info.dtype != GgufDType::F32 {
+                // `--quant F32` diagnostic passthrough (or any future CPP
+                // "F32 always" row whose source isn't already F32): actually
+                // dequantize, don't just relabel — the same corruption class
+                // the F16-norm branch below already exists to prevent. Reuses
+                // `dequantize_for_gquant` (Q4_K/Q5_0 via glproc, everything
+                // else via glcore) even though no G-Quant re-encoding follows;
+                // it is simply "decode this tensor to f32", which is exactly
+                // what this branch needs.
+                let f32_weights = dequantize_for_gquant(&gguf, info)?;
+                let bytes: Vec<u8> = f32_weights.iter().flat_map(|f| f.to_le_bytes()).collect();
+                datas.push(bytes);
+            } else if p.dtype == DType::F16 && info.dtype == GgufDType::F32 {
+                // CPP's "F16 always" norm-tensor assignment (attn_norm/
+                // ffn_norm) relabels the manifest dtype without the source
+                // GGUF ever having been F16 — this model's norms are F32.
+                // Actually narrow the bytes here; previously this branch
+                // fell through to the plain copy below, which wrote raw F32
+                // bytes under a manifest entry claiming F16 (half the bytes
+                // the shape/dtype pair promised), corrupting every reader
+                // that trusts the manifest's dtype to size its read.
+                let f32_bytes = gguf
+                    .tensor_data(info)
+                    .map_err(|e| convert_err(format!("tensor {}: {e}", info.name)))?;
+                let f16_bytes: Vec<u8> = f32_bytes
+                    .chunks_exact(4)
+                    .flat_map(|b| f32_to_f16(f32::from_le_bytes([b[0], b[1], b[2], b[3]])).to_le_bytes())
+                    .collect();
+                datas.push(f16_bytes);
             } else {
                 let bytes = gguf
                     .tensor_data(info)
@@ -780,6 +843,12 @@ mod tests {
         // F16, not GQ4A, even though quant=Gq4a is active.
         let attn_norm = l0.tensor("attn_norm.weight").unwrap();
         assert_eq!(attn_norm.dtype, DType::F16);
+        // Regression: the manifest dtype must match the actual bytes on
+        // disk. This tensor's source GGUF dtype is F32 (synth_gguf always
+        // writes F32) — the CPP relabel to F16 must carry a real conversion,
+        // not just overwrite the dtype tag on untouched F32 bytes (which
+        // silently doubled every reader's expected byte count).
+        assert_eq!(attn_norm.size, 8 * 2, "8 elements at 2 bytes/elem for real F16, not F32's 4");
 
         // output_norm (Extreme, "F32 always") stays F32.
         assert_eq!(pkg.manifest().shared.tensor("output_norm.weight").unwrap().dtype, DType::F32);
@@ -835,6 +904,123 @@ mod tests {
         let attn_norm = l0.tensor("attn_norm.weight").unwrap();
         assert_eq!(attn_norm.dtype, DType::F16);
         assert_eq!(pkg.manifest().shared.tensor("output_norm.weight").unwrap().dtype, DType::F32);
+    }
+
+    /// `--quant F32` diagnostic passthrough: every tensor gets F32,
+    /// unconditionally — no sensitivity table consulted, no GQ4A/GQ2A
+    /// tensor anywhere in the manifest, regardless of the tensor's role.
+    #[test]
+    fn convert_quant_f32_assigns_f32_to_every_tensor() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Reuse the GQ2A fixture's tensor set (deliberately mixes every
+        // sensitivity bucket) so this proves F32 mode ignores the sensitivity
+        // table entirely, not just that the two "always" rows happen to
+        // already be F32/F16 by coincidence.
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&gq2a_tensors(), &[("llama.block_count", 1)]));
+        let out = tmp.path().join("out");
+
+        let opts = ConvertOptions { quant: QuantTarget::F32, ..Default::default() };
+        let report = convert(&gguf_path, &out, &opts).unwrap();
+
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert!(pkg.verify_integrity().is_empty());
+
+        let l0 = pkg.layer_manifest(0).unwrap();
+        for name in ["attn_norm.weight", "attn_q.weight", "attn_v.weight", "ffn_down.weight"] {
+            assert_eq!(l0.tensor(name).unwrap().dtype, DType::F32, "{name} must be F32 under --quant F32");
+        }
+        assert_eq!(pkg.manifest().shared.tensor("output_norm.weight").unwrap().dtype, DType::F32);
+        assert_eq!(pkg.manifest().shared.tensor("token_embeddings").unwrap().dtype, DType::F32);
+
+        // No superblock-eligibility warnings: F32 has no block size, so
+        // nothing should ever fall back with a "not a multiple of 256" note.
+        assert!(
+            report.warnings.iter().all(|w| !w.contains("not a multiple of")),
+            "F32 mode must never hit the superblock-eligibility path: {:?}",
+            report.warnings
+        );
+        assert!(pkg.manifest().quantization.is_none(), "an all-F32 package has no quantization scheme");
+    }
+
+    /// F32 diagnostic vs a real Q4_K_M source: opt-in via GWENLAND_TEST_GGUF,
+    /// same bar as the GQ4A/GQ2A baselines. This is the one test that
+    /// actually exercises the new dequantize-on-mismatch branch in
+    /// `write_group` (real Q4_K/Q5_0/Q6_K source tensors, not the synthetic
+    /// fixture's all-F32 data) — proof the diagnostic control group is
+    /// itself uncorrupted before anyone draws a conclusion from its E2E
+    /// output (see notes/project_gllm_e2e_garbage_output.md).
+    #[test]
+    fn quant_f32_diagnostic_dequantizes_every_real_tensor() {
+        let Ok(path) = std::env::var("GWENLAND_TEST_GGUF") else {
+            eprintln!("SKIP: GWENLAND_TEST_GGUF not set (no real GGUF available)");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out_f32");
+        let opts = ConvertOptions { quant: QuantTarget::F32, ..Default::default() };
+        let report = convert(Path::new(&path), &out, &opts).unwrap();
+
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert!(pkg.verify_integrity().is_empty());
+
+        let mut non_f32 = Vec::new();
+        for t in &pkg.manifest().shared.tensors {
+            if t.dtype != DType::F32 {
+                non_f32.push(t.name.clone());
+            }
+        }
+        for layer in &pkg.manifest().layers {
+            for t in &layer.tensors {
+                if t.dtype != DType::F32 {
+                    non_f32.push(format!("layer {}: {}", layer.index, t.name));
+                }
+            }
+        }
+        assert!(non_f32.is_empty(), "every tensor must be F32 under --quant F32, found: {non_f32:?}");
+
+        let package_bytes: u64 = walk_dir_size(&out);
+        let source_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "F32 diagnostic: {} ({} layers, {} shared tensors, {} warnings)\n\
+             source GGUF: {source_bytes} bytes, GLLM+F32 package: {package_bytes} bytes \
+             (expected: uncompressed, several times larger than the Q4_K_M source)",
+            report.model_id, report.num_layers, report.shared_tensors, report.warnings.len()
+        );
+    }
+
+    /// Regression test for the Q6_K silent-corruption bug (found via
+    /// `diff_dump.rs` while investigating `.gllm` E2E garbage output, see
+    /// notes/issues/gllm-e2e-garbage-output.md): `glcore::GgufFile::dequantize`
+    /// DOES accept Q6_K (unlike Q4_K/Q5_0, which it rejects outright) but gets
+    /// the nibble layout wrong — `dequantize_for_gquant` must route Q6_K
+    /// through `glproc::kernels::dequant::q6_k::scalar::run` (the
+    /// GGML-faithful implementation), not fall through to `glcore`. Every
+    /// real Q4_K_M GGUF has Q6_K-sourced tensors (`ffn_down.weight` in this
+    /// model's case, every layer), so this is opt-in via GWENLAND_TEST_GGUF
+    /// rather than a synthetic block — the bug only manifested on real
+    /// tensor bytes, not the hand-built single-block fixtures `glproc`'s own
+    /// kernel tests use.
+    #[test]
+    fn dequantize_for_gquant_routes_q6_k_through_glproc_not_glcore() {
+        let Ok(path) = std::env::var("GWENLAND_TEST_GGUF") else {
+            eprintln!("SKIP: GWENLAND_TEST_GGUF not set (no real GGUF available)");
+            return;
+        };
+        let gguf = GgufFile::open(&path).unwrap();
+        let info = gguf
+            .tensors
+            .iter()
+            .find(|t| t.dtype == GgufDType::Q6_K)
+            .expect("a real Q4_K_M model must have at least one Q6_K tensor to test against");
+
+        let routed = dequantize_for_gquant(&gguf, info).unwrap();
+        let raw = gguf.tensor_data(info).unwrap();
+        let ground_truth = glproc::kernels::dequant::q6_k::scalar::run(raw).unwrap();
+        assert_eq!(
+            routed, ground_truth,
+            "tensor {:?}: dequantize_for_gquant must match glproc's GGML-faithful Q6_K dequant",
+            info.name
+        );
     }
 
     /// GQ4A vs Q4_K_M baseline: opt-in via GWENLAND_TEST_GGUF (Pridwen v5
