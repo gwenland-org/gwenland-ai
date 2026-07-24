@@ -1,0 +1,47 @@
+\section{Complexity Analysis}
+\label{sec:complexity}
+
+\subsection{Per-Component Costs}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Time complexity by component; $n$ = operations in the graph,
+$k$ = constraints, $p$ = candidate plans, $d$ = metric dimensions.}
+\label{tab:complexity}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Component & Complexity & Notes \\
+\midrule
+Single constraint (per plan) & $O(n)$ & Safety $O(n^2)$ worst case, $O(n)$ observed \\
+Validation (total) & $O(knp)$ & $k = 7$ by default \\
+Plan generation & $O(N_{\max} \cdot n)$ & bounded by $N_{\max} = 64$ \\
+Cost evaluation & $O(dp)$ & $d = 5$ \\
+Dispatch & $O(n)$ & single plan, one-time \\
+\midrule
+Overall & $O(knp + dp + n)$ & dominated by $O(knp)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Worst Case vs.\ Practice}
+
+The worst case assumes every plan survives all $k$ constraints. With
+the default ordering (cheap, high-rejection constraints first),
+early-exit reduces effective cost by $2.5$--$3.5\times$: shape and
+backend-capability checks reject 30--50\% of candidates, and on average
+only 2--3 of 7 constraints execute per plan.
+
+The empirical measurements of Section~\ref{subsec:empirical} bound the
+constant factors: for $k = 7$ and $p = 6$ real ResNet-50 plans,
+validation plus cost-minimal selection completes in
+$1.4$--$8.2\,\mu$s---seven orders of magnitude below a single model
+inference on the same machine. The dominant planning cost in practice
+is not the algorithm but optional per-candidate \emph{calibration}
+(one real execution per plan) when empirically-grounded metrics are
+desired.
+
+\subsection{Memory}
+
+$O(p(n + d))$ for candidate plans and metric vectors; with $p \leq 64$
+and $d = 5$ this is linear in graph size.

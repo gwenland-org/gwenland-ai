@@ -9,7 +9,7 @@ use crate::gquant::{GQ2ABlock, GQ4ABlock};
 /// mantissa. No `half` crate dependency — mirrors
 /// [`glcore::format::gguf::f16_to_f32`]'s bit layout so the two are exact
 /// inverses (mod round-trip precision loss) of each other.
-fn f32_to_f16(value: f32) -> u16 {
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = (bits >> 16) & 0x8000;
     let exp = ((bits >> 23) & 0xff) as i32;

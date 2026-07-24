@@ -1,0 +1,51 @@
+\section{Cost Evaluation and Execution Policies}
+\label{sec:cost}
+
+\subsection{Metric Vector}
+
+Every plan carries the five-dimensional metric vector of
+Section~\ref{sec:math}: latency ($m_1$, ms), peak memory ($m_2$, MB),
+synchronization overhead ($m_3$, ms), energy ($m_4$, mJ), and
+numerical error ($m_5$, dimensionless $L_2$). The dimensions are
+deliberately heterogeneous: they capture qualitatively different
+failure budgets (time, space, coordination, power, precision), and the
+weight vector---not the metric definitions---decides their relative
+importance.
+
+\subsection{Policies as Weight Vectors}
+
+\begin{table}[H]
+\centering
+\small
+\caption{Preset execution policies.}
+\label{tab:policies}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Policy & Weight vector $\mathbf{w}$ & Recommended context \\
+\midrule
+Latency  & $(0.6, 0.1, 0.1, 0.1, 0.1)$ & real-time, interactive services \\
+Memory   & $(0.1, 0.6, 0.1, 0.1, 0.1)$ & edge devices, multi-model batching \\
+Energy   & $(0.1, 0.1, 0.1, 0.6, 0.1)$ & mobile, battery, green computing \\
+Balanced & $(0.2, 0.2, 0.2, 0.2, 0.2)$ & general-purpose, benchmarking \\
+Custom   & user-supplied               & domain-specific requirements \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Policy resolution is a constant-time lookup plus normalization. By
+Theorem~\ref{thm:policy-independence}, switching policies can never
+change which plans are \emph{valid}---only which valid plan wins.
+
+\subsection{Normalization}
+
+Because the metric dimensions carry different units, implementations
+normalize each dimension before applying the weights; the reference
+implementations divide by the per-dimension maximum across the valid
+candidate set. Normalization choice is behavior-relevant: as the
+empirical study shows (Section~\ref{subsec:empirical}, Finding~2),
+max-normalization amplifies small absolute differences in a dimension
+whose spread is tiny---a $10^{-6}$ relative numerical deviation
+normalizes to $1.0$ when it is the largest in its dimension, which
+makes selection strongly exactness-preserving. Threshold-relative
+normalization ($m_5 / \epsilon$) is a principled alternative and is
+discussed in Section~\ref{sec:discussion}.

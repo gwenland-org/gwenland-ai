@@ -1,0 +1,67 @@
+\section{Implementation}
+\label{sec:implementation}
+
+The production implementation spans four Rust crates
+(${\sim}8{,}500$ lines). Rust's zero-cost abstractions let the
+trait-based architecture compile away: constraint and backend
+polymorphism costs one virtual call per check.
+
+\paragraph{glcore (${\sim}3{,}000$ lines).}
+Framework-agnostic core: the \texttt{Constraint} trait
+(\texttt{validate(\&self, plan) -> ValidationResult}), the
+\texttt{Backend} trait (\texttt{supports\_op}, \texttt{supports\_dtype},
+\texttt{supports\_layout}, \texttt{allocate}, \texttt{deallocate},
+\texttt{execute\_op}), and the \texttt{Dispatcher} trait; data
+structures \texttt{TensorOp}, \texttt{ExecutionPlan},
+\texttt{MetricVector} ($d = 5$), \texttt{WeightVector}; and error type
+\texttt{GateError} encoding \texttt{ConstraintViolation} (with the
+violated constraint and operation), \texttt{NoValidPlan}, and
+\texttt{BackendError}.
+
+\paragraph{glproc.}
+CPU backend for x86-64 (AVX-512, up to $8\times$ over scalar) and ARM64
+(NEON); multi-threaded via \texttt{rayon}; FP32/FP16/INT8; pooled
+allocator cutting allocation overhead ${\sim}60\%$ vs.\ per-call
+\texttt{malloc}.
+
+\paragraph{glcuda.}
+NVIDIA backend on the CUDA runtime API: stream-ordered asynchronous
+execution, \texttt{cudaMallocAsync}, FP32/FP16 (Tensor Cores), INT8,
+and INT4 (packed kernels); hand-tuned convolution, matmul, attention,
+and layer-norm kernels.
+
+\paragraph{glvulkan.}
+Cross-vendor GPU backend compiling each operation to SPIR-V compute
+shaders dispatched via command buffers; descriptor sets for buffer
+binding, pipeline barriers for ordering. Its purpose is portability
+across NVIDIA, AMD, Intel, and ARM Mali without CUDA.
+
+\paragraph{Dispatcher and policies.}
+The dispatcher routes operations through trait objects
+(\texttt{Box<dyn Backend>}), so backends can be registered at runtime;
+resource management follows Rust ownership; all fallible paths return
+\texttt{Result}. \texttt{ExecutionPolicy} is an enum
+(\texttt{Latency}, \texttt{Memory}, \texttt{Energy},
+\texttt{Balanced}, \texttt{Custom}) resolved to weight vectors by
+constant-time lookup.
+
+\paragraph{Composability.}
+Three extension axes: register a new \texttt{Constraint}; register a
+new \texttt{Backend}; replace a metric estimator---each without
+touching existing components.
+
+\paragraph{Reference implementations for empirical validation.}
+Complementing the production crates, two deliberately minimal,
+independently coded implementations execute the full
+algorithm end-to-end on a real pretrained network and are used in
+Section~\ref{subsec:empirical}: \texttt{gate\_resnet}, a
+dependency-free Rust binary (im2col convolution, scoped-thread
+parallelism, no BLAS or SIMD intrinsics---auditability over speed),
+and \texttt{gate\_py}, a NumPy implementation. Both load identical
+ImageNet weights, generate real (executable) candidate plans, validate
+all seven constraints---including bitwise determinism re-execution---and
+select per-policy plans. Their outputs agree with each other and with
+three external runtimes to ${\sim}10^{-6}$ relative $L_2$, which is
+what qualifies them as the numerical reference for the empirical study.
+All code, weights export scripts, and raw results are provided in the
+accompanying \texttt{gate-empirical} artifact.

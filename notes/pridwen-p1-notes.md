@@ -561,3 +561,265 @@ block struct, encoder, scalar + AVX2 dequant kernels, CPP policy, glconv
 wiring, verified against a real model. What remains for Phase 2 per v5
 §14 is the FHT/GQ2A-R decision gate (§6) and Stage 2 calibration work —
 both explicitly deferred, not silently skipped.
+
+---
+
+[2026-07-22T06:00:00Z] [TYPE: BLOCKER]
+Description: Built the first real `.gllm` E2E text-in/text-out driver
+(`glictus-caliburni/examples/run_package_e2e.rs`), closing the gap
+recorded in Pridwen-proposal-v5.md §14 Phase 2 ("Blocking gap found
+2026-07-22, not yet built"). `GllmEngine` (gllm_engine.rs) already had
+real embedding lookup, LM head, prefill/decode loops, and sampling —
+the only new glue was a tokenizer (`glcore::tokenizer::Tokenizer::from_gguf`
+against the *original* GGUF, since `.gllm` still has no embedded
+tokenizer, ARTX1 OQ3) and a CLI wrapper reporting prefill/decode TPS.
+
+Running it surfaced two real, pre-existing bugs (both fixed, both
+pre-dating this session's Phase 2 work):
+
+1. `GllmEngine::load_shared` and `GlprocBackend::required_tensor` both
+   decoded tensor bytes via `glcore::format::decode_tensor`, which only
+   understands F32/F16/BF16 — any tensor CPP assigned GQ4A/GQ2A panicked
+   on load. Fixed by special-casing GQ4A/GQ2A in both call sites to use
+   `glproc::kernels::gquant::dequant_gq4a_stream`/`dequant_gq2a_stream`
+   directly, mirroring the Phase 2 ADR's existing precedent (glictus-
+   caliburni -> glproc, one direction only). Considered instead giving
+   `glcore` its own glproc dependency for a single unified decode_tensor —
+   REJECTED, confirmed structurally impossible: glproc/Cargo.toml already
+   depends on glcore unconditionally, so the reverse would be a circular
+   dependency Cargo cannot build at all, not just a layering preference.
+
+2. Real converter bug in `converter.rs`'s `write_group`: CPP's "F16
+   always" assignment for attn_norm/ffn_norm (converter.rs:329, `dtype =
+   assigned`) only ever relabeled the manifest's dtype field — the
+   `write_group` else-branch wrote the tensor's original GGUF bytes
+   unconverted (still F32 on this model), so the manifest claimed F16 (2
+   bytes/elem) over what were actually F32 bytes (4 bytes/elem). Every
+   existing test only asserted the dtype label, never the byte count, so
+   this was invisible until something actually tried to decode the bytes
+   using the manifest's declared size. Fixed with a real F32->F16 byte
+   conversion in that branch (reusing gquant/encoder.rs's existing
+   `f32_to_f16`, now `pub(crate)`); added a regression assertion on
+   `attn_norm.size` (not just `.dtype`) to convert_gq4a_cpp_end_to_end so
+   this class of bug can't reappear silently. All 316 glictus-caliburni
+   lib tests still pass.
+
+After both fixes, ran the E2E example against a real GQ4A_CPP package
+converted from qwen2.5-0.5b-instruct-q4_k_m.gguf (same source model as
+every other Phase 1/2 measurement in this file). Result:
+  - It completes without crashing: full 30-token prefill + 64-token
+    decode pass through all 24 layers via the real GlprocBackend math
+    (RMSNorm, QKV, RoPE, GQA attention, SwiGLU FFN — no NullBackend).
+  - Output text is GARBAGE — multilingual noise tokens, not remotely
+    coherent, despite `gwen run` producing correct output on the
+    identical source GGUF via the older glcore/GlprocEngine path minutes
+    earlier in the same session.
+  - TPS is far below `gwen run`'s baseline: prefill 1.04 tok/s, decode
+    1.44 tok/s vs `gwen run`'s 69.2/24.31 tok/s on the same hardware —
+    every runtime log line shows "unmapped 24" per token, i.e. GllmRuntime
+    appears to mmap and unmap all 24 layer files from disk on every
+    single token's forward pass, not once at model load.
+
+Differential test attempted to isolate GQ4A math from a wiring bug:
+converted the SAME source GGUF with no --quant flag at all (plain
+passthrough). This did NOT produce a clean F32-only control group —
+manifest inspection showed 170 of 291 tensors are still raw native GGUF
+quant formats when CPP doesn't touch them (Q5_0=133, Q8_0=13, Q6_K=12,
+Q4_K=12; only 121 are F32) and `.gllm`'s runtime read path (both fixed
+call sites above) never handled Q5_0/Q8_0/Q6_K either — only the
+*converter's* dequantize_for_gquant (glproc-backed, ADR-scoped) handles
+those, and only for tensors CPP is actively re-encoding to GQ4A/GQ2A.
+So the unquantized package fails to load at all (panics on
+token_embeddings: Q5_0) rather than serving as a clean baseline.
+
+Ruled out by manual code inspection (did not find the bug, but narrowed
+it): no bias tensor was accidentally GQ4A-encoded (all failed the
+numel%256 eligibility check and correctly kept F32); tensor name mapping
+(token_embd.weight -> token_embeddings, output.weight -> output_head.weight)
+is correct and this model does have a real, separate output_head.weight
+(not tied embeddings, so the embed.clone() fallback never triggers); GQA
+head-to-kv-head grouping in GlprocBackend (`kv_head = h / heads_per_kv`)
+looks structurally correct; matvec's row-major [out_dim, in_dim]
+convention appears consistent between the GQ4A encoder's flat buffer
+and decode_tensor's F32 path.
+
+NOT ruled out / not inspected — most likely locations for the actual
+bug, in rough order of suspicion:
+  - `glproc::kernels::gquant::dequant_gq4a_stream`/the GQ4A encoder
+    losing too much precision at real-model scale (only ever validated
+    via bit-exact-vs-scalar parity tests and small synthetic round-trip
+    tolerance tests — never against real trained weights through a full
+    24-layer forward pass until this run).
+  - `glproc::attention::attention_one_into` / `KvCacheSlot`'s
+    `read_f32_rows`/`write_f32_row` byte layout, not inspected this pass.
+  - `GllmRuntime`'s layer-to-layer activation threading / mmap-per-layer
+    scheduling (`scheduler.rs`, `AdaptivePrefetcher`) — untouched, and
+    is also the prime suspect for the 1-1.4 tok/s figure (per-token full
+    unmap/remap of all 24 layers strongly suggests the runtime is not
+    designed for — or has a bug preventing — cross-token layer-file
+    reuse, though ARTX05/06's low-RAM-footprint design goal may make
+    this intentional at some granularity worth checking against its own
+    spec before assuming it's a defect).
+
+Action taken: per explicit user instruction, did NOT continue debugging
+numerics or performance in this session. Filing as an open, unresolved,
+CRITICAL correctness gap — this is the first time any GQ4A/GQ2A output
+has been checked for real generation quality (not just PPL-TBD or block-
+level parity), and the result is that Pridwen's real-model output
+quality is currently unknown-bad, not unknown-good. Recorded in
+Pridwen-proposal-v5.md's Open Questions (§15) as a new, high-priority
+item. The example (`run_package_e2e.rs`) and both dequant/F16 fixes are
+kept — they are real, necessary infrastructure and the only reason this
+bug is now visible and reproducible instead of silently TBD.
+
+---
+
+[2026-07-22T07:30:00Z] [TYPE: FINDING]
+Description: Investigated the garbage-output bug (previous entry) by
+diffing `.gllm`'s runtime path (`GlprocBackend`/`GllmEngine`) against the
+known-good `gwen run` path (`glcore::runtime::Runtime` + `glproc::engine::
+GlprocEngine` + `glproc::runner::Runner`) point by point, without editing
+any code (explicit instruction: find the problem, don't fix it yet).
+
+Ruled out as equivalent between both paths (verified via Explore agent +
+manual source reading, not guessed):
+  - Attention scale factor: both paths call the same
+    `glproc::attention::attention_one_into`, which applies
+    `1/sqrt(head_dim)` internally (glproc/src/attention.rs:92,110); neither
+    caller pre-scales. Identical.
+  - RoPE arithmetic: `Runner::rope()` (glproc/src/runner.rs:132-147) and
+    `GlprocBackend::rope_neox` (glproc_backend.rs:146-157) are the same
+    NeoX-pairing formula, byte-for-byte. (Style *selection* differs
+    structurally — glproc reads architecture-specific RopeStyle from GGUF
+    metadata, glproc_backend.rs hardcodes NeoX unconditionally — but Qwen2
+    is NeoX either way, so this doesn't explain the bug on this model.)
+  - GQA head-to-kv-head mapping: identical formula in both
+    (`kv_head = h / (n_heads/n_kv_heads)`).
+  - Weight matrix layout: GGUF's native [in_features, out_features]-
+    fastest-first convention is preserved unchanged end-to-end — glproc's
+    loader never transposes, and neither does the .gllm converter
+    (`row_major_shape` + raw byte copy in write_group) nor
+    glcore::format::gllm::decode_tensor (pure byte reinterpret). Both
+    paths feed glproc::kernels::matvec the same [out_dim, in_dim] shape
+    the same way.
+  - `head_dim` derivation: glproc prefers GGUF's `attention.key_length`
+    metadata key, falling back to `embedding_length/num_heads`
+    (loader.rs:675-676); `.gllm`'s ModelMetadata::head_dim()
+    (manifest/metadata.rs:180-186) ALWAYS uses the fallback formula only —
+    there is no key_length field anywhere in ModelMetadata, and the ARTX07
+    converter never reads or propagates that GGUF key. This IS a real,
+    silent gap for any model where key_length != embedding_length/
+    num_heads (structurally identical to the RMS-eps gap below in shape),
+    but verified NOT the cause here: confirmed via `gwen info` that this
+    GGUF has no `qwen2.attention.key_length` key at all, so both paths
+    compute the same 896/14=64 by the same fallback path on this specific
+    model. Still worth closing — flagged, not fixed.
+
+**Leading suspect, verified present on the actual test model:**
+RMSNorm epsilon is hardcoded as `RMS_EPS: f32 = 1e-5` independently in
+BOTH `glproc_backend.rs:50` and `gllm_engine.rs:65`, with no field in
+`ModelMetadata` (manifest/metadata.rs:108-145) to carry the GGUF's actual
+declared value, and the ARTX07 converter never reads or propagates
+`{arch}.attention.layer_norm_rms_epsilon` into the manifest at all. Ran
+`gwen info qwen2.5-0.5b-instruct-q4_k_m.gguf` and confirmed this exact
+model declares `qwen2.attention.layer_norm_rms_epsilon = F32(1e-6)` — a
+**10x difference** from the hardcoded `1e-5` used by every RMSNorm call in
+the `.gllm` path (attn_norm and ffn_norm in all 24 layers, plus the final
+output_norm). `glproc::runner::Runner` (the known-good path) reads this
+value correctly from GGUF metadata at load time
+(glproc/src/loader.rs:681, defaulting to 1e-5 only when the key is
+genuinely absent).
+
+This is mechanistically consistent with the observed symptom: a 10x
+epsilon error distorts the normalized magnitude of every activation
+before every downstream matmul in every layer, compounding across 24
+layers plus the final LM head projection — plausibly enough to turn
+coherent logits into structurally-valid-but-wrong-token noise, without
+crashing or producing NaN/shape errors (which is exactly what was
+observed: a clean 94-token pass, garbage content).
+
+**Not yet confirmed as root cause** — this was found by code inspection
+and cross-referencing GGUF metadata, not by actually patching the
+constant and re-running to see if output becomes coherent. Per explicit
+user instruction this session, the fix was NOT applied and the E2E test
+was NOT re-run against a corrected epsilon. The differential
+logits/hidden-state dump recommended by the investigating agent (compare
+`Runner::step`'s `ws.logits`/`ws.x` against `GlprocBackend::execute_layer`'s
+`output.data` / `GllmEngine::logits_for`'s `raw_logits`, same fixed
+prompt token, greedy sampling, `GLPROC_ATTN_SEQ=1` to remove threaded
+float non-associativity as a confound) was also not built this session —
+recommended as the next concrete step to actually confirm this diagnosis
+before writing a fix.
+
+Action needed next session (not done, per instruction): (1) add an
+`rms_eps` field to `ModelMetadata`, populate it from GGUF
+`{arch}.attention.layer_norm_rms_epsilon` in the ARTX07 converter
+(defaulting to 1e-5 only when absent, matching glproc's own fallback),
+thread it through to `GlprocBackend`/`GllmEngine` in place of the
+hardcoded constants; (2) re-run `run_package_e2e.rs` and confirm output
+becomes coherent; (3) separately, close the `head_dim`/`key_length` gap
+found above (same shape of bug, different field) even though it didn't
+manifest on this particular model.
+
+---
+
+[2026-07-22T08:15:00Z] [TYPE: FINDING]
+Description: Applied the rms_eps fix from the previous entry's action
+plan and re-tested — **NEGATIVE RESULT, garbage output persists
+unchanged.** This is a real, useful data point: the epsilon mismatch was
+a genuine bug (fixed, kept, real model now correctly records
+`rms_eps: 9.999999974752427e-7` in its manifest, matching the GGUF's
+declared `1e-6`), but it was NOT the (sole) cause of the garbage output.
+
+What was done: added `rms_eps: Option<f64>` to `ModelMetadata`
+(manifest/metadata.rs) + `effective_rms_eps()` accessor (default 1e-5,
+mirroring `effective_rope_freq_base`'s existing pattern exactly);
+populated it in the ARTX07 converter from
+`{arch}.attention.layer_norm_rms_epsilon` (converter.rs); replaced the
+hardcoded `RMS_EPS: f32 = 1e-5` constants in both `GlprocBackend`
+(threaded via the existing `AttnShape` struct, captured once at
+construction like `rope_freq_base` already was) and `GllmEngine`
+(reads `model.metadata.effective_rms_eps()` directly per-call). Updated
+3 test fixtures that construct `ModelMetadata` literally
+(metadata.rs, glproc_backend.rs, test_helpers.rs) to add the new field;
+`test_helpers.rs`'s `qwen05b_metadata()` now carries the real measured
+`Some(1e-6)` instead of `None`, since that fixture's whole purpose is
+mirroring the real model's actual values. All 316 lib tests still pass.
+
+Reconverted the real model — manifest confirms `rms_eps` is now read
+correctly (not the old hardcoded 1e-5). Re-ran `run_package_e2e.rs` with
+the identical prompt/config as the original bug report. Output: still
+garbage, byte-for-byte a different garbage string than before (as
+expected, since the norm math did change), but equally incoherent.
+Prefill/decode TPS also unchanged (~1.0 tok/s both directions) — the
+per-token full-remap performance issue is untouched by this fix, as
+expected (it's a separate, already-flagged suspect).
+
+Conclusion: epsilon was A bug, not THE bug (or not the only one). Root
+cause is still open. Per the investigating agent's original report, the
+next-most-likely remaining suspects, still not inspected this session:
+GQ4A dequant/encoder precision at real-model scale (only ever validated
+via bit-exact-vs-scalar parity and small synthetic round-trip tolerance,
+never a real 24-layer forward pass), and `glproc::attention::
+attention_one_into` / `KvCacheSlot`'s byte layout. The differential
+logits dump (compare `Runner::step`'s `ws.logits` against
+`GllmEngine::logits_for`'s `raw_logits` on the same fixed token, greedy
+sampling) recommended in the prior entry was still not built — this
+remains the most direct way to bisect further, and is more likely to
+localize the bug precisely than continuing to reason from code reading
+alone (two hypotheses checked by inspection so far; both real bugs, both
+insufficient to explain the symptom on their own).
+
+Not yet attempted: isolating whether GQ4A quantization itself is
+implicated by testing an all-F32-shared-tensors package (`token_embeddings`/
+`output_head`/`output_norm` unquantized, only per-layer weights at GQ4A).
+CPP's Stage 1 table always assigns `token_embd`/`output` to GQ4A (EXTREME
+sensitivity → escape hatch, but the escape hatch under GQ4A_CPP IS GQ4A,
+since GQ4A_CPP is degenerate/homogeneous per §5's note) — there is
+currently no CLI/policy option to keep shared tensors F32 while still
+quantizing layer weights, so this isolation would require either a
+temporary code change to force it (not done, no code should be added
+just for a throwaway diagnostic) or waiting for GQ2A_CPP's real
+heterogeneous assignment (attn_q/attn_k/token_embd/output still escape to
+GQ4A under GQ2A_CPP too, per §5's table — same problem, doesn't help
+isolate).

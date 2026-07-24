@@ -1,0 +1,168 @@
+\section{Mathematical Foundation}
+\label{sec:math}
+
+\subsection{Domains}
+
+Let $\mathcal{T}$ denote the set of all tensor types (rank, shape, data
+type); $\mathcal{O}$ the set of tensor operations, i.e.\ partial
+functions from input types to output types; $\mathcal{B}$ the set of
+hardware backends, each characterized by its supported operations,
+data types, memory capacity, and alignment requirements; and
+$\mathcal{L}$ the set of memory layouts, i.e.\ mappings from logical
+tensor indices to physical offsets. A \emph{tensor computation graph}
+is a DAG $\mathcal{G} = (V, E)$ whose vertices are tensor operations
+and whose edges are data dependencies.
+
+\subsection{Execution Plans}
+
+\begin{definition}[Execution plan]
+An execution plan for $\mathcal{G}$ is a tuple
+$P = (\sigma, \beta, \mathcal{L}_{\mathrm{map}}, \mathbf{m})$, where
+$\sigma = (o_1, \ldots, o_k)$ is a topological ordering of the
+operations of $\mathcal{G}$; $\beta \in \mathcal{B}$ is the target
+backend; $\mathcal{L}_{\mathrm{map}}: V \to \mathcal{L}$ assigns a
+memory layout to each intermediate tensor; and
+$\mathbf{m} \in \R^d$ is the plan's metric vector.
+\end{definition}
+
+The set of all plans is $\mathcal{P}$; a finite candidate subset is
+$\mathcal{P}_{\text{cand}} \subseteq \mathcal{P}$.
+
+\subsection{Constraints and Validation}
+
+\begin{definition}[Constraint]
+A constraint is a \emph{total} function
+$C: \mathcal{P} \to \{0, 1\}$. Plan $P$ satisfies $C$ iff $C(P) = 1$.
+\end{definition}
+
+Totality guarantees that every plan receives a definitive pass/fail
+determination---there are no undefined cases, which is essential for
+the correctness results of Section~\ref{sec:correctness}.
+
+\begin{definition}[Validator]
+A validator over constraints $C_1, \ldots, C_k$ is the product
+\begin{equation}
+V(P) \;=\; \prod_{i=1}^{k} C_i(P).
+\label{eq:validator}
+\end{equation}
+\end{definition}
+
+$V(P) = 1$ iff every constraint accepts $P$; a single violation
+invalidates the plan. This strict conjunctive semantics encodes the
+principle that correctness is all-or-nothing.
+
+\begin{definition}[Valid execution set]
+$\mathcal{P}_{\text{valid}} =
+ \{P \in \mathcal{P}_{\text{cand}} \mid V(P) = 1\}$.
+\end{definition}
+
+$\mathcal{P}_{\text{valid}}$ is always well defined (possibly empty),
+and it is the \emph{only} domain over which the \gate{} optimizer
+operates.
+
+\subsection{Metrics, Weights, and Cost}
+
+\gate{} uses a five-dimensional metric vector
+$\mathbf{m}(P) = (m_1, \ldots, m_5)(P)$:
+
+\begin{center}
+\small
+\begin{tabular}{@{}llll@{}}
+\toprule
+Dimension & Symbol & Description & Unit \\
+\midrule
+Latency & $m_1$ & estimated total execution time & ms \\
+Peak memory & $m_2$ & maximum live allocation & MB \\
+Sync overhead & $m_3$ & kernel launches, transfers, barriers & ms \\
+Energy & $m_4$ & total energy consumed & mJ \\
+Numerical error & $m_5$ & cumulative $L_2$ error estimate & --- \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+All components are non-negative and are estimated analytically from the
+plan's structure, so cost evaluation itself adds no execution overhead.
+
+\begin{definition}[Weight vector]
+$\mathbf{w} \in \R^d_{\geq 0}$ with $\sum_{i=1}^d w_i = 1$; the set of
+valid weight vectors is the standard simplex $\Delta^{d-1}$.
+\end{definition}
+
+\begin{definition}[Cost function]
+$\mathcal{C}(P, \mathbf{w}) = \mathbf{w}^{\top} \mathbf{m}(P)
+ = \sum_{i=1}^{d} w_i \, m_i(P)$.
+\end{definition}
+
+\begin{lemma}[Monotonicity]
+\label{lem:monotonicity}
+For fixed $\mathbf{w}$ with $w_i > 0$, $\mathcal{C}$ is strictly
+increasing in each metric component: if $P$ and $P'$ differ only in
+dimension $i$ with $m_i(P) > m_i(P')$, then
+$\mathcal{C}(P, \mathbf{w}) > \mathcal{C}(P', \mathbf{w})$.
+\end{lemma}
+
+\begin{proof}
+Immediate from linearity:
+$\mathcal{C}(P,\mathbf{w}) - \mathcal{C}(P',\mathbf{w})
+ = w_i \,(m_i(P) - m_i(P')) > 0$.
+\end{proof}
+
+\subsection{Execution Policies}
+
+\begin{definition}[Execution policy]
+A policy is a mapping $\pi: \mathcal{K} \to \Delta^{d-1}$ from a
+deployment context $\kappa$ to a weight vector.
+\end{definition}
+
+\gate{} ships five presets: Latency $(0.6,0.1,0.1,0.1,0.1)$, Memory
+$(0.1,0.6,0.1,0.1,0.1)$, Energy $(0.1,0.1,0.1,0.6,0.1)$, Balanced
+$(0.2,0.2,0.2,0.2,0.2)$, and Custom (user-supplied).
+
+\begin{theorem}[Policy independence of validity]
+\label{thm:policy-independence}
+For any $\mathbf{w}, \mathbf{w}' \in \Delta^{d-1}$,
+$\mathcal{P}_{\text{valid}}(\mathbf{w}) =
+ \mathcal{P}_{\text{valid}}(\mathbf{w}')$.
+\end{theorem}
+
+\begin{proof}
+$\mathcal{P}_{\text{valid}}$ is defined by $V$ alone
+(Eq.~\ref{eq:validator}); no constraint reads $\mathbf{w}$. Hence the
+valid set is invariant under any change of weights.
+\end{proof}
+
+The policy affects only \emph{which valid plan is selected}, never
+\emph{whether the selected plan is valid}.
+
+\subsection{The Selection Criterion}
+
+The central operation of \gate{} is
+\begin{equation}
+P^{*} \;=\; \argmin_{P \in \mathcal{P}_{\text{valid}}}
+            \mathcal{C}(P, \mathbf{w})
+      \;=\; \argmin_{P \in \mathcal{P}_{\text{cand}}}
+            \bigl\{\, \mathcal{C}(P, \mathbf{w}) \;\big|\; V(P) = 1 \,\bigr\}.
+\label{eq:selection}
+\end{equation}
+
+The side condition $V(P) = 1$ is the mathematical expression of
+``constraint before optimization.''
+
+\subsection{Empty Valid Set Semantics}
+
+When $\mathcal{P}_{\text{valid}} = \emptyset$ the argmin is undefined,
+and \gate{} raises an explicit \texttt{ConstraintViolation} error. The
+dispatch function is the partial function
+\begin{equation}
+\Phi(\mathcal{P}_{\text{cand}}, V, \mathbf{w}) =
+\begin{cases}
+\displaystyle P^{*} = \argmin_{P \in \mathcal{P}_{\text{valid}}}
+  \mathcal{C}(P, \mathbf{w})
+  & \text{if } \mathcal{P}_{\text{valid}} \neq \emptyset, \\[1.2em]
+\bot \;\; (\texttt{ConstraintViolation})
+  & \text{if } \mathcal{P}_{\text{valid}} = \emptyset.
+\end{cases}
+\end{equation}
+
+\gate{} either returns a valid, cost-minimal plan or raises an explicit
+error; it never returns an invalid plan.

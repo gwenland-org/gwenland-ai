@@ -709,6 +709,16 @@ pub struct Runner<'m> {
     trace_on: bool,
     /// Traces from the most recent `generate`; empty when `trace_on` is false.
     traces: Vec<glcore::trace::TokenTrace>,
+    /// Diagnostic-only: capture the residual stream after every layer of the
+    /// next [`Runner::step`] call. Off by default, zero cost when off (same
+    /// pattern as `trace_on`/`prof` above) — built for
+    /// `glictus-caliburni/examples/diff_dump.rs`, which compares this
+    /// known-good path's per-layer hidden states against `GlprocBackend`'s to
+    /// localize the still-open `.gllm` E2E garbage-output bug.
+    capture_hidden: bool,
+    /// One entry per layer from the most recent `step()` call, in order;
+    /// empty when `capture_hidden` is false.
+    hidden_dump: Vec<Vec<f32>>,
 }
 
 impl<'m> Runner<'m> {
@@ -766,7 +776,26 @@ impl<'m> Runner<'m> {
                 .map(|_| Box::new(Prof::default())),
             trace_on: false,
             traces: Vec::new(),
+            capture_hidden: false,
+            hidden_dump: Vec::new(),
         }
+    }
+
+    /// Diagnostic-only (see [`Runner`]'s `hidden_dump` field docs): turn
+    /// per-layer hidden-state capture on or off for subsequent `step()`
+    /// calls (`forward_into`/`forward`). Off by default.
+    pub fn set_capture_hidden(&mut self, on: bool) {
+        self.capture_hidden = on;
+        if !on {
+            self.hidden_dump = Vec::new();
+        }
+    }
+
+    /// The residual stream after each layer of the most recent `step()`
+    /// call, in layer order. Empty unless [`Runner::set_capture_hidden`] was
+    /// turned on before that call.
+    pub fn hidden_dump(&self) -> &[Vec<f32>] {
+        &self.hidden_dump
     }
 
     /// Run one forward pass for `token` at position `pos`, leaving the
@@ -774,6 +803,21 @@ impl<'m> Runner<'m> {
     /// Advances the KV cursor — call with strictly increasing `pos`.
     pub fn forward_into(&mut self, token: u32, pos: usize) -> Result<(), GlError> {
         self.step(token, pos, true)
+    }
+
+    /// As [`forward_into`](Self::forward_into), but through the *batched*
+    /// prefill path ([`Self::step_chunk`]) instead of the single-token one.
+    ///
+    /// Diagnostic-only, built for `glictus-caliburni/examples/diff_dump.rs`:
+    /// real generation ([`Self::generate`]) always processes position 0 (and
+    /// every prompt token) through `step_chunk`, even for a one-token
+    /// prompt — `step`/`forward_into` is only ever reached for genuine
+    /// autoregressive decode positions (`pos >= prompt.len()`, always >= 1).
+    /// A caller diffing this path's behavior against another engine must
+    /// drive it the way real generation actually does, not through
+    /// `step`'s code path, which position 0 never exercises in practice.
+    pub fn forward_chunk_into(&mut self, tokens: &[u32], start_pos: usize) -> Result<(), GlError> {
+        self.step_chunk(tokens, start_pos, true)
     }
 
     /// Forward pass with an optional LM head. Prefill only needs the KV
@@ -798,6 +842,9 @@ impl<'m> Runner<'m> {
 
         let ws = &mut self.ws;
         self.model.embed_into(token, &mut ws.x)?;
+        if self.capture_hidden {
+            self.hidden_dump.clear();
+        }
 
         // One timestamp per phase boundary, only when profiling.
         let mut t = self.prof.as_ref().map(|_| std::time::Instant::now());
@@ -1045,6 +1092,9 @@ impl<'m> Runner<'m> {
             for (xi, di) in ws.x.iter_mut().zip(&ws.proj) {
                 *xi += di;
             }
+            if self.capture_hidden {
+                self.hidden_dump.push(ws.x.clone());
+            }
             lap(&mut self.prof, |p| &mut p.down);
         }
 
@@ -1113,6 +1163,9 @@ impl<'m> Runner<'m> {
         for (b, &token) in tokens.iter().enumerate() {
             self.model
                 .embed_into(token, &mut bws.xb[b * dim..(b + 1) * dim])?;
+        }
+        if self.capture_hidden {
+            self.hidden_dump.clear();
         }
 
         for (l, layer) in self.model.layers.iter().enumerate() {
@@ -1430,6 +1483,13 @@ impl<'m> Runner<'m> {
                 {
                     *xi += di;
                 }
+            }
+            if self.capture_hidden {
+                // Diagnostic-only, and deliberately narrow: captures the
+                // LAST row only, for `diff_dump.rs`'s single-token
+                // (`bsz == 1`) use — not a general per-batch-row capture.
+                let last = bsz - 1;
+                self.hidden_dump.push(bws.xb[last * dim..(last + 1) * dim].to_vec());
             }
             lap(&mut self.prof, |p| &mut p.p_down);
         }

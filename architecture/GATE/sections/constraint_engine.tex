@@ -1,0 +1,75 @@
+\section{Constraint Engine}
+\label{sec:constraint-engine}
+
+The constraint engine determines whether an execution plan preserves the
+semantic correctness of the original tensor computation. Each candidate
+passes through a sequential chain of constraint checks with early-exit:
+the first violation short-circuits the chain.
+
+\subsection{The Seven Constraint Types}
+
+\paragraph{1. Shape.}
+For each operation $o$ with inputs $t_1, \ldots, t_n$ and output
+$t_{\text{out}}$, the shape-compatibility predicate
+$\phi_o(\text{shape}(t_1), \ldots, \text{shape}(t_n)) \to
+\text{shape}(t_{\text{out}})$ must hold (e.g.\ inner dimensions of a
+matrix product must agree). Static/dynamic check, $O(|V|)$ per plan,
+backend-independent.
+
+\paragraph{2. Tensor layout.}
+The layout assignment $\Lambda: \mathcal{T} \to \{\text{NC}, \text{CN},
+\text{NCHW}, \text{NHWC}, \ldots\}$ must be compatible with every
+consuming operation and the target backend; a kernel requiring NHWC
+invalidates a plan assigning NCHW without an interposed transpose.
+Static, $O(|V|)$, backend-dependent.
+
+\paragraph{3. Memory.}
+$C_{\text{mem}}(P) = 1$ iff $M(P) \leq M_{\max}(\beta)$, where $M(P)$
+is the peak of the sum of live allocations over the execution schedule.
+Static, $O(|V|)$, user-configurable budget.
+
+\paragraph{4. Backend capability.}
+The capability predicate $\kappa: \mathcal{O} \times \mathcal{B} \to
+\{0,1\}$ must accept every operation, covering both operation-level and
+datatype-level support. Static, $O(|V|)$, backend-dependent.
+
+\paragraph{5. Numerical error.}
+The estimated cumulative error must satisfy
+$\|\hat{\mathbf{y}} - \mathbf{y}_{\text{ref}}\|_2 \leq \epsilon$
+(default $\epsilon = 10^{-4}$). Because the reference output is
+unavailable at validation time, \gate{} bounds the effect of dtype
+conversions, reorderings, and layout transformations with an analytical
+interval-arithmetic model; in the empirical reference implementations
+(Section~\ref{subsec:empirical}) the estimate is grounded by one
+calibration execution per candidate. $O(|V| \cdot d)$, tolerance
+user-configurable.
+
+\paragraph{6. Determinism.}
+Rejects plans containing non-deterministic operations when
+\texttt{require\_determinism} is set: atomic parallel reductions with
+unstable summation order, floating-point reassociation, and inherently
+non-deterministic algorithms (top-$k$ tie-breaking, sampling). Static,
+$O(|V|)$.
+
+\paragraph{7. Safety.}
+Verifies that (1) every tensor read is within allocated bounds, (2)
+every write targets a valid buffer, (3) buffer lifetimes cover all
+uses, and (4) no aliasing creates data races. $O(|V|^2)$ worst case
+(alias and liveness analysis), $O(|V|)$ in practice.
+
+\subsection{Composability}
+
+Adding a constraint $C_{k+1}$ yields the validator
+$V'(P) = V(P) \cdot C_{k+1}(P)$ with no modification of existing
+constraints---open for extension, closed for modification. Each
+constraint is an independent object behind a uniform interface
+(\texttt{Constraint} trait in Rust, protocol in Python), and
+Theorem~\ref{thm:soundness} holds for any $k$.
+
+\subsection{Default Validation Order}
+
+Constraints are ordered cheapest-and-most-rejective first to maximize
+early-exit benefit: shape, tensor layout, memory, backend capability,
+numerical error, determinism, safety. Empirically this ordering reduces
+effective validation cost by $2.5$--$3.5\times$
+(Section~\ref{sec:complexity}).
