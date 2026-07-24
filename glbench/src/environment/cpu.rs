@@ -213,10 +213,27 @@ pub fn probe_mhz() -> Option<f64> {
 /// parsing logic for one more class.
 #[cfg(target_os = "windows")]
 pub(crate) fn wmic_field(class: &str, field: &str) -> Option<String> {
-    let output = std::process::Command::new("wmic")
-        .args([class, "get", field, "/format:list"])
-        .output()
-        .ok()?;
+    wmic_field_where(class, None, field)
+}
+
+/// As [`wmic_field`], with an optional `where <condition>` clause inserted
+/// before `get` — e.g. `wmic process where ProcessId=1234 get
+/// PeakWorkingSetSize /format:list`, for a single-process query instead of a
+/// system-wide one. [`super::super::measurement::memory`] uses this form;
+/// [`wmic_field`] stays the zero-argument case every other caller wants,
+/// rather than every call site building its own `Vec<&str>` of args.
+#[cfg(target_os = "windows")]
+pub(crate) fn wmic_field_where(class: &str, condition: Option<&str>, field: &str) -> Option<String> {
+    let mut args: Vec<&str> = vec![class];
+    if let Some(cond) = condition {
+        args.push("where");
+        args.push(cond);
+    }
+    args.push("get");
+    args.push(field);
+    args.push("/format:list");
+
+    let output = std::process::Command::new("wmic").args(&args).output().ok()?;
     if !output.status.success() {
         return None;
     }

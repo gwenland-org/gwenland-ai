@@ -3,6 +3,7 @@
 //! the same [`runs::compare`] delta along a particular axis. glbench compares;
 //! it never routes between engines.
 
+pub mod accuracy;
 pub mod engine;
 pub mod hardware;
 pub mod quantization;

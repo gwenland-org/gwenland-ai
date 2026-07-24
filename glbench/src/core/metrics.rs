@@ -98,6 +98,12 @@ pub struct MeasurementSet {
     /// measured via RAPL, never estimated from TDP. `None` when no energy
     /// counter was readable (non-Linux, missing permissions, no RAPL).
     pub energy_joules: Option<f64>,
+    /// Average CPU utilization across the measured phase, percent, where
+    /// 100% means one core continuously busy (see
+    /// [`crate::measurement::cpu::utilization_pct`] for what values above
+    /// 100 mean on a multi-core budget). `None` when the OS-level process
+    /// CPU-time counters were not readable.
+    pub cpu_utilization_pct: Option<f64>,
 }
 
 impl MeasurementSet {
@@ -164,6 +170,7 @@ impl ToJson for MeasurementSet {
                 Json::Arr(self.cold.iter().map(|c| c.to_json()).collect()),
             ),
             ("energy_joules", opt_num(self.energy_joules)),
+            ("cpu_utilization_pct", opt_num(self.cpu_utilization_pct)),
         ])
     }
 }
@@ -198,6 +205,7 @@ impl FromJson for MeasurementSet {
                 None => Vec::new(),
             },
             energy_joules: v.get("energy_joules").and_then(|n| n.as_f64()),
+            cpu_utilization_pct: v.get("cpu_utilization_pct").and_then(|n| n.as_f64()),
         })
     }
 }
@@ -261,6 +269,7 @@ mod tests {
                 total_ms: 200.0,
             }],
             energy_joules: Some(41.5),
+            cpu_utilization_pct: Some(65.5),
         };
         let back = MeasurementSet::from_json(&set.to_json()).unwrap();
         assert_eq!(back.iterations, set.iterations);

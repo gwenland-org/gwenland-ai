@@ -3,6 +3,7 @@
 //! that turns an engine's output into glbench's iteration metrics.
 
 pub mod bandwidth;
+pub mod cpu;
 pub mod memory;
 pub mod raw;
 pub mod throughput;
