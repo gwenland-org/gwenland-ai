@@ -15,6 +15,12 @@ July 17, 2026) and mapped to the actual GwenLand codebase.
 **Rule**: Before touching any GATE-related code, read the relevant doc here
 first. These docs are the single source of truth for design decisions.
 
+**License** (for `GATE.tex`/`GATE.pdf` and its `sections/`): Dual — [CC
+BY-NC-ND 4.0](LICENSE) (non-commercial) + commercial license available on
+request (see [LICENSE](LICENSE)). The architecture-mapping docs listed
+below (`GATE-*.md`) are GwenLand project documentation, not part of the
+paper, and follow the repository's own code license.
+
 ---
 
 ## Files
