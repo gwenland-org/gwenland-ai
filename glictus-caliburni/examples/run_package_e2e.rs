@@ -81,6 +81,12 @@ fn main() {
         top_p: 0.95,
         repeat_penalty: 1.1,
         trace: Default::default(),
+        // Unioned inside GllmEngine with whatever the .gllm package's own
+        // manifest declares (see gllm_engine.rs's run_request) — supplying
+        // it here too matters specifically for older packages converted
+        // before manifest-level EOS existed, or ones whose source GGUF
+        // metadata was less complete than this tokenizer's own resolve.
+        stopping: glcore::stopping::StoppingCriteria::from_tokenizer(&tokenizer),
     };
 
     let output = engine.infer(input).expect("run request through GllmRuntime + GlprocBackend");

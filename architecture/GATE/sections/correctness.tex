@@ -1,0 +1,83 @@
+\section{Correctness Guarantees}
+\label{sec:correctness}
+
+\begin{theorem}[Constraint soundness]
+\label{thm:soundness}
+If $V(P) = 1$, then $P$ satisfies all $k$ constraints:
+$\forall i \in \{1, \ldots, k\}: C_i(P) = 1$.
+\end{theorem}
+
+\begin{proof}
+$V(P) = \prod_{i=1}^{k} C_i(P)$ with each factor in $\{0, 1\}$. The
+product equals $1$ iff every factor equals $1$.
+\end{proof}
+
+Acceptance by the validator is a sufficient condition for constraint
+satisfaction---every plan surviving validation is semantically correct
+with respect to all registered constraints.
+
+\begin{theorem}[Dispatch correctness]
+\label{thm:dispatch}
+\gate{} never dispatches an invalid plan: if \gate{} dispatches
+$P^{*}$, then $V(P^{*}) = 1$.
+\end{theorem}
+
+\begin{proof}
+The dispatch phase receives input exclusively from
+$\mathcal{P}_{\text{valid}} = \{P \in \mathcal{P}_{\text{cand}} \mid
+V(P) = 1\}$. Hence $P^{*} \in \mathcal{P}_{\text{valid}}$ and
+$V(P^{*}) = 1$.
+\end{proof}
+
+This safety property holds unconditionally---for any constraint set,
+backend inventory, or computation graph---because it relies only on
+the structural fact that dispatch operates over
+$\mathcal{P}_{\text{valid}}$.
+
+\begin{corollary}[Constraint satisfaction]
+Every dispatched plan satisfies all seven default constraint types:
+shape, tensor layout, memory, backend capability, numerical error,
+determinism, and safety.
+\end{corollary}
+
+\begin{theorem}[Optimality]
+\label{thm:optimality}
+Among valid plans, \gate{} selects the cost-minimal one:
+$\forall P \in \mathcal{P}_{\text{valid}}:
+ \mathcal{C}(P^{*}, \mathbf{w}) \leq \mathcal{C}(P, \mathbf{w})$.
+\end{theorem}
+
+\begin{proof}
+$\mathcal{C}(\cdot, \mathbf{w})$ is a real-valued function on the
+finite, non-empty set $\mathcal{P}_{\text{valid}}$; such a function
+attains its minimum, and \gate{} computes it by linear scan.
+\end{proof}
+
+\gate{} therefore does not trade optimality for correctness---it
+restricts the \emph{search space} to valid plans and is exactly optimal
+within it. The guarantee is relative to candidate-set quality
+(Section~\ref{sec:discussion}).
+
+\subsection{Additional Properties}
+
+\paragraph{Termination.}
+The candidate set is finite, each constraint check terminates, and
+dispatch delegates to backends that terminate on valid plans; hence the
+algorithm terminates.
+
+\paragraph{Completeness.}
+If at least one valid plan exists in $\mathcal{P}_{\text{cand}}$,
+\gate{} finds it: the validation loop examines every candidate and
+admits any plan with $V(P) = 1$.
+
+\paragraph{Safety.}
+Independent of the constraint set, cost model, weight vector, and
+backend, the algorithm never dispatches an invalid plan
+(Theorem~\ref{thm:dispatch}).
+
+\begin{remark}[Completeness of the constraint set]
+\gate{} guarantees satisfaction of \emph{registered} constraints. The
+seven defaults cover the most common error sources, but novel sources
+may exist; the composable design admits new constraints, and
+Theorem~\ref{thm:soundness} holds for any $k$.
+\end{remark}

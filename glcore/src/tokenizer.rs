@@ -702,6 +702,22 @@ mod tests {
     }
 
     #[test]
+    fn stopping_criteria_from_tokenizer_captures_every_resolved_stop_id() {
+        // Bridges glcore::stopping::StoppingCriteria to this tokenizer's own
+        // resolved set — must agree with `stop_token_ids()` exactly, not just
+        // the metadata eos_id, so a caller building `InferInput::stopping`
+        // from a real Tokenizer gets the same answer `is_stop_token` gives.
+        let tk = spm_tokenizer();
+        let criteria = crate::stopping::StoppingCriteria::from_tokenizer(&tk);
+        assert!(!criteria.is_empty());
+        for &id in tk.stop_token_ids() {
+            assert!(criteria.is_stop(id), "criteria missed resolved stop id {id}");
+        }
+        assert!(!criteria.is_stop(tk.bos_id()));
+        assert!(!criteria.is_stop(9999));
+    }
+
+    #[test]
     fn qwen_style_stop_markers_resolve_from_vocab() {
         // Byte-level vocab carrying both qwen stop tokens; eos metadata
         // points at <|endoftext|> but <|im_end|> must stop generation too.

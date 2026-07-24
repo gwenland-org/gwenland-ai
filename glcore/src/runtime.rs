@@ -91,6 +91,7 @@ impl Runtime {
     /// Run inference on a text prompt; returns the generated text.
     pub fn infer(&self, prompt: &str, mut config: InferInput) -> Result<String, GlError> {
         config.token_ids = self.encode_prompt(prompt)?;
+        self.apply_default_stopping(&mut config);
         Ok(self.engine.infer(config)?.text)
     }
 
@@ -103,8 +104,30 @@ impl Runtime {
         on_token: impl Fn(&str) + Send,
     ) -> Result<crate::engine_trait::InferOutput, GlError> {
         config.token_ids = self.encode_prompt(prompt)?;
+        self.apply_default_stopping(&mut config);
         self.engine
             .stream(config, &move |_id, text| on_token(text))
+    }
+
+    /// Fill `config.stopping` from this runtime's own tokenizer when the
+    /// caller left it empty (the default — "no early stop"). Every existing
+    /// caller that just builds `InferInput { .. }` without touching
+    /// `stopping` gets correct EOS handling for free; a caller with an
+    /// explicit opinion is never overridden.
+    ///
+    /// Checked by equality against `StoppingCriteria::default()`, not
+    /// `is_empty()`: a caller that set only `ignoring_eos()` (no stop ids,
+    /// but an explicit request to suppress stopping) has `is_empty() ==
+    /// true` yet must not be treated as "untouched" — `is_empty` is
+    /// deliberately scoped to the id set alone (see its own doc comment),
+    /// so this is the one place that needs the fuller "was this genuinely
+    /// never populated at all" check instead.
+    fn apply_default_stopping(&self, config: &mut InferInput) {
+        if config.stopping == crate::stopping::StoppingCriteria::default() {
+            if let Some(tk) = self.tokenizer.as_ref() {
+                config.stopping = crate::stopping::StoppingCriteria::from_tokenizer(tk);
+            }
+        }
     }
 
     /// Shut the engine down gracefully, consuming the runtime.

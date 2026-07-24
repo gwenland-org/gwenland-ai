@@ -11,7 +11,7 @@ use glictus_caliburni::converter::{ConvertOptions, QuantPolicy, QuantTarget, con
 
 fn usage() -> ! {
     eprintln!(
-        "usage: glconv <input.gguf> <output_dir> [--model-id ID] [--quant GQ4A|GQ2A] [--policy CPP]"
+        "usage: glconv <input.gguf> <output_dir> [--model-id ID] [--quant GQ4A|GQ2A|F32] [--policy CPP]"
     );
     std::process::exit(2);
 }
@@ -30,8 +30,14 @@ fn main() -> ExitCode {
             "--quant" => match args.next().as_deref() {
                 Some("GQ4A") => opts.quant = QuantTarget::Gq4a,
                 Some("GQ2A") => opts.quant = QuantTarget::Gq2a,
+                Some("F32") => {
+                    eprintln!(
+                        "[warn] --quant F32 produces uncompressed packages for diagnostic use only"
+                    );
+                    opts.quant = QuantTarget::F32;
+                }
                 _ => {
-                    eprintln!("--quant only supports GQ4A or GQ2A so far (Pridwen v5 §14)");
+                    eprintln!("--quant only supports GQ4A, GQ2A, or F32 (diagnostic) so far (Pridwen v5 §14)");
                     usage();
                 }
             },
@@ -52,6 +58,9 @@ fn main() -> ExitCode {
                 "OK: {} -> {} ({} layers, {} shared tensors)",
                 input, out_dir, report.num_layers, report.shared_tensors
             );
+            if !report.eos_token_ids.is_empty() {
+                println!("[info] EOS token ids: {:?}", report.eos_token_ids);
+            }
             for w in &report.warnings {
                 println!("warning: {w}");
             }

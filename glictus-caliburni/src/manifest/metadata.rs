@@ -10,6 +10,11 @@ pub const RUNTIME_FORMAT_VERSION: &str = "1.0.0";
 /// Default RoPE frequency base when the manifest omits it.
 const DEFAULT_ROPE_FREQ_BASE: f64 = 10_000.0;
 
+/// Default RMSNorm epsilon when the manifest omits it — matches
+/// `glproc::loader`'s own fallback for GGUF sources that don't declare
+/// `{arch}.attention.layer_norm_rms_epsilon`.
+const DEFAULT_RMS_EPS: f64 = 1e-5;
+
 /// GLLM format version (semantic versioning), stored as its raw string.
 ///
 /// Serde is `transparent`; like [`super::types::ExtensionUri`],
@@ -142,6 +147,24 @@ pub struct ModelMetadata {
     /// Whether attention layers use bias.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention_bias: Option<bool>,
+    /// RMSNorm epsilon (default 1e-5 when absent — see
+    /// [`Self::effective_rms_eps`]). Sourced from GGUF's
+    /// `{arch}.attention.layer_norm_rms_epsilon`; many real models (e.g.
+    /// Qwen2.5) declare `1e-6`, not the default, so this must be read from
+    /// the source model rather than assumed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rms_eps: Option<f64>,
+    /// Token ids that end generation, extracted from the source GGUF at
+    /// conversion time (`tokenizer.ggml.eos_token_id` and/or
+    /// `tokenizer.ggml.eos_token_ids` — see `converter::extract_eos_token_ids`).
+    /// Empty when absent from the source or on packages converted before
+    /// this field existed — never treated as an error by itself; a `.gllm`
+    /// package with no EOS ids simply cannot self-stop and falls back to
+    /// whatever `InferInput::stopping` a caller supplies (see
+    /// `glcore::stopping` and `GllmEngine::run_request`'s manifest-first,
+    /// `InferInput`-fallback priority).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub eos_token_ids: Vec<u32>,
 }
 
 impl ModelMetadata {
@@ -199,6 +222,11 @@ impl ModelMetadata {
     pub fn effective_rope_freq_base(&self) -> f64 {
         self.rope_freq_base.unwrap_or(DEFAULT_ROPE_FREQ_BASE)
     }
+
+    /// Effective RMSNorm epsilon (1e-5 when absent).
+    pub fn effective_rms_eps(&self) -> f64 {
+        self.rms_eps.unwrap_or(DEFAULT_RMS_EPS)
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +252,8 @@ mod tests {
             expert_used_count: None,
             sliding_window: None,
             attention_bias: None,
+            rms_eps: None,
+            eos_token_ids: Vec::new(),
         }
     }
 
@@ -324,5 +354,26 @@ mod tests {
         let mut m = metadata();
         m.rope_freq_base = Some(1_000_000.0);
         assert_eq!(m.effective_rope_freq_base(), 1_000_000.0);
+    }
+
+    #[test]
+    fn model_metadata_eos_token_ids_roundtrips_serde() {
+        // Absent case: the field must not appear in the JSON at all
+        // (backward compatibility with packages converted before it
+        // existed — `skip_serializing_if` is the contract under test).
+        let absent = metadata();
+        assert!(absent.eos_token_ids.is_empty());
+        let json = serde_json::to_string(&absent).unwrap();
+        assert!(!json.contains("eos_token_ids"), "{json}");
+        let back: ModelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, absent);
+
+        // Present case: Qwen2.5's real dual EOS ids.
+        let mut present = metadata();
+        present.eos_token_ids = vec![151_645, 151_643];
+        let json = serde_json::to_string(&present).unwrap();
+        assert!(json.contains("eos_token_ids"), "{json}");
+        let back: ModelMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, present);
     }
 }

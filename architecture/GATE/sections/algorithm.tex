@@ -1,0 +1,118 @@
+\section{The \gate{} Algorithm}
+\label{sec:algorithm}
+
+\gate{} proceeds in four phases---\textbf{generate, validate, evaluate,
+dispatch}---refined into seven steps.
+
+\begin{description}[leftmargin=1.5em]
+  \item[Step 1: Generate candidate plans.] The Plan Generator explores
+    execution strategies for the tensor graph across available
+    backends, producing a finite candidate set
+    $\mathcal{P}_{\text{cand}}$ (default bound: 8 candidates, maximum
+    64). Each candidate fixes backend assignment, layout configuration,
+    operation ordering, and fusion decisions.
+  \item[Step 2: Validate.] Each candidate is submitted to the
+    Constraint Engine (Eq.~\ref{eq:validator}) with early-exit: the
+    first violated constraint short-circuits the remaining checks.
+  \item[Step 3: Reject invalid plans.] Rejected plans are logged with
+    the identity of the first violated constraint and the specific
+    reason---diagnostics, not silent fallback.
+  \item[Step 4: Error on empty valid set.] If
+    $\mathcal{P}_{\text{valid}} = \emptyset$, terminate with
+    \texttt{ConstraintViolation}. \gate{} never silently substitutes a
+    potentially incorrect plan.
+  \item[Step 5: Evaluate cost.] Compute
+    $\mathcal{C}(P, \mathbf{w}) = \mathbf{w}^{\top}\mathbf{m}(P)$ for
+    every valid plan, with $\mathbf{w}$ resolved from the execution
+    policy.
+  \item[Step 6: Select.] $P^{*} = \argmin_{P \in
+    \mathcal{P}_{\text{valid}}} \mathcal{C}(P, \mathbf{w})$
+    (Eq.~\ref{eq:selection}).
+  \item[Step 7: Dispatch.] Execute $P^{*}$ on its target backend and
+    return the output tensors.
+\end{description}
+
+\begin{algorithm}[H]
+\small
+\caption{\gate{}: generate--validate--evaluate--dispatch}
+\label{alg:gate}
+\KwInput{graph $\mathcal{G}$; backends $\mathcal{B}$; constraints
+  $C_1,\ldots,C_k$; policy $\pi$; context $\kappa$}
+\KwOutput{execution result of the optimal valid plan}
+$\mathcal{P}_{\text{cand}} \gets \textsc{GeneratePlans}(\mathcal{G}, \mathcal{B})$\;
+$\mathcal{P}_{\text{valid}} \gets \emptyset$\;
+\ForEach{$P \in \mathcal{P}_{\text{cand}}$}{
+  $valid \gets \top$\;
+  \For{$i \gets 1$ \KwTo $k$}{
+    \If{$C_i(P) = 0$}{
+      $valid \gets \bot$; \textsc{LogRejection}$(P, C_i)$; \textbf{break}\;
+    }
+  }
+  \lIf{$valid$}{$\mathcal{P}_{\text{valid}} \gets
+    \mathcal{P}_{\text{valid}} \cup \{P\}$}
+}
+\lIf{$\mathcal{P}_{\text{valid}} = \emptyset$}{
+  \KwRet{\texttt{ConstraintViolation}}}
+$\mathbf{w} \gets \pi(\kappa)$\;
+$P^{*} \gets \argmin_{P \in \mathcal{P}_{\text{valid}}}
+  \mathbf{w}^{\top}\mathbf{m}(P)$\;
+\KwRet{$\textsc{Dispatch}(P^{*})$}\;
+\end{algorithm}
+
+\subsection{Reference Interface (Python)}
+
+\begin{lstlisting}[style=python]
+def execute(
+    tensor_graph: Sequence[TensorOp],
+    policy: ExecutionPolicy = ExecutionPolicy.BALANCED,
+    *,
+    memory_budget_mb: float = 4096.0,
+    max_numerical_error: float = 1e-4,
+    require_determinism: bool = False,
+    custom_weights: Optional[WeightVector] = None,
+    num_candidates: int = 8,
+) -> ExecutionResult:
+    validator = Validator(constraints=[
+        ShapeConstraint(tensor_graph),
+        TensorLayoutConstraint(),
+        MemoryConstraint(memory_budget_mb),
+        BackendCapabilityConstraint(),
+        NumericalErrorConstraint(max_numerical_error),
+        DeterminismConstraint(require_determinism),
+        SafetyConstraint(),
+    ])
+    weights = custom_weights or WeightVector.from_policy(policy)
+    planner = Planner(validator=validator,
+                      cost_evaluator=CostEvaluator(weights),
+                      num_candidates=num_candidates)
+    candidates = planner.generate_candidates(tensor_graph, policy)
+    best_plan = planner.select_best(candidates)
+    return Dispatcher().dispatch(best_plan)
+\end{lstlisting}
+
+\subsection{Reference Interface (Rust)}
+
+\begin{lstlisting}[style=rust]
+fn execute(
+    graph:  &TensorGraph,
+    policy: ExecutionPolicy,
+    config: &GateConfig,
+) -> Result<ExecutionResult, PlanError> {
+    let mut validator = Validator::new();
+    validator.register(Box::new(ShapeConstraint { graph: graph.ops.clone() }));
+    validator.register(Box::new(TensorLayoutConstraint::new()));
+    validator.register(Box::new(MemoryConstraint { budget_mb: config.memory_budget_mb }));
+    validator.register(Box::new(BackendCapabilityConstraint::new()));
+    validator.register(Box::new(NumericalErrorConstraint { max_error: config.max_numerical_error }));
+    validator.register(Box::new(DeterminismConstraint::new(config.require_determinism)));
+    validator.register(Box::new(SafetyConstraint::new()));
+
+    let weights = config.custom_weights
+        .unwrap_or_else(|| WeightVector::from_policy(policy));
+    let planner = Planner::new(validator, CostEvaluator::new(weights),
+                               config.num_candidates);
+    let mut candidates = planner.generate_candidates(graph, policy);
+    let best_plan = planner.select_best(&mut candidates)?;
+    Dispatcher::new().dispatch(&best_plan)
+}
+\end{lstlisting}

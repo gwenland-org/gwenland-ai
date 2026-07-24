@@ -22,6 +22,11 @@ pub struct InferInput {
     /// Off by default — it costs an O(vocab) sweep per token, so throughput
     /// measured with tracing on is not comparable to throughput without it.
     pub trace: crate::trace::TraceConfig,
+    /// Token ids that end generation early, checked post-sample/pre-emit —
+    /// see `crate::stopping` for why this exists and where it lives.
+    /// Empty (the default) means "no early stop," preserving today's
+    /// behavior for any caller that doesn't populate it.
+    pub stopping: crate::stopping::StoppingCriteria,
 }
 
 impl Default for InferInput {
@@ -34,6 +39,7 @@ impl Default for InferInput {
             top_p: 0.95,
             repeat_penalty: 1.1,
             trace: crate::trace::TraceConfig::default(),
+            stopping: crate::stopping::StoppingCriteria::default(),
         }
     }
 }

@@ -11,12 +11,14 @@ pub mod engine_trait;
 pub mod error;
 pub mod format;
 pub mod runtime;
+pub mod stopping;
 pub mod telemetry;
 pub mod tensor;
 pub mod tokenizer;
 pub mod trace;
 
 pub use engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
+pub use stopping::StoppingCriteria;
 pub use telemetry::{
     BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile, StageTiming,
 };
