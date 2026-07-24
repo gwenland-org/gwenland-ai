@@ -68,6 +68,8 @@ impl EngineAdapter {
     /// The engine is created here (the only place glbench names concrete engine
     /// types); everything after goes through [`Backend`].
     pub fn load(spec: &WorkloadSpec) -> Result<EngineAdapter, GlError> {
+        enable_engine_profiling();
+
         if spec.engine == "gllm" {
             return Self::load_gllm(spec);
         }
@@ -211,6 +213,37 @@ impl EngineAdapter {
                 engine.stream(config, &|_id, _text| {})
             }
         }
+    }
+}
+
+/// Ask `glproc` to collect its own per-stage telemetry for this process.
+///
+/// `glproc::runner::Runner` only populates `backend`/`memory`/`moe` stage
+/// timings when the `GLPROC_PROFILE` env var is set — off by default because
+/// per-stage instrumentation has real overhead the engine does not want to
+/// pay on every request unconditionally. glbench had never set it, which
+/// meant the entire telemetry section (`render::text::telemetry`'s
+/// backend/timeline/memory/MoE breakdown, and everything built on top of it —
+/// the ASCII flame graph, the KV-cache memory-risk validation check) was
+/// silently unreachable through the normal `glbench run` CLI: `session.telemetry`
+/// was always `None` unless a caller happened to already know and export a
+/// glproc-internal env var name themselves. Found while E2E-verifying the
+/// flame graph feature: the telemetry section never printed on a real run.
+///
+/// glbench exists specifically to observe engine internals, so it should
+/// always ask for that data rather than requiring the user to know how. Set
+/// once per process, here at the single boundary where every engine gets
+/// constructed — not restored afterward, unlike `thread_scale`'s sweep,
+/// because this is a permanent "yes, profile yourself" instruction for
+/// glbench's whole run, not a transient parameter sweep.
+fn enable_engine_profiling() {
+    if std::env::var_os("GLPROC_PROFILE").is_some() {
+        return; // Respect an explicit caller override, don't clobber it.
+    }
+    // SAFETY: called once, synchronously, before any engine or thread that
+    // reads this variable is constructed (the very first line of `load`).
+    unsafe {
+        std::env::set_var("GLPROC_PROFILE", "1");
     }
 }
 

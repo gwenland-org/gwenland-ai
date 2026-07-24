@@ -83,6 +83,12 @@ pub fn session(session: &BenchmarkSession) -> String {
     if let Some(bytes) = hw.storage.model_file_bytes {
         s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
     }
+    if let Some(bytes) = m.peak_memory_bytes {
+        s.push_str(&format!("peak RSS {:.2} GiB (process high-water mark, includes model load)\n", bytes_to_gib(bytes)));
+    }
+    if let Some(pct) = m.cpu_utilization_pct {
+        s.push_str(&format!("CPU utilization {pct:.1}% (measured phase, {} logical cores)\n", hw.cpu.logical_cores));
+    }
     s.push('\n');
 
     // Throughput table.
@@ -328,6 +334,8 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
                 un / p.total_ms * 100.0
             ));
         }
+
+        s.push_str(&crate::render::flamegraph::render_phase(label, p));
     }
 
     if let Some(m) = &t.memory {
@@ -439,8 +447,9 @@ fn behavior(b: &crate::behavior::BehaviorReport, synthetic_prompt: bool) -> Stri
     }
     if let Some(st) = &b.stall {
         s.push_str(&format!(
-            "  stall        p50 {:.1} ms | p99 {:.1} ms | max {:.1} ms | jitter {:.2}{}\n",
+            "  stall        p50 {:.1} ms | p95 {:.1} ms | p99 {:.1} ms | max {:.1} ms | jitter {:.2}{}\n",
             st.p50_ms,
+            st.p95_ms,
             st.p99_ms,
             st.max_ms,
             st.jitter,
@@ -550,6 +559,86 @@ pub fn sweep(r: &crate::runner::scale::SweepReport) -> String {
     }
     s.push_str(&t.render());
     s.push_str(&format!("\nverdict: {}\n", r.scaling.as_str()));
+    s
+}
+
+/// `glbench thread-scale`'s report: decode throughput vs. `GLPROC_THREADS`,
+/// plus the per-thread speedup relative to the lowest thread count in the
+/// sweep (the standard parallel-scaling efficiency framing).
+pub fn thread_sweep(r: &crate::runner::thread_scale::ThreadScaleReport) -> String {
+    let mut s = String::new();
+    s.push_str("glbench thread-scale :: decode throughput vs. GLPROC_THREADS\n\n");
+
+    let baseline = r
+        .points
+        .first()
+        .map(|p| Stats::from_samples(&p.session.measurements.decode_tps_samples()).mean);
+
+    let mut t = Table::new(&["threads", "decode tps (mean)", "median", "std", "speedup", "efficiency"])
+        .right_align(1)
+        .right_align(2)
+        .right_align(3)
+        .right_align(4)
+        .right_align(5);
+    for p in &r.points {
+        let dec = Stats::from_samples(&p.session.measurements.decode_tps_samples());
+        let speedup = baseline.filter(|&b| b > 0.0).map(|b| dec.mean / b);
+        t.row(&[
+            format!("{}", p.threads),
+            format!("{:.1}", dec.mean),
+            format!("{:.1}", dec.median),
+            format!("{:.1}", dec.std_dev),
+            speedup.map_or("-".into(), |v| format!("{v:.2}x")),
+            // Efficiency: speedup achieved per thread added, 100% = perfect
+            // linear scaling relative to the baseline thread count.
+            match (speedup, r.points.first().map(|p0| p0.threads)) {
+                (Some(sp), Some(t0)) if t0 > 0 => {
+                    format!("{:.0}%", sp / (p.threads as f64 / t0 as f64) * 100.0)
+                }
+                _ => "-".into(),
+            },
+        ]);
+    }
+    s.push_str(&t.render());
+    s.push_str(&format!("\nverdict: {}\n", r.scaling.as_str()));
+    s
+}
+
+/// Render an [`crate::comparison::accuracy::AccuracyVsPerf`] join.
+pub fn accuracy_vs_perf(j: &crate::comparison::accuracy::AccuracyVsPerf) -> String {
+    use crate::comparison::accuracy::AccuracyFigure;
+
+    let mut s = String::new();
+    s.push_str("glbench accuracy-vs-perf\n\n");
+    s.push_str(&format!("engine   {}\n", j.engine));
+    s.push_str(&format!("model (run)      {}\n", j.run_model_path));
+    s.push_str(&format!("model (accuracy) {}\n", j.accuracy_model_path));
+    if !j.model_paths_match {
+        s.push_str(
+            "  ! model paths do not appear to match — this comparison may be joining \
+             unrelated runs\n",
+        );
+    }
+    s.push('\n');
+    s.push_str(&format!("decode tps (mean)   {:.1}\n", j.decode_tps_mean));
+    s.push_str(&format!("prefill tps (mean)  {:.1}\n", j.prefill_tps_mean));
+    s.push('\n');
+    match &j.accuracy {
+        AccuracyFigure::KlDivergence { mean, max, tokens_compared } => {
+            s.push_str(&format!("KL-divergence vs oracle   mean {mean:.6} nats | max {max:.6} nats\n"));
+            s.push_str(&format!("  over {tokens_compared} compared token positions\n"));
+        }
+        AccuracyFigure::Perplexity { value, evaluated_tokens } => {
+            s.push_str(&format!("perplexity   {value:.3}\n"));
+            s.push_str(&format!("  over {evaluated_tokens} evaluated tokens\n"));
+        }
+        AccuracyFigure::Unknown => {
+            s.push_str(
+                "accuracy figure not recognized — expected a kl-div or ppl archive \
+                 (looked for kl_mean/kl_max or perplexity fields)\n",
+            );
+        }
+    }
     s
 }
 
