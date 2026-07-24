@@ -1,0 +1,90 @@
+\section{Introduction}
+\label{sec:introduction}
+
+Modern tensor computation frameworks face a fundamental tension between
+performance optimization and execution correctness. Systems such as
+TVM~\cite{chen2018tvm}, XLA~\cite{xla2017}, TensorRT~\cite{tensorrt2020},
+and ONNX Runtime~\cite{onnxruntime2019} prioritize throughput by
+aggressively applying optimizations---operator fusion, layout
+transformation, quantization, kernel autotuning---without formally
+verifying that the optimized execution plan preserves the numerical
+semantics of the original computation. The gap between optimization and
+correctness widens further under backend heterogeneity: a plan that is
+valid on one accelerator may silently violate shape, layout, memory, or
+numerical constraints on another.
+
+This is not a hypothetical concern. During the empirical study reported
+in Section~\ref{subsec:empirical}, an off-the-shelf release of a widely
+deployed tensor compiler produced a ResNet-50 module whose output
+diverged from four independent reference implementations by a relative
+$L_2$ distance greater than $1.2$---changing the top-1
+prediction---while compiling without a single warning. Fast, silent, and
+wrong is precisely the failure mode this paper addresses.
+
+\gate{} (Gwen Algorithm for Tensor Execution) is a
+\emph{correctness-driven execution algorithm} built on one foundational
+insight:
+
+\begin{quote}
+\itshape ``Numbers are not considered trustworthy until logical
+constraints validate them.''
+\end{quote}
+
+A numerical result produced by a tensor computation is meaningless if
+the execution plan that generated it violated one or more semantic
+constraints. \gate{} inverts the traditional execution paradigm by
+placing constraint validation \emph{before} cost optimization: every
+plan considered by the optimizer has already been proven valid, which
+eliminates the possibility of selecting a fast but incorrect execution
+strategy.
+
+\subsection{What \gate{} Is---and Is Not}
+
+\gate{}'s position in the tensor execution ecosystem is easily
+misunderstood, so we state it precisely. \gate{} is \textbf{not} a
+neural-network framework (it defines no layers, losses, or training
+loops), \textbf{not} a compiler (it parses no source and emits no
+machine code), \textbf{not} an optimizer (it applies no loop
+transformations or fusion itself), \textbf{not} a scheduler, and
+\textbf{not} a tensor library. \gate{} \emph{is} the protocol layer that
+sits above all of these components: it accepts candidate execution plans
+as input, validates them against a composable set of logical
+constraints, evaluates their cost under a policy-driven objective, and
+selects the optimal valid plan for dispatch. \gate{} defines the
+\emph{protocol} by which optimization and correctness interact, not the
+implementation of either.
+
+\subsection{Contributions}
+
+This paper makes the following contributions:
+
+\begin{enumerate}[leftmargin=2em]
+  \item \textbf{Algorithm.} A four-phase execution algorithm
+    (generate--validate--evaluate--dispatch) in which a constraint
+    engine enforcing seven composable constraint types---shape, tensor
+    layout, memory, backend capability, numerical error, determinism,
+    and safety---runs strictly before any cost evaluation
+    (Sections~\ref{sec:algorithm}--\ref{sec:constraint-engine}).
+  \item \textbf{Formalization.} Mathematical definitions of execution
+    plans, constraints, validators, the valid execution set, metric
+    vectors, weight vectors, and the cost function, together with proofs
+    of constraint soundness, dispatch correctness, and cost optimality
+    (Sections~\ref{sec:math} and~\ref{sec:correctness}).
+  \item \textbf{Complexity analysis.} Constraint validation adds
+    $O(knp)$ overhead for $k$ constraints and $p$ candidate plans of $n$
+    operations, with early-exit reducing the effective cost by
+    $2.5$--$3.5\times$ in practice (Section~\ref{sec:complexity}).
+  \item \textbf{Implementation.} A four-crate Rust implementation
+    (glcore, glproc, glcuda, glvulkan), plus two independent,
+    dependency-free reference implementations used for empirical
+    validation (Section~\ref{sec:implementation}).
+  \item \textbf{Evaluation.} An analytical study across ten models and
+    five competing frameworks (Section~\ref{sec:evaluation}), now
+    complemented by an end-to-end \emph{empirical} proof-of-concept on
+    commodity CPU and real TPU~v5e hardware
+    (Section~\ref{subsec:empirical}), in which the full 7-constraint
+    validation and plan selection measure at $1.4$--$8.2\,\mu$s per
+    policy---seven orders of magnitude below one inference---and in
+    which the numerical-error constraint catches a real miscompilation
+    in a production compiler.
+\end{enumerate}

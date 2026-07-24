@@ -1,0 +1,184 @@
+% ═══════════════════════════════════════════════════════════════════════
+% GATE: Gwen Algorithm for Tensor Execution  (revised edition)
+% A Correctness-Driven Execution Algorithm for Heterogeneous Backends
+%
+% Revision: sections reconstructed from GATE.md; evaluation extended
+% with the empirical proof-of-concept study (gate-empirical artifact).
+% Compile with: latexmk -pdf GATE.tex   (or pdflatex x2 + bibtex)
+% ═══════════════════════════════════════════════════════════════════════
+\documentclass[11pt,a4paper]{article}
+
+% ─── Packages ───────────────────────────────────────────────────────────
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{listings}
+\usepackage{algpseudocode}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{pifont}
+
+% ─── hyperref (last among content packages) ────────────────────────────
+\usepackage[
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=darkgray,
+  urlcolor=blue!70!black,
+  bookmarks=true,
+  bookmarksnumbered=true,
+  unicode=true,
+  pdftitle={GATE: Gwen Algorithm for Tensor Execution},
+  pdfauthor={Gwen Research Group}
+]{hyperref}
+
+% ─── Theorem environments ──────────────────────────────────────────────
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}{Corollary}[section]
+\newtheorem{remark}{Remark}[section]
+\newtheorem{assumption}{Assumption}[section]
+
+% ─── Algorithm settings ────────────────────────────────────────────────
+\SetAlFnt{\small}
+\SetAlCapFnt{\small}
+\SetAlCapNameFnt{\small}
+\SetKwInput{KwInput}{Input}
+\SetKwInput{KwOutput}{Output}
+
+% ─── Code listings ─────────────────────────────────────────────────────
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\bfseries\color{blue!70!black},
+  commentstyle=\itshape\color{gray},
+  stringstyle=\color{green!50!black},
+  breaklines=true,
+  frame=single,
+  numbers=left,
+  numberstyle=\tiny\color{gray},
+  xleftmargin=1.5em,
+  framexleftmargin=1em,
+  tabsize=4
+}
+\lstdefinestyle{python}{
+  language=Python,
+  morekeywords={self,True,False,None,def,class,return,for,if,else,elif,in,not,and,or,with,as,from,import,raise,assert,yield}
+}
+\lstdefinestyle{rust}{
+  language=C, % close enough for pseudocode
+  morekeywords={fn,let,mut,impl,trait,pub,struct,enum,use,mod,self,Self,match,return,for,if,else,Vec,Box,Result,Option,HashMap,Ok,Err,Some,None}
+}
+
+% ─── Custom commands ───────────────────────────────────────────────────
+\newcommand{\gate}{\textsc{Gate}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+\newcommand{\argmin}{\operatorname*{arg\,min}}
+
+% ─── Section numbering depth ───────────────────────────────────────────
+\setcounter{secnumdepth}{3}
+\setcounter{tocdepth}{2}
+
+% ─── Spacing ───────────────────────────────────────────────────────────
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{1.5em}
+
+\begin{document}
+
+% ─── Title ─────────────────────────────────────────────────────────────
+\begin{center}
+  {\LARGE\bfseries GATE: Gwen Algorithm for Tensor Execution\par}
+  \vspace{0.5em}
+  {\large A Correctness-Driven Execution Algorithm for\\Heterogeneous Tensor Backends\par}
+  \vspace{1.5em}
+  {\normalsize Gwen Research Group\par}
+  \vspace{0.3em}
+  {\small Revised edition --- \today\par}
+\end{center}
+\vspace{1em}
+
+% ─── Abstract ──────────────────────────────────────────────────────────
+\begin{abstract}
+Modern tensor computation frameworks face a fundamental tension between
+performance optimization and execution correctness. Existing systems
+including TVM~\cite{chen2018tvm}, XLA~\cite{xla2017},
+TensorRT~\cite{tensorrt2020}, and ONNX Runtime~\cite{onnxruntime2019}
+prioritize throughput by aggressively applying optimizations such as
+operator fusion, layout transformation, and quantization without
+formally verifying that the optimized execution plan preserves the
+numerical semantics of the original computation. This gap is
+exacerbated by backend heterogeneity, where a plan valid on one
+accelerator may silently violate shape, layout, or numerical
+constraints on another.
+
+We present \gate{} (Gwen Algorithm for Tensor Execution), a
+correctness-driven execution algorithm that \emph{selects the optimal
+execution plan from a set of logically validated execution plans}.
+\gate{} introduces a constraint engine that enforces seven composable
+constraint types---shape, tensor layout, memory, backend capability,
+numerical error, determinism, and safety---before any cost evaluation
+occurs, so the optimization objective operates exclusively over the
+valid execution set. We formalize the algorithm, prove that every
+dispatched plan satisfies all constraints and is cost-minimal among
+valid plans, and show that validation adds only $O(kn)$ overhead for
+$k$ constraint types and $n$ candidate plans.
+
+We describe an implementation spanning four Rust crates (glcore,
+glproc, glcuda, glvulkan) and evaluate \gate{} analytically against
+five major frameworks across ten models. We complement this with an
+end-to-end \emph{empirical} proof-of-concept on commodity CPU and real
+TPU~v5e hardware: two independent, fully-executable implementations of
+the algorithm run pretrained ResNet-50 under all five execution
+policies, with the complete 7-constraint validation and plan selection
+measuring $1.4$--$8.2\,\mu$s per policy---seven orders of magnitude
+below one inference---while five independent runtimes agree to
+${\sim}10^{-6}$ relative $L_2$ on identical inputs. The same study
+surfaced a silent miscompilation in an off-the-shelf release of a
+production tensor compiler; the numerical-error constraint that
+\gate{} enforces by construction is precisely the check that catches
+it.
+\end{abstract}
+
+% ─── Table of Contents ─────────────────────────────────────────────────
+\newpage
+\tableofcontents
+\newpage
+
+% ═══════════════════════════════════════════════════════════════════════
+% BODY SECTIONS (modular inputs)
+% ═══════════════════════════════════════════════════════════════════════
+
+\input{sections/introduction}
+\input{sections/related_work}
+\input{sections/design_philosophy}
+\input{sections/math_foundation}
+\input{sections/algorithm}
+\input{sections/constraint_engine}
+\input{sections/cost_evaluation}
+\input{sections/architecture}
+\input{sections/complexity}
+\input{sections/correctness}
+\input{sections/implementation}
+\input{sections/evaluation}
+\input{sections/discussion}
+\input{sections/conclusion}
+
+% ─── Bibliography ──────────────────────────────────────────────────────
+\newpage
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}

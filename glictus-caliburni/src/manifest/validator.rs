@@ -210,6 +210,18 @@ impl<'a> ManifestValidator<'a> {
             ));
         }
 
+        // V18: declared EOS ids (if any) must be valid vocabulary indices —
+        // an out-of-range id would silently never fire, defeating the whole
+        // point of storing it.
+        for &id in &m.metadata.eos_token_ids {
+            if id as u64 >= m.metadata.vocab_size {
+                result.errors.push(format!(
+                    "V18: eos_token_ids contains {id} >= vocab_size={}",
+                    m.metadata.vocab_size
+                ));
+            }
+        }
+
         result
     }
 }
@@ -361,6 +373,24 @@ mod tests {
         );
         let r = validate(&json);
         assert!(r.warnings.iter().any(|w| w.starts_with("V17")), "{:?}", r.warnings);
+    }
+
+    #[test]
+    fn manifest_validator_v18_rejects_out_of_range_eos_id() {
+        // Minimal fixture's vocab_size is 1000 — 9999 is well out of range.
+        let json = fixtures::minimal_manifest_json(1)
+            .replace("\"head_count_kv\":8", "\"head_count_kv\":8,\"eos_token_ids\":[9999]");
+        let r = validate(&json);
+        assert!(r.errors.iter().any(|e| e.starts_with("V18")), "{:?}", r.errors);
+    }
+
+    #[test]
+    fn manifest_validator_v18_accepts_in_range_eos_ids() {
+        let json = fixtures::minimal_manifest_json(1)
+            .replace("\"head_count_kv\":8", "\"head_count_kv\":8,\"eos_token_ids\":[0,999]");
+        let r = validate(&json);
+        assert!(r.is_ok(), "errors: {:?}", r.errors);
+        assert!(!r.errors.iter().any(|e| e.starts_with("V18")), "{:?}", r.errors);
     }
 
     #[test]

@@ -95,6 +95,11 @@ pub struct ConvertReport {
     pub shared_tensors: usize,
     /// Non-fatal notes (unmapped tensors, tokenizer skip, â€¦).
     pub warnings: Vec<String>,
+    /// EOS token ids extracted from the source GGUF (see
+    /// `extract_eos_token_ids`), same value written to
+    /// `ModelMetadata::eos_token_ids`. Surfaced here so the CLI can report
+    /// what it found without re-deriving it.
+    pub eos_token_ids: Vec<u32>,
 }
 
 fn convert_err(msg: impl Into<String>) -> GllmError {
@@ -218,6 +223,37 @@ fn arch_meta_u64(gguf: &GgufFile, arch: &str, key: &str) -> Option<u64> {
     gguf.get_meta(&format!("{arch}.{key}")).and_then(|v| v.as_u64())
 }
 
+/// Extract EOS token ids from GGUF tokenizer metadata.
+///
+/// `tokenizer.ggml.eos_token_ids` (an array — the less common, but more
+/// complete key some newer conversions write for multi-EOS models) *overrides*
+/// `tokenizer.ggml.eos_token_id` (the single, standard key) when present,
+/// rather than merging the two — an array author who wrote down a specific
+/// set meant that set, not "this plus whatever the singular key also says."
+/// Deduplicated and sorted for a stable, comparable result.
+///
+/// Empty when neither key is present — not an error. Some models
+/// legitimately omit EOS metadata; a `.gllm` package converted from one
+/// simply has no manifest-level stop ids and falls back to whatever
+/// `InferInput::stopping` a caller supplies (see `glcore::stopping`).
+fn extract_eos_token_ids(gguf: &GgufFile) -> Vec<u32> {
+    let mut ids: Vec<u32> = gguf
+        .get_meta("tokenizer.ggml.eos_token_ids")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+        .unwrap_or_default();
+
+    if ids.is_empty() {
+        if let Some(id) = gguf.get_meta("tokenizer.ggml.eos_token_id").and_then(|v| v.as_u64()) {
+            ids.push(id as u32);
+        }
+    }
+
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Convert a GGUF file into a GLLM package directory.
 ///
 /// Writes `gllm.json`, `GLLMShared.gllm`, `GLLMTensorLayer-NNNN.gllm`, and
@@ -263,6 +299,20 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         })
         .ok_or_else(|| convert_err("cannot determine vocab_size (E002)"))?;
 
+    // Not a warning when found — that's the success path, and the CLI
+    // reports it as its own info line from `ConvertReport::eos_token_ids`
+    // (see `glconv.rs`) rather than mixing it into `warnings`, which is
+    // reserved for non-fatal *problems*.
+    let eos_token_ids = extract_eos_token_ids(&gguf);
+    if eos_token_ids.is_empty() {
+        warnings.push(
+            "no tokenizer.ggml.eos_token_id(s) found in source GGUF; this package cannot \
+             self-stop at end-of-sequence and will fall back to whatever InferInput::stopping \
+             a caller supplies"
+                .to_string(),
+        );
+    }
+
     let metadata = ModelMetadata {
         vocab_size,
         context_length,
@@ -284,6 +334,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
             .get_meta(&format!("{arch}.attention.layer_norm_rms_epsilon"))
             .and_then(|v| v.as_f32())
             .map(f64::from),
+        eos_token_ids: eos_token_ids.clone(),
     };
 
     let model_id = opts
@@ -573,6 +624,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         num_layers,
         shared_tensors: shared_plan.len(),
         warnings,
+        eos_token_ids,
     })
 }
 
@@ -696,6 +748,43 @@ mod tests {
 
         // head_count_kv falls back to num_heads when absent.
         assert_eq!(pkg.manifest().metadata.head_count_kv, 2);
+    }
+
+    #[test]
+    fn glconv_extracts_eos_from_gguf_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf_path = write_gguf(
+            tmp.path(),
+            &synth_gguf(&standard_tensors(), &[("tokenizer.ggml.eos_token_id", 7)]),
+        );
+        let out = tmp.path().join("out");
+
+        let report = convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+        assert_eq!(report.eos_token_ids, vec![7]);
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("no tokenizer.ggml.eos_token_id")),
+            "{:?}",
+            report.warnings
+        );
+
+        // Round-trips through the written manifest, not just the in-memory report.
+        let pkg = GllmPackage::open(&out).unwrap();
+        assert_eq!(pkg.manifest().metadata.eos_token_ids, vec![7]);
+    }
+
+    #[test]
+    fn glconv_warns_when_source_has_no_eos_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gguf_path = write_gguf(tmp.path(), &synth_gguf(&standard_tensors(), &[]));
+        let out = tmp.path().join("out");
+
+        let report = convert(&gguf_path, &out, &ConvertOptions::default()).unwrap();
+        assert!(report.eos_token_ids.is_empty());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("no tokenizer.ggml.eos_token_id")),
+            "{:?}",
+            report.warnings
+        );
     }
 
     #[test]

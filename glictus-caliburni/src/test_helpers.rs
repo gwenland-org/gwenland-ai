@@ -48,8 +48,12 @@ pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
 
 /// Metadata for Qwen2.5-0.5B-Instruct â€” the reference model these crates are
 /// verified against. Values are the real ones read from its GGUF (dim 896,
-/// 14 query heads / 2 KV heads, head_dim 64, ctx 32768, rope base 1e6), so
-/// tests asserting on derived sizes are checking a shape that actually ships.
+/// 14 query heads / 2 KV heads, head_dim 64, ctx 32768, rope base 1e6, rms
+/// eps 1e-6 â€” confirmed via `gwen info` on the actual file, NOT the 1e-5
+/// default; this is the exact value whose mismatch against a hardcoded 1e-5
+/// produced garbage E2E output before rms_eps was threaded through
+/// ModelMetadata), so tests asserting on derived sizes are checking a shape
+/// that actually ships.
 pub(crate) fn qwen05b_metadata() -> crate::manifest::ModelMetadata {
     crate::manifest::ModelMetadata {
         vocab_size: 151_936,
@@ -65,6 +69,9 @@ pub(crate) fn qwen05b_metadata() -> crate::manifest::ModelMetadata {
         expert_used_count: None,
         sliding_window: None,
         attention_bias: None,
+        rms_eps: Some(1e-6),
+        // Qwen2.5's real dual EOS: <|im_end|> and <|endoftext|>.
+        eos_token_ids: vec![151_645, 151_643],
     }
 }
 

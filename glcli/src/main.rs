@@ -122,6 +122,8 @@ fn cmd_run(
         // Tracing off: it costs an O(vocab) sweep per token and the CLI has no
         // surface to report it. glbench is the tool that asks for traces.
         trace: TraceConfig::default(),
+        // Empty: `Runtime::stream` fills this from its own tokenizer.
+        stopping: Default::default(),
     };
 
     match prompt {

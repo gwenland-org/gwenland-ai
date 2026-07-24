@@ -45,9 +45,18 @@ const FFN_GATE: &str = "ffn_gate.weight";
 const FFN_UP: &str = "ffn_up.weight";
 const FFN_DOWN: &str = "ffn_down.weight";
 
-/// RMSNorm epsilon. Not present in [`ModelMetadata`] (ARTX03 does not carry
-/// it), so this uses the value every reference model (Qwen2.5/Qwen3) ships.
-const RMS_EPS: f32 = 1e-5;
+/// Attention Q/K/V bias — present in Qwen2 (and thus real Qwen2.5 `.gllm`
+/// packages, confirmed against a real converted manifest), absent in most
+/// other architectures (including Qwen3, per `plugin.rs`'s own doc comment).
+/// Naming matches every other tensor constant above: `.weight`/`.bias`
+/// suffix on the bare role name, exactly what the ARTX07 converter writes —
+/// verified directly against a real package manifest rather than assumed
+/// (`grep '"name": "attn_[qkv].bias"' gllm.json`), since a wrong guess here
+/// (e.g. an underscore instead of a dot) would silently never match and
+/// leave the bias unapplied again, just for a different reason.
+const ATTN_Q_BIAS: &str = "attn_q.bias";
+const ATTN_K_BIAS: &str = "attn_k.bias";
+const ATTN_V_BIAS: &str = "attn_v.bias";
 
 /// Fixed hyperparameters a [`GlprocBackend`] needs that
 /// [`ExecutionBackend::execute_layer`] is not handed per call — attention
@@ -60,6 +69,13 @@ struct AttnShape {
     n_kv_heads: usize,
     head_dim: usize,
     rope_freq_base: f32,
+    /// RMSNorm epsilon (`ModelMetadata::effective_rms_eps`, sourced from the
+    /// GGUF's `{arch}.attention.layer_norm_rms_epsilon` at conversion time).
+    /// Previously hardcoded `1e-5` here regardless of the source model —
+    /// real models disagree (Qwen2.5 ships `1e-6`), and a wrong epsilon
+    /// silently distorts every RMSNorm call's output magnitude rather than
+    /// erroring, so it must come from the model, not an assumed constant.
+    rms_eps: f32,
 }
 
 /// CPU execution backend that forwards to glproc's per-op kernels.
@@ -91,6 +107,7 @@ impl GlprocBackend {
                 n_kv_heads: metadata.head_count_kv as usize,
                 head_dim: head_dim as usize,
                 rope_freq_base: metadata.effective_rope_freq_base() as f32,
+                rms_eps: metadata.effective_rms_eps() as f32,
             },
         })
     }
@@ -114,6 +131,18 @@ fn required_tensor(
         layer: layer_index,
         reason: format!("layer {layer_index} file has no data for tensor {name:?}"),
     })?;
+    // `glcore::format::decode_tensor` only understands F32/F16/BF16 (glcore
+    // has no glproc dependency — GQ4A/GQ2A dequant kernels live in glproc,
+    // and glproc already depends on glcore, so the reverse dependency would
+    // be circular). CPP assigns most per-layer weight tensors GQ4A/GQ2A, so
+    // this — the one place in the crate that already legitimately depends
+    // on glproc (ADR: architecture/Pridwen-P2-ADR-glproc-dequant.md) — is
+    // where that dequant has to happen, mirroring `GllmEngine::load_shared`.
+    match entry.dtype {
+        crate::manifest::DType::GQ4A => return Ok(glproc::kernels::gquant::dequant_gq4a_stream(bytes)),
+        crate::manifest::DType::GQ2A => return Ok(glproc::kernels::gquant::dequant_gq2a_stream(bytes)),
+        _ => {}
+    }
     let dtype_str = serde_json::to_value(entry.dtype)
         .ok()
         .and_then(|v| v.as_str().map(str::to_string))
@@ -124,6 +153,24 @@ fn required_tensor(
             layer: layer_index,
             reason: format!("tensor {name:?}: {e}"),
         })
+}
+
+/// Like [`required_tensor`], but returns `None` when the tensor is absent
+/// from the manifest instead of erroring — for tensors some architectures
+/// carry and others do not (Qwen2's `attn_q/k/v.bias`, absent on Qwen3 and
+/// most other families). A tensor that IS present but fails to decode still
+/// propagates its error: "optional" means optional *presence*, never
+/// "ignore a real decode failure."
+fn optional_tensor(
+    layer_index: u32,
+    mapping: &LayerMapping,
+    manifest: &LayerManifest,
+    name: &str,
+) -> GllmResult<Option<Vec<f32>>> {
+    if manifest.tensor(name).is_none() {
+        return Ok(None);
+    }
+    required_tensor(layer_index, mapping, manifest, name).map(Some)
 }
 
 /// Apply rotary position embeddings in place, NeoX style (Qwen2/Qwen3/phi/
@@ -189,6 +236,9 @@ impl ExecutionBackend for GlprocBackend {
         let wq = required_tensor(idx, layer, manifest, ATTN_Q)?;
         let wk = required_tensor(idx, layer, manifest, ATTN_K)?;
         let wv = required_tensor(idx, layer, manifest, ATTN_V)?;
+        let bq = optional_tensor(idx, layer, manifest, ATTN_Q_BIAS)?;
+        let bk = optional_tensor(idx, layer, manifest, ATTN_K_BIAS)?;
+        let bv = optional_tensor(idx, layer, manifest, ATTN_V_BIAS)?;
         let wo = required_tensor(idx, layer, manifest, ATTN_OUTPUT)?;
         let ffn_norm_w = required_tensor(idx, layer, manifest, FFN_NORM)?;
         let w_gate = required_tensor(idx, layer, manifest, FFN_GATE)?;
@@ -198,7 +248,7 @@ impl ExecutionBackend for GlprocBackend {
 
         // --- attention block ---
         let mut xn = vec![0.0f32; dim];
-        glproc::kernels::rms_norm_into(&input.data, &attn_norm_w, RMS_EPS, &mut xn);
+        glproc::kernels::rms_norm_into(&input.data, &attn_norm_w, s.rms_eps, &mut xn);
 
         let mut q = vec![0.0f32; dim];
         let mut k = vec![0.0f32; kv_dim];
@@ -206,6 +256,38 @@ impl ExecutionBackend for GlprocBackend {
         glproc::kernels::matvec(&wq, &xn, &mut q, dim, dim);
         glproc::kernels::matvec(&wk, &xn, &mut k, kv_dim, dim);
         glproc::kernels::matvec(&wv, &xn, &mut v, kv_dim, dim);
+
+        // Attention bias, added right after the projection and BEFORE RoPE —
+        // matches glproc::runner::Runner::step's order exactly (runner.rs
+        // ~847-861). This was the confirmed root cause of the E2E garbage
+        // output bug (notes/pridwen-p1-notes.md): Qwen2/2.5 carries these
+        // three tensors in every layer, they were present in the manifest
+        // and passed validation, but this function never fetched or applied
+        // them — every Q/K/V vector in every layer was silently missing an
+        // additive term the model was trained with. `None` (tensor absent,
+        // e.g. Qwen3) means skip, not zero-and-continue-with-a-warning: a
+        // model that never had bias should behave exactly as before this fix.
+        //
+        // TODO: q_norm/k_norm (Qwen3's per-head RMSNorm on Q/K, used INSTEAD
+        // of attention bias) is still not implemented here. Not needed for
+        // Qwen2/2.5, but the same class of silent omission would corrupt a
+        // Qwen3 package (e.g. the gllm-qwen3-17b package already on disk)
+        // the same way this bug corrupted Qwen2.5. Tracked: GWEN-XXX.
+        if let Some(b) = &bq {
+            for (qi, bi) in q.iter_mut().zip(b) {
+                *qi += bi;
+            }
+        }
+        if let Some(b) = &bk {
+            for (ki, bi) in k.iter_mut().zip(b) {
+                *ki += bi;
+            }
+        }
+        if let Some(b) = &bv {
+            for (vi, bi) in v.iter_mut().zip(b) {
+                *vi += bi;
+            }
+        }
 
         for h in 0..s.n_heads {
             rope_neox(&mut q[h * s.head_dim..(h + 1) * s.head_dim], pos, s.head_dim, s.rope_freq_base);
@@ -255,7 +337,7 @@ impl ExecutionBackend for GlprocBackend {
         }
 
         // --- feed-forward block (dense SwiGLU) ---
-        glproc::kernels::rms_norm_into(&x, &ffn_norm_w, RMS_EPS, &mut xn);
+        glproc::kernels::rms_norm_into(&x, &ffn_norm_w, s.rms_eps, &mut xn);
         let mut gate = vec![0.0f32; hidden_dim];
         let mut up = vec![0.0f32; hidden_dim];
         glproc::kernels::matvec(&w_gate, &xn, &mut gate, hidden_dim, dim);
@@ -324,6 +406,8 @@ mod tests {
             expert_used_count: None,
             sliding_window: None,
             attention_bias: None,
+            rms_eps: None,
+            eos_token_ids: Vec::new(),
         }
     }
 
@@ -364,7 +448,38 @@ mod tests {
     /// — the same writer the converter uses, so the fixture cannot drift
     /// from the real on-disk format.
     fn write_fixture_layer(dir: &std::path::Path, index: u32, seed: f32) -> (LayerMapping, LayerManifest) {
-        let tensors = fixture_layer_tensors(seed);
+        write_layer_from_tensors(dir, index, fixture_layer_tensors(seed))
+    }
+
+    /// As [`fixture_layer_tensors`], plus `attn_q/k/v.bias` — the tensor set
+    /// a real Qwen2-family layer carries (see `plugin.rs`'s
+    /// `standard_transformer_accepts_a_real_qwen2_layer`), for exercising the
+    /// bias-add path the plain fixture never touches.
+    fn fixture_layer_tensors_with_bias(seed: f32) -> Vec<(&'static str, Vec<u64>, Vec<f32>)> {
+        const DIM: usize = 8;
+        let vec_of = |n: usize, scale: f32| -> Vec<f32> {
+            (0..n).map(|i| (i as f32 * scale + seed).sin()).collect()
+        };
+        let mut tensors = fixture_layer_tensors(seed);
+        tensors.push((ATTN_Q_BIAS, vec![DIM as u64], vec_of(DIM, 0.21)));
+        tensors.push((ATTN_K_BIAS, vec![DIM as u64], vec_of(DIM, 0.22)));
+        tensors.push((ATTN_V_BIAS, vec![DIM as u64], vec_of(DIM, 0.23)));
+        tensors
+    }
+
+    fn write_fixture_layer_with_bias(dir: &std::path::Path, index: u32, seed: f32) -> (LayerMapping, LayerManifest) {
+        write_layer_from_tensors(dir, index, fixture_layer_tensors_with_bias(seed))
+    }
+
+    /// Shared write path for both [`write_fixture_layer`] and
+    /// [`write_fixture_layer_with_bias`] — writing tensor bytes and building
+    /// the matching manifest is identical either way; only which tensors are
+    /// in the list differs.
+    fn write_layer_from_tensors(
+        dir: &std::path::Path,
+        index: u32,
+        tensors: Vec<(&'static str, Vec<u64>, Vec<f32>)>,
+    ) -> (LayerMapping, LayerManifest) {
         let byte_data: Vec<Vec<u8>> = tensors.iter().map(|(_, _, v)| f32_bytes(v)).collect();
         let specs: Vec<(&str, &[u64], crate::manifest::DType, &[u8])> = tensors
             .iter()
@@ -480,6 +595,131 @@ mod tests {
         // slot must accept it without erroring.
         backend.execute_layer(&mapping, &manifest, &mut kv, &input, &mut output).unwrap();
         assert_eq!(kv.current_seq_len, 2);
+    }
+
+    /// Regression test for the confirmed E2E garbage-output root cause
+    /// (notes/pridwen-p1-notes.md): a layer carrying real `attn_q/k/v.bias`
+    /// tensors (a real Qwen2/2.5 layer's tensor set) must produce a
+    /// different output than the identical weights with no bias — proving
+    /// the bias is actually fetched and added, not merely present in the
+    /// manifest and silently ignored the way it was before this fix.
+    #[test]
+    fn execute_layer_applies_attention_bias_when_present() {
+        let dir_no_bias = TempDir::new().unwrap();
+        let dir_with_bias = TempDir::new().unwrap();
+        let metadata = fixture_metadata();
+        let backend = GlprocBackend::new(&metadata).unwrap();
+
+        let input = ActivationBuffer {
+            data: (0..8).map(|i| (i as f32 * 0.37).cos()).collect(),
+            shape: vec![8],
+        };
+
+        let (mapping_a, manifest_a) = write_fixture_layer(dir_no_bias.path(), 0, 0.0);
+        let mut kv_a = fixture_kv_slot(&metadata, 16);
+        let mut out_a = ActivationBuffer::zeros(vec![8]);
+        backend.execute_layer(&mapping_a, &manifest_a, &mut kv_a, &input, &mut out_a).unwrap();
+
+        let (mapping_b, manifest_b) = write_fixture_layer_with_bias(dir_with_bias.path(), 0, 0.0);
+        let mut kv_b = fixture_kv_slot(&metadata, 16);
+        let mut out_b = ActivationBuffer::zeros(vec![8]);
+        backend.execute_layer(&mapping_b, &manifest_b, &mut kv_b, &input, &mut out_b).unwrap();
+
+        assert_ne!(
+            out_a.data, out_b.data,
+            "identical weights but with real attn_q/k/v.bias present must give a different output"
+        );
+        assert!(out_b.data.iter().all(|x| x.is_finite()), "{:?}", out_b.data);
+    }
+
+    /// The other half of the bias contract: an architecture that never had
+    /// attention bias (Qwen3, or the plain synthetic fixture used by every
+    /// other test in this file) must behave exactly as it did before this
+    /// fix — no error, and numerically identical to explicitly adding a
+    /// zero bias vector. This is the "optional means optional" half of
+    /// `optional_tensor`'s contract: absence must not just "not crash," it
+    /// must be indistinguishable from a real but all-zero bias.
+    #[test]
+    fn execute_layer_missing_bias_tensors_do_not_error_and_match_explicit_zero_bias() {
+        let dir_absent = TempDir::new().unwrap();
+        let dir_zero = TempDir::new().unwrap();
+        let metadata = fixture_metadata();
+        let backend = GlprocBackend::new(&metadata).unwrap();
+
+        let input = ActivationBuffer {
+            data: (0..8).map(|i| (i as f32 * 0.37).cos()).collect(),
+            shape: vec![8],
+        };
+
+        // No bias tensors in the manifest at all (the standard fixture).
+        let (mapping_absent, manifest_absent) = write_fixture_layer(dir_absent.path(), 0, 0.0);
+        let mut kv_absent = fixture_kv_slot(&metadata, 16);
+        let mut out_absent = ActivationBuffer::zeros(vec![8]);
+        backend
+            .execute_layer(&mapping_absent, &manifest_absent, &mut kv_absent, &input, &mut out_absent)
+            .expect("missing bias tensors must not be an error — most architectures have none");
+
+        // Bias tensors present, but every value is zero.
+        const DIM: u64 = 8;
+        let mut tensors = fixture_layer_tensors(0.0);
+        tensors.push((ATTN_Q_BIAS, vec![DIM], vec![0.0; DIM as usize]));
+        tensors.push((ATTN_K_BIAS, vec![DIM], vec![0.0; DIM as usize]));
+        tensors.push((ATTN_V_BIAS, vec![DIM], vec![0.0; DIM as usize]));
+        let (mapping_zero, manifest_zero) = write_layer_from_tensors(dir_zero.path(), 0, tensors);
+        let mut kv_zero = fixture_kv_slot(&metadata, 16);
+        let mut out_zero = ActivationBuffer::zeros(vec![8]);
+        backend
+            .execute_layer(&mapping_zero, &manifest_zero, &mut kv_zero, &input, &mut out_zero)
+            .unwrap();
+
+        assert_eq!(
+            out_absent.data, out_zero.data,
+            "an absent bias tensor must behave identically to an explicit all-zero one"
+        );
+    }
+
+    /// DIAGNOSTIC (not yet a fix-validating regression test — see the gate
+    /// report): does a token's output actually change depending on whether a
+    /// prior token's KV context is present? If KV-cached attention is wired
+    /// correctly, processing token2 right after token1 (same slot, pos 0 then
+    /// pos 1) must give a different result than processing token2 alone on a
+    /// fresh slot (pos 0, nothing to attend to but itself).
+    #[test]
+    fn execute_layer_uses_prior_kv_context_not_just_current_token() {
+        let dir = TempDir::new().unwrap();
+        let metadata = fixture_metadata();
+        let (mapping, manifest) = write_fixture_layer(dir.path(), 0, 0.0);
+        let backend = GlprocBackend::new(&metadata).unwrap();
+
+        let token1 = ActivationBuffer {
+            data: (0..8).map(|i| (i as f32 * 0.11).sin()).collect(),
+            shape: vec![8],
+        };
+        let token2 = ActivationBuffer {
+            data: (0..8).map(|i| (i as f32 * 0.53).cos()).collect(),
+            shape: vec![8],
+        };
+
+        // Sequential: token1 then token2, same KV slot (pos 0, then pos 1).
+        let mut kv_seq = fixture_kv_slot(&metadata, 16);
+        let mut out1 = ActivationBuffer::zeros(vec![8]);
+        backend.execute_layer(&mapping, &manifest, &mut kv_seq, &token1, &mut out1).unwrap();
+        let mut out2_with_context = ActivationBuffer::zeros(vec![8]);
+        backend
+            .execute_layer(&mapping, &manifest, &mut kv_seq, &token2, &mut out2_with_context)
+            .unwrap();
+
+        // Isolated: token2 alone on a FRESH KV slot (pos 0, no token1 present).
+        let mut kv_fresh = fixture_kv_slot(&metadata, 16);
+        let mut out2_isolated = ActivationBuffer::zeros(vec![8]);
+        backend
+            .execute_layer(&mapping, &manifest, &mut kv_fresh, &token2, &mut out2_isolated)
+            .unwrap();
+
+        assert_ne!(
+            out2_with_context.data, out2_isolated.data,
+            "token2's output must depend on whether token1's KV context is present"
+        );
     }
 
     #[test]
@@ -636,7 +876,7 @@ mod tests {
 
         // --- reduce to a token: norm -> lm_head -> argmax ---
         let mut normed = vec![0.0f32; DIM];
-        glproc::kernels::rms_norm_into(&hidden.data, &final_norm, RMS_EPS, &mut normed);
+        glproc::kernels::rms_norm_into(&hidden.data, &final_norm, 1e-5, &mut normed);
         let mut logits = vec![0.0f32; VOCAB];
         glproc::kernels::matvec(&lm_head, &normed, &mut logits, VOCAB, DIM);
 

@@ -1,0 +1,68 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What the Empirical Study Changes}
+
+The empirical validation sharpens three claims. First, the cost of
+formal correctness is smaller than the analytical model conservatively
+assumed: validation and selection measure in microseconds
+(Section~\ref{subsec:empirical}, Finding~1), so the earlier
+``below 3\% planning overhead'' bound is dominated entirely by optional
+calibration, not by the algorithm. Second, the risk \gate{} guards
+against is demonstrably real: a production compiler release silently
+miscompiled a standard vision model in a way that per-operator testing
+did not catch (Finding~3). Third, correctness-first selection has
+observable consequences (Finding~2), which motivates the normalization
+discussion below.
+
+\subsection{Cost Normalization Sensitivity}
+
+Max-normalization makes each metric dimension's \emph{largest} candidate
+value the unit. When a dimension's spread is tiny---e.g.\ $m_5$
+differing by $10^{-6}$ between exact and BatchNorm-folded plans---the
+normalized difference is still $1.0$, and the dimension can dominate
+selection despite being practically insignificant. This is
+conservative (exactness-preserving) but can forgo real performance.
+A principled alternative is \emph{threshold-relative} normalization for
+bounded metrics: normalize $m_5$ by the constraint tolerance
+$\epsilon$ rather than the candidate maximum, so deviations far below
+tolerance contribute proportionally little. We leave a systematic
+study of normalization schemes to future work; the linear cost model
+itself (Lemma~\ref{lem:monotonicity}) is agnostic to this choice.
+
+\subsection{Limitations}
+
+\begin{itemize}[leftmargin=1.6em]
+  \item \textbf{Candidate-set relativity.} Optimality
+    (Theorem~\ref{thm:optimality}) is relative to
+    $\mathcal{P}_{\text{cand}}$; heuristic generation may omit the
+    globally optimal strategy.
+  \item \textbf{Analytical error model.} Interval-arithmetic bounds may
+    overestimate error and reject acceptable plans; the empirical
+    implementations sidestep this via calibration, which trades
+    planning time for tightness.
+  \item \textbf{Single-device execution.} No distributed or multi-GPU
+    execution yet.
+  \item \textbf{Backend coverage.} CPU, CUDA, and Vulkan today; TPU
+    access in this paper is via XLA/JAX rather than a native backend.
+  \item \textbf{Energy metrology.} $m_4$ requires platform power
+    counters; on the empirical CPU platform (Windows, no RAPL access)
+    it degrades to an analytical estimate, and cloud TPU guests expose
+    no power telemetry at all. The metric is well-defined but its
+    \emph{measurement} is platform-gated.
+  \item \textbf{Reference-implementation performance.} The
+    dependency-free Rust reference is $9\times$ slower than ONNX
+    Runtime on CPU; production deployments would pair \gate{} with
+    optimized kernels (glproc/glcuda), for which the analytical study
+    models the expected regime.
+\end{itemize}
+
+\subsection{Future Work}
+
+(1) ML-guided plan generation to improve candidate quality; (2)
+distributed execution across devices and nodes; (3) runtime constraint
+adaptation under changing system load; (4) additional backends (native
+TPU, WebGPU, SYCL); (5) drop-in runtime integration for PyTorch and
+TensorFlow; (6) formal verification of the constraint implementations
+themselves; and (7) threshold-relative cost normalization
+(Section~\ref{sec:cost}).

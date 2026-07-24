@@ -1,0 +1,23 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+\gate{} inverts the customary relationship between optimization and
+correctness in tensor execution: plans are proven valid against seven
+composable constraint types before any cost is evaluated, and the
+optimizer's argmin ranges only over the validated set. We formalized
+the algorithm, proved constraint soundness, dispatch correctness, and
+cost optimality, and bounded validation overhead at $O(knp)$.
+
+The empirical study strengthens the case beyond the original analytical
+projections. Measured on commodity hardware with two independent,
+fully-executable implementations of the algorithm, the entire
+validate-and-select step costs microseconds---seven orders of magnitude
+below one model inference---while five independent implementations
+across CPU and TPU~v5e agree to ${\sim}10^{-6}$ relative $L_2$ on
+identical inputs. Most tellingly, an off-the-shelf release of a major
+tensor compiler silently miscompiled ResNet-50 during this very study;
+the constraint that \gate{} enforces by construction is the one that
+catches it.
+
+Correctness in tensor execution does not have to be expensive. It has
+to be checked.
