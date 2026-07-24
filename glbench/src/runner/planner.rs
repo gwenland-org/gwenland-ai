@@ -72,6 +72,10 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     //    exactly the work the tok/s figures describe. RAPL is package-level
     //    and Linux-only; where unreadable the meter is None and the report
     //    simply carries no energy figure (never a TDP estimate).
+    //    CPU time is bracketed the same way, for the same reason (measure
+    //    exactly the phase the throughput numbers describe, not model load).
+    let cpu_time_before = crate::measurement::cpu::process_cpu_time();
+    let wall_before = std::time::Instant::now();
     let meter = EnergyMeter::start();
     let mut measurements = MeasurementSet::default();
     // One clock reading per measured iteration, for `avg_mhz` below — coarser
@@ -90,6 +94,24 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     }
     measurements.energy_joules = meter.and_then(EnergyMeter::stop);
     measurements.cold = cold;
+    // Process high-water-mark RSS, read once after the measured phase (the
+    // OS already tracks the peak — no sampling loop needed). Necessarily
+    // includes model-load time too, since the watermark is monotonic for the
+    // process's whole lifetime — see measurement::memory's module docs for
+    // why that is the honest, not-an-approximation reading to take here.
+    measurements.peak_memory_bytes = crate::measurement::memory::peak_rss_bytes();
+    // Average CPU utilization over exactly the measured phase (bracketed
+    // above, same reasoning as the energy meter): a "compute_bound" verdict
+    // from `analysis::bottleneck` alongside low utilization here would
+    // itself be a finding (the CPU isn't actually the thing being waited on).
+    measurements.cpu_utilization_pct = match (cpu_time_before, crate::measurement::cpu::process_cpu_time()) {
+        (Some(before), Some(after)) => crate::measurement::cpu::utilization_pct(
+            after.total_secs - before.total_secs,
+            wall_before.elapsed().as_secs_f64(),
+            environment.hardware.cpu.logical_cores,
+        ),
+        _ => None,
+    };
 
     // 4b. End-of-run CPU clock, for thermal-throttle detection. A second,
     //     cheap reading (not a full CpuInfo::probe) — the start reading was

@@ -42,10 +42,17 @@ pub mod core;
 pub mod engine;
 pub mod environment;
 pub mod export;
+#[cfg(feature = "gllm-bench")]
+pub mod kl_divergence;
 pub mod measurement;
+#[cfg(feature = "gllm-bench")]
+pub mod ppl;
+pub mod quant_info;
 pub mod render;
 pub mod runner;
 pub mod storage;
+#[cfg(feature = "gllm-bench")]
+pub mod tensor_stats;
 pub mod validation;
 
 pub use crate::core::session::BenchmarkSession;

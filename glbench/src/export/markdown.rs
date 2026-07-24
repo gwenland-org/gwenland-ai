@@ -25,7 +25,19 @@ pub fn render(session: &BenchmarkSession) -> String {
     if let Some(bytes) = session.environment.hardware.storage.model_file_bytes {
         s.push_str(&format!("- **Model size:** {:.2} GiB\n", bytes_to_gib(bytes)));
     }
+    if let Some(bytes) = m.peak_memory_bytes {
+        s.push_str(&format!(
+            "- **Peak RSS:** {:.2} GiB (process high-water mark, includes model load)\n",
+            bytes_to_gib(bytes)
+        ));
+    }
     let hw = &session.environment.hardware;
+    if let Some(pct) = m.cpu_utilization_pct {
+        s.push_str(&format!(
+            "- **CPU utilization:** {pct:.1}% (measured phase, {} logical cores)\n",
+            hw.cpu.logical_cores
+        ));
+    }
     if let Some(name) = &hw.gpu.name {
         s.push_str(&format!(
             "- **Device:** {} ({})\n",
@@ -243,6 +255,12 @@ fn telemetry_section(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option
                 un / p.total_ms * 100.0
             ));
         }
+        let flame = crate::render::flamegraph::render_phase(label, p);
+        if !flame.is_empty() {
+            s.push_str("\n```text\n");
+            s.push_str(flame.trim_start_matches('\n'));
+            s.push_str("```\n");
+        }
         s.push('\n');
     }
 
@@ -337,8 +355,9 @@ fn behavior_section(b: &crate::behavior::BehaviorReport, synthetic_prompt: bool)
     }
     if let Some(st) = &b.stall {
         s.push_str(&format!(
-            "- **Stall:** p50 {:.1} ms · p99 {:.1} ms · max {:.1} ms · jitter {:.2}{}\n",
+            "- **Stall:** p50 {:.1} ms · p95 {:.1} ms · p99 {:.1} ms · max {:.1} ms · jitter {:.2}{}\n",
             st.p50_ms,
+            st.p95_ms,
             st.p99_ms,
             st.max_ms,
             st.jitter,

@@ -263,7 +263,12 @@ fn sliding_window_log_probs(
 }
 
 /// Numerically stable log-softmax: `log(softmax(x))_i = x_i - max(x) - log(sum(exp(x - max(x))))`.
-fn log_softmax(logits: &[f32]) -> Vec<f32> {
+///
+/// `pub(crate)`: shared with [`crate::kl_divergence`], which needs the exact
+/// same computation on both engines' logits — a second copy here would be
+/// the same "two implementations of one thing" risk this whole workspace
+/// just got audited for (`architecture/mensura-veritatis-v3/ARTX2-Quant.md`).
+pub(crate) fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();
     let log_sum_exp = sum_exp.ln();
