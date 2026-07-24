@@ -5,6 +5,7 @@
 
 pub mod deterministic;
 pub mod integrity;
+pub mod memory;
 pub mod numerical;
 pub mod parity;
 pub mod reproducibility;

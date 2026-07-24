@@ -96,6 +96,7 @@ pub fn validate(session: &BenchmarkSession) -> ValidationReport {
     check_thermal(session, &mut report);
     super::deterministic::check(session, &mut report);
     super::reproducibility::check(session, &mut report);
+    super::memory::check(session, &mut report);
     report
 }
 

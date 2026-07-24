@@ -171,6 +171,7 @@ fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
             ("mean_ms", Json::Num(s.mean_ms)),
             ("std_dev_ms", Json::Num(s.std_dev_ms)),
             ("p50_ms", Json::Num(s.p50_ms)),
+            ("p95_ms", Json::Num(s.p95_ms)),
             ("p99_ms", Json::Num(s.p99_ms)),
             ("max_ms", Json::Num(s.max_ms)),
             ("stall_count", Json::Num(s.stall_count as f64)),

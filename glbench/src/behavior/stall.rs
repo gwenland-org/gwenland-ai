@@ -32,6 +32,10 @@ pub struct StallSignal {
     /// Median — resistant to the spikes, so `p50` far below `mean` is itself
     /// evidence that a few outliers are dragging the average.
     pub p50_ms: f64,
+    /// 95th percentile — the conventional "typical worst case" figure
+    /// production LLM-serving reports lead with (between the median and the
+    /// noisier, single-sample-sensitive p99).
+    pub p95_ms: f64,
     /// 99th percentile: the tail a user actually feels.
     pub p99_ms: f64,
     /// Slowest single inter-token gap, ms.
@@ -75,6 +79,7 @@ impl StallSignal {
             mean_ms,
             std_dev_ms,
             p50_ms,
+            p95_ms: quantile(&gaps, 0.95)?,
             p99_ms: quantile(&gaps, 0.99)?,
             max_ms: gaps.iter().copied().fold(f64::NEG_INFINITY, f64::max),
             stall_count: gaps.iter().filter(|&&g| g > threshold).count(),

@@ -90,6 +90,30 @@ bandwidth-contention reasoning as `ab`:
 glbench scale --engine glproc --model model.gguf --sweep 32,64,128,256,512
 ```
 
+Sweep decode throughput across `glproc`'s own thread-pool sizes (via
+`GLPROC_THREADS`) and report speedup/efficiency relative to the lowest
+thread count — glproc-only, since other engines have no equivalent knob:
+
+```sh
+glbench thread-scale --engine glproc --model model.gguf --sweep 1,2,4,8
+```
+
+Decode every tensor in a `.gllm` package, flagging NaN/Inf/zero-variance
+(`gllm-bench` feature); `--full` adds a per-tensor mean/std/min/max
+distribution, `--norm-only` restricts the scan to RMSNorm gamma weights:
+
+```sh
+glbench tensor-stats --model path/to/package/ --full --norm-only
+```
+
+Join a `run` archive's throughput with a `kl-div`/`ppl` archive's
+numerical-accuracy figures into one side-by-side view — no new measurement,
+both archives must already exist:
+
+```sh
+glbench accuracy-vs-perf run.json kl-div.json
+```
+
 Re-render an archive, or convert it:
 
 ```sh
@@ -282,9 +306,15 @@ Module map (one crate, internal module folders — no sub-crates):
 | `export`       | hand-rolled JSON / Markdown / CSV                          |
 | `render`       | terminal text + tables                                     |
 | `storage`      | user-managed archive files (no database)                   |
+| `quant_info`   | static `.gllm` manifest dtype tally, no inference (own hand-rolled JSON reader, not glictus-caliburni's) |
+| `ppl`          | WikiText-2 perplexity via the `.gllm` runtime (behind `gllm-bench`) |
+| `kl_divergence` | per-position KL-divergence between a `.gllm` package and the `glproc` oracle, teacher-forced (behind `gllm-bench`) |
+| `tensor_stats` | decodes every tensor in a `.gllm` package and flags NaN/Inf/zero-variance (behind `gllm-bench`) |
 
-See [`DESIGN.md`](DESIGN.md) for the responsibility boundaries and data flow,
-and [`ROADMAP.md`](ROADMAP.md) for planned features and non-goals.
+See [`ARCHITECTURE.md`](ARCHITECTURE.md) for the crate layout, entry-point →
+module map, and dependency direction; [`DESIGN.md`](DESIGN.md) for the
+responsibility boundaries and data flow; [`ROADMAP.md`](ROADMAP.md) for
+planned features and non-goals.
 
 ## Benchmarking GLLM
 

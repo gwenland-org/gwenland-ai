@@ -18,9 +18,16 @@ use std::process::ExitCode;
 use glbench::comparison::runs;
 use glbench::core::workload::{WorkloadKind, WorkloadSpec};
 use glbench::export::{csv, markdown};
+#[cfg(feature = "gllm-bench")]
+use glbench::kl_divergence::{self, KlDivArgs};
+#[cfg(feature = "gllm-bench")]
+use glbench::ppl::{self, PplArgs};
+use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
-use glbench::runner::{planner, scale};
+use glbench::runner::{planner, scale, thread_scale};
 use glbench::storage::archive;
+#[cfg(feature = "gllm-bench")]
+use glbench::tensor_stats::{self, TensorStatsArgs};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -30,8 +37,17 @@ fn main() -> ExitCode {
         Some("compare") => cmd_compare(&args[1..]),
         Some("validate") => cmd_validate(&args[1..]),
         Some("scale") => cmd_scale(&args[1..]),
+        Some("thread-scale") => cmd_thread_scale(&args[1..]),
+        Some("accuracy-vs-perf") => cmd_accuracy_vs_perf(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
+        Some("quant-info") => cmd_quant_info(&args[1..]),
+        #[cfg(feature = "gllm-bench")]
+        Some("ppl") => cmd_ppl(&args[1..]),
+        #[cfg(feature = "gllm-bench")]
+        Some("kl-div") => cmd_kl_div(&args[1..]),
+        #[cfg(feature = "gllm-bench")]
+        Some("tensor-stats") => cmd_tensor_stats(&args[1..]),
         Some("help") | Some("--help") | Some("-h") | None => {
             print_usage();
             return ExitCode::SUCCESS;
@@ -72,13 +88,77 @@ usage:
   glbench scale   --engine <name> --model <path> --sweep N,N,N,...
                   (runs the identical prompt at each token budget in --sweep,
                    sequentially, and classifies how decode throughput scales)
+  glbench thread-scale --engine glproc --model <path> --sweep N,N,N,...
+                  (runs the identical prompt at each GLPROC_THREADS value in
+                   --sweep, sequentially, and reports speedup/efficiency
+                   relative to the lowest thread count — glproc only, since
+                   GLPROC_THREADS is glproc's own env override)
   glbench inspect <session.json>
   glbench export  <session.json> --format <json|md|csv> [--out <file>]
+  glbench accuracy-vs-perf <run.json> <accuracy.json>
+                  (joins a `run` archive's throughput with a `kl-div` or
+                   `ppl` archive's numerical-accuracy figures, side by side —
+                   no new measurement, both archives must already exist)
+  glbench quant-info --model <package-dir> [--out <file.json>]
+                  (static inspection of a .gllm package: dtype tally and
+                   quantization coverage, no inference, no model load;
+                   --model names the package directory, e.g. the folder
+                   containing gllm.json — ZIP-archive .gllm files are not
+                   yet readable, see glictus-caliburni ARTX06)
 
 glbench measures engine performance; it does not optimize it.";
 
+/// Only present when built with `--features gllm-bench` — appended to
+/// [`USAGE`] at print time so a default build's usage text never mentions a
+/// command it does not have.
+#[cfg(feature = "gllm-bench")]
+const PPL_USAGE: &str = "\
+  glbench ppl     --model <package-dir> --gguf <original.gguf>
+                  [--context N] [--stride N] [--out <file.json>]
+                  (perplexity over an embedded WikiText-2 sample via
+                   teacher-forced log-probs; --gguf supplies the tokenizer,
+                   since .gllm packages do not embed one yet, ARTX1 OQ3;
+                   default context 512, stride 256 — the known garbage-output
+                   bug this was diagnostic-only for is fixed, but this number
+                   is not yet re-validated, see glbench ppl's own output)
+";
+
+#[cfg(feature = "gllm-bench")]
+const KL_DIV_USAGE: &str = "\
+  glbench kl-div  --model <package-dir> --gguf <original.gguf>
+                  [--tokens N] [--out <file.json>]
+                  (per-position KL-divergence between the .gllm package and
+                   glproc::runner::Runner's logits, teacher-forced over the
+                   same embedded WikiText-2 sample as ppl; default 64 tokens
+                   — see glbench::kl_divergence module docs for why this
+                   command exists)
+";
+
+#[cfg(feature = "gllm-bench")]
+const TENSOR_STATS_USAGE: &str = "\
+  glbench tensor-stats --model <package-dir> [--out <file.json>]
+                  [--full] [--norm-only]
+                  (decode every tensor in the package and flag NaN / Inf /
+                   zero-variance tensors — a fast structural sanity check,
+                   see glbench::tensor_stats module docs; --full adds a
+                   per-tensor mean/std/min/max distribution to the output;
+                   --norm-only restricts the scan to *norm.weight tensors,
+                   the RMSNorm gamma weights, for --full --norm-only together)
+";
+
+fn full_usage() -> String {
+    #[cfg(feature = "gllm-bench")]
+    {
+        format!("{USAGE}\n{PPL_USAGE}\n{KL_DIV_USAGE}\n{TENSOR_STATS_USAGE}")
+    }
+    #[cfg(not(feature = "gllm-bench"))]
+    {
+        USAGE.to_string()
+    }
+}
+
 fn print_usage() {
-    println!("{USAGE}");
+    println!("{}", full_usage());
 }
 
 /// Flags shared by `run` and `ab`, parsed once. `models` collects every
@@ -312,11 +392,74 @@ fn cmd_scale(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `glbench thread-scale` — decode-throughput sweep over `--sweep`'s
+/// `GLPROC_THREADS` values. See [`thread_scale`]'s module docs for why this
+/// is `glproc`-only.
+fn cmd_thread_scale(args: &[String]) -> Result<(), String> {
+    let mut sweep_arg: Option<String> = None;
+    let mut rest = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sweep" => {
+                i += 1;
+                sweep_arg = Some(args.get(i).ok_or("--sweep needs a value")?.clone());
+            }
+            other => rest.push(other.to_string()),
+        }
+        i += 1;
+    }
+
+    let sweep_arg = sweep_arg.ok_or("thread-scale needs --sweep N,N,N,...")?;
+    let mut thread_counts = Vec::new();
+    for part in sweep_arg.split(',') {
+        thread_counts.push(parse_num::<usize>(part.trim(), "--sweep")?);
+    }
+    if thread_counts.len() < 2 {
+        return Err("--sweep needs at least two values to say anything about scaling".into());
+    }
+
+    let mut a = parse_run_args(&rest)?;
+    match a.models.len() {
+        0 => return Err("--model is required".into()),
+        1 => a.spec.model_path = a.models.remove(0),
+        _ => return Err("thread-scale takes one --model".into()),
+    }
+    if a.spec.engine != "glproc" {
+        return Err(format!(
+            "thread-scale only supports --engine glproc (GLPROC_THREADS has no effect on '{}'); \
+             see thread_scale module docs for why other engines are not silently swept",
+            a.spec.engine
+        ));
+    }
+
+    let report = thread_scale::run_thread_sweep(&a.spec, &thread_counts, &progress).map_err(|e| e.to_string())?;
+    print!("{}", text::thread_sweep(&report));
+    Ok(())
+}
+
 /// `glbench inspect` — re-render an archived session to the terminal.
 fn cmd_inspect(args: &[String]) -> Result<(), String> {
     let path = args.first().ok_or("inspect needs an archive path")?;
     let session = archive::read(Path::new(path))?;
     print!("{}", text::session(&session));
+    Ok(())
+}
+
+/// `glbench accuracy-vs-perf` — join a `run` archive with a `kl-div`/`ppl`
+/// archive. See [`glbench::comparison::accuracy`]'s module docs.
+fn cmd_accuracy_vs_perf(args: &[String]) -> Result<(), String> {
+    let run_path = args.first().ok_or("accuracy-vs-perf needs a run.json path")?;
+    let accuracy_path = args.get(1).ok_or("accuracy-vs-perf needs a second, accuracy.json path")?;
+
+    let run = archive::read(Path::new(run_path))?;
+    let accuracy_text =
+        std::fs::read_to_string(accuracy_path).map_err(|e| format!("reading {accuracy_path}: {e}"))?;
+    let accuracy_json =
+        glbench::export::json::parse(&accuracy_text).map_err(|e| format!("parsing {accuracy_path}: {e}"))?;
+
+    let joined = glbench::comparison::accuracy::join(&run, &accuracy_json);
+    print!("{}", text::accuracy_vs_perf(&joined));
     Ok(())
 }
 
@@ -361,6 +504,138 @@ fn cmd_export(args: &[String]) -> Result<(), String> {
         None => print!("{rendered}"),
     }
     Ok(())
+}
+
+/// `glbench quant-info` — static dtype/coverage inspection of a `.gllm`
+/// package directory. No inference, no model load.
+fn cmd_quant_info(args: &[String]) -> Result<(), String> {
+    let mut model: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model = Some(PathBuf::from(args.get(i).ok_or("--model needs a value")?));
+            }
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(args.get(i).ok_or("--out needs a value")?));
+            }
+            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let model = model.ok_or("quant-info needs --model <package-dir>")?;
+    quant_info::run_quant_info(QuantInfoArgs { model, out })
+}
+
+/// `glbench ppl` — perplexity of a `.gllm` package on the embedded
+/// WikiText-2 sample. Gated behind `gllm-bench`: see [`ppl`]'s module docs
+/// for why the number this prints is diagnostic-only today.
+#[cfg(feature = "gllm-bench")]
+fn cmd_ppl(args: &[String]) -> Result<(), String> {
+    let mut a = PplArgs::default();
+    let mut model: Option<PathBuf> = None;
+    let mut gguf: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model = Some(PathBuf::from(args.get(i).ok_or("--model needs a value")?));
+            }
+            "--gguf" => {
+                i += 1;
+                gguf = Some(PathBuf::from(args.get(i).ok_or("--gguf needs a value")?));
+            }
+            "--context" => {
+                i += 1;
+                a.context = parse_num(args.get(i).ok_or("--context needs a value")?, "--context")?;
+            }
+            "--stride" => {
+                i += 1;
+                a.stride = parse_num(args.get(i).ok_or("--stride needs a value")?, "--stride")?;
+            }
+            "--out" => {
+                i += 1;
+                a.out = Some(PathBuf::from(args.get(i).ok_or("--out needs a value")?));
+            }
+            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    a.model = model.ok_or("ppl needs --model <package-dir>")?;
+    a.gguf = gguf.ok_or("ppl needs --gguf <original.gguf> (packages don't embed a tokenizer yet)")?;
+    ppl::run_ppl(a)
+}
+
+/// `glbench kl-div` — per-position KL-divergence between a `.gllm` package
+/// and `glproc::runner::Runner` (the oracle), teacher-forced over the
+/// embedded WikiText-2 sample. See [`kl_divergence`]'s module docs for the
+/// full research vetting behind this command (`RESEARCH_REQUIREMENTS.md`'s
+/// 8 mandatory questions) and why it exists alongside `ppl`.
+#[cfg(feature = "gllm-bench")]
+fn cmd_kl_div(args: &[String]) -> Result<(), String> {
+    let mut a = KlDivArgs::default();
+    let mut model: Option<PathBuf> = None;
+    let mut gguf: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model = Some(PathBuf::from(args.get(i).ok_or("--model needs a value")?));
+            }
+            "--gguf" => {
+                i += 1;
+                gguf = Some(PathBuf::from(args.get(i).ok_or("--gguf needs a value")?));
+            }
+            "--tokens" => {
+                i += 1;
+                a.tokens = parse_num(args.get(i).ok_or("--tokens needs a value")?, "--tokens")?;
+            }
+            "--out" => {
+                i += 1;
+                a.out = Some(PathBuf::from(args.get(i).ok_or("--out needs a value")?));
+            }
+            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    a.model = model.ok_or("kl-div needs --model <package-dir>")?;
+    a.gguf = gguf.ok_or("kl-div needs --gguf <original.gguf> (packages don't embed a tokenizer yet)")?;
+    kl_divergence::run_kl_divergence(a)
+}
+
+/// `glbench tensor-stats` — decode every tensor in a `.gllm` package and
+/// flag NaN/Inf/zero-variance. See [`tensor_stats`]'s module docs for the
+/// full research vetting.
+#[cfg(feature = "gllm-bench")]
+fn cmd_tensor_stats(args: &[String]) -> Result<(), String> {
+    let mut model: Option<PathBuf> = None;
+    let mut out: Option<PathBuf> = None;
+    let mut full = false;
+    let mut norm_only = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                i += 1;
+                model = Some(PathBuf::from(args.get(i).ok_or("--model needs a value")?));
+            }
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(args.get(i).ok_or("--out needs a value")?));
+            }
+            "--full" => full = true,
+            "--norm-only" => norm_only = true,
+            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let model = model.ok_or("tensor-stats needs --model <package-dir>")?;
+    tensor_stats::run_tensor_stats(TensorStatsArgs { model, out, full, norm_only })
 }
 
 fn default_prompt() -> String {
