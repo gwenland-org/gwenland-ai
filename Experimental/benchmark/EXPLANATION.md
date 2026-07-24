@@ -3,7 +3,7 @@
 **Author:** JinXSuper  
 **Project:** GwenLand — Rust-Native AI Inference Toolkit  
 **Date:** June 2026  
-**License:** [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/)
+**License:** Dual — [CC BY-NC-ND 4.0](https://creativecommons.org/licenses/by-nc-nd/4.0/) (non-commercial) + commercial license available on request (see [LICENSE](LICENSE))
 
 ---
 
@@ -107,10 +107,9 @@ GDTQP is a smarter decompression method for AI model files that concentrates its
 
 ## License
 
-**CC BY-NC-ND 4.0** — Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International
+**Dual license** — see [LICENSE](LICENSE) for full terms:
 
-You are free to share this document with proper attribution. You may not use it for commercial purposes. You may not distribute modified versions.
-
-Full license: https://creativecommons.org/licenses/by-nc-nd/4.0/
+1. **CC BY-NC-ND 4.0** — Creative Commons Attribution-NonCommercial-NoDerivatives 4.0 International. You are free to share this document with proper attribution. You may not use it for commercial purposes. You may not distribute modified versions. Full license: https://creativecommons.org/licenses/by-nc-nd/4.0/
+2. **Commercial license** — required for any commercial use; not granted by option 1. Contact jinxsuperdev@gmail.com.
 
 Copyright © 2026 JinXSuper × GwenLand. All rights reserved.
