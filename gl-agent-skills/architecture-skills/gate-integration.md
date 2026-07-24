@@ -2,13 +2,22 @@
 
 > **Domain:** architecture-skills
 > **Applies to:** runtime engine selection, kernel/strategy dispatch in every engine
-> **Last updated:** 2026-07-17
+> **Last updated:** 2026-07-24
 >
-> ⚠️ **Scope note:** there is no `GATE.md` spec in this repository today. This
-> skill documents the gating *pattern* as it actually exists in the code —
-> the measured-policy gates listed below. If a formal GATE algorithm spec
-> lands later, it supersedes this file and this file must be updated to
-> reference it, not paraphrase it.
+> ⚠️ **Naming collision — read this first.** This file's "gate" (lowercase)
+> and **GATE** (the *Gwen Algorithm for Tensor Execution*, formalized in
+> [`architecture/GATE/`](../../architecture/GATE/README.md)) are related but
+> distinct. This file's gates are small, named `if` branches where measured
+> policy overrides hardware capability (the table below) — empirical,
+> per-decision-point, no formal proof obligation. GATE is a general
+> generate→validate→evaluate→dispatch protocol with composable logical
+> constraints and correctness theorems, implemented (boilerplate stage) in
+> `glcore::gate`. GATE does not yet drive any of the gates below — see
+> [`architecture/GATE/GATE-mapping.md`](../../architecture/GATE/GATE-mapping.md)
+> §5 (Integration Points) for where that connection would eventually form.
+> This file remains the ground truth for the *existing* gates until such a
+> wave lands; per this file's own prior instruction, do not paraphrase the
+> GATE paper here — read `architecture/GATE/` directly.
 
 ## BEFORE YOU START
 
@@ -99,3 +108,5 @@ if cfg.n_kv_heads >= 3 { ... } // why 3? measured where? cite or don't merge
 - [fallback-chain.md](fallback-chain.md)
 - [../cpu-skills/rejected-optimizations.md](../cpu-skills/rejected-optimizations.md)
 - [../cpu-skills/threading-model.md](../cpu-skills/threading-model.md)
+- [`architecture/GATE/README.md`](../../architecture/GATE/README.md) — the
+  formal GATE algorithm; read its own terminology note too
