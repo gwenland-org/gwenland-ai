@@ -1,0 +1,11 @@
+label,iteration,prompt_tokens,generated_tokens,prefill_ms,decode_ms,total_ms,prefill_tps,decode_tps,energy_j_per_token
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold-0,24,7,308.4997,210.6186,519.0000,77.7959,33.2354,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold-1,24,7,289.4152,209.7799,499.0000,82.9258,33.3683,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold-2,24,7,222.3127,229.3892,451.0000,107.9560,30.5158,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold-3,24,7,271.4016,231.6762,503.0000,88.4298,30.2146,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,cold-4,24,7,216.1664,211.6754,427.0000,111.0256,33.0695,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,0,24,7,300.0208,295.7808,595.0000,79.9945,23.6662,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,1,24,7,242.8024,280.2205,523.0000,98.8458,24.9803,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,2,24,7,222.5544,236.4813,459.0000,107.8388,29.6006,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,3,24,7,383.4352,465.9118,849.0000,62.5921,15.0243,
+glproc-qwen2.5-0.5b-instruct-q4_k_m,4,24,7,250.2812,382.9949,633.0000,95.8921,18.2770,

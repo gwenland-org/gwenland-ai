@@ -1,0 +1,9 @@
+glbench thread-scale :: decode throughput vs. GLPROC_THREADS
+
+threads  decode tps (mean)  median  std  speedup  efficiency
+-------  -----------------  ------  ---  -------  ----------
+1                     13.4    13.6  0.5    1.00x        100%
+2                     21.6    21.8  0.4    1.61x         81%
+4                     23.5    23.6  0.9    1.75x         44%
+
+verdict: sub-linear

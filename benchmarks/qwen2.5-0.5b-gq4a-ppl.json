@@ -1,0 +1,19 @@
+{
+  "context_len": 128,
+  "cross_entropy_mean": 3.9688660646608773,
+  "dataset": "wikitext2-sample-embedded",
+  "evaluated_tokens": 768,
+  "model_path": "C:/Users/reyha/AppData/Local/Temp/claude/c--Users-reyha-Documents-JinXSuper-Projects-GwenLand/24257311-766e-4a5e-8e66-05a6e31c0b73/scratchpad/qwen05b.gllm",
+  "per_window_ce": [
+    3.6793668838765825,
+    4.421916591782065,
+    3.925206248561153,
+    3.889323764361052,
+    4.191824644622102,
+    3.705558254762309
+  ],
+  "perplexity": 52.92448385886107,
+  "stride": 128,
+  "timestamp": "2026-07-24T06:11:29Z",
+  "total_tokens": 819
+}

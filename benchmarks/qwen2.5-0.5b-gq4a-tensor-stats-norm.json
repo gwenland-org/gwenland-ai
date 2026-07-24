@@ -1,0 +1,451 @@
+{
+  "distributions": [
+    {
+      "count": 896,
+      "dtype": "F32",
+      "max": 16.75,
+      "mean": 7.139321804046631,
+      "min": -0.01141357421875,
+      "std_dev": 1.1036528968480217,
+      "tensor_name": "output_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 0.360107421875,
+      "mean": 0.03322740963527134,
+      "min": -0.310546875,
+      "std_dev": 0.09655618621127628,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 2.3359375,
+      "mean": 1.184760502406529,
+      "min": 0.2490234375,
+      "std_dev": 0.16293896387279294,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 2.900390625,
+      "mean": 0.9834418978009906,
+      "min": -0.0855712890625,
+      "std_dev": 0.3444626058275506,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.8740234375,
+      "mean": 1.3478315453311163,
+      "min": 0.00008219480514526367,
+      "std_dev": 0.34725952534973753,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.701171875,
+      "mean": 1.4557709693908691,
+      "min": -1.248046875,
+      "std_dev": 0.43279286632387604,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.455078125,
+      "mean": 0.7217670168195452,
+      "min": 0,
+      "std_dev": 0.18463990897277457,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.5390625,
+      "mean": 1.2015741552625383,
+      "min": -1.3779296875,
+      "std_dev": 0.4709872669694521,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 13.015625,
+      "mean": 2.6120758056640625,
+      "min": 0,
+      "std_dev": 0.7710427144648292,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.134765625,
+      "mean": 1.4547136851719447,
+      "min": -0.666015625,
+      "std_dev": 0.4730917201306722,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 2.5703125,
+      "mean": 1.2746406699131643,
+      "min": -0.00008475780487060547,
+      "std_dev": 0.36314495380535355,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.576171875,
+      "mean": 1.4844501529421126,
+      "min": 0.0251007080078125,
+      "std_dev": 0.5013043981303613,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.853515625,
+      "mean": 1.1492467607770647,
+      "min": 0,
+      "std_dev": 0.3390569712224598,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.140625,
+      "mean": 1.6606182030269079,
+      "min": -0.63037109375,
+      "std_dev": 0.45677204526447696,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 2.05078125,
+      "mean": 1.4513757428420442,
+      "min": 0.0002925395965576172,
+      "std_dev": 0.4360163413308303,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.0546875,
+      "mean": 1.950615985052926,
+      "min": -1.0205078125,
+      "std_dev": 0.5449021377106623,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.7880859375,
+      "mean": 1.1980870381396795,
+      "min": -0.00009781122207641602,
+      "std_dev": 0.38676994415798943,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.205078125,
+      "mean": 1.5532526288713728,
+      "min": 0.032958984375,
+      "std_dev": 0.5702179462767334,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.2353515625,
+      "mean": 0.7234347207205636,
+      "min": 0,
+      "std_dev": 0.2822985932111036,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 7.81640625,
+      "mean": 2.9601759569985524,
+      "min": -0.037811279296875,
+      "std_dev": 1.4233578139422471,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 1.794921875,
+      "mean": 1.1176859162348722,
+      "min": -0.00007432699203491211,
+      "std_dev": 0.4715737627736493,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.109375,
+      "mean": 1.670874868120466,
+      "min": -0.28466796875,
+      "std_dev": 0.8854383461574156,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.34375,
+      "mean": 1.7900220326014928,
+      "min": 0.1300048828125,
+      "std_dev": 0.8720265128235319,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 13.7890625,
+      "mean": 3.3300542490822926,
+      "min": -0.049468994140625,
+      "std_dev": 1.9063362224732565,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.21875,
+      "mean": 2.0834635325840543,
+      "min": 0.1302490234375,
+      "std_dev": 0.9543408548696054,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.734375,
+      "mean": 1.6791807583400182,
+      "min": -0.311279296875,
+      "std_dev": 0.8702941618183089,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 5.36328125,
+      "mean": 1.6862365177699499,
+      "min": 0.16943359375,
+      "std_dev": 0.7910394237565361,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 6.96484375,
+      "mean": 2.746845245361328,
+      "min": -0.071533203125,
+      "std_dev": 1.4913389776247123,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.17578125,
+      "mean": 1.7141060147966658,
+      "min": 0.1781005859375,
+      "std_dev": 0.7100917042940311,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.888671875,
+      "mean": 1.9237510136195592,
+      "min": 0.037353515625,
+      "std_dev": 0.9106934567013508,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.37890625,
+      "mean": 1.8817999703543526,
+      "min": 0.187744140625,
+      "std_dev": 0.6945971988726477,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 6.76953125,
+      "mean": 1.922607694353376,
+      "min": -0.042236328125,
+      "std_dev": 0.9387763655471016,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.6171875,
+      "mean": 1.8640515463692802,
+      "min": 0.258544921875,
+      "std_dev": 0.6472065929591894,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 12.375,
+      "mean": 2.712360041482108,
+      "min": 0.06756591796875,
+      "std_dev": 1.1957300527913024,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.58984375,
+      "mean": 2.0944810594831194,
+      "min": 0.26904296875,
+      "std_dev": 0.6177313580365122,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.6015625,
+      "mean": 2.232095241546631,
+      "min": 0.06280517578125,
+      "std_dev": 0.6270641620830963,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 5.421875,
+      "mean": 2.3447352818080356,
+      "min": 0.27490234375,
+      "std_dev": 0.6236678644274224,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.60546875,
+      "mean": 2.2447772366659984,
+      "min": -0.027252197265625,
+      "std_dev": 0.6169528598097789,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.66015625,
+      "mean": 2.3352934973580495,
+      "min": 0.2432861328125,
+      "std_dev": 0.6232832176425207,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 4.91796875,
+      "mean": 1.7517187935965401,
+      "min": -0.03955078125,
+      "std_dev": 0.567127732082528,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 5.55859375,
+      "mean": 2.804683412824358,
+      "min": 0.415771484375,
+      "std_dev": 0.6347841870428163,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 8.6875,
+      "mean": 2.1511861256190707,
+      "min": -0.0528564453125,
+      "std_dev": 0.9332632433270689,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 6.55859375,
+      "mean": 2.843573978969029,
+      "min": 0.36376953125,
+      "std_dev": 0.5212295185419261,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 8.796875,
+      "mean": 1.7370200838361467,
+      "min": 0.0238037109375,
+      "std_dev": 0.9923300938539382,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 6.2265625,
+      "mean": 2.809304714202881,
+      "min": 0.01837158203125,
+      "std_dev": 0.8159616699535229,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 8.4453125,
+      "mean": 1.9147926739283971,
+      "min": 0.05218505859375,
+      "std_dev": 0.9869330108868197,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 3.125,
+      "mean": 2.0981787805046355,
+      "min": 0.0004138946533203125,
+      "std_dev": 0.31754176238504966,
+      "tensor_name": "ffn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 9.9375,
+      "mean": 2.437044416155134,
+      "min": 0.2880859375,
+      "std_dev": 1.0302047484456323,
+      "tensor_name": "attn_norm.weight"
+    },
+    {
+      "count": 896,
+      "dtype": "F16",
+      "max": 7.76171875,
+      "mean": 3.926861354282924,
+      "min": 0,
+      "std_dev": 0.5513160035577443,
+      "tensor_name": "ffn_norm.weight"
+    }
+  ],
+  "issues": [],
+  "model_path": "C:/Users/reyha/AppData/Local/Temp/claude/c--Users-reyha-Documents-JinXSuper-Projects-GwenLand/24257311-766e-4a5e-8e66-05a6e31c0b73/scratchpad/qwen05b.gllm",
+  "skipped_dtypes": {},
+  "tensors_scanned": 49,
+  "tensors_skipped": 0,
+  "timestamp": "2026-07-24T05:59:48Z"
+}

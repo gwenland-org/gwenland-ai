@@ -1,0 +1,12 @@
+glbench accuracy-vs-perf
+
+engine   glproc
+model (run)      C:/Users/reyha/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf
+model (accuracy) C:/Users/reyha/AppData/Local/Temp/claude/c--Users-reyha-Documents-JinXSuper-Projects-GwenLand/24257311-766e-4a5e-8e66-05a6e31c0b73/scratchpad/qwen05b.gllm
+  ! model paths do not appear to match — this comparison may be joining unrelated runs
+
+decode tps (mean)   22.3
+prefill tps (mean)  89.0
+
+KL-divergence vs oracle   mean 0.998597 nats | max 7.515453 nats
+  over 32 compared token positions
