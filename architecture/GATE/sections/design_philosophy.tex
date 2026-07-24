@@ -1,0 +1,48 @@
+\section{Design Philosophy}
+\label{sec:design}
+
+Six principles govern every design decision in \gate{}.
+
+\paragraph{1. Correctness first.}
+A performance number attached to an incorrect result is worse than
+useless---it is misleading. \gate{} treats correctness as a
+precondition, not a metric to trade off: no plan reaches the cost model
+until it has been proven valid.
+
+\paragraph{2. Constraint before optimization.}
+The optimizer's search space is $\mathcal{P}_{\text{valid}}$, never
+$\mathcal{P}_{\text{cand}}$. This ordering is structural, not
+procedural: the argmin in the selection criterion
+(Section~\ref{sec:math}) is defined over the validated set, so no
+implementation shortcut can bypass validation without changing the
+algorithm itself.
+
+\paragraph{3. Composable execution.}
+Constraints, backends, and metric estimators are independent objects
+behind uniform interfaces (\texttt{Constraint}, \texttt{Backend} traits).
+Adding an eighth constraint or a fourth backend requires no modification
+of existing components---the open-closed principle applied to execution
+semantics.
+
+\paragraph{4. Backend independence.}
+\gate{} makes no assumption about the execution substrate. The same
+algorithm dispatches to CPU SIMD code, CUDA kernels, or Vulkan compute
+shaders; backend-specific knowledge is confined to capability
+predicates and metric estimators supplied by each backend.
+
+\paragraph{5. Execution policy as a first-class object.}
+Deployment contexts differ: a real-time service optimizes latency, an
+edge device optimizes memory, a battery-powered system optimizes energy.
+\gate{} encodes these preferences as weight vectors on a fixed metric
+space, so changing the deployment goal is a configuration change, not a
+code change---and, by the policy-independence theorem, can never
+compromise validity.
+
+\paragraph{6. Logical validation over empirical trust.}
+Test suites sample behavior; constraints assert it. \gate{} favors
+explicit, per-plan logical checks over the assumption that a kernel
+that passed its unit tests will compose correctly with every other
+kernel on every backend. The empirical study in
+Section~\ref{subsec:empirical} shows this distinction is not
+academic: a production compiler whose per-operator tests all pass can
+still miscompile their composition.

@@ -1,0 +1,69 @@
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Tensor compilers and runtimes.}
+TVM~\cite{chen2018tvm} pioneered learning-based schedule search over a
+tensor IR; XLA~\cite{xla2017} performs whole-graph fusion for TPUs and
+GPUs; MLIR~\cite{lattner2021mlir} provides reusable compiler
+infrastructure with progressive lowering; TensorRT~\cite{tensorrt2020}
+applies aggressive inference-time optimization on NVIDIA GPUs;
+Halide~\cite{ragan2013halide} separates algorithm from schedule;
+IREE~\cite{iree2022} lowers ML programs through MLIR to portable
+runtimes; ONNX Runtime~\cite{onnxruntime2019} executes a common exchange
+format across execution providers; and Glow~\cite{glow2018} lowers
+graphs to two-level IR for heterogeneous accelerators. These systems
+optimize aggressively, and their validation of the \emph{resulting
+execution plan} is best-effort rather than formal: correctness is
+established by test suites and kernel-level unit tests, not by
+validating each concrete plan before dispatch.\footnote{The practical
+consequence is visible in Section~\ref{subsec:empirical}: TVM
+0.25.0---an official release wheel---miscompiles any graph containing
+more than one \texttt{BatchNormalization} node on the platform under
+test, producing silently divergent outputs from a correct intermediate
+representation. \gate{}'s numerical-error constraint rejects exactly
+this class of plan before it can execute.}
+
+\paragraph{Formal approaches.}
+STOKE~\cite{stoke2013} searches over x86 instruction sequences
+under a formal equivalence checker, and translation
+validation~\cite{palsberg1995translation,necula2000translation} verifies
+individual compilations after the fact. These systems provide strong
+guarantees for scalar code or single kernels, but do not address
+plan-level properties of tensor programs---peak memory, layout
+compatibility across a heterogeneous backend set, determinism of
+parallel reductions, or accumulated numerical error.
+
+\paragraph{Positioning.}
+Table~\ref{tab:related} summarizes the capability matrix. \gate{} is,
+to our knowledge, the only system that combines explicit plan-level
+constraint validation, multi-candidate plan generation, a policy-driven
+cost model, backend agnosticism, and formal correctness guarantees for
+the dispatched plan.
+
+\begin{table}[H]
+\centering
+\small
+\caption{Capability comparison. \cmark{} indicates first-class support.}
+\label{tab:related}
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+System & \begin{tabular}{@{}c@{}}Constraint\\validation\end{tabular}
+       & \begin{tabular}{@{}c@{}}Plan\\generation\end{tabular}
+       & \begin{tabular}{@{}c@{}}Cost\\model\end{tabular}
+       & \begin{tabular}{@{}c@{}}Backend\\agnostic\end{tabular}
+       & \begin{tabular}{@{}c@{}}Formal\\correctness\end{tabular} \\
+\midrule
+TVM~\cite{chen2018tvm}            &        & \cmark & \cmark & \cmark &        \\
+XLA~\cite{xla2017}                &        &        & \cmark &        &        \\
+MLIR~\cite{lattner2021mlir}       &        &        &        & \cmark &        \\
+TensorRT~\cite{tensorrt2020}      &        &        & \cmark &        &        \\
+Halide~\cite{ragan2013halide}     &        & \cmark &        &        &        \\
+IREE~\cite{iree2022}              &        &        & \cmark & \cmark &        \\
+ONNX Runtime~\cite{onnxruntime2019} &      &        & \cmark & \cmark &        \\
+Glow~\cite{glow2018}         &        &        &        &        &        \\
+STOKE~\cite{stoke2013}    & \cmark & \cmark & \cmark &        & \cmark \\
+\midrule
+\textbf{\gate{}} & \cmark & \cmark & \cmark & \cmark & \cmark \\
+\bottomrule
+\end{tabular}
+\end{table}

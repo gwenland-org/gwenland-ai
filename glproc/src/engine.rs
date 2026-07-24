@@ -85,11 +85,19 @@ impl GlprocEngine {
         let started = Instant::now();
         let mut text = String::new();
 
+        // `input.stopping` — not a direct `tokenizer.is_stop_token` reach-
+        // through — so every stop decision flows through the one trait-level
+        // mechanism (`glcore::stopping::StoppingCriteria`) every engine
+        // consumes the same way. In this workspace `glcore::Runtime` always
+        // auto-fills `stopping` from this same tokenizer before `run` ever
+        // sees it (`GlprocEngine` is never driven any other way today — see
+        // `glcore::runtime::Runtime::apply_default_stopping`), so this is a
+        // wiring change, not a behavior change.
         let (token_ids, timing) = runner.generate(
             &input.token_ids,
             input.max_new_tokens,
             &mut sampler,
-            |id| tokenizer.is_stop_token(id),
+            |id| input.stopping.is_stop(id),
             |id| {
                 let piece = tokenizer.decode_token_text(id);
                 if let Some(cb) = on_token.as_deref_mut() {

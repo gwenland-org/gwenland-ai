@@ -201,6 +201,17 @@ impl EngineAdapter {
             } else {
                 glcore::trace::TraceConfig::default()
             },
+            // `Tokenized` backends get this auto-filled from their own
+            // tokenizer inside `glcore::Runtime::stream` (see its module
+            // docs). `RawTokens` (GLLM) has no tokenizer at this layer and
+            // uses synthetic, not real, prompts — a stop id landing mid
+            // synthetic-token-stream would truncate the very throughput
+            // measurement being taken, so this explicitly asks the engine to
+            // ignore whatever stop ids its own package manifest declares
+            // (GllmEngine now merges in manifest EOS ids unconditionally;
+            // without this, glbench's GLLM benchmarks would silently start
+            // running variable-length, unmeasurable decode passes).
+            stopping: glcore::stopping::StoppingCriteria::default().ignoring_eos(),
         };
         match &self.backend {
             Backend::Tokenized(rt) => {
