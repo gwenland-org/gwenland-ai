@@ -3,7 +3,7 @@
 **Project:** GwenLand — Rust-Native AI Inference Toolkit  
 **Author:** JinXSuper  
 **Version:** 0.1 (Concept Draft) · June 2026  
-**License:** [CC BY-NC-ND 4.0](LICENSE)
+**License:** Dual — [CC BY-NC-ND 4.0](LICENSE) (non-commercial) + commercial license available on request (see [LICENSE](LICENSE))
 
 ---
 

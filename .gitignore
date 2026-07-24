@@ -72,6 +72,19 @@ desktop.ini
 *.log
 
 # -----------------------------------------------------------------------------
+# LaTeX build byproducts (papers under architecture/*/ ship the .tex + .pdf
+# source/output; these are regenerable via latexmk, not source)
+# -----------------------------------------------------------------------------
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
+*.synctex.gz
+
+# -----------------------------------------------------------------------------
 # Tauri
 # -----------------------------------------------------------------------------
 packages/gui/src-tauri/.global-state.json
