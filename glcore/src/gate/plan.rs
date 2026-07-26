@@ -9,22 +9,35 @@ use crate::gate::metrics::MetricVector;
 
 /// One tensor operation — a member of the paper's `𝒪` domain (§4.1).
 ///
-/// Marker stub only: GwenLand has no op-DAG representation yet (see
-/// `architecture/GATE/GATE-mapping.md` Gap 1) — this type carries no
-/// shape/dtype information or behavior. It exists so
-/// [`ExecutionPlan::ordering`] has something concrete to be a `Vec` of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct TensorOp;
+/// Named by the weight tensor it operates on (GGUF tensor-name convention,
+/// e.g. `"blk.0.ffn_gate.weight"`); no dependency edges or shape/dtype
+/// beyond the name are tracked. This is deliberately not a full op-DAG —
+/// GwenLand's engines execute a fixed, hand-written layer walk
+/// (`Runner::generate`, `GpuModel::generate`), not a graph a planner walks
+/// generically, so a richer representation would describe a compiler this
+/// codebase does not have. The name is enough to let a backend crate (e.g.
+/// `glproc`) generate real per-tensor format candidates against it — see
+/// `Planner::generate_candidates`'s glproc caller for a worked example.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TensorOp {
+    /// The weight tensor this op reads, by name.
+    pub tensor_name: String,
+}
+
+impl TensorOp {
+    /// A tensor op named after the weight tensor it operates on.
+    pub fn new(tensor_name: impl Into<String>) -> Self {
+        TensorOp { tensor_name: tensor_name.into() }
+    }
+}
 
 /// A tensor computation graph — the paper's `𝒢 = (V, E)` (§4.1): a DAG of
 /// operations and data dependencies.
 ///
-/// Marker stub only, matching [`TensorOp`]: no dependency edges are
-/// tracked. Exists so `Planner::generate_candidates`'s signature (see
-/// `planner.rs`) matches the paper's reference interface (§5.2, where
-/// `ShapeConstraint { graph: graph.ops.clone() }` reads a `.ops` field) —
-/// see `architecture/GATE/GATE-mapping.md` Gap 1 for why a real graph
-/// representation is deliberately not built this sprint.
+/// Unordered: no edges are tracked, per [`TensorOp`]'s doc — GwenLand has
+/// no op-DAG representation to derive edges from, only a fixed per-layer
+/// walk. `ops` is the graph's vertex set; a caller building candidates
+/// (e.g. `Planner::generate_candidates`) treats each op independently.
 #[derive(Debug, Clone, Default)]
 pub struct TensorGraph {
     /// This graph's operations. Unordered: no edges/dependencies tracked.

@@ -129,20 +129,46 @@ const PREFILL_CHUNK: usize = 32;
 const REPEAT_WINDOW: usize = 64;
 
 /// Apply rotary position embeddings in place to one head's vector.
-fn rope(x: &mut [f32], pos: usize, head_dim: usize, freq_base: f32, style: RopeStyle) {
+/// Fill `cos`/`sin` (each `head_dim/2` long) with this position's RoPE
+/// rotation table. `freq_base` and `head_dim` are `Config`-level (shared by
+/// every layer and every head, not per-layer), so for a fixed `pos` these
+/// values are identical across every [`rope_apply`] call that position will
+/// ever make — callers compute this ONCE per position, not once per
+/// head/layer. Style-independent: `RopeStyle` only picks which *indices*
+/// consume a given (cos, sin) pair in [`rope_apply`], not which values exist.
+///
+/// This replaces the old per-head `rope()`, which called `sin_cos()` fresh
+/// inside every head's loop — on Qwen2.5-0.5B (24 layers, 16 total Q+KV
+/// heads, head_dim=64) that was 12,288 `sin_cos()` calls/token where 32
+/// suffice, a measured 9.65x cost on the RoPE portion alone (isolated probe:
+/// `benches/rope_probe.rs`), ~5% of one decode step's wall clock before this
+/// fix.
+fn fill_rope_table(cos: &mut [f32], sin: &mut [f32], pos: usize, head_dim: usize, freq_base: f32) {
     let half = head_dim / 2;
+    debug_assert!(cos.len() >= half && sin.len() >= half);
     for i in 0..half {
         let freq = 1.0 / freq_base.powf(2.0 * i as f32 / head_dim as f32);
         let theta = pos as f32 * freq;
-        let (sin, cos) = theta.sin_cos();
+        let (s, c) = theta.sin_cos();
+        sin[i] = s;
+        cos[i] = c;
+    }
+}
+
+/// Apply a precomputed rotation table (see [`fill_rope_table`]) to one head.
+/// No `sin_cos()`/`powf()` here — just the multiply-subtract rotation math,
+/// reusing whatever the caller already computed for this position.
+fn rope_apply(x: &mut [f32], cos: &[f32], sin: &[f32], head_dim: usize, style: RopeStyle) {
+    let half = head_dim / 2;
+    for i in 0..half {
         let (a, b) = match style {
             RopeStyle::Norm => (2 * i, 2 * i + 1),
             RopeStyle::Neox => (i, i + half),
         };
         let x0 = x[a];
         let x1 = x[b];
-        x[a] = x0 * cos - x1 * sin;
-        x[b] = x0 * sin + x1 * cos;
+        x[a] = x0 * cos[i] - x1 * sin[i];
+        x[b] = x0 * sin[i] + x1 * cos[i];
     }
 }
 
@@ -274,6 +300,12 @@ struct Workspace {
     qkv: Vec<f32>,
     /// Per-head RMSNorm scratch (qwen3 q/k norm), `[head_dim]`.
     head: Vec<f32>,
+    /// RoPE rotation table for the current position, `[head_dim / 2]` each —
+    /// filled once per `step()` call (see `fill_rope_table`) and reused by
+    /// every layer's and every head's `rope_apply` call, since `rope_freq_base`
+    /// is a `Config`-level constant, not per-layer.
+    rope_cos: Vec<f32>,
+    rope_sin: Vec<f32>,
     /// Attention output, `[n_heads * head_dim]`.
     attn_out: Vec<f32>,
     /// Attention/FFN projection back to the residual, `[dim]`.
@@ -320,6 +352,13 @@ struct BatchWorkspace {
     /// attention in parallel, so they cannot share the decode scratch.
     /// `[chunk][kv capacity]`.
     scoresb: Vec<f32>,
+    /// RoPE rotation tables, one per chunk position, `[chunk][head_dim / 2]`
+    /// each — filled once per `step_chunk()` call (see `fill_rope_table`),
+    /// before the per-layer loop, and reused by every layer for that
+    /// position (same `Config`-level-constant reasoning as `Workspace`'s
+    /// `rope_cos`/`rope_sin`).
+    rope_cos_b: Vec<f32>,
+    rope_sin_b: Vec<f32>,
     /// One Q8 activation per batch row for the integer-dot matmuls.
     acts: Vec<QuantizedActivation>,
 }
@@ -743,6 +782,8 @@ impl<'m> Runner<'m> {
                 xn: vec![0.0; c.dim],
                 qkv: vec![0.0; q_dim + 2 * kv_dim],
                 head: vec![0.0; c.head_dim],
+                rope_cos: vec![0.0; c.head_dim / 2],
+                rope_sin: vec![0.0; c.head_dim / 2],
                 attn_out: vec![0.0; q_dim],
                 proj: vec![0.0; c.dim],
                 gate: vec![0.0; c.hidden_dim],
@@ -764,6 +805,8 @@ impl<'m> Runner<'m> {
                 gateb: vec![0.0; PREFILL_CHUNK * c.hidden_dim],
                 upb: vec![0.0; PREFILL_CHUNK * c.hidden_dim],
                 scoresb: vec![0.0; PREFILL_CHUNK * kv_capacity],
+                rope_cos_b: vec![0.0; PREFILL_CHUNK * (c.head_dim / 2)],
+                rope_sin_b: vec![0.0; PREFILL_CHUNK * (c.head_dim / 2)],
                 acts: (0..PREFILL_CHUNK)
                     .map(|_| {
                         QuantizedActivation::with_capacity(c.dim.max(c.hidden_dim).max(q_dim))
@@ -842,6 +885,9 @@ impl<'m> Runner<'m> {
 
         let ws = &mut self.ws;
         self.model.embed_into(token, &mut ws.x)?;
+        // Once per token, not once per head/layer — see `fill_rope_table`'s
+        // doc for why this is valid (rope_freq_base is Config-level).
+        fill_rope_table(&mut ws.rope_cos, &mut ws.rope_sin, pos, head_dim, c.rope_freq_base);
         if self.capture_hidden {
             self.hidden_dump.clear();
         }
@@ -924,20 +970,20 @@ impl<'m> Runner<'m> {
             }
 
             for h in 0..c.n_heads {
-                rope(
+                rope_apply(
                     &mut q[h * head_dim..(h + 1) * head_dim],
-                    pos,
+                    &ws.rope_cos,
+                    &ws.rope_sin,
                     head_dim,
-                    c.rope_freq_base,
                     c.rope_style,
                 );
             }
             for h in 0..c.n_kv_heads {
-                rope(
+                rope_apply(
                     &mut k[h * head_dim..(h + 1) * head_dim],
-                    pos,
+                    &ws.rope_cos,
+                    &ws.rope_sin,
                     head_dim,
-                    c.rope_freq_base,
                     c.rope_style,
                 );
                 self.cache.write_k(l, h, &k[h * head_dim..(h + 1) * head_dim]);
@@ -1168,6 +1214,20 @@ impl<'m> Runner<'m> {
             self.hidden_dump.clear();
         }
 
+        let half = head_dim / 2;
+        // Once per chunk position, not once per head/layer — see
+        // `fill_rope_table`'s doc. `bsz` tables computed up front, reused by
+        // every layer below for the position they belong to.
+        for b in 0..bsz {
+            fill_rope_table(
+                &mut bws.rope_cos_b[b * half..(b + 1) * half],
+                &mut bws.rope_sin_b[b * half..(b + 1) * half],
+                start_pos + b,
+                head_dim,
+                c.rope_freq_base,
+            );
+        }
+
         for (l, layer) in self.model.layers.iter().enumerate() {
             // --- attention block ---
             for b in 0..bsz {
@@ -1268,23 +1328,13 @@ impl<'m> Runner<'m> {
                     }
                 }
 
+                let cos = &bws.rope_cos_b[b * half..(b + 1) * half];
+                let sin = &bws.rope_sin_b[b * half..(b + 1) * half];
                 for h in 0..c.n_heads {
-                    rope(
-                        &mut q[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        head_dim,
-                        c.rope_freq_base,
-                        c.rope_style,
-                    );
+                    rope_apply(&mut q[h * head_dim..(h + 1) * head_dim], cos, sin, head_dim, c.rope_style);
                 }
                 for h in 0..c.n_kv_heads {
-                    rope(
-                        &mut k[h * head_dim..(h + 1) * head_dim],
-                        pos,
-                        head_dim,
-                        c.rope_freq_base,
-                        c.rope_style,
-                    );
+                    rope_apply(&mut k[h * head_dim..(h + 1) * head_dim], cos, sin, head_dim, c.rope_style);
                     self.cache
                         .write_k_at(l, h, pos, &k[h * head_dim..(h + 1) * head_dim]);
                     self.cache

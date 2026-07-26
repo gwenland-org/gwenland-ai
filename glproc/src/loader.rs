@@ -645,11 +645,28 @@ fn build_layer(
     })
 }
 
+/// As [`load_gguf`], with `prefer_q4k_native` overriding
+/// `qdot::q4k_native()`'s env-var default for the duration of this call —
+/// the seam GATE's session-init plan selection uses (see
+/// `GlprocEngine::load_model`). `None` reproduces [`load_gguf`] exactly:
+/// every existing caller of that function is unaffected by this one
+/// existing.
+pub fn load_gguf_with_gate(
+    gguf: &GgufFile,
+    prefer_q4k_native: Option<bool>,
+) -> Result<GlprocModel, GlError> {
+    qdot::with_q4k_native_override(prefer_q4k_native, || load_gguf_inner(gguf))
+}
+
 /// Parse config and dequantize every weight of a GGUF transformer.
 ///
 /// Supports llama-family architectures (llama, mistral, qwen2, tinyllama...)
 /// that use the standard `blk.N.*` tensor naming.
 pub fn load_gguf(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
+    load_gguf_inner(gguf)
+}
+
+fn load_gguf_inner(gguf: &GgufFile) -> Result<GlprocModel, GlError> {
     let arch = gguf
         .get_meta("general.architecture")
         .and_then(GgufValue::as_str)

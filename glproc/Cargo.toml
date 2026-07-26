@@ -1,6 +1,6 @@
 [package]
 name = "glproc"
-version = "0.1.155"
+version = "0.2.45"
 edition = "2021"
 description = "GwenLand AI CPU inference engine (source of truth)"
 license-file = "../LICENSE"
@@ -28,4 +28,20 @@ harness = false
 
 [[bench]]
 name = "q4k_regime"
+harness = false
+
+[[bench]]
+name = "vnni512_probe"
+harness = false
+
+[[bench]]
+name = "row_tile_probe"
+harness = false
+
+[[bench]]
+name = "rope_probe"
+harness = false
+
+[[bench]]
+name = "elementwise_add_probe"
 harness = false

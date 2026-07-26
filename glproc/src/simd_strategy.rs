@@ -22,7 +22,19 @@ impl SimdStrategy {
     }
 
     /// Probe CPU features and core count. Called once per process.
+    ///
+    /// `GLPROC_FORCE_SCALAR=1` bypasses detection entirely — a diagnostic
+    /// knob (same pattern as `GLPROC_Q4K_NATIVE`/`GLPROC_ATTN_SEQ`) for
+    /// isolating whether a numerical discrepancy comes from SIMD
+    /// reassociation/kernel behavior or from something architectural
+    /// upstream of it (same reason `use_ref`-style toggles exist in
+    /// llama.cpp — see `architecture/percival/CPU/ARTX01-Generic-CPU.md`
+    /// W4). Read once via the same `OnceLock` as the rest of detection, not
+    /// a hot-path getenv.
     fn probe() -> Self {
+        if matches!(std::env::var("GLPROC_FORCE_SCALAR"), Ok(v) if !v.is_empty() && v != "0") {
+            return SimdStrategy::Scalar;
+        }
         #[cfg(target_arch = "x86_64")]
         {
             let avx512 = std::arch::is_x86_feature_detected!("avx512f")

@@ -1,0 +1,517 @@
+{
+  "analysis": {
+    "bottleneck": "compute_bound",
+    "ceiling_basis": "measured",
+    "ceiling_efficiency": 0.5758756340963074,
+    "decode_tps": {
+      "ci95": 0.34458071778619903,
+      "count": 5,
+      "max": 37.3186785992364,
+      "mean": 37.06367657727673,
+      "median": 37.12775186618438,
+      "min": 36.623948359775014,
+      "p95": 37.307451332600614,
+      "p99": 37.31643314590924,
+      "std_dev": 0.2482570012868869
+    },
+    "health": 0.6950751983155637,
+    "hypotheses": [],
+    "notes": [
+      "Decode 37.1 tok/s vs bandwidth ceiling 64.4 tok/s (32 GB/s, measured on this machine, over 0.49 GB weights) = 58% of peak.",
+      "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+    ],
+    "prefill_tps": {
+      "ci95": 1.0733696581336436,
+      "count": 5,
+      "max": 141.69549740658596,
+      "mean": 140.66909744555997,
+      "median": 140.66542932239926,
+      "min": 139.52258036611613,
+      "p95": 141.61345209012416,
+      "p99": 141.67908834329359,
+      "std_dev": 0.7733210793470057
+    },
+    "roofline": {
+      "ceiling_gbs": 31.626779772845094,
+      "decode": [
+        {
+          "bucket": "attention",
+          "ceiling_frac": 0.31795641790874685,
+          "gb_per_s": 10.055937606562637,
+          "intensity_flop_per_byte": 2.0923217550274225,
+          "share": 0.19786392851493373,
+          "total_ms": 684.4566,
+          "verdict": "indeterminate"
+        },
+        {
+          "bucket": "ffn",
+          "ceiling_frac": 0.6885584335824041,
+          "gb_per_s": 21.77688593964588,
+          "intensity_flop_per_byte": 1.8823529411764706,
+          "share": 0.5664973938699863,
+          "total_ms": 1959.6441,
+          "verdict": "indeterminate"
+        },
+        {
+          "bucket": "lm_head",
+          "ceiling_frac": 0.7372978371245121,
+          "gb_per_s": 23.318356321731958,
+          "intensity_flop_per_byte": 1.8823529411764706,
+          "share": 0.22952520515555375,
+          "total_ms": 793.9802,
+          "verdict": "bandwidth-bound"
+        },
+        {
+          "bucket": "other",
+          "ceiling_frac": null,
+          "gb_per_s": null,
+          "intensity_flop_per_byte": null,
+          "share": 0.006113472459526239,
+          "total_ms": 21.1479,
+          "verdict": "unknown"
+        }
+      ],
+      "prefill": [
+        {
+          "bucket": "attention",
+          "ceiling_frac": 0.05000032235025579,
+          "gb_per_s": 1.5813491835428042,
+          "intensity_flop_per_byte": 66.95429616087752,
+          "share": 0.15354991825087508,
+          "total_ms": 238.02839999999998,
+          "verdict": "not-bandwidth-bound"
+        },
+        {
+          "bucket": "ffn",
+          "ceiling_frac": 0.05829794798522826,
+          "gb_per_s": 1.8437763621375927,
+          "intensity_flop_per_byte": 60.23529411764706,
+          "share": 0.8165327727064684,
+          "total_ms": 1265.7642,
+          "verdict": "not-bandwidth-bound"
+        },
+        {
+          "bucket": "other",
+          "ceiling_frac": null,
+          "gb_per_s": null,
+          "intensity_flop_per_byte": null,
+          "share": 0.029917309042656295,
+          "total_ms": 46.3769,
+          "verdict": "unknown"
+        }
+      ]
+    }
+  },
+  "behavior": {
+    "anomaly": {
+      "drift_frac": 0.03950679491740228,
+      "drift_monotonic": false,
+      "quarter_gap_ms": [
+        27.182067741935484,
+        31.50757741935484,
+        27.67899032258065,
+        28.255944117647065
+      ],
+      "samples": 127,
+      "spike_ratio": 1.2398548667085814,
+      "spike_token": 68
+    },
+    "confidence_divergence": {
+      "max_rank": 3,
+      "mean_confidence_gap": 0.08124500408685915,
+      "mean_rank": 0.2890625,
+      "top_choice_rate": 0.7890625,
+      "uncertain_offpick_rate": 0.0234375
+    },
+    "cot": {
+      "flag": "NORMAL",
+      "thinking_capable": false,
+      "threshold_nats": 0.5,
+      "threshold_top_prob": 0.9
+    },
+    "entropy": {
+      "max": 4.048439025878906,
+      "mean_nats": 1.464504732783098,
+      "mean_top_prob": 0.6235108272521757,
+      "min": 0.0013366718776524067,
+      "p50": 1.3497248888015747,
+      "p95": 3.650010108947754,
+      "std_dev": 1.097871930637206
+    },
+    "ood": {
+      "mean_logprob": -0.8829387302928922,
+      "min_logprob": -3.427753210067749,
+      "p95_surprise": 2.4632601737976074,
+      "perplexity": 2.4179951110514466
+    },
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 128,
+      "unique_1gram_ratio": 0.6953125,
+      "unique_2gram_ratio": 0.905511811023622,
+      "unique_3gram_ratio": 0.9523809523809523
+    },
+    "stall": {
+      "jitter": 0.19689675369215476,
+      "max_ms": 64.4612,
+      "mean_ms": 28.64669133858267,
+      "p50_ms": 27.1038,
+      "p95_ms": 33.966,
+      "p99_ms": 63.9818,
+      "stall_count": 0,
+      "std_dev_ms": 5.640440528588095
+    },
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q4_K_M",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2995,
+        "model": "11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 31.626779772845094
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": 2745901056,
+        "total_bytes": 8382472192
+      },
+      "storage": {
+        "model_file_bytes": 491400032
+      },
+      "thermal": {
+        "avg_mhz": 2995,
+        "end_mhz": 2995,
+        "start_mhz": 2995,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": [
+      {
+        "decode_ms": 3295.8368,
+        "generated_tokens": 128,
+        "prefill_ms": 1694.1773,
+        "prompt_tokens": 220,
+        "total_ms": 4990
+      },
+      {
+        "decode_ms": 3321.9249,
+        "generated_tokens": 128,
+        "prefill_ms": 1667.5683999999999,
+        "prompt_tokens": 220,
+        "total_ms": 4989
+      },
+      {
+        "decode_ms": 3199.5889,
+        "generated_tokens": 128,
+        "prefill_ms": 1660.0421999999999,
+        "prompt_tokens": 220,
+        "total_ms": 4859
+      },
+      {
+        "decode_ms": 3358.2682999999997,
+        "generated_tokens": 128,
+        "prefill_ms": 1572.4097000000002,
+        "prompt_tokens": 220,
+        "total_ms": 4930
+      },
+      {
+        "decode_ms": 3448.0132000000003,
+        "generated_tokens": 128,
+        "prefill_ms": 1562.8044,
+        "prompt_tokens": 220,
+        "total_ms": 5010
+      }
+    ],
+    "cpu_utilization_pct": 87.82094506753523,
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 3435.085,
+        "generated_tokens": 128,
+        "prefill_ms": 1563.9948000000002,
+        "prompt_tokens": 220,
+        "total_ms": 4999
+      },
+      {
+        "decode_ms": 3447.5559000000003,
+        "generated_tokens": 128,
+        "prefill_ms": 1552.6252,
+        "prompt_tokens": 220,
+        "total_ms": 5000
+      },
+      {
+        "decode_ms": 3429.9178,
+        "generated_tokens": 128,
+        "prefill_ms": 1569.4476000000002,
+        "prompt_tokens": 220,
+        "total_ms": 4999
+      },
+      {
+        "decode_ms": 3494.9809,
+        "generated_tokens": 128,
+        "prefill_ms": 1576.8057,
+        "prompt_tokens": 220,
+        "total_ms": 5071
+      },
+      {
+        "decode_ms": 3460.8192999999997,
+        "generated_tokens": 128,
+        "prefill_ms": 1557.1333,
+        "prompt_tokens": 220,
+        "total_ms": 5017
+      }
+    ],
+    "model_bytes": 491400032,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": 1296506880
+  },
+  "metadata": {
+    "created_unix": 1785030520,
+    "glbench_version": "0.1.163",
+    "label": "glproc-qwen2.5-0.5b-instruct-q4_k_m",
+    "schema_version": 1
+  },
+  "telemetry": {
+    "backend": {
+      "kernels": [
+        {
+          "kernel": "Q8_0 fused-swiglu integer-dot",
+          "role": "ffn_gate_up"
+        },
+        {
+          "kernel": "Q8_0 integer-dot",
+          "role": "ffn_down"
+        },
+        {
+          "kernel": "Q8_0 integer-dot",
+          "role": "lm_head"
+        }
+      ],
+      "simd_path": "avx2",
+      "threads": 4
+    },
+    "decode": {
+      "stages": [
+        {
+          "bytes_read": 3369074688,
+          "calls": 3072,
+          "gb_per_s": 12.857252883086312,
+          "gmac_per_s": 12.100943889963588,
+          "macs": 3170893824,
+          "name": "qkv",
+          "share": 0.07575009204363702,
+          "total_ms": 262.0369
+        },
+        {
+          "bytes_read": 893386752,
+          "calls": 3072,
+          "gb_per_s": 4.216682110128117,
+          "gmac_per_s": 7.379193692724204,
+          "macs": 1563426816,
+          "name": "attention",
+          "share": 0.06124763993639276,
+          "total_ms": 211.8696
+        },
+        {
+          "bytes_read": 2620391424,
+          "calls": 3072,
+          "gb_per_s": 12.445453238920335,
+          "gmac_per_s": 11.713367754277963,
+          "macs": 2466250752,
+          "name": "attn_out",
+          "share": 0.060866196534903966,
+          "total_ms": 210.5501
+        },
+        {
+          "bytes_read": 28449964032,
+          "calls": 3072,
+          "gb_per_s": 22.63101607504184,
+          "gmac_per_s": 21.299779835333496,
+          "macs": 26776436736,
+          "name": "ffn_gate_up",
+          "share": 0.36341126091457154,
+          "total_ms": 1257.1227000000001
+        },
+        {
+          "bytes_read": 14224982016,
+          "calls": 3072,
+          "gb_per_s": 20.24846789862914,
+          "gmac_per_s": 19.057381551650955,
+          "macs": 13388218368,
+          "name": "ffn_down",
+          "share": 0.2030861329554148,
+          "total_ms": 702.5214
+        },
+        {
+          "bytes_read": 18514313216,
+          "calls": 128,
+          "gb_per_s": 23.318356321731958,
+          "gmac_per_s": 21.946688302806546,
+          "macs": 17425235968,
+          "name": "lm_head",
+          "share": 0.22952520515555375,
+          "total_ms": 793.9802
+        },
+        {
+          "bytes_read": null,
+          "calls": 128,
+          "gb_per_s": null,
+          "gmac_per_s": null,
+          "macs": null,
+          "name": "sampler",
+          "share": 0.006113472459526239,
+          "total_ms": 21.1479
+        }
+      ],
+      "total_ms": 3459.2288,
+      "unattributed_ms": 0
+    },
+    "memory": {
+      "kv_cache_bytes": 100663296,
+      "model_bytes": 669476864,
+      "scratch_bytes": 0
+    },
+    "moe": null,
+    "prefill": {
+      "stages": [
+        {
+          "bytes_read": null,
+          "calls": 168,
+          "gb_per_s": null,
+          "gmac_per_s": null,
+          "macs": null,
+          "name": "serial",
+          "share": 0.029917309042656295,
+          "total_ms": 46.3769
+        },
+        {
+          "bytes_read": 184246272,
+          "calls": 168,
+          "gb_per_s": 2.1297315616998898,
+          "gmac_per_s": 64.14250350531434,
+          "macs": 5549064192,
+          "name": "qkv",
+          "share": 0.055807768118260596,
+          "total_ms": 86.5115
+        },
+        {
+          "bytes_read": null,
+          "calls": 168,
+          "gb_per_s": null,
+          "gmac_per_s": null,
+          "macs": null,
+          "name": "fixup",
+          "share": 0.007721155654268772,
+          "total_ms": 11.9691
+        },
+        {
+          "bytes_read": 48857088,
+          "calls": 168,
+          "gb_per_s": 1.1056266307607012,
+          "gmac_per_s": 61.91509132259926,
+          "macs": 2735996928,
+          "name": "attention",
+          "share": 0.02850623754370086,
+          "total_ms": 44.1895
+        },
+        {
+          "bytes_read": 143302656,
+          "calls": 168,
+          "gb_per_s": 1.502781152768034,
+          "gmac_per_s": 45.26023236571961,
+          "macs": 4315938816,
+          "name": "attn_out",
+          "share": 0.06151475693464487,
+          "total_ms": 95.3583
+        },
+        {
+          "bytes_read": 1555857408,
+          "calls": 168,
+          "gb_per_s": 1.878190600701851,
+          "gmac_per_s": 56.5666816211381,
+          "macs": 46858764288,
+          "name": "ffn_gate_up",
+          "share": 0.534380917699645,
+          "total_ms": 828.3810000000001
+        },
+        {
+          "bytes_read": null,
+          "calls": 168,
+          "gb_per_s": null,
+          "gmac_per_s": null,
+          "macs": null,
+          "name": "ffn_downq",
+          "share": 0.06937738098962724,
+          "total_ms": 107.5467
+        },
+        {
+          "bytes_read": 777928704,
+          "calls": 168,
+          "gb_per_s": 2.35852825263426,
+          "gmac_per_s": 71.03332149110241,
+          "macs": 23429382144,
+          "name": "ffn_down",
+          "share": 0.21277447401719612,
+          "total_ms": 329.8365
+        }
+      ],
+      "total_ms": 1550.1695000000004,
+      "unattributed_ms": 0
+    }
+  },
+  "validation": {
+    "findings": [],
+    "passed": true
+  },
+  "workload": {
+    "cold_iters": 5,
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "decode",
+    "max_new_tokens": 128,
+    "measure_iters": 5,
+    "model_path": "C:/Users/reyha/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "prompt": "Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads.",
+    "seed": 42,
+    "temperature": 0,
+    "verify_against": null,
+    "warmup_iters": 1
+  }
+}
