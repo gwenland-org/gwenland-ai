@@ -33,6 +33,26 @@ creative; it's re-running a completed experiment at the user's expense.
    width. The engine *detects* AVX-512 and *declines* it — that behavior is
    intentional. (Includes "at least use AVX-512VNNI-512" — declined for the
    same reason; 256-bit VNNI is the ceiling.)
+   **Re-measured 2026-07-26 under JinXSuper's explicit override** (a
+   VNNI-512 `q8_0` qdot kernel, `row_dot` + `row_dot_packed8`, parity-tested
+   and kept behind `GLPROC_VNNI512=1`, default off — see `glproc/src/
+   kernels/qdot/q8_0/vnni512.rs` and `benches/vnni512_probe.rs`). Isolated
+   kernel probe: **+20-26% GMAC/s over VNNI-256**, real and repeatable.
+   Production `glbench` A/B (decode+prefill, 2 repeats, thermal-checked):
+   **decode flat (+0.3%, +1.1%), prefill flat-to-negative (-1.5%, -17.7%,
+   within this hardware's known ~20% session noise) — verdict `neutral`
+   both times.** No throttling observed in any of the 4 runs (2995 MHz
+   constant start/avg/end) — **the original thermal/downclock mechanism was
+   never actually triggered here**, so the verdict's true cause is not
+   downclock but that qdot is not the pipeline's actual bottleneck at
+   production scale (same shape as entry 7's fusion lesson — a
+   faster-in-isolation kernel doesn't move end-to-end tok/s when something
+   else dominates wall clock). **Conclusion unchanged (still REJECTED for
+   production use), but now grounded in a real A/B instead of policy alone
+   — the width genuinely doesn't pay off, for a different reason than
+   originally assumed.** Do not re-open this without a new mechanism
+   (e.g. a redesigned dispatch path that removes whatever overhead is
+   currently swamping the kernel-level gain).
 4. **PREFETCH_CHUNK = 64 software prefetching** — REJECTED: tested, no
    improvement. The hardware prefetcher already saturates linear weight
    streams; software prefetch just burned issue slots.
@@ -48,6 +68,29 @@ creative; it's re-running a completed experiment at the user's expense.
    in L2 ⇒ compute-bound nibble unpack, not bandwidth. Closed as a
    hardware-tier dead end; the shipped answer is load-time repack → Q8_0.
    Full post-mortem context in [quantization.md](quantization.md).
+8. **Row-tiled qdot (R=8 output rows batched against one shared activation,
+   8 independent accumulator chains — `glproc/src/kernels/qdot/q8_0/
+   row_tile.rs`, `GLPROC_ROW_TILE=1`)** — REJECTED for production default,
+   2026-07-26. Isolated probe (`benches/row_tile_probe.rs`): **2x GMAC/s**
+   over the sequential dispatch — the strongest isolated result of any entry
+   here. Production `glbench` A/B (2 repeats, thermal-checked, no
+   throttling): decode flat (+0.9%, +0.7%), prefill mixed sign (+6.2%,
+   -2.1%) — verdict `neutral` both times. Stage-level breakdown explains the
+   gap: `ffn_down` (moderate-size matmul) genuinely gained **+8.9% GMAC/s**,
+   but `lm_head` (151936×896, already `bandwidth-bound` per its own roofline
+   verdict) **lost 9.4%** — compute-side ILP cannot help a stage that's
+   already bandwidth-bound, and `lm_head`'s ~23-25% share of decode time
+   cancels `ffn_down`'s gain in the aggregate. **This is the third time this
+   exact shape has appeared** (entry 7's fusion lesson, entry 3's VNNI-512
+   re-measurement, now this): an isolated-kernel win evaporates in
+   production because the real workload is a *mix* of compute-bound and
+   bandwidth-bound stages, and a technique tuned for one regime doesn't
+   transfer to the other — a single global dispatch flag can't help; it
+   needs to be selective per-stage. Kernel kept (parity-tested), default
+   off. If revisited, the open question is not "does row-tiling work" (yes,
+   confirmed on `ffn_down`) but "can the flag be scoped to only the
+   compute-bound stages" — that is the actual next experiment, not another
+   whole-pipeline A/B.
 
 ## How rejections happen (the ✅ pattern)
 

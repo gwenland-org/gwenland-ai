@@ -19,8 +19,8 @@ GwenLand:
 | Execution plan `P` | `ExecutionPlan` | `glcore::gate::plan` | net-new (Phase 3) |
 | Backend `β ∈ ℬ` | `BackendKind` | `glcore::gate::plan` | net-new — closed enum of GwenLand's 4 engines, not an open trait-object set like the paper's `ℬ` |
 | Memory layout `𝓛` | `MemoryLayout` | `glcore::gate::plan` | net-new, stub-only |
-| Tensor op `𝒪` member | `TensorOp` | `glcore::gate::plan` | net-new **marker stub only** — see §3 |
-| Computation graph `𝒢` | `TensorGraph` | — | **does not exist**, not created this sprint — see §3 |
+| Tensor op `𝒪` member | `TensorOp` | `glcore::gate::plan` | **live** — carries a `tensor_name: String`; no shape/dtype beyond the name, still not the paper's full `𝒪` (see §3) |
+| Computation graph `𝒢` | `TensorGraph` | `glcore::gate::plan` | **live**, minimal — `ops: Vec<TensorOp>`, no dependency edges (see §3) |
 | Constraint `C: 𝒫→{0,1}` | `Constraint` trait | `glcore::gate::constraint` | net-new |
 | Validation outcome | `ValidationResult` | `glcore::gate::constraint` | net-new |
 | Validator `V = ∏Cᵢ` | `Validator` | `glcore::gate::validator` | net-new |
@@ -28,7 +28,7 @@ GwenLand:
 | Weight vector `w ∈ Δ⁴` | `WeightVector` | `glcore::gate::metrics` | net-new |
 | Normalization strategy | `NormalizationStrategy` | `glcore::gate::metrics` | net-new |
 | Execution policy `π` | `ExecutionPolicy` | `glcore::gate::policy` | net-new |
-| Plan generator | `Planner` | `glcore::gate::planner` | net-new, protocol-only (see §3) |
+| Plan generator | `Planner` | `glcore::gate::planner` | **live** — `generate_candidates`/`select_best` are real (Wave A), driven by a caller-supplied `CandidateSource` (see §3, §5) |
 | Dispatcher | `Dispatcher` | `glcore::gate::dispatcher` | net-new, protocol-only |
 | Error (`ConstraintViolation` etc.) | `GateError` | `glcore::gate::error` | net-new — **not merged into `GlError`**, see §4 |
 | `Backend` trait (paper §11) | — | — | **does not exist** — see §2 |
@@ -61,8 +61,16 @@ Short list, because it *is* short:
 Everything else in the paper's §11 implementation description
 (`Constraint` trait, `Backend` trait with `supports_op`/`supports_dtype`,
 `TensorOp`, `ExecutionPlan`, `MetricVector`, `WeightVector`, `GateError`)
-**is not in this codebase.** Phase 3's boilerplate is the first time any of
-it exists in Rust source, anywhere in this repo.
+was not in this codebase as of Phase 3's boilerplate — that boilerplate
+was the first time any of it existed in Rust source. **As of GATE Wave A
++ Wave C, `glproc` is wired to it for real**, not just compiling
+standalone (see §5): `glproc/src/gate.rs`'s `FfnWeightFormatSource` is the
+first concrete `CandidateSource`, and `GlprocEngine::load_model`
+(`glproc/src/engine.rs`) calls `Planner::generate_candidates`/
+`select_best` once per session, before any tensor loads, to decide the
+FFN weight-format policy (Q8_0 repack vs. native Q4_K). The `Backend`
+trait with `supports_op`/`supports_dtype` from the paper's §11 still does
+not exist — Wave A/C did not touch that gap.
 
 ---
 
@@ -72,12 +80,15 @@ Net-new, in dependency order:
 
 1. `glcore::gate::error::GateError` — no dependencies.
 2. `glcore::gate::plan::{ExecutionPlan, BackendKind, OpId, MemoryLayout}`,
-   plus a **marker-only `TensorOp`** — a zero-field or minimal struct just
-   sufficient for `ExecutionPlan::ordering: Vec<TensorOp>` to compile. This
-   is *not* the paper's `𝒪` (a partial function between tensor types) — it
-   has no shape-checking behavior yet. That behavior needs a real
-   `TensorGraph`, which is explicitly **not built this sprint** (see
-   Gap 1 below).
+   plus `TensorOp` — **as of GATE Wave A, no longer marker-only**: it
+   carries a `tensor_name: String` (GGUF tensor-name convention), enough
+   for a backend crate to build real per-tensor candidates against (see
+   `glproc::gate::FfnWeightFormatSource`). Still not the paper's full `𝒪`
+   (a partial function between tensor types) — no shape-checking behavior,
+   no dtype. `TensorGraph` (`ops: Vec<TensorOp>`) is likewise live but
+   deliberately minimal — no dependency edges, per Gap 1's continued
+   scope (a full op-DAG remains out of scope; Wave A built only the
+   minimum a `CandidateSource` needs).
 3. `glcore::gate::constraint::{Constraint, ValidationResult}` — depends on
    `plan`.
 4. `glcore::gate::validator::Validator` — depends on `constraint`.
@@ -85,17 +96,35 @@ Net-new, in dependency order:
    depends on `plan` (for `normalize(plans: &[ExecutionPlan], ...)`).
 6. `glcore::gate::policy::ExecutionPolicy` — depends on `metrics`.
 7. `glcore::gate::planner::Planner` — depends on `validator`, `metrics`,
-   `plan`. `generate_candidates` and `select_best` are `todo!()` — there is
-   no `TensorGraph` to generate candidates *from* yet, so this cannot be
-   real even in principle until Gap 1 is resolved.
+   `plan`. **As of Wave A, `generate_candidates` and `select_best` are
+   real**, not `todo!()`: `generate_candidates` drives a caller-supplied
+   `CandidateSource` (a new trait, mirroring `Constraint`'s
+   backend-crate-supplies-the-logic pattern) over the graph's ops;
+   `select_best` validates every candidate and returns the cost-minimal
+   valid one, or `GateError::NoValidPlan`. This did not require resolving
+   Gap 1 in full — it only needed the minimal `TensorGraph`/`TensorOp`
+   from item 2 above, not a real op-DAG.
 8. `glcore::gate::dispatcher::Dispatcher` — depends on `plan`, `error`.
    `dispatch` is `todo!()` — there is no bridge from `ExecutionPlan` to an
    actual `Box<dyn GlEngine>` call yet (see Integration Points, §5).
 
-**Explicitly not created this sprint:** `TensorGraph`, any concrete
-`Constraint` impl (`ShapeConstraint` et al.), any real cost estimator, any
-code that calls a `GlEngine` from inside `glcore::gate`. All of §3's types
-compile and their tests pass; none of them do anything yet.
+**Explicitly not created this sprint (original Phase 3 boilerplate):**
+`TensorGraph`, any concrete `Constraint` impl (`ShapeConstraint` et al.),
+any real cost estimator, any code that calls a `GlEngine` from inside
+`glcore::gate`. At that point, all of §3's types compiled and their tests
+passed, but none of them did anything yet.
+
+**As of GATE Wave A + Wave C:** `TensorGraph` exists (minimal, see item
+2); `Planner::generate_candidates`/`select_best` are real (item 7);
+`glproc::gate::FfnWeightFormatSource` is a real `CandidateSource` whose
+`MetricVector.latency_ms` values come from live calibration against the
+target model (Wave C — see `glproc/src/gate.rs`), not hardcoded
+constants; `GlprocEngine::load_model` calls `Planner` once per session.
+Still not created: any concrete `Constraint` impl (`Validator` is
+registered empty in glproc today — see Gap 1's note on speculative
+design), and no code anywhere calls a `GlEngine` from *inside*
+`glcore::gate` itself (the `GlEngine`-calling code lives in `glproc`,
+which calls *into* `glcore::gate`, not the reverse — see §5).
 
 ---
 
@@ -158,17 +187,43 @@ strategies.
 
 ## 5. Integration Points
 
-None of these are wired this sprint — `glcore::gate` compiles standalone
-with zero external callers. This section is a map of *where* future waves
-connect it, so Wave G4+ in `GATE-impl-plan.md` has concrete anchors instead
-of vague intent.
+At the original Phase 3 boilerplate, none of these were wired —
+`glcore::gate` compiled standalone with zero external callers. **As of
+GATE Wave A + Wave C, `glproc` is a real external caller** (below); the
+other integration points in this section remain future-wave anchors, not
+yet connected.
 
-**`glproc` engine dispatch** (`glproc/src/engine.rs`, `GlprocEngine::run`) —
-today calls `Runner::generate` directly with no plan selection step at
-all. A GATE-integrated future would insert `Planner::select_best` between
-`GlprocEngine::infer` receiving an `InferInput` and `Runner::generate`
-being called — but only once `TensorGraph` (Gap 1) exists to generate
-candidates from. Not before.
+**`glproc` engine dispatch** (`glproc/src/engine.rs`,
+`GlprocEngine::load_model`) — **wired as of Wave A.** `load_model` calls
+`glproc::gate::resolve_prefer_q4k_native` once per session, before any
+tensor is loaded, which itself runs `Planner::generate_candidates` /
+`select_best` over `FfnWeightFormatSource`'s two weight-format candidates
+(`glproc/src/gate.rs`). The resolved choice is threaded into
+`loader::load_gguf_with_gate` (`glproc/src/loader.rs`), which every FFN
+tensor's format decision (`weight()`) reads via a thread-local override
+(`kernels::qdot::with_q4k_native_override`) for the duration of that one
+load. As of Wave C, each candidate's `MetricVector.latency_ms` comes from
+real in-process calibration (`glproc::gate::calibrate`) against the
+model being loaded, cached for the rest of the process — not a
+hardcoded constant.
+This is narrower than the paragraph below once described: it does not
+touch `GlprocEngine::infer`/`Runner::generate` at all (the decode loop is
+untouched — GATE runs once at load, per its own philosophy), and it did
+not require `TensorGraph` (Gap 1) to be a real op-DAG — only the minimal
+`TensorGraph`/`TensorOp` shape item 2 (§3) describes. A GATE-integrated
+*decode-path* plan selection (inserting `Planner::select_best` between
+`GlprocEngine::infer` and `Runner::generate` for per-request backend/
+kernel choice beyond weight format) remains future-wave territory, not
+yet built.
+
+**`GLPROC_Q4K_NATIVE` env var status (Wave A).** This env var previously
+controlled `kernels::qdot::q4k_native()` unconditionally. It now only
+takes effect for callers that reach `loader::load_gguf` directly,
+bypassing `GlprocEngine` (e.g. `glproc/tests/q4k_e2e.rs`'s A/B harness).
+Any caller going through `GlprocEngine::load_model` has that env var
+superseded by GATE's `resolve_prefer_q4k_native` — GATE is the
+decision-maker for this choice now, not the env var, by design (see
+`kernels::qdot::q4k_native`'s doc comment).
 
 **`glbench`'s `engine/adapter.rs`** — `EngineAdapter::load` /
 `build_engine()` is today's *entire* engine-selection mechanism: match on

@@ -28,8 +28,10 @@ use std::thread::JoinHandle;
 
 use crate::kernels::bridge::{bridge_row_dot, QuantFormat};
 use crate::kernels::matmul;
+use crate::kernels::qdot::q8_0::row_tile;
 use crate::kernels::qdot::{
-    row_dot_q8, row_dot_q8_packed8, row_dot_q8_xn, QuantizedActivation,
+    has_vnni_256, row_dot_q8, row_dot_q8_packed8, row_dot_q8_xn, row_tile_enabled,
+    QuantizedActivation,
 };
 use crate::simd_strategy::SimdStrategy;
 
@@ -576,6 +578,48 @@ pub fn par_matvec_qdot(
     // rewards with far better DRAM page locality than 4 interleaved streams
     // that each skip (n-1) rows between reads.
     let chunk = out_dim.div_ceil(n);
+
+    // Row-tiled fast path (GLPROC_ROW_TILE=1, default off — see
+    // `qdot::row_tile_enabled`'s doc): R=8 output rows processed together
+    // against the one shared activation, with 8 independent accumulator
+    // chains, instead of one row at a time. Only defined for Q8_0 on a wide
+    // VNNI-256 backend today — every other format/backend combination falls
+    // through to the unchanged sequential loop below.
+    const R: usize = 8;
+    if matches!(fmt, QuantFormat::Q8_0)
+        && matches!(strategy, SimdStrategy::Avx2 | SimdStrategy::Avx512)
+        && has_vnni_256()
+        && row_tile_enabled()
+    {
+        pool.run(&|tid| {
+            let out = &out;
+            let lo = (tid * chunk).min(out_dim);
+            let hi = (lo + chunk).min(out_dim);
+            let tiled_hi = lo + (hi - lo) / R * R;
+            let mut o = lo;
+            while o < tiled_hi {
+                let rows: [&[u8]; R] =
+                    std::array::from_fn(|r| &weights[(o + r) * row_bytes..(o + r + 1) * row_bytes]);
+                // SAFETY: strategy is a wide backend and has_vnni_256() is
+                // true, so AVX2+FMA+F16C+AVX512VL+AVX512VNNI are present.
+                let dots = unsafe { row_tile::row_tile_dot::<R>(rows, act) };
+                for (r, dot) in dots.into_iter().enumerate() {
+                    // SAFETY: o+r < out_dim == y.len(), and no other thread
+                    // touches this range.
+                    unsafe { *out.0.add(o + r) = dot };
+                }
+                o += R;
+            }
+            // Tail: fewer than R rows left in this thread's chunk.
+            for o in tiled_hi..hi {
+                let row = &weights[o * row_bytes..(o + 1) * row_bytes];
+                let dot = row_dot_q8(fmt, row, act, strategy);
+                // SAFETY: o < out_dim == y.len(), and no other thread touches o.
+                unsafe { *out.0.add(o) = dot };
+            }
+        });
+        return;
+    }
 
     pool.run(&|tid| {
         let out = &out;

@@ -11,6 +11,7 @@
 
 pub mod attention;
 pub mod engine;
+pub mod gate;
 pub mod kernels;
 pub mod kv_cache;
 pub mod loader;

@@ -124,6 +124,80 @@ pub fn has_vnni_256() -> bool {
     })
 }
 
+/// True when genuine 512-bit-wide AVX-512VNNI (`vpdpbusd` on zmm) is
+/// available. Separate from [`has_vnni_256`] on purpose: this is the exact
+/// datapath `gl-agent-skills/cpu-skills/rejected-optimizations.md` entry 3
+/// closed for thermal/downclock reasons on the i3-1115G4 reference tier.
+/// Detecting it is not the same as using it — see [`vnni512_enabled`].
+pub fn has_vnni_512() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::arch::is_x86_feature_detected!("avx512f")
+                && std::arch::is_x86_feature_detected!("avx512bw")
+                && std::arch::is_x86_feature_detected!("avx512vnni")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    })
+}
+
+/// Opt-in gate for the 512-bit VNNI qdot path (`GLPROC_VNNI512=1`), default
+/// **false**. This is a revisit of a closed entry in `gl-agent-skills/
+/// cpu-skills/rejected-optimizations.md` (#3, "AVX-512F ... Includes 'at
+/// least use AVX-512VNNI-512' — declined"), under JinXSuper's explicit
+/// authorization to re-measure it — see `benches/vnni512_probe.rs`'s doc for
+/// the isolated-kernel result that motivated this production A/B (VNNI-512
+/// beat VNNI-256 by 20-26% GMAC/s in that probe, but the probe did not
+/// measure the thermal/downclock question the rejection was actually about).
+///
+/// **Do not flip this default without a production glbench A/B (warm+cold,
+/// decode AND prefill) that also checks `environment.hardware.cpu.thermal`
+/// for throttling** — per the rejected-optimizations anti-pattern note, an
+/// isolated probe alone is not sufficient grounds, and this project's own
+/// probes have disagreed with production by 0.07x-2.40x before.
+///
+/// Cached in a `OnceLock`, unlike `q4k_native`'s deliberately-uncached env
+/// lookup — that one is fine uncached because it is read only ~200 times per
+/// model *load*. This function is read from inside `row_dot_q8`/
+/// `row_dot_q8_packed8`, the per-row hot loop called millions of times per
+/// token; an uncached `std::env::var` there was measured to cost far more
+/// than any kernel-width effect (production decode dropped from ~37 to ~11
+/// tok/s with the flag unset — see this session's A/B notes), so the lookup
+/// itself must happen at most once per process.
+pub fn vnni512_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        has_vnni_512() && matches!(std::env::var("GLPROC_VNNI512"), Ok(v) if !v.is_empty() && v != "0")
+    })
+}
+
+/// Opt-in gate for the row-tiled qdot path (`GLPROC_ROW_TILE=1`), default
+/// **false**. Different axis than [`vnni512_enabled`]: that one widened a
+/// single row's instruction (256->512-bit) and came up neutral in
+/// production — see `gl-agent-skills/cpu-skills/rejected-optimizations.md`
+/// entry 3. This gates `q8_0::row_tile::row_tile_dot`, which instead tiles
+/// R=8 *output rows* against one shared activation with 8 independent
+/// accumulator chains, per `architecture/percival/CPU/ARTX02-IceLake.md`
+/// Finding F05 (llama.cpp's real IceLake win is many independent chains
+/// across rows, not a wider per-row dot). Isolated probe
+/// (`benches/row_tile_probe.rs`) measured **2x GMAC/s** over the current
+/// sequential dispatch — same anti-pattern warning applies: an isolated
+/// probe alone is not sufficient grounds to trust in production, hence the
+/// flag, hence the required A/B before flipping the default.
+///
+/// Cached in a `OnceLock` for the same reason `vnni512_enabled` is — this is
+/// read from `threading::par_matvec_qdot`'s per-call hot path.
+pub fn row_tile_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        matches!(std::env::var("GLPROC_ROW_TILE"), Ok(v) if !v.is_empty() && v != "0")
+    })
+}
+
 /// One quantized weight row · Q8 activation, integer inner loop.
 /// `fmt`-specific kernels; scalar is the parity ground truth for AVX2.
 pub fn row_dot_q8(
@@ -143,7 +217,9 @@ pub fn row_dot_q8(
         },
         QuantFormat::Q8_0 => match strategy {
             SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe {
-                if has_vnni_256() {
+                if vnni512_enabled() {
+                    q8_0::vnni512::row_dot(row, act)
+                } else if has_vnni_256() {
                     q8_0::vnni::row_dot(row, act)
                 } else {
                     q8_0::avx2::row_dot(row, act)
@@ -160,6 +236,33 @@ pub fn row_dot_q8(
             SimdStrategy::Scalar => q4_k::scalar::row_dot(row, act),
         },
     }
+}
+
+thread_local! {
+    /// Set only by `loader::load_gguf_with_gate` for the duration of one
+    /// `load_gguf` call, to let a GATE-selected plan override the env-var
+    /// default without threading a new parameter through every `weight()`
+    /// call site. `None` = no override, fall through to the env var (every
+    /// existing caller of `load_gguf` is unaffected). Thread-local, not a
+    /// process-global `OnceLock`, so concurrent loads on different threads
+    /// (as `q4k_e2e.rs`'s A/B test and any future multi-model host would
+    /// do) cannot clobber each other's override.
+    static GATE_OVERRIDE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Set this thread's `q4k_native()` override for the duration of `f`,
+/// restoring the previous value (including `None`) afterward on every exit
+/// path, including a panic unwind through `f`.
+pub(crate) fn with_q4k_native_override<T>(value: Option<bool>, f: impl FnOnce() -> T) -> T {
+    let previous = GATE_OVERRIDE.with(|cell| cell.replace(value));
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            GATE_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let _restore = Restore(previous);
+    f()
 }
 
 /// Should the loader keep Q4_K tensors native (Wave 3) instead of repacking
@@ -184,6 +287,17 @@ pub fn row_dot_q8(
 /// A fused Q4_K SwiGLU kernel would close this; that is Wave-4 work. Until it
 /// exists, repack-to-Q8_0 stays the production default.
 ///
+/// **`GLPROC_Q4K_NATIVE` is superseded whenever a caller goes through
+/// `GlprocEngine::load_model`.** That path always calls
+/// `gate::resolve_prefer_q4k_native` and sets
+/// [`with_q4k_native_override`]'s thread-local before loading a single
+/// tensor — GATE's session-init answer is checked first and, when set,
+/// wins unconditionally over the env var below. The env var still works
+/// exactly as documented for any caller that reaches [`crate::loader::
+/// load_gguf`] directly (bypassing `GlprocEngine`, e.g. `q4k_e2e.rs`'s A/B
+/// test) — this is not a bug, it is GATE actually being the decision-maker
+/// now that one exists (see `architecture/GATE/GATE-algorithm.md`).
+///
 /// Deliberately NOT cached in a OnceLock: consulted only at load time (~200
 /// getenv calls per model), and the E2E test flips it between two loads in one
 /// process.
@@ -192,6 +306,13 @@ pub fn q4k_native() -> bool {
         SimdStrategy::detect(),
         SimdStrategy::Avx2 | SimdStrategy::Avx512
     );
+    if let Some(gate_choice) = GATE_OVERRIDE.with(|cell| cell.get()) {
+        // GATE's answer still respects the hardware gate: it selected
+        // between two measured tok/s numbers, not between "native works"
+        // and "native doesn't" — a non-wide backend can't run the native
+        // kernel regardless of what GATE picked.
+        return gate_choice && wide;
+    }
     match std::env::var("GLPROC_Q4K_NATIVE") {
         Ok(v) if !v.is_empty() && v != "0" => wide, // opt-in, still needs AVX2
         _ => false,
@@ -239,9 +360,15 @@ pub fn supports(fmt: crate::kernels::bridge::QuantFormat) -> bool {
 /// `strategy` must be a wide backend from `SimdStrategy::detect()`.
 pub fn row_dot_q8_packed8(row: &[u8], pq: &[u8], ps: &[f32]) -> [f32; 8] {
     // SAFETY: only called on wide backends (AVX2+FMA+F16C present); the
-    // VNNI branch additionally checks vnni_256.
+    // VNNI branches additionally check vnni_256/vnni512.
     unsafe {
-        if has_vnni_256() {
+        // vnni512's packed8 requires an even block count (see its doc) —
+        // every real model dimension this project has loaded satisfies
+        // that, but fall back rather than risk an out-of-bounds slice on
+        // a future odd shape instead of asserting production down.
+        if vnni512_enabled() && (row.len() / 34) % 2 == 0 {
+            q8_0::vnni512::row_dot_packed8(row, pq, ps)
+        } else if has_vnni_256() {
             q8_0::vnni::row_dot_packed8(row, pq, ps)
         } else {
             q8_0::avx2::row_dot_packed8(row, pq, ps)

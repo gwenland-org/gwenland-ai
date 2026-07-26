@@ -7,7 +7,8 @@ use glcore::format::gguf::GgufFile;
 use glcore::tokenizer::Tokenizer;
 use glcore::GlError;
 
-use crate::loader::load_gguf;
+use crate::gate::resolve_prefer_q4k_native;
+use crate::loader::load_gguf_with_gate;
 use crate::model::GlprocModel;
 use crate::runner::Runner;
 use crate::sampler::{Sampler, SamplerConfig};
@@ -360,8 +361,22 @@ impl GlEngine for GlprocEngine {
         let t_parse = Instant::now();
         self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
         let parse_s = t_parse.elapsed().as_secs_f64();
+
+        // GATE, once per session: decide the FFN weight-format policy
+        // before loading a single tensor (paper §5 Steps 1, 5, 6 — the
+        // ~µs-scale Planner run, not per-token, not per-tensor). The
+        // decision's answer feeds every `weight()` call `load_gguf_with_gate`
+        // makes below; the decode loop never re-runs this (GATE plan
+        // selected at session init — no re-planning here).
+        let prefer_q4k_native = resolve_prefer_q4k_native(
+            &gguf,
+            glcore::gate::Validator::new(),
+            glcore::gate::ExecutionPolicy::Latency,
+        )
+        .map_err(|e| GlError::Engine(format!("GATE plan selection failed: {e}")))?;
+
         let t_weights = Instant::now();
-        let model = load_gguf(&gguf)?;
+        let model = load_gguf_with_gate(&gguf, Some(prefer_q4k_native))?;
         let weights_s = t_weights.elapsed().as_secs_f64();
         // X5 step 1: fault every weight page in and pin it before the first
         // token, so no decode ever stalls on a page fault or swap-in.

@@ -53,6 +53,37 @@ result, not the methodology.
 9. **Negative results get archived too** — the rejected-optimizations list
    is built from properly measured losses; an unrecorded failed experiment
    will be re-run by the next optimist.
+10. **Adaptive repeat, not blind repeat.** Rule 8 says reproduce a
+    *surprising* result — that is a filter, not "always run twice." Skip the
+    second repeat when the first run's verdict is unambiguous *and*
+    consistent with an already-established baseline (e.g. matches a prior
+    session's number within its usual noise band, or the change is
+    correctness-preserving and both metrics moved the same direction by a
+    clearly-non-noise margin). Repeat when: the two metrics disagree in
+    direction, the result contradicts what the isolated probe predicted, the
+    magnitude is close to the known noise floor for that metric (prefill
+    especially — ~20% session-to-session on this machine), or `glbench`
+    itself calls the verdict anything other than a clean `improved`/
+    `regressed`. Judgment call, not a fixed count — the goal is to spend the
+    second run's ~2 minutes only where it can change the conclusion.
+11. **Don't rebuild what didn't change.** `cargo build`'s own incrementality
+    handles most of this, but two patterns still waste whole rebuild cycles:
+    running `cargo test` and then a separate `cargo build` for the same
+    unchanged sources (the test binary already proves the lib compiles —
+    only rebuild `glbench` once, after the last source edit, not after
+    every intermediate step); and rebuilding `glbench` when only a
+    `benches/*_probe.rs` file changed (probes are separate binaries — a
+    probe-only edit needs `cargo bench`, not `cargo build -p glbench`).
+12. **Match the build strategy to how the change is gated.** A flag-gated
+    experiment (`GLPROC_*=1` opt-in, default off) needs exactly one build —
+    toggle the env var between the baseline and candidate `glbench run`
+    calls, same binary. Reserve the `git stash` / dual-binary dance (stash
+    the change, build a true "before" binary, pop, build the "after"
+    binary) for changes with **no flag** — i.e. correctness-preserving
+    refactors applied unconditionally, where there is no env var to toggle.
+    Reaching for the dual-binary approach on a flag-gated change is the
+    common over-engineering direction; reaching for a flag on an
+    unconditional bit-exact change is unnecessary indirection the other way.
 
 ## ✅ Correct Pattern
 
@@ -76,6 +107,12 @@ Claim in a PR/gate report:
 
 ## GwenLand-Specific Notes
 
+- **New isolated kernel probe? Use `glproc/benches/common/mod.rs`.** Every
+  probe needs the same PRNG, Q8_0 row generator, and warmup-then-time loop —
+  `#[path = "common/mod.rs"] mod common;` at the top of a new `benches/
+  *_probe.rs` file gets all of it instead of re-deriving it. This does not
+  change rule 1 (probes still never justify a merge by themselves) — it just
+  removes the copy-paste tax of writing one.
 - The roofline is the sanity check bracketing every claim: a decode result
   implying > 100 % of the measured 29 GB/s ceiling is wrong somewhere —
   find the error before publishing (usually workload or unit math).
