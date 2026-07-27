@@ -1,7 +1,7 @@
 # ARTX13 — Tokenization Architecture
 
 **Series:** gljax (Sanctum Visibilia) Architecture Research
-**Status:** Draft — research-grounded
+**Status:** Draft — research-grounded; **§0.2 wave A13.0 IMPLEMENTED and measured** (`glcore/gltokenizer`)
 **Depends on:** ARTX04 (checkpoint loading), ARTX11 §3.2 (cross-vocabulary speculation), ARTX16 §1.2 (request lifecycle)
 **Introduces:** `gljax/src/tok/`
 **Next:** [ARTX14 — Sampling & Logits Processing](ARTX14-sampling-and-logits-processing.md)
@@ -25,9 +25,10 @@ A grep across ARTX01–ARTX12 returns **zero headings** for tokenization. Yet:
 The series specified an engine that takes token IDs and returns logits, and never specified how text
 becomes IDs or how IDs become text. ARTX13 closes the input side; ARTX14 closes the output side.
 
-## 0.2 GwenLand already has a tokenizer — but it is **not validated**
+## 0.2 GwenLand had a tokenizer — it was measured, found wrong, and replaced
 
-`glcore/src/tokenizer.rs` — **796 lines, from scratch, zero ML dependencies.** Its own module doc:
+`glcore/src/tokenizer.rs` — 796 lines, from scratch, zero ML dependencies. ⚠️ Still present and still
+used by 12 callers; superseded by `glcore/gltokenizer` (§0.2.2). Its own module doc:
 
 > BPE tokenizer, written from scratch. Two vocabulary styles are supported, covering the models GGUF
 > files ship: **SPM style** (llama family) — tokens use `▁` for spaces, merging is driven by
@@ -72,24 +73,59 @@ produced by hand during an unrelated investigation: the glproc/llama.cpp perplex
 verified *"tokenization identical (819 tokens both engines, first-20 token IDs byte-for-byte
 identical via `llama-tokenize.exe --ids`)"* — one model, one sample, once, not a standing test.
 
-### ⚠️ 0.2.2 Revised decision
+### ✅ 0.2.2 RESOLVED — measured, then rewritten
 
-⚠️ **DESIGN DECISION — gljax reuses `glcore::tokenizer`, but reuse is gated on hardening it first
-(Wave A13.0). It is treated as unverified until reference parity exists.**
+**Wave A13.0 ran.** The suspicion in §0.2.1 was correct, and the measurement was worse than the
+inspection suggested. `glcore::tokenizer` was scored against llama.cpp's reference vectors
+(`ggml-vocab-*.gguf` + `.inp`/`.out`, whose expected ids come from the HuggingFace tokenizers —
+reference **data**, not reference code):
 
-The reuse argument still holds — a third BPE implementation in this repo would be a third place for
-the same subtle bug, and glcore's already covers both vocabulary families and both load paths.
-What changes is the **order**: hardening is a prerequisite wave, not a follow-up.
+| Vocabulary | OLD `glcore::tokenizer` | NEW `gltokenizer` |
+|---|---|---|
+| llama-bpe | **65.2%** (30/46) | **100%** (46/46) |
+| qwen2 | 82.6% (38/46) | **100%** |
+| starcoder · refact · mpt · deepseek-coder · deepseek-llm | 84.8% (39/46) | **100%** |
+| llama-spm · gpt-2 · phi-3 | 97.8% (45/46) | **100%** |
 
-⛔ This matters more for gljax than it did for glproc, for a reason specific to this series: **ARTX11
-§3.2's cross-vocabulary speculation and ARTX13 §5's `VocabIntersection` both compute over token
-surface forms.** A tokenizer whose merge logic is unvalidated makes every downstream claim about
-vocabulary overlap unvalidated too. And a tokenizer bug is invisible in exactly the way ARTX12 was
-written to catch: wrong token IDs produce fluent, plausible, wrong output with no error anywhere.
+⛔ **Not one vocabulary was correct.** The best was 45/46; the worst, llama-bpe, got **a third of
+its inputs wrong**. The round-trip tests passed throughout, because they tested
+`decode(encode(x)) == x` rather than `encode(x) == reference` — and §0.2.1's compensating error made
+the round trip hold while the ids were wrong.
 
-⚠️ **The dependency shape is a separate question (§1.2).** ARTX01 committed gljax to zero heavy
-dependencies; `glcore` also carries GGUF parsing, quantization kernels, and tensor types that gljax
-does not want.
+⚠️ **DESIGN DECISION — the tokenizer was rewritten, not hardened.** `glcore/gltokenizer` is a new
+crate: an original BPE implementation written from the algorithm's definition. Three defects only the
+parity harness could find:
+
+1. **Merge rules keyed by concatenation.** A merge list is a list of *pairs*; different splits of the
+   same string are different rules with different ranks. Measured on llama-bpe: **152,403 of 280,147
+   rules lost (54%)**. qwen2 and command-r happen to have zero such collisions, which is why the bug
+   stayed hidden there.
+2. **The "GPT-2 family" is not one shape.** gpt-2/mpt spell digits `" ?\p{N}+"` (a run may absorb a
+   leading space); starcoder/refact spell them bare. Otherwise identical.
+3. **Llama-3's `ignore_merges` was missing** — behavioural, not an optimisation. For `" Việt"`,
+   correct rank-order BPE reaches `ĠVi|á»ĩ|t` because `ĠV+i` (rank 31158) fires before `á»+ĩ`
+   (69499), making the whole-token form unreachable. Llama-3 emits the vocabulary entry directly.
+
+**Speed, same corpus, release build, median of 5 repeats over 5,440 bytes:**
+
+| Regime | Speedup | Why |
+|---|---|---|
+| Byte-level | **7.1×** | Pre-tokenized chunks are word-sized, so the old `O(n³)` loop ran on tiny `n` |
+| SPM | **848×** | ⭐ No pre-tokenizer, so the *whole input* was one merge run — where a cubic loop actually bites |
+
+⚠️ Reported per regime rather than as one number: a combined mean is the SPM figure in disguise, and
+the two have different causes.
+
+⚠️ **Four families are refused rather than partially supported**, per §2.3's rule: `command-r`
+(45/46 — diverges on one long-whitespace vector; cause is in merge application, unresolved),
+`falcon` (extra leading punctuation arm), `qwen35` (unknown pre-tokenizer name), `gemma-4`
+(tokenizer model is not BPE). ⛔ **`gemma-4` being unsupported is a live problem for ARTX11 §4**,
+which names Gemma as the multi-architecture target.
+
+⚠️ **Migration has not happened.** Twelve files still call `glcore::tokenizer`. Switching them
+changes token ids and therefore moves every perplexity number in the repo — including the ~46%
+glproc/llama.cpp gap, whose tokenization was verified for exactly one model. That is a decision to
+take deliberately, one caller at a time.
 
 ## 0.3 What ARTX13 actually specifies
 
@@ -423,8 +459,8 @@ glserve/src/api/
 
 | Wave | Scope | Gate |
 |---|---|---|
-| **A13.0** ⛔ | **Harden `glcore::tokenizer` (§0.2).** Real-vocabulary fixtures; exercise score-driven SPM merge selection and byte-level merge-list application; reference parity | ⭐ **Token-ID parity against an external reference** (`llama-tokenize --ids` and/or HF `tokenizers`) on ≥3 real vocabularies × a corpus with ASCII, CJK, emoji, RTL, mixed whitespace, and adversarial merge-boundary strings. **Blocks every wave below.** |
-| **A13.1** | `Tokenizer` trait + `glcore` impl + `VocabFingerprint` | Round-trip `decode(encode(s)) == s` over the same corpus |
+| **A13.0** ✅ | **DONE — rewritten as `glcore/gltokenizer`.** Zero-allocation merge engine, hand-written pre-tokenizer, GGUF vocab reader | ✅ **10 vocabularies at 46/46 exact** against llama.cpp's reference vectors. 4 refused rather than partially supported. `glcore/tests/tokenizer_before_after.rs` holds the before/after. |
+| **A13.1** ◐ | `Tokenizer` trait + `VocabFingerprint` — ⚠️ **the concrete type exists; the trait and fingerprint do not yet** | Round-trip holds; fingerprint still to build |
 | **A13.2** | `validate.rs` | Vocab/model mismatch is refused at `Session::new`, not at first token |
 | **A13.3** | ⭐ `stream.rs` | **No `�` ever emitted mid-stream** for a corpus of multi-byte text; concatenated deltas == whole-sequence `decode` |
 | **A13.4** | `hetero.rs` | Coverage reported; SLEM/TLI agree with a reference on a real cross-family pair |
@@ -437,10 +473,14 @@ at once, and it is cheap to assert on every streaming test.
 
 ## 6.1 Open questions
 
-0. ⛔ **Does `glcore::tokenizer`'s merge selection actually match a reference?** (§0.2.1) Unknown —
-   the score-driven SPM path and the byte-level merge-list path are both untested. This is the
-   highest-risk unknown in the document and A13.0 exists to close it. Until it is closed, every
-   §5 claim about vocabulary overlap inherits the uncertainty.
+0. ✅ **ANSWERED — it did not.** Every vocabulary was wrong, worst case 30/46 (§0.2.2). Closed by
+   rewriting rather than hardening. The replacement is at 46/46 on ten families.
+0b. ⛔ **NEW — `gemma-4` is unsupported.** Its `tokenizer.ggml.model` is `gemma4`, not BPE, so the
+   new crate refuses it. ARTX11 §4 names Gemma as *the* multi-architecture target, so this must be
+   closed before A11.0 can claim Gemma support.
+0c. ⚠️ **NEW — `command-r` diverges on one vector** in merge application, not splitting (§0.2.2).
+   Refused for now. Worth understanding, because whatever causes it may affect other vocabularies
+   that simply lack a vector to expose it.
 1. **SPM window size** (§4.2) — how many trailing tokens must be re-decoded for correct spacing?
    Measure; do not guess.
 2. **Padded vocabularies** (§2.3) — the legitimate `tok.vocab_size() < model.vocab_size` case needs
