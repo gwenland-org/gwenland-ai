@@ -201,7 +201,80 @@ impl Tokenizer {
         match self.v.style {
             Style::Spm => self.encode_spm(text, ids),
             Style::ByteLevel => self.encode_byte_level(text, ids),
+            Style::SpmBpe => self.encode_spm_bpe(text, ids),
         }
+    }
+
+    /// Gemma-4's shape: SentencePiece surface form, merge-list ranking.
+    ///
+    /// Spaces become `▁` across the *whole* input first, then the text is cut
+    /// at newline runs only — there is no word-level splitting, so a merge may
+    /// legitimately span what other families would call several words.
+    fn encode_spm_bpe(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
+        SCRATCH.with(|sc| {
+            let mut sc = sc.borrow_mut();
+            let Scratch {
+                merger, prepared, ..
+            } = &mut *sc;
+
+            prepared.clear();
+            for ch in text.chars() {
+                prepared.push(if ch == ' ' { SPM_SPACE } else { ch });
+            }
+
+            let v = &self.v;
+            let ranker = ByteLevelRanker(v);
+            let mut err = None;
+
+            let mut chunks: Vec<&str> = Vec::new();
+            PreTok::Lines.split(prepared, |c| chunks.push(c));
+
+            for chunk in chunks {
+                // ⚠️ A run of newlines is looked up whole before merging.
+                // Gemma-4's vocabulary carries multi-newline tokens that
+                // rank-order merging cannot always reach, the same class of
+                // problem `ignore_merges` solves for Llama-3 — but scoped to
+                // newline runs rather than to every pre-token.
+                if chunk.as_bytes()[0] == b'\n' {
+                    if let Some(&id) = v.token_to_id.get(chunk) {
+                        ids.push(id);
+                        continue;
+                    }
+                }
+                merger.run(chunk, &ranker, |piece| {
+                    if err.is_some() {
+                        return;
+                    }
+                    if let Some(&id) = v.token_to_id.get(piece) {
+                        ids.push(id);
+                        return;
+                    }
+                    // Byte fallback is `<0xNN>`, not the GPT-2 remap: this
+                    // style never encoded its bytes as printable chars.
+                    for b in piece.bytes() {
+                        let mut buf = [0u8; 6];
+                        let key = fmt_byte_token(b, &mut buf);
+                        if let Some(&id) = v.token_to_id.get(key) {
+                            ids.push(id);
+                        } else if let Some(unk) = v.unk_id {
+                            ids.push(unk);
+                        } else {
+                            err = Some(TokError::Unencodable {
+                                ch: piece.to_string(),
+                            });
+                            return;
+                        }
+                    }
+                });
+                if err.is_some() {
+                    break;
+                }
+            }
+            match err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
+        })
     }
 
     /// SPM: map *every* whitespace run's spaces to `▁`, optionally prepend the
@@ -345,7 +418,9 @@ impl Tokenizer {
             return;
         };
         match self.v.style {
-            Style::Spm => {
+            // SpmBpe shares SPM's *surface form* — `▁` for space, `<0xNN>` for
+            // raw bytes — even though its merges come from a list.
+            Style::Spm | Style::SpmBpe => {
                 if let Some(b) = parse_byte_token(tok) {
                     out.push(b);
                     return;

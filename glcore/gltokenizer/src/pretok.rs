@@ -30,6 +30,13 @@ pub enum PreTok {
     /// A byte-level BPE splitter, parameterised by the three axes that
     /// actually vary between the patterns in the wild (see [`BpeSplit`]).
     Bpe(BpeSplit),
+    /// Split on newline runs only: `[^\n]+|[\n]+`.
+    ///
+    /// The Gemma-4 shape. There is no word-level splitting at all — merges run
+    /// across whole lines, which is why `▁` has to mark spaces (they are
+    /// ordinary characters to the merge engine). The newline split exists so
+    /// no symbol can ever span a line break.
+    Lines,
 }
 
 /// The three independent axes the real patterns differ on.
@@ -119,6 +126,18 @@ impl PreTok {
                 }
             }
             PreTok::Bpe(s) => scan(text, *s, &mut out),
+            PreTok::Lines => {
+                let b = text.as_bytes();
+                let mut i = 0;
+                while i < b.len() {
+                    let nl = b[i] == b'\n';
+                    let start = i;
+                    while i < b.len() && (b[i] == b'\n') == nl {
+                        i += 1;
+                    }
+                    out(&text[start..i]);
+                }
+            }
         }
     }
 
@@ -332,6 +351,19 @@ mod tests {
 
     const QWEN: PreTok = PreTok::Bpe(BpeSplit::QWEN2);
     const CL100K: PreTok = PreTok::Bpe(BpeSplit::LLAMA3);
+
+    /// Gemma-4 cuts at newline runs and nowhere else — a whole sentence stays
+    /// one chunk, which is what lets its merges cross word boundaries.
+    #[test]
+    fn lines_split_on_newline_runs_only() {
+        assert_eq!(go(PreTok::Lines, "a b\nc"), ["a b", "\n", "c"]);
+        assert_eq!(go(PreTok::Lines, "a\n\n\nb"), ["a", "\n\n\n", "b"]);
+        assert_eq!(go(PreTok::Lines, "\n"), ["\n"]);
+        assert_eq!(go(PreTok::Lines, "no newlines at all"), ["no newlines at all"]);
+        assert_eq!(go(PreTok::Lines, ""), Vec::<String>::new());
+        // A carriage return is NOT a split point: the pattern is `[\n]+`.
+        assert_eq!(go(PreTok::Lines, "a\r\nb"), ["a\r", "\n", "b"]);
+    }
 
     #[test]
     fn none_is_identity() {
