@@ -1,0 +1,11 @@
+[package]
+name = "gltokenizer"
+version = "0.1.0"
+edition = "2021"
+description = "BPE tokenizer for GwenLand: SPM and byte-level, zero-allocation merge engine."
+
+[dependencies]
+thiserror = "1"
+serde_json = "1"
+
+[dev-dependencies]
