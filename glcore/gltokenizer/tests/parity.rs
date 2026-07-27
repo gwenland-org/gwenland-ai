@@ -164,7 +164,7 @@ fn reference_token_id_parity() {
 
     let reports: Vec<Report> = ALL.iter().map(|n| check(&dir, n)).collect();
 
-    eprintln!("\n{:<16} {:>8}  {}", "vocab", "parity", "note");
+    eprintln!("\n{:<16} {:>8}  note", "vocab", "parity");
     eprintln!("{}", "-".repeat(72));
     for r in &reports {
         match (&r.load_error, r.total) {
@@ -189,15 +189,22 @@ fn reference_token_id_parity() {
     // Vocabularies this crate claims to support must be exact. The claim is
     // deliberately narrow: an unsupported family should show up as a load
     // refusal in the table above, not as a silent partial pass.
-    // Every family the crate claims to support. Listing all ten means a
+    // Every family the crate claims to support. Listing all thirteen means a
     // regression in any of them fails the build, not just the headline ones.
     let must_be_exact = [
-        "qwen2", "llama-bpe", "llama-spm", "gpt-2", "starcoder", "refact", "mpt",
-        "deepseek-coder", "deepseek-llm", "phi-3",
+        "qwen2", "qwen35", "llama-bpe", "llama-spm", "gpt-2", "starcoder", "refact", "mpt",
+        "command-r", "deepseek-coder", "deepseek-llm", "phi-3", "gemma-4",
     ];
     // Families that must REFUSE rather than partially work (see gguf.rs).
+    //
+    // ⚠️ `gpt-neox` and `aquila` are here for a different reason than
+    // `falcon`: they carry no `tokenizer.ggml.pre` key at all, so they reach
+    // llama.cpp's `default` fallback arm — which is NOT the GPT-2 shape they
+    // were previously loaded as. Refusing them is a deliberate loss of
+    // coverage in exchange for not shipping a silent mis-split; neither has
+    // reference vectors, so the mis-split would never have been caught.
     for r in &reports {
-        if matches!(r.vocab, "command-r" | "falcon" | "qwen35") {
+        if matches!(r.vocab, "falcon" | "gpt-neox" | "aquila") {
             assert!(
                 r.load_error.is_some(),
                 "{} must be refused, not silently supported",

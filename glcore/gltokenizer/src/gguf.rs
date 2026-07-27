@@ -187,39 +187,108 @@ pub fn read_metadata(bytes: &[u8]) -> Result<HashMap<String, Meta>, TokError> {
 /// Unknown names are refused rather than defaulted: a wrong pre-tokenizer
 /// silently changes token ids, which is the failure mode this crate exists to
 /// remove.
+/// ⛔ **This table is grouped by the pre-tokenizer's actual regex, not by
+/// model family.** Names that look related routinely land in different
+/// groups — `smollm` is not cl100k, `trillion` is not Qwen2, `codeshell` is
+/// not GPT-2 — and an earlier version of this table got thirteen of them
+/// wrong precisely by grouping on the name. Every entry below was read off
+/// llama.cpp's `pre_type` → `regex_exprs` switch, and each group is one
+/// pattern this crate implements *exactly*. Adding a name means checking
+/// which `case` arm it reaches, not which model it sounds like.
 pub fn pretok_from_name(name: &str) -> Result<PreTok, TokError> {
     Ok(PreTok::Bpe(match name {
-        // GPT-2 shape, digits may take a leading space.
-        "default" | "gpt-2" | "olmo" | "jais" | "mpt" | "bloom" | "gpt3-finnish"
-        | "codeshell" | "smaug" | "poro" | "viking" => BpeSplit::GPT2,
+        // ── GPT-2 arm alone ───────────────────────────────────────────────
+        // `'s|…| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)`
+        // llama.cpp: GPT2 / MPT / OLMO / JAIS / TRILLION / GRANITE_DOCLING.
+        "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es" | "jina-v2-de"
+        | "a.x-4.0" | "mellum" | "modern-bert" | "exaone4" | "mpt" | "olmo" | "jais"
+        | "trillion" | "granite-docling" => BpeSplit::GPT2,
 
-        // GPT-2 shape, digits never take a leading space.
-        "starcoder" | "refact" => BpeSplit::STARCODER,
-
-        // cl100k shape, three-digit runs.
-        "llama3" | "llama-bpe" | "dbrx" | "smollm" | "exaone" | "minerva-7b" | "gpt-4o"
-        | "llama4" | "seed-coder" => BpeSplit::LLAMA3,
-
-        // cl100k shape, single digits.
-        "qwen2" | "deepseek-llm" | "deepseek-coder" | "deepseek-v3" | "stablelm2"
-        | "chatglm-bpe" | "tekken" | "bailingmoe" | "trillion" => BpeSplit::QWEN2,
-
-        // ⚠️ REFUSED DELIBERATELY, not unimplemented.
+        // ── `\p{N}` first, then the GPT-2 arm ─────────────────────────────
+        // Splitting digits off first is why they never absorb a leading
+        // space; that is the whole difference from the group above.
+        // llama.cpp: STARCODER / REFACT / COMMAND_R / SMOLLM / CODESHELL /
+        // EXAONE / MINERVA.
         //
-        // `command-r` pre-tokenizes correctly but diverges on one reference
-        // vector (45/46): on a long whitespace run the reference splits
-        // `\n    \n     ` + `\n` where rank-order BPE reaches
-        // `\n    \n    ` + ` \n`. The cause is in merge application,
-        // not in splitting, and is unresolved.
-        //
-        // Claiming support at 45/46 would mean silently mis-tokenizing
-        // whitespace-heavy input such as source code — exactly the failure
-        // this crate refuses elsewhere. Re-enable only at 46/46.
-        //
-        // `falcon` is refused for a different reason: its pattern carries an
-        // extra leading `[<punct>$+<=>^~|]+` arm that none of the three
-        // shapes here express.
+        // ⭐ `command-r` belongs here, **measured 46/46**. A previous note in
+        // this file claimed 45/46 with a divergence in *merge application*;
+        // that was wrong — the miss was the splitter, and it is this shape.
+        "starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone"
+        | "minerva-7b" => BpeSplit::STARCODER,
 
+        // ── cl100k arms, three-digit runs ─────────────────────────────────
+        // llama.cpp: LLAMA3 / DBRX / SMAUG / CHATGLM4 — one regex, three
+        // pre_types. Only the LLAMA3 arm also sets `ignore_merges`; see
+        // [`ignore_merges_for`].
+        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
+        | "lfm2" | "jina-v5-nano" | "dbrx" | "smaug-bpe" | "glm4" | "chatglm-bpe" => {
+            BpeSplit::LLAMA3
+        }
+
+        // ── cl100k arms, single digits ────────────────────────────────────
+        // llama.cpp: QWEN2 / STABLELM2 / HUNYUAN / SOLAR_OPEN.
+        "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
+        | "hunyuan" => BpeSplit::QWEN2,
+
+        // ⚠️ APPROXIMATED, NOT EXACT — kept because it is *measured*, flagged
+        // because the shape is not the same function.
+        //
+        // llama.cpp gives each of these a multi-expression pipeline rather
+        // than one arm: `deepseek-llm` splits on `[\r\n]`, then a huge
+        // explicit Latin/Greek/Cyrillic letter class, then `\s?[punct]+`,
+        // `\s+$`, a CJK arm and `\p{N}+`; `deepseek-coder` uses `[\r\n]`,
+        // `\s?\p{L}+`, `\s?\p{P}+`, a CJK arm and `\p{N}`.
+        //
+        // Both score **46/46** against the reference corpus under the QWEN2
+        // arm, which is the same evidence every other entry here rests on. But
+        // `\s?\p{L}+` lets *any* whitespace lead a word while the QWEN2 arm's
+        // `[^\r\n\p{L}\p{N}]?` explicitly excludes `\r` and `\n`, so the two
+        // are known to differ somewhere the corpus does not reach.
+        //
+        // Refusing a family that passes every vector we have would be its own
+        // kind of dishonesty. The claim is therefore narrowed rather than
+        // withdrawn, and `audit.rs` reports it in a separate tier.
+        "deepseek-llm" | "deepseek-coder" => BpeSplit::QWEN2,
+
+        // ⚠️ `qwen35` is the QWEN2 pattern with `\p{L}` widened to
+        // `[\p{L}\p{M}]` in the letter arm (and `\p{M}` excluded from the
+        // punctuation arm). This crate does not carry a `\p{M}` table — but
+        // its letter class is `char::is_alphabetic`, already a documented
+        // superset of `\p{L}` that absorbs most combining marks (see
+        // `pretok::is_letter`). That approximation is *closer* to qwen35 than
+        // to qwen2, and qwen35 scores **50/50** against the reference corpus,
+        // whose vectors include Khmer combining marks.
+        //
+        // So this is measured, not assumed — but the residual gap is real:
+        // marks outside `Other_Alphabetic` (e.g. U+0301 COMBINING ACUTE) are
+        // punctuation to us and letters to qwen35. No reference vector covers
+        // that, which is exactly why it is written down here.
+        "qwen35" => BpeSplit::QWEN2,
+
+        // ── everything else is refused ────────────────────────────────────
+        //
+        // Names deliberately NOT mapped, with the reason, so the next person
+        // does not re-add them by pattern-matching on the family:
+        //
+        // * `default` — NOT the GPT-2 shape. llama.cpp's fallback arm is a
+        //   four-expression pipeline (punct run, GPT-2 arm, `\p{N}+`,
+        //   `[0-9][0-9][0-9]`), and it exists for GGUFs that lost their
+        //   `tokenizer.ggml.pre` key. llama.cpp itself logs "GENERATION
+        //   QUALITY WILL BE DEGRADED" when it lands here. Refusing is the
+        //   honest response to missing metadata.
+        // * `falcon` — same shape as `default` minus `\p{N}+`, plus a
+        //   backtick in the punctuation class. Needs the pipeline.
+        // * `bloom`, `gpt3-finnish`, `poro-chat`, `viking` — a single
+        //   `" ?[^(\s|.,!?…。，、।۔،)]+"` expression, unrelated to any arm here.
+        // * `gpt-4o`, `llama4`, `tekken`, `tiny_aya`, `youtu` — case-split
+        //   letter runs written as lookahead groups
+        //   (`((?=[\p{L}])([^a-z]))*`), which no axis here expresses.
+        // * `deepseek-v3`, `hunyuan-dense`, `joyai-llm` — `\p{P}`/`\p{S}`
+        //   classes plus a CJK arm.
+        // * `seed-coder` — QWEN2-like but its punctuation arm excludes
+        //   `[\r\n]` instead of trailing them.
+        // * `bailingmoe` — QWEN2-like but `\s*[\r\n]` without the `+`.
+        // * `superbpe`, `chameleon`, `kimi-k2`, `grok-2`, `afmoe` — bespoke.
         other => return Err(TokError::UnsupportedPreTokenizer(other.to_string())),
     }))
 }
@@ -231,8 +300,31 @@ pub fn pretok_from_name(name: &str) -> Result<PreTok, TokError> {
 /// reaches `ĠVi|á»ĩ|t` because `ĠV+i` (rank 31158) fires before `á»+ĩ`
 /// (69499), making the whole-token form unreachable. The reference emits the
 /// single vocabulary entry.
+///
+/// ⛔ This is a property of the *pre_type*, not of the regex shape, so it does
+/// NOT follow the grouping in [`pretok_from_name`]. `dbrx`, `smaug-bpe`,
+/// `glm4` and `chatglm-bpe` share llama3's regex but do **not** set this flag.
+/// An earlier version listed `llama4` and `gpt-4o` here — both wrong: they
+/// reach llama.cpp's `GPT4O` arm, which sets no such flag (and whose regex
+/// this crate refuses anyway).
 fn ignore_merges_for(pre_name: &str) -> bool {
-    matches!(pre_name, "llama3" | "llama-bpe" | "llama4" | "gpt-4o")
+    matches!(
+        pre_name,
+        "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral" | "midm-2.0"
+            | "lfm2" | "jina-v5-nano"
+    )
+}
+
+/// Families where llama.cpp forces a BOS token on regardless of what
+/// `tokenizer.ggml.add_bos_token` says.
+///
+/// ⚠️ Metadata is not the last word here. The same `pre_type` arm that sets
+/// [`ignore_merges_for`] also sets `add_bos = true` unconditionally, so a
+/// llama-3 GGUF whose metadata says `false` still gets a BOS in llama.cpp.
+/// Honouring only the metadata would shift every id by one position on the
+/// models most likely to be run.
+fn force_add_bos(pre_name: &str) -> bool {
+    ignore_merges_for(pre_name)
 }
 
 /// Build a [`Vocab`] from GGUF bytes.
@@ -297,6 +389,15 @@ pub fn vocab_from_gguf(bytes: &[u8]) -> Result<Vocab, TokError> {
             // `add_space_prefix`; absent means the SPM default, which is on.
             get_bool("tokenizer.ggml.add_space_prefix").unwrap_or(true),
         ),
+        // Gemma-4 (and Sarvam-MoE): declared as its own tokenizer model rather
+        // than as `gpt2` + a pre-tokenizer name, because it is genuinely a
+        // different shape — SentencePiece surface form, merge-list ranking,
+        // and no word-level pre-splitting at all.
+        //
+        // ⚠️ The vocabulary also ships 262 144 `scores`. They are NOT used:
+        // llama.cpp reads only `merges` for this model, and believing the
+        // scores instead silently produces different ids. See [`Style::SpmBpe`].
+        "gemma4" => (Style::SpmBpe, PreTok::Lines, false),
         other => return Err(TokError::UnsupportedModel(other.to_string())),
     };
 
@@ -319,7 +420,11 @@ pub fn vocab_from_gguf(bytes: &[u8]) -> Result<Vocab, TokError> {
         bos_id: get_u32("tokenizer.ggml.bos_token_id"),
         eos_id: get_u32("tokenizer.ggml.eos_token_id").unwrap_or(0),
         unk_id: get_u32("tokenizer.ggml.unknown_token_id"),
-        add_bos_default: get_bool("tokenizer.ggml.add_bos_token").unwrap_or(style == Style::Spm),
+        // llama.cpp overrides the metadata to `true` for Gemma-4 as well as
+        // for the llama-3 arm, and logs that it is doing so.
+        add_bos_default: force_add_bos(&pre_name)
+            || style == Style::SpmBpe
+            || get_bool("tokenizer.ggml.add_bos_token").unwrap_or(style == Style::Spm),
     }
     .into_vocab()
 }
@@ -349,5 +454,77 @@ mod tests {
             pretok_from_name("qwen2").unwrap(),
             PreTok::Bpe(BpeSplit::QWEN2)
         );
+    }
+
+    /// ⭐ Pins the thirteen entries an earlier table got wrong by grouping on
+    /// the model name instead of on llama.cpp's `regex_exprs` arm. Each of
+    /// these looks like it belongs somewhere else, which is exactly why it
+    /// needs a test rather than a comment.
+    #[test]
+    fn name_groups_follow_the_regex_not_the_family() {
+        // Sound cl100k, are actually the starcoder two-expression shape.
+        for n in ["smollm", "exaone", "minerva-7b", "command-r"] {
+            assert_eq!(
+                pretok_from_name(n).unwrap(),
+                PreTok::Bpe(BpeSplit::STARCODER),
+                "{n}"
+            );
+        }
+        // Sounds GPT-2-ish, is starcoder.
+        assert_eq!(
+            pretok_from_name("codeshell").unwrap(),
+            PreTok::Bpe(BpeSplit::STARCODER)
+        );
+        // Sounds Qwen-ish, is plain GPT-2.
+        assert_eq!(
+            pretok_from_name("trillion").unwrap(),
+            PreTok::Bpe(BpeSplit::GPT2)
+        );
+        // Sounds Qwen-ish, is cl100k (three-digit runs).
+        assert_eq!(
+            pretok_from_name("chatglm-bpe").unwrap(),
+            PreTok::Bpe(BpeSplit::LLAMA3)
+        );
+    }
+
+    /// ⛔ `default` is llama.cpp's *fallback* arm — a four-expression pipeline,
+    /// not the GPT-2 shape it was previously mapped to. It is reached only by
+    /// a GGUF missing `tokenizer.ggml.pre`, which llama.cpp itself warns will
+    /// degrade generation quality.
+    #[test]
+    fn missing_pre_metadata_is_refused_not_guessed() {
+        assert!(pretok_from_name("default").is_err());
+    }
+
+    /// Names whose regex this crate cannot express must stay refused, however
+    /// familiar the model is.
+    #[test]
+    fn inexpressible_patterns_stay_refused() {
+        for n in [
+            "falcon",       // extra punct-run and 3-digit passes
+            "gpt-4o",       // case-split lookahead groups
+            "llama4",       // same
+            "tekken",       // same
+            "bloom",        // a single unrelated expression
+            "viking",       // same, plus \p{N}
+            "poro-chat",    // same
+            "seed-coder",   // punctuation arm excludes [\r\n]
+            "bailingmoe",   // \s*[\r\n] without the +
+            "deepseek-v3",  // \p{P}/\p{S} classes plus a CJK arm
+        ] {
+            assert!(pretok_from_name(n).is_err(), "{n} must be refused");
+        }
+    }
+
+    /// `ignore_merges` tracks llama.cpp's `pre_type`, which does NOT line up
+    /// with the regex grouping: dbrx and chatglm share llama3's pattern but
+    /// not its flag.
+    #[test]
+    fn ignore_merges_does_not_follow_the_regex_group() {
+        assert!(ignore_merges_for("llama-bpe"));
+        assert!(ignore_merges_for("pixtral"));
+        for n in ["dbrx", "smaug-bpe", "glm4", "chatglm-bpe", "qwen2", "llama4", "gpt-4o"] {
+            assert!(!ignore_merges_for(n), "{n} must not set ignore_merges");
+        }
     }
 }
