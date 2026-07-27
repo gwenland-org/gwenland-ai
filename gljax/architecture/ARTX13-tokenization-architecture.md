@@ -1,0 +1,493 @@
+# ARTX13 — Tokenization Architecture
+
+**Series:** gljax (Sanctum Visibilia) Architecture Research
+**Status:** Draft — research-grounded
+**Depends on:** ARTX04 (checkpoint loading), ARTX11 §3.2 (cross-vocabulary speculation), ARTX16 §1.2 (request lifecycle)
+**Introduces:** `gljax/src/tok/`
+**Next:** [ARTX14 — Sampling & Logits Processing](ARTX14-sampling-and-logits-processing.md)
+**Research grounded:** 2026-07-27 (sources at end)
+
+---
+
+# 0. The Gap, and the Asset
+
+## 0.1 Why this document exists
+
+A grep across ARTX01–ARTX12 returns **zero headings** for tokenization. Yet:
+
+* ARTX16 §1.2's request lifecycle step 3 is *"Tokenize prompt — gljax tokenizer (host side)"* — a
+  reference to something never specified.
+* ARTX11 §3.2's cross-vocabulary speculation (SLEM/TLI) is **entirely** a statement about tokenizer
+  semantics — string-level matching and vocabulary intersection.
+* ARTX16's SSE streaming (§1.5) emits text per token, which requires incremental detokenization —
+  the hardest problem in this document (§4).
+
+The series specified an engine that takes token IDs and returns logits, and never specified how text
+becomes IDs or how IDs become text. ARTX13 closes the input side; ARTX14 closes the output side.
+
+## 0.2 GwenLand already has a tokenizer — but it is **not validated**
+
+`glcore/src/tokenizer.rs` — **796 lines, from scratch, zero ML dependencies.** Its own module doc:
+
+> BPE tokenizer, written from scratch. Two vocabulary styles are supported, covering the models GGUF
+> files ship: **SPM style** (llama family) — tokens use `▁` for spaces, merging is driven by
+> per-token scores, unknown bytes fall back to `<0xNN>` byte tokens; **Byte-level BPE** (gpt2/qwen
+> family) — raw bytes are first mapped to printable unicode chars, then merged using an explicit
+> merge list. Vocabularies load from GGUF metadata (`Tokenizer::from_gguf`) or a HuggingFace
+> `tokenizer.json` (`Tokenizer::from_file`).
+
+Existing surface: `encode`, `encode_chat`, `decode`, `decode_token`, `decode_token_text`,
+`vocab_size`, `eos_id`, `bos_id`, `add_bos_default`, `is_stop_token`, `stop_token_ids`,
+`special_tokens`, `merges`.
+
+### ⛔ 0.2.1 The test inventory, and what it does not cover
+
+There are **9 unit tests, no `glcore/tests/` integration directory, and no reference-parity check
+against any external tokenizer.** Reading them precisely:
+
+| Test | Covers | ⚠️ |
+|---|---|---|
+| `spm_round_trip_ascii` | `"Hello World"`, `"Hello"`, `"abc def"`, `"a  b"`, `" leading"` | **ASCII only** |
+| `spm_byte_fallback` | `"ab!"` via `<0x21>` | the fallback path |
+| `byte_level_round_trip` | a vocab built from the 256 byte-map entries | **"no merges"** — by construction |
+| `eos_is_a_stop_token`, `stopping_criteria_...`, `qwen_style_stop_markers_...` | stop-token resolution | not the tokenizer algorithm |
+| `encode_chat_*` (×2), `decode_skips_specials` | ChatML wrapping, special skipping | not the tokenizer algorithm |
+
+⛔ **The two tests that exercise the algorithm both disable the algorithm.**
+
+1. The SPM fixture is a **~296-token synthetic vocabulary** built in-test, and it passes
+   `vec![0.0; n]` for the scores — with the fixture's own comment reading
+   *"uniform scores → longest-merge fallback not needed."* **SPM tokenization *is* score-driven merge
+   selection.** With every score equal, the comparison path that chooses between competing merges is
+   never taken.
+2. The byte-level fixture is documented as *"every mapped single byte is a token; **no merges**."*
+   Byte-level BPE's merge-list application is therefore also never exercised.
+
+**So: the byte-fallback path and the trivial no-merge paths are tested. The actual BPE merge logic —
+of both families — is not.** That is the opposite of the coverage one would want, because merge
+selection is where tokenizers silently disagree.
+
+There is exactly **one** data point of real-vocabulary validation anywhere in the repo, and it was
+produced by hand during an unrelated investigation: the glproc/llama.cpp perplexity comparison
+verified *"tokenization identical (819 tokens both engines, first-20 token IDs byte-for-byte
+identical via `llama-tokenize.exe --ids`)"* — one model, one sample, once, not a standing test.
+
+### ⚠️ 0.2.2 Revised decision
+
+⚠️ **DESIGN DECISION — gljax reuses `glcore::tokenizer`, but reuse is gated on hardening it first
+(Wave A13.0). It is treated as unverified until reference parity exists.**
+
+The reuse argument still holds — a third BPE implementation in this repo would be a third place for
+the same subtle bug, and glcore's already covers both vocabulary families and both load paths.
+What changes is the **order**: hardening is a prerequisite wave, not a follow-up.
+
+⛔ This matters more for gljax than it did for glproc, for a reason specific to this series: **ARTX11
+§3.2's cross-vocabulary speculation and ARTX13 §5's `VocabIntersection` both compute over token
+surface forms.** A tokenizer whose merge logic is unvalidated makes every downstream claim about
+vocabulary overlap unvalidated too. And a tokenizer bug is invisible in exactly the way ARTX12 was
+written to catch: wrong token IDs produce fluent, plausible, wrong output with no error anywhere.
+
+⚠️ **The dependency shape is a separate question (§1.2).** ARTX01 committed gljax to zero heavy
+dependencies; `glcore` also carries GGUF parsing, quantization kernels, and tensor types that gljax
+does not want.
+
+## 0.3 What ARTX13 actually specifies
+
+1. The **trait** gljax depends on, so the implementation stays swappable (§1)
+2. **Vocabulary loading** — which sources, and what must be validated (§2)
+3. **Chat templating** — the layer above encode (§3)
+4. ⭐ **Incremental detokenization** — the streaming problem, and why it is not `decode(one_token)` (§4)
+5. **Cross-vocabulary support** for ARTX11 (§5)
+
+---
+
+# 1. The Tokenizer Contract
+
+## 1.1 Why a trait, when there is only one implementation
+
+ARTX08's rejected-alternative #7 declined a trait with one implementor. The reasoning does **not**
+apply here, and the difference is worth being explicit about:
+
+| | ARTX08's `Matmul` trait | ARTX13's `Tokenizer` trait |
+|---|---|---|
+| Implementors, realistically | 1 forever (`dot_general`) | ≥ 2 — `glcore`, plus **a second vocabulary at the same time** (ARTX11 draft ≠ target) |
+| Purpose | Dispatch | **Decoupling** — keeps `glcore` out of gljax's core types |
+
+⭐ ARTX11's cross-vocabulary speculation requires gljax to hold **two live tokenizers with different
+vocabularies simultaneously**. That is a genuine polymorphism requirement, not a speculative one.
+
+## 1.2 The seam
+
+```rust
+// gljax/src/tok/mod.rs
+//
+// gljax depends on THIS, never on glcore directly. The glcore-backed
+// implementation lives behind a default-on feature so gljax stays compilable
+// without it (tests, and any future standalone build).
+
+pub trait Tokenizer: Send + Sync {
+    fn encode(&self, text: &str, add_special: bool) -> Vec<TokenId>;
+    /// Whole-sequence decode. NOT valid for streaming — see §4.
+    fn decode(&self, ids: &[TokenId], skip_special: bool) -> String;
+
+    fn vocab_size(&self) -> usize;
+    fn eos_id(&self) -> TokenId;
+    fn bos_id(&self) -> Option<TokenId>;
+    fn is_stop(&self, id: TokenId) -> bool;
+
+    /// Raw surface form of one token, WITHOUT byte-level unmapping applied.
+    /// Needed by §4's incremental decoder and §5's SLEM.
+    fn token_bytes(&self, id: TokenId) -> &[u8];
+
+    /// Stable identity of this vocabulary. Used to decide `VocabRelation`
+    /// (ARTX11 §2.3) and to key the ARTX04 compile cache.
+    fn vocab_fingerprint(&self) -> VocabFingerprint;
+}
+
+/// SHA-256 over (sorted vocab entries ++ merge list ++ special tokens).
+/// Two tokenizers with equal fingerprints are interchangeable; unequal
+/// fingerprints mean ARTX11 must use a heterogeneous algorithm (§5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VocabFingerprint([u8; 32]);
+```
+
+⚠️ **DESIGN DECISION — `vocab_fingerprint` is computed, never trusted from metadata.**
+ARTX11 §2.3's `VocabRelation::Identical` is a *correctness* precondition: if two vocabularies are
+assumed identical and are not, speculative decoding silently produces wrong tokens while remaining
+fluent — ARTX12's core bug class. A model name or tokenizer-class string is not evidence; the
+content hash is.
+
+⚠️ Two tokenizers from the *same family but different generations* are the trap this catches. ARTX11
+§3.1 flagged "Qwen3-1.7B drafted by Qwen2.5-0.5B — ⚠️ verify, cross-generation tokenizers may
+differ." The fingerprint turns that warning into an assertion.
+
+---
+
+# 2. Vocabulary Loading
+
+## 2.1 The two source formats
+
+| Source | Path | What it carries |
+|---|---|---|
+| **GGUF metadata** | `Tokenizer::from_gguf` | Vocab, scores/merges, special IDs, `add_bos_token` — embedded in the model file |
+| **HF `tokenizer.json`** | `Tokenizer::from_file` | The full HF pipeline description (§2.2) |
+
+⚠️ ARTX04 loads safetensors and `.gllm`; ARTX12 Part A will add GGUF. **The tokenizer source and the
+weight source need not be the same file**, and gljax must not assume they are: a safetensors
+checkpoint ships `tokenizer.json` beside it, while a GGUF embeds both.
+
+## 2.2 The HF pipeline, and what gljax must respect
+
+`tokenizer.json` describes a five-stage pipeline:
+
+```text
+raw text
+   ▼  normalizer      strip / lowercase / NFC / accent removal
+   ▼  pre_tokenizer   split into word-level pieces (whitespace, regex, ByteLevel)
+   ▼  model           BPE | Unigram | WordPiece | WordLevel → subword IDs
+   ▼  post_processor  add BOS/EOS/template special tokens
+   ▼  decoder         IDs → text (the inverse, and NOT symmetric — §4)
+```
+
+⚠️ **The `pre_tokenizer` stage is where the two families genuinely diverge**, and getting it wrong is
+silent:
+
+* **SentencePiece / SPM** works on raw text with **no whitespace pre-tokenization** — whitespace is
+  itself part of the token stream, encoded as `▁`. Unknown bytes fall back to `<0xNN>`.
+* **Byte-level BPE** (GPT-2, Qwen) maps raw bytes to printable Unicode first, then merges. tiktoken's
+  variant skips normalization entirely and goes straight to a regex chunk before BPE — which is
+  where its ~2–3× speed advantage comes from.
+
+`glcore::tokenizer` already implements both. ARTX13 adds only the requirement that the **family be
+detected and recorded**, not inferred per call.
+
+## 2.3 Validation at load
+
+⚠️ **DESIGN DECISION — validate the tokenizer against the model at `Session::new`, and refuse to
+serve on mismatch.**
+
+```rust
+pub fn validate(tok: &dyn Tokenizer, model: &ModelConfig) -> Result<(), TokError> {
+    // V1 — the one that catches the most damage.
+    // A vocab/embedding mismatch means gather_embed reads out of bounds or
+    // silently maps to the wrong row. Fluent garbage, no error.
+    if tok.vocab_size() != model.vocab_size {
+        return Err(TokError::VocabSizeMismatch {
+            tokenizer: tok.vocab_size(), model: model.vocab_size });
+    }
+    // V2 — EOS must exist and be in range, or generation never terminates.
+    if tok.eos_id() as usize >= model.vocab_size {
+        return Err(TokError::EosOutOfRange(tok.eos_id()));
+    }
+    // V3 — BOS policy must match the checkpoint's declared intent.
+    // ⚠️ GwenLand has been bitten by BOS handling before: the glproc/llama.cpp
+    // perplexity comparison had to explicitly verify `add_bos_token: false`
+    // was honoured by both engines before the numbers could be trusted.
+    Ok(())
+}
+```
+
+⚠️ V1 deserves emphasis: a padded vocabulary is common (models round `vocab_size` up to a multiple of
+64 or 128 for tensor-core alignment), so `tok.vocab_size() < model.vocab_size` is *legitimate* while
+the reverse is fatal. The check must distinguish the two rather than demand equality — recorded as an
+open detail for implementation, since it depends on ARTX12 Part A's config parsing.
+
+---
+
+# 3. Chat Templating
+
+`glcore::tokenizer` already exposes `encode_chat(user) -> Option<Vec<u32>>`. ARTX16's
+`/v1/chat/completions` needs more: a full `messages[]` array with roles.
+
+⚠️ **DESIGN DECISION — chat templating lives in `glserve`, not in gljax.**
+
+The template is a *serving* concern: it maps an OpenAI-shaped request onto a model-specific prompt
+format. It has no bearing on the engine, changes per model without changing the engine, and belongs
+next to the API types that produce it (ARTX16 §8's `api/openai.rs` reasoning).
+
+```rust
+// glserve/src/api/template.rs
+pub trait ChatTemplate {
+    fn render(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> String;
+}
+```
+
+⚠️ ⛔ **Do not implement a Jinja2 interpreter.** HF `chat_template` fields are Jinja2, and evaluating
+arbitrary Jinja in a serving process is both a large dependency and an untrusted-input execution
+surface. gljax ships a small set of *known* templates (ChatML, Llama-3, Gemma) selected by the
+model's declared family, and **refuses unknown templates rather than guessing**. A wrong template
+produces fluent, subtly-off output — the ARTX12 bug class again, this time from a formatting error.
+
+---
+
+# 4. ⭐ Incremental Detokenization — the hard part
+
+## 4.1 Why `decode(&[one_token])` is wrong
+
+ARTX16 §1.5 streams one SSE chunk per token, each carrying a text delta. The naive implementation
+calls `decode` on the single new token. **This is incorrect, for two independent reasons.**
+
+**Reason 1 — partial UTF-8.** Byte-level BPE tokens are byte sequences, not characters. A multi-byte
+character (emoji, CJK, Cyrillic) commonly spans two or more tokens. Decoding one token yields an
+incomplete UTF-8 sequence, which lossy decoding renders as `�` — and the substitution happens
+*before* transmission, so no amount of client-side buffering can recover it. This is a real, reported
+production failure mode, not a theoretical one.
+
+**Reason 2 — context-dependent spacing.** vLLM's own incremental-detokenization work records the
+core difficulty: *the tokenizer decides whether to add a space depending on the surrounding token
+IDs.* SPM's `▁` handling and byte-level BPE's leading-space convention both make a token's rendered
+text a function of its neighbours. Per-token decode cannot see them.
+
+⚠️ Byte-level tokenizers can also emit sequences that are **not valid UTF-8 at all** — that is an
+established property of byte-level vocabularies, not a bug to fix. The decoder must degrade
+gracefully rather than assume validity.
+
+## 4.2 The design
+
+⚠️ **DESIGN DECISION — a stateful per-request `IncrementalDecoder` that emits only complete
+characters and carries a byte remainder.**
+
+```rust
+// gljax/src/tok/stream.rs
+
+/// One per in-flight request. Owned by the request, not the tokenizer.
+pub struct IncrementalDecoder<'t> {
+    tok: &'t dyn Tokenizer,
+    /// All tokens so far. Needed because rendering is context-dependent (§4.1).
+    ids: Vec<TokenId>,
+    /// Bytes produced but not yet emitted: an incomplete UTF-8 tail.
+    pending: Vec<u8>,
+    /// How many bytes of the full decode have already been emitted.
+    emitted_bytes: usize,
+}
+
+impl<'t> IncrementalDecoder<'t> {
+    /// Push one token; return the text delta that is SAFE to emit now.
+    /// Returns "" when the token only extends an incomplete character.
+    pub fn push(&mut self, id: TokenId) -> String {
+        self.ids.push(id);
+        self.pending.extend_from_slice(self.tok.token_bytes(id));
+
+        // Emit the longest valid UTF-8 prefix; keep the remainder pending.
+        match std::str::from_utf8(&self.pending) {
+            Ok(s) => { let out = s.to_string(); self.pending.clear(); out }
+            Err(e) => {
+                let good = e.valid_up_to();
+                // ⚠️ error_len() == Some(_) means genuinely INVALID bytes, not
+                // merely incomplete. Byte-level vocabs can produce these.
+                // Emit the good prefix, drop the bad byte, keep going.
+                let out = unsafe { std::str::from_utf8_unchecked(&self.pending[..good]) }.to_string();
+                match e.error_len() {
+                    None        => { self.pending.drain(..good); }          // incomplete: wait
+                    Some(bad)   => { self.pending.drain(..good + bad); }    // invalid: skip
+                }
+                out
+            }
+        }
+    }
+
+    /// Flush at end of generation. Any still-pending bytes were a truncated
+    /// character — emit U+FFFD once rather than silently dropping them.
+    pub fn finish(&mut self) -> String {
+        if self.pending.is_empty() { String::new() } else { self.pending.clear(); "\u{FFFD}".into() }
+    }
+}
+```
+
+⚠️ **The `ids` field is retained deliberately even though `push` does not read it.** Reason 2 above
+(context-dependent spacing) means a fully correct implementation must be able to re-render a window
+of recent tokens rather than concatenating per-token bytes. The byte-concatenation path above is
+correct for **byte-level BPE**, where a token's bytes are context-independent; it is **not**
+guaranteed correct for SPM-style vocabularies with `▁` handling.
+
+⚠️ **DESIGN DECISION — the decoder has two strategies, selected by vocabulary family.**
+
+```text
+ByteLevel  → concatenate token_bytes, split on UTF-8 boundaries   (above; cheap)
+Spm        → re-decode a trailing window of N tokens each step,
+             diff against what was already emitted                 (correct; costlier)
+```
+
+⚠️ The SPM path's window size is a correctness/cost tradeoff and must be **measured**, not guessed.
+A window that is too short reintroduces the spacing bug at the window boundary. Recorded as an open
+question (§7).
+
+## 4.3 Interaction with ARTX11
+
+⚠️ Speculative decoding accepts a **variable number of tokens per iteration** (ARTX11 §5.1), and
+rejected drafts must never reach the decoder.
+
+```text
+speculative_step returns AcceptResult { tokens: [t0, t1, t2], .. }
+   ▼
+for t in tokens:  decoder.push(t)  → concatenate the deltas → ONE SSE chunk
+```
+
+⚠️ Pushing rejected tokens would corrupt `pending` and the emitted stream. The decoder must be driven
+from `AcceptResult::tokens` — the *accepted* list — never from the draft candidates. This is a
+one-line rule that is easy to violate when wiring the two subsystems, and it belongs in ARTX12's
+integration tests.
+
+---
+
+# 5. Cross-Vocabulary Support (for ARTX11)
+
+ARTX11 §3.2 adopted Timor et al.'s lossless heterogeneous-vocabulary algorithms — **SLEM**
+(String-Level Exact Match) and **TLI** (Token-Level Intersection) — which work with off-the-shelf
+models and require no training. ARTX13 supplies what they need from the tokenizer layer.
+
+```rust
+// gljax/src/tok/hetero.rs
+
+/// SLEM verifies on DETOKENIZED STRINGS rather than token IDs, so it needs
+/// a cheap, allocation-light per-token surface form on both sides.
+pub fn token_str(tok: &dyn Tokenizer, id: TokenId) -> Cow<'_, str>;
+
+/// TLI restricts verification to the shared vocabulary subset.
+/// Built ONCE at pairing time (ARTX11 §2.3), never per step.
+pub struct VocabIntersection {
+    /// draft id → target id, for surface forms present in both.
+    draft_to_target: HashMap<TokenId, TokenId>,
+    /// Fraction of the draft vocabulary that mapped. ⚠️ Low coverage means
+    /// TLI's acceptance rate degrades; below a threshold, prefer SLEM.
+    pub coverage: f64,
+}
+
+pub fn build_intersection(draft: &dyn Tokenizer, target: &dyn Tokenizer) -> VocabIntersection;
+```
+
+⚠️ **DESIGN DECISION — the intersection is built once at pairing and its coverage is reported.**
+ARTX11 §3.2 noted cross-family speculation is *"strictly worse than same-family when both are
+available."* Coverage is the number that quantifies how much worse, and it is knowable before a
+single token is generated — so it belongs in the startup log and in ARTX16's `/health` payload, not
+discovered from a disappointing acceptance rate in production.
+
+⚠️ Building the intersection is `O(|V_draft|)` map lookups over surface forms — for two 151,936-entry
+vocabularies that is trivially fast, but it is `O(V)` **memory** for the map. Noted, not optimized.
+
+---
+
+# 6. Module Layout + Wave Plan
+
+```text
+gljax/src/tok/
+├── mod.rs        Tokenizer trait, TokenId, VocabFingerprint
+├── glcore.rs     the glcore-backed impl, behind `feature = "glcore-tokenizer"` (default on)
+├── stream.rs     §4  IncrementalDecoder (ByteLevel + Spm strategies)
+├── hetero.rs     §5  token_str, VocabIntersection
+└── validate.rs   §2.3 load-time checks
+
+glserve/src/api/
+└── template.rs   §3  ChatTemplate — serving-side, known templates only
+```
+
+| Wave | Scope | Gate |
+|---|---|---|
+| **A13.0** ⛔ | **Harden `glcore::tokenizer` (§0.2).** Real-vocabulary fixtures; exercise score-driven SPM merge selection and byte-level merge-list application; reference parity | ⭐ **Token-ID parity against an external reference** (`llama-tokenize --ids` and/or HF `tokenizers`) on ≥3 real vocabularies × a corpus with ASCII, CJK, emoji, RTL, mixed whitespace, and adversarial merge-boundary strings. **Blocks every wave below.** |
+| **A13.1** | `Tokenizer` trait + `glcore` impl + `VocabFingerprint` | Round-trip `decode(encode(s)) == s` over the same corpus |
+| **A13.2** | `validate.rs` | Vocab/model mismatch is refused at `Session::new`, not at first token |
+| **A13.3** | ⭐ `stream.rs` | **No `�` ever emitted mid-stream** for a corpus of multi-byte text; concatenated deltas == whole-sequence `decode` |
+| **A13.4** | `hetero.rs` | Coverage reported; SLEM/TLI agree with a reference on a real cross-family pair |
+| **A13.5** | `template.rs` (glserve) | Rendered prompt is byte-identical to HF's for the same messages, on each supported family |
+
+⚠️ **A13.3's gate is the load-bearing one and it is stated as an invariant, not a metric:**
+*the concatenation of all streamed deltas must equal the whole-sequence decode of the same token
+list.* That single property catches partial-UTF-8 bugs, spacing bugs, and off-by-one emission bugs
+at once, and it is cheap to assert on every streaming test.
+
+## 6.1 Open questions
+
+0. ⛔ **Does `glcore::tokenizer`'s merge selection actually match a reference?** (§0.2.1) Unknown —
+   the score-driven SPM path and the byte-level merge-list path are both untested. This is the
+   highest-risk unknown in the document and A13.0 exists to close it. Until it is closed, every
+   §5 claim about vocabulary overlap inherits the uncertainty.
+1. **SPM window size** (§4.2) — how many trailing tokens must be re-decoded for correct spacing?
+   Measure; do not guess.
+2. **Padded vocabularies** (§2.3) — the legitimate `tok.vocab_size() < model.vocab_size` case needs
+   ARTX12 Part A's config parsing to distinguish it from a real mismatch.
+3. **Does `glcore::tokenizer` handle Gemma's vocabulary?** ARTX11 §4 requires multi-architecture
+   support; glcore's doc names llama and gpt2/qwen families. Gemma is SentencePiece-based and should
+   fit the SPM path, but this is **unverified**.
+4. **Dependency weight** — does depending on `glcore` pull GGUF parsing and quantization kernels into
+   gljax's build? If so, the tokenizer may need extracting into its own crate.
+
+---
+
+# Appendix A — Design Decision Summary
+
+| # | Decision | Rationale | Reversible? |
+|---|---|---|---|
+| D0 | ⛔ **`glcore::tokenizer` is treated as UNVERIFIED; Wave A13.0 hardening blocks all reuse** | 9 tests, synthetic ~296-token fixtures, ASCII only; both merge paths disabled by construction (`vec![0.0; n]`, "no merges"). One hand-made real-vocab check exists, from an unrelated investigation | N/A |
+| D1 | Reuse `glcore::tokenizer` (after D0); do not write a second BPE | 796 lines, both vocab families, both load paths — a third implementation would be a third place for the same bug | Medium |
+| D2 | Depend on a `Tokenizer` **trait**, not on `glcore` directly | ARTX11 needs two live vocabularies simultaneously — real polymorphism | Trivial |
+| D3 | `vocab_fingerprint` is **computed**, never trusted from metadata | ARTX11's `Identical` is a correctness precondition; a name is not evidence | Trivial |
+| D4 | Validate tokenizer against model at `Session::new` | A vocab mismatch is fluent garbage, not an error | Trivial |
+| D5 | Chat templating lives in `glserve`, not gljax | It is a serving concern that changes per model without changing the engine | Medium |
+| D6 | ⛔ No Jinja2 interpreter; known templates only, refuse unknown | Large dependency + untrusted-input execution; a wrong template is silent | Medium |
+| D7 | Streaming uses a stateful `IncrementalDecoder`, never `decode(one_token)` | Partial UTF-8 and context-dependent spacing both break per-token decode | Hard |
+| D8 | Two decode strategies selected by vocab family (ByteLevel / Spm) | Byte concatenation is correct for one and not the other | Medium |
+| D9 | Invalid (not merely incomplete) bytes are skipped, not buffered | Byte-level vocabs can emit non-UTF-8; buffering would stall the stream forever | Trivial |
+| D10 | `finish()` emits one U+FFFD for a truncated tail | Silent truncation hides a real generation event | Trivial |
+| D11 | The decoder is driven from `AcceptResult::tokens`, never draft candidates | Rejected tokens would corrupt the stream (ARTX11 §5) | Trivial |
+| D12 | `VocabIntersection` built once at pairing; **coverage reported** | Quantifies cross-family degradation before generation, not after | Trivial |
+| D13 | A13.3 gate: streamed deltas concatenate to the whole-sequence decode | One invariant catches three bug classes | N/A |
+
+---
+
+# Sources
+
+- [Summary of the tokenizers | HuggingFace](https://huggingface.co/docs/transformers/en/tokenizer_summary) and [The tokenization pipeline](https://huggingface.co/docs/tokenizers/en/pipeline) — normalizer → pre_tokenizer → model → post_processor → decoder; BPE/Unigram/WordPiece/WordLevel.
+- [Tokenizers | HuggingFace](https://huggingface.co/docs/transformers/en/fast_tokenizers) — `tokenizer.json` fields: version, truncation, padding, added_tokens, normalizer, pre_tokenizer, post_processor, decoder, model.
+- [SentencePiece: Subword Tokenization with BPE and Unigram](https://mbrenndoerfer.com/writing/sentencepiece-subword-tokenization-bpe-unigram) — raw-text operation, whitespace as a token, no whitespace pre-tokenization.
+- [How to Train and Choose a Custom Tokenizer with tiktoken, SentencePiece, and HF Tokenizers](https://www.bestaiweb.ai/how-to-train-and-choose-a-custom-tokenizer-with-tiktoken-sentencepiece-and-hf-tokenizers-in-2026/) — tiktoken skips normalization, regex chunk before BPE, ~2–3× faster.
+- [Multibyte UTF-8 Characters Broken in Streaming Mode (TRT-LLM)](https://github.com/oobabooga/textgen/issues/6778) — `�` substitution happens before transmission; client-side buffering cannot recover it.
+- [Incremental Detokenization · huggingface/tokenizers #1666](https://github.com/huggingface/tokenizers/issues/1666) — the tokenizer's spacing decision depends on surrounding token IDs.
+- [Byte-level Tokenizers Unavoidably Enable LLMs to Generate Ill-formed UTF-8](https://openreview.net/pdf?id=j2hH02UVch) — partial and invalid UTF-8 as a structural property of byte-level vocabularies.
+- [LLM Output Streaming and Real-Time Token Delivery Architectures](https://zylos.ai/research/2026-03-28-llm-output-streaming-token-delivery-architectures/) — streaming decode with buffered incomplete sequences.
+- [Accelerating LLM Inference with Lossless Speculative Decoding Algorithms for Heterogeneous Vocabularies](https://arxiv.org/abs/2502.05202) — SLEM / TLI, the algorithms §5 supports.
+
+**Repo-internal:** `glcore/src/tokenizer.rs` (796 lines: SPM + byte-level BPE, `from_gguf`,
+`from_file`, `encode_chat`); `ARTX04` (checkpoint loading); `ARTX11 §2.3, §3.2, §5.1` (pairing
+contract, heterogeneous vocabularies, `AcceptResult`); `ARTX16 §1.2, §1.5` (request lifecycle, SSE);
+`memory/project_glproc_precision_gap_vs_llamacpp.md` (BOS-handling verification as a prerequisite for
+trusting cross-engine numbers).
