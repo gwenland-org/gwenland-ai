@@ -25,14 +25,43 @@
 /// Which pre-tokenizer shape a vocabulary uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreTok {
-    /// GPT-2: unbounded digit runs, no case-insensitive contractions,
-    /// no `[\r\n]*` tail on punctuation.
-    Gpt2,
-    /// Qwen2 / cl100k / Llama-3 shape. `digit_run` is the maximum number of
-    /// digits kept together: 1 for Qwen2, 3 for cl100k and Llama-3.
-    Cl100k { digit_run: usize },
     /// No pre-tokenization: the whole string is one chunk (SPM path).
     None,
+    /// A byte-level BPE splitter, parameterised by the three axes that
+    /// actually vary between the patterns in the wild (see [`BpeSplit`]).
+    Bpe(BpeSplit),
+}
+
+/// The three independent axes the real patterns differ on.
+///
+/// Enumerating named families instead would need a variant per model and
+/// still not say *what* differs; these three fields say exactly that, and the
+/// reference vectors decide each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BpeSplit {
+    /// Case-insensitive contractions, a `[^\r\n\p{L}\p{N}]?` lead
+    /// before letter runs, a `[\r\n]*` tail on punctuation runs, and a
+    /// `\s*[\r\n]+` arm. GPT-2-era patterns have none of these;
+    /// cl100k-era patterns have all of them.
+    pub modern: bool,
+    /// Maximum digits kept in one chunk: 1 (Qwen2), 3 (cl100k/Llama-3), or
+    /// `usize::MAX` (GPT-2 `\p{N}+`).
+    pub digit_run: usize,
+    /// Whether a digit run may absorb one leading space — GPT-2's
+    /// `" ?\p{N}+"`. ⚠️ This is the axis that separates gpt-2/mpt from
+    /// starcoder/refact, which are otherwise identical.
+    pub space_digit: bool,
+}
+
+impl BpeSplit {
+    /// GPT-2, MPT: `" ?\p{N}+"`, unbounded runs, case-sensitive.
+    pub const GPT2: Self = Self { modern: false, digit_run: usize::MAX, space_digit: true };
+    /// StarCoder, Refact: as GPT-2 but digits never take a leading space.
+    pub const STARCODER: Self = Self { modern: false, digit_run: usize::MAX, space_digit: false };
+    /// cl100k / Llama-3: modern arms, three-digit runs.
+    pub const LLAMA3: Self = Self { modern: true, digit_run: 3, space_digit: false };
+    /// Qwen2 and friends: modern arms, single digits.
+    pub const QWEN2: Self = Self { modern: true, digit_run: 1, space_digit: false };
 }
 
 /// `\p{N}` — Unicode general category N (Nd, Nl, No).
@@ -89,18 +118,15 @@ impl PreTok {
                     out(text);
                 }
             }
-            PreTok::Gpt2 => self.scan(text, false, usize::MAX, &mut out),
-            PreTok::Cl100k { digit_run } => self.scan(text, true, *digit_run, &mut out),
+            PreTok::Bpe(s) => scan(text, *s, &mut out),
         }
     }
 
-    fn scan<'a>(
-        &self,
-        text: &'a str,
-        modern: bool,
-        digit_run: usize,
-        out: &mut impl FnMut(&'a str),
-    ) {
+}
+
+fn scan<'a>(text: &'a str, sp: BpeSplit, out: &mut impl FnMut(&'a str)) {
+    let (modern, digit_run, space_digit) = (sp.modern, sp.digit_run, sp.space_digit);
+    {
         let b = text.as_bytes();
         let mut i = 0usize;
 
@@ -143,6 +169,18 @@ impl PreTok {
             }
 
             // ── digits ────────────────────────────────────────────────────
+            // ⚠️ GPT-2 spells this " ?\p{N}+" — a digit run may absorb one
+            // leading space. The modern patterns spell it bare (`\p{N}` /
+            // `\p{N}{1,3}`) with no leading space, so this arm is GPT-2 only.
+            // Missing it turns " 4" into " " + "4", which changes ids.
+            if space_digit && c == ' ' {
+                let j = i + 1;
+                if j < b.len() && is_num(char_at(text, j)) {
+                    i = take_while(text, j, is_num);
+                    out(&text[start..i]);
+                    continue;
+                }
+            }
             if is_num(c) {
                 let mut count = 0;
                 while i < b.len() && count < digit_run {
@@ -292,8 +330,8 @@ mod tests {
         v
     }
 
-    const QWEN: PreTok = PreTok::Cl100k { digit_run: 1 };
-    const CL100K: PreTok = PreTok::Cl100k { digit_run: 3 };
+    const QWEN: PreTok = PreTok::Bpe(BpeSplit::QWEN2);
+    const CL100K: PreTok = PreTok::Bpe(BpeSplit::LLAMA3);
 
     #[test]
     fn none_is_identity() {
@@ -303,7 +341,7 @@ mod tests {
 
     #[test]
     fn words_carry_a_leading_space() {
-        assert_eq!(go(PreTok::Gpt2, "Hello World"), ["Hello", " World"]);
+        assert_eq!(go(PreTok::Bpe(BpeSplit::GPT2), "Hello World"), ["Hello", " World"]);
         assert_eq!(go(QWEN, "Hello World"), ["Hello", " World"]);
     }
 
@@ -311,7 +349,7 @@ mod tests {
     /// contractions stayed glued to their stem.
     #[test]
     fn contractions_split() {
-        assert_eq!(go(PreTok::Gpt2, "don't"), ["don", "'t"]);
+        assert_eq!(go(PreTok::Bpe(BpeSplit::GPT2), "don't"), ["don", "'t"]);
         assert_eq!(go(QWEN, "don't"), ["don", "'t"]);
     }
 
@@ -319,7 +357,7 @@ mod tests {
     fn contractions_are_case_insensitive_only_in_modern() {
         assert_eq!(go(QWEN, "DON'T"), ["DON", "'T"]);
         // GPT-2's pattern is case-sensitive: 'T is punctuation + letter.
-        assert_eq!(go(PreTok::Gpt2, "DON'T"), ["DON", "'", "T"]);
+        assert_eq!(go(PreTok::Bpe(BpeSplit::GPT2), "DON'T"), ["DON", "'", "T"]);
     }
 
     /// Qwen2 keeps digits single-wide; cl100k groups up to three.
@@ -327,7 +365,7 @@ mod tests {
     fn digit_runs_differ_by_family() {
         assert_eq!(go(QWEN, "12345"), ["1", "2", "3", "4", "5"]);
         assert_eq!(go(CL100K, "12345"), ["123", "45"]);
-        assert_eq!(go(PreTok::Gpt2, "12345"), ["12345"]);
+        assert_eq!(go(PreTok::Bpe(BpeSplit::GPT2), "12345"), ["12345"]);
     }
 
     /// Newlines were not a split point at all in the old implementation.
@@ -364,7 +402,7 @@ mod tests {
 
     #[test]
     fn every_chunk_is_reachable_and_lossless() {
-        for p in [PreTok::Gpt2, QWEN, CL100K] {
+        for p in [PreTok::Bpe(BpeSplit::GPT2), QWEN, CL100K] {
             for s in [
                 "Hello, World! 123",
                 "  leading",

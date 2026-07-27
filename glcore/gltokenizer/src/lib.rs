@@ -31,10 +31,11 @@
 //! from its definition.
 
 pub mod bpe;
+pub mod gguf;
 pub mod pretok;
 pub mod vocab;
 
-pub use pretok::PreTok;
+pub use pretok::{BpeSplit, PreTok};
 pub use vocab::{Style, Vocab, VocabParts, SPM_SPACE};
 
 use std::cell::RefCell;
@@ -51,6 +52,8 @@ pub enum TokError {
     },
     #[error("SPM vocabulary has {scores} scores for {vocab} tokens")]
     ScoreCountMismatch { scores: usize, vocab: usize },
+    #[error("malformed GGUF: {0}")]
+    Gguf(String),
     #[error("malformed tokenizer.json: {0}")]
     Json(String),
     #[error("tokenizer.json is missing `{0}`")]
@@ -86,8 +89,13 @@ struct Scratch {
 struct ByteLevelRanker<'a>(&'a Vocab);
 impl bpe::Ranker for ByteLevelRanker<'_> {
     #[inline]
-    fn rank(&self, piece: &str) -> Option<i64> {
-        self.0.merge_ranks.get(piece).map(|&r| -(r as i64))
+    fn rank(&self, piece: &str, left_len: usize) -> Option<i64> {
+        let rules = self.0.merge_ranks.get(piece)?;
+        // Only the rule whose split point matches this pair applies.
+        rules
+            .iter()
+            .find(|(l, _)| *l as usize == left_len)
+            .map(|(_, r)| -(*r as i64))
     }
 }
 
@@ -98,7 +106,9 @@ impl bpe::Ranker for ByteLevelRanker<'_> {
 struct SpmRanker<'a>(&'a Vocab);
 impl bpe::Ranker for SpmRanker<'_> {
     #[inline]
-    fn rank(&self, piece: &str) -> Option<i64> {
+    fn rank(&self, piece: &str, _left_len: usize) -> Option<i64> {
+        // SPM is vocabulary-driven: any split of a vocabulary entry is valid,
+        // so the split point carries no information here.
         let id = *self.0.token_to_id.get(piece)?;
         let score = self.0.scores.get(id as usize).copied().unwrap_or(0.0);
         // f32 → ordered i64. Scores are small and finite in practice; scaling
@@ -261,6 +271,15 @@ impl Tokenizer {
             mapped.clear();
             for b in chunk.bytes() {
                 mapped.push(v.byte_to_char[b as usize]);
+            }
+            // Llama-3's `ignore_merges`: a pre-token already in the vocabulary
+            // is emitted whole, because rank-order BPE may not be able to
+            // reach it (see `gguf::ignore_merges_for`).
+            if v.ignore_merges {
+                if let Some(&id) = v.token_to_id.get(mapped.as_str()) {
+                    ids.push(id);
+                    continue;
+                }
             }
             merger.run(mapped, &ranker, |piece| {
                 if err.is_some() {
@@ -469,6 +488,7 @@ mod tests {
             style: Style::Spm,
             pretok: PreTok::None,
             add_dummy_prefix,
+            ignore_merges: false,
             bos_id: Some(1),
             eos_id: 2,
             unk_id: Some(0),
@@ -526,8 +546,9 @@ mod tests {
                 merges: vec![],
                 special_ids: vec![],
                 style: Style::ByteLevel,
-                pretok: PreTok::Gpt2,
+                pretok: PreTok::Bpe(BpeSplit::GPT2),
                 add_dummy_prefix: false,
+                ignore_merges: false,
                 bos_id: None,
                 eos_id: 0,
                 unk_id: None,
@@ -545,8 +566,9 @@ mod tests {
             merges: vec![],
             special_ids: vec![0],
             style: Style::ByteLevel,
-            pretok: PreTok::Cl100k { digit_run: 1 },
+            pretok: PreTok::Bpe(BpeSplit::QWEN2),
             add_dummy_prefix: false,
+            ignore_merges: false,
             bos_id: None,
             eos_id: 0,
             unk_id: None,
@@ -587,6 +609,7 @@ mod tests {
             style: Style::Spm,
             pretok: PreTok::None,
             add_dummy_prefix: false,
+            ignore_merges: false,
             bos_id: None,
             eos_id: 0,
             unk_id: None,

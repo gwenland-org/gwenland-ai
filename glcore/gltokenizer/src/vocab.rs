@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 
-use crate::pretok::PreTok;
+use crate::pretok::{BpeSplit, PreTok};
 use crate::TokError;
 
 /// Which encoding convention a vocabulary uses.
@@ -43,8 +43,10 @@ pub struct Vocab {
     pub(crate) token_to_id: HashMap<Box<str>, u32>,
     /// SPM merge scores, indexed by id. Empty for byte-level vocabularies.
     pub(crate) scores: Vec<f32>,
-    /// Byte-level merge ranks. Empty for SPM vocabularies.
-    pub(crate) merge_ranks: HashMap<Box<str>, u32>,
+    /// Byte-level merge rules, keyed by concatenation and disambiguated by
+    /// the left symbol's byte length. ⚠️ A plain concatenation key collapses
+    /// distinct rules together; see [`crate::bpe::Ranker::rank`].
+    pub(crate) merge_ranks: HashMap<Box<str>, Box<[(u32, u32)]>>,
 
     pub(crate) style: Style,
     pub(crate) pretok: PreTok,
@@ -55,6 +57,13 @@ pub struct Vocab {
     /// disable it, and corrupts chat templates by injecting a space into the
     /// middle of every rendered segment.
     pub(crate) add_dummy_prefix: bool,
+
+    /// Llama-3's `ignore_merges`: when a pre-token exists verbatim in the
+    /// vocabulary, emit it directly instead of running the merge loop.
+    /// ⚠️ This is NOT an optimisation — it changes results. Rank-order BPE
+    /// can be forced down a path that makes the whole-token form
+    /// unreachable, so the two disagree on real inputs.
+    pub(crate) ignore_merges: bool,
 
     /// Special tokens, longest-first, for the pre-encode split. Input text
     /// containing one of these must yield that token's id rather than being
@@ -83,6 +92,7 @@ pub struct VocabParts {
     pub style: Style,
     pub pretok: PreTok,
     pub add_dummy_prefix: bool,
+    pub ignore_merges: bool,
     pub bos_id: Option<u32>,
     pub eos_id: u32,
     pub unk_id: Option<u32>,
@@ -111,6 +121,13 @@ fn gpt2_byte_map() -> ([char; 256], HashMap<char, u8>) {
     (b2c, c2b)
 }
 
+impl VocabParts {
+    /// Consume these parts into a validated [`Vocab`].
+    pub fn into_vocab(self) -> Result<Vocab, TokError> {
+        Vocab::from_parts(self)
+    }
+}
+
 impl Vocab {
     pub fn from_parts(p: VocabParts) -> Result<Self, TokError> {
         if p.id_to_token.is_empty() {
@@ -137,11 +154,23 @@ impl Vocab {
             token_to_id.entry(t.as_str().into()).or_insert(id as u32);
         }
 
-        let merge_ranks = p
-            .merges
-            .iter()
-            .enumerate()
-            .map(|(rank, (a, b))| (format!("{a}{b}").into_boxed_str(), rank as u32))
+        // Group by concatenation, keeping every rule's (left_len, rank).
+        // Collisions are real: llama-bpe has ~2.2 rules per concatenation.
+        let mut grouped: HashMap<Box<str>, Vec<(u32, u32)>> = HashMap::new();
+        for (rank, (a, b)) in p.merges.iter().enumerate() {
+            grouped
+                .entry(format!("{a}{b}").into_boxed_str())
+                .or_default()
+                .push((a.len() as u32, rank as u32));
+        }
+        let merge_ranks: HashMap<Box<str>, Box<[(u32, u32)]>> = grouped
+            .into_iter()
+            .map(|(k, mut v)| {
+                // Best (lowest) rank first: the common case is one entry, and
+                // when there are several the scan stops at the first match.
+                v.sort_unstable();
+                (k, v.into_boxed_slice())
+            })
             .collect();
 
         let special_ids: std::collections::HashSet<u32> = p.special_ids.into_iter().collect();
@@ -172,6 +201,7 @@ impl Vocab {
             style: p.style,
             pretok: p.pretok,
             add_dummy_prefix: p.add_dummy_prefix,
+            ignore_merges: p.ignore_merges,
             specials_by_len,
             special_ids,
             stop_ids,
@@ -268,6 +298,7 @@ impl Vocab {
             style,
             pretok,
             add_dummy_prefix,
+            ignore_merges: false,
             bos_id: None,
             eos_id,
             unk_id: None,
@@ -331,9 +362,9 @@ fn parse_pretok(v: Option<&serde_json::Value>) -> Result<PreTok, TokError> {
                     return classify_regex(re);
                 }
             }
-            Ok(PreTok::Gpt2)
+            Ok(PreTok::Bpe(BpeSplit::GPT2))
         }
-        "ByteLevel" => Ok(PreTok::Gpt2),
+        "ByteLevel" => Ok(PreTok::Bpe(BpeSplit::GPT2)),
         "Split" => {
             let re = v
                 .get("pattern")
@@ -356,7 +387,7 @@ fn classify_regex(re: &str) -> Result<PreTok, TokError> {
     let modern = re.contains("(?i:") || re.contains("[^\\r\\n\\p{L}\\p{N}]");
     if !modern {
         return if re.contains("\\p{L}") {
-            Ok(PreTok::Gpt2)
+            Ok(PreTok::Bpe(BpeSplit::GPT2))
         } else {
             Err(TokError::UnsupportedPreTokenizer(re.to_string()))
         };
@@ -374,7 +405,7 @@ fn classify_regex(re: &str) -> Result<PreTok, TokError> {
     } else {
         1
     };
-    Ok(PreTok::Cl100k { digit_run })
+    Ok(PreTok::Bpe(BpeSplit { modern: true, digit_run, space_digit: false }))
 }
 
 fn find_bytelevel_flag(v: Option<&serde_json::Value>, key: &str) -> Option<bool> {
@@ -400,9 +431,9 @@ mod tests {
 
     #[test]
     fn classifies_the_three_real_patterns() {
-        assert_eq!(classify_regex(QWEN_RE).unwrap(), PreTok::Cl100k { digit_run: 1 });
-        assert_eq!(classify_regex(CL100K_RE).unwrap(), PreTok::Cl100k { digit_run: 3 });
-        assert_eq!(classify_regex(GPT2_RE).unwrap(), PreTok::Gpt2);
+        assert_eq!(classify_regex(QWEN_RE).unwrap(), PreTok::Bpe(BpeSplit::QWEN2));
+        assert_eq!(classify_regex(CL100K_RE).unwrap(), PreTok::Bpe(BpeSplit::LLAMA3));
+        assert_eq!(classify_regex(GPT2_RE).unwrap(), PreTok::Bpe(BpeSplit::GPT2));
     }
 
     #[test]
@@ -418,8 +449,9 @@ mod tests {
             merges: vec![],
             special_ids: vec![],
             style: Style::ByteLevel,
-            pretok: PreTok::Gpt2,
+            pretok: PreTok::Bpe(BpeSplit::GPT2),
             add_dummy_prefix: false,
+            ignore_merges: false,
             bos_id: None,
             eos_id: 0,
             unk_id: None,
@@ -436,8 +468,9 @@ mod tests {
             merges: vec![],
             special_ids: vec![],
             style: Style::ByteLevel,
-            pretok: PreTok::Gpt2,
+            pretok: PreTok::Bpe(BpeSplit::GPT2),
             add_dummy_prefix: false,
+            ignore_merges: false,
             bos_id: None,
             eos_id: 99,
             unk_id: None,
@@ -456,6 +489,7 @@ mod tests {
             style: Style::Spm,
             pretok: PreTok::None,
             add_dummy_prefix: true,
+            ignore_merges: false,
             bos_id: None,
             eos_id: 0,
             unk_id: None,
