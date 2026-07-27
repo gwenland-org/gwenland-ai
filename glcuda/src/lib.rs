@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use glcore::engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use gltokenizer::Tokenizer;
 use glcore::GlError;
 
 use driver::Cuda;
@@ -107,7 +107,7 @@ impl GlcudaEngine {
             .tokenizer
             .as_ref()
             .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
-        Ok(tok.encode(text, true))
+        Ok(tok.encode(text, true)?)
     }
 
     /// Encode a chat turn using the model's chat template (ChatML for the
@@ -118,7 +118,10 @@ impl GlcudaEngine {
             .tokenizer
             .as_ref()
             .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
-        Ok(tok.encode_chat(user).unwrap_or_else(|| tok.encode(user, true)))
+        match tok.encode_chat(user)? {
+            Some(ids) => Ok(ids),
+            None => Ok(tok.encode(user, true)?),
+        }
     }
 
     fn sampler_for(&self, input: &InferInput) -> Sampler {
@@ -226,7 +229,7 @@ impl GlEngine for GlcudaEngine {
         }
         let gguf = GgufFile::open(path)?;
         let t_parse = Instant::now();
-        self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
+        self.tokenizer = Some(Tokenizer::from_gguf_path(path)?);
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         let t_stage = Instant::now();

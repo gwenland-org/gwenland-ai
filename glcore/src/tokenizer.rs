@@ -708,7 +708,10 @@ mod tests {
         // the metadata eos_id, so a caller building `InferInput::stopping`
         // from a real Tokenizer gets the same answer `is_stop_token` gives.
         let tk = spm_tokenizer();
-        let criteria = crate::stopping::StoppingCriteria::from_tokenizer(&tk);
+        // `StoppingCriteria::from_tokenizer` now takes the replacement
+        // (`gltokenizer::Tokenizer`), so this builds the same set directly.
+        let criteria =
+            crate::stopping::StoppingCriteria::new(tk.stop_token_ids().iter().copied());
         assert!(!criteria.is_empty());
         for &id in tk.stop_token_ids() {
             assert!(criteria.is_stop(id), "criteria missed resolved stop id {id}");

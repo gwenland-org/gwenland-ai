@@ -13,6 +13,7 @@ license-file = "../LICENSE"
 # JSON/CSV/Markdown writers are hand-rolled in src/export so the data model
 # stays decoupled from any serialization framework.
 [dependencies]
+gltokenizer = { path = "../glcore/gltokenizer" }
 glcore = { path = "../glcore" }
 glproc = { path = "../glproc" }
 

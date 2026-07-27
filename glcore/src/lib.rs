@@ -16,6 +16,16 @@ pub mod runtime;
 pub mod stopping;
 pub mod telemetry;
 pub mod tensor;
+/// ⛔ **Superseded by the `gltokenizer` crate.** Zero production callers
+/// remain; it is kept only so `tests/tokenizer_before_after.rs` can still
+/// measure what it replaced.
+///
+/// Measured against llama.cpp's reference vectors it scored 65.2%–97.8% per
+/// vocabulary — *no* vocabulary was fully correct. Do not build on it.
+#[deprecated(
+    since = "0.1.164",
+    note = "use the `gltokenizer` crate; this scored 65-98% against reference vectors"
+)]
 pub mod tokenizer;
 pub mod trace;
 

@@ -19,7 +19,7 @@
 
 use glcore::engine_trait::{GlEngine, InferInput};
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use gltokenizer::Tokenizer;
 use glictus_caliburni::runtime::GllmEngine;
 
 struct Args {
@@ -64,7 +64,7 @@ fn main() {
 
     eprintln!("loading tokenizer from {} ...", args.gguf_path);
     let gguf = GgufFile::open(&args.gguf_path).expect("open source GGUF for tokenizer");
-    let tokenizer = Tokenizer::from_gguf(&gguf).expect("build tokenizer from GGUF metadata");
+    let tokenizer = Tokenizer::from_gguf_path(&gguf_path).expect("build tokenizer from GGUF metadata");
 
     eprintln!("loading .gllm package from {} ...", args.package_dir);
     let mut engine = GllmEngine::new();

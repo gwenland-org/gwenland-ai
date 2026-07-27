@@ -2459,6 +2459,7 @@ dependencies = [
  "glcuda",
  "glictus-caliburni",
  "glproc",
+ "gltokenizer",
  "tempfile",
 ]
 
@@ -2476,6 +2477,7 @@ name = "glcore"
 version = "0.1.163"
 dependencies = [
  "byteorder",
+ "gltokenizer",
  "memmap2",
  "serde",
  "serde_json",
@@ -2489,6 +2491,7 @@ version = "0.1.155"
 dependencies = [
  "glcore",
  "glproc",
+ "gltokenizer",
  "libc",
 ]
 
@@ -2498,6 +2501,7 @@ version = "0.1.164"
 dependencies = [
  "glcore",
  "glproc",
+ "gltokenizer",
  "memmap2",
  "serde",
  "serde_json",
@@ -2543,6 +2547,7 @@ name = "glproc"
 version = "0.2.45"
 dependencies = [
  "glcore",
+ "gltokenizer",
  "libc",
  "num_cpus",
 ]
