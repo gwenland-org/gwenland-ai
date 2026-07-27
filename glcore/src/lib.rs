@@ -38,4 +38,9 @@ pub use trace::{TokenTrace, TraceConfig};
 pub use error::GlError;
 pub use runtime::Runtime;
 pub use tensor::{DType, Tensor};
+/// ⛔ Re-export of the superseded tokenizer. Zero users; kept only so the
+/// deprecation is visible at the crate root rather than silently vanishing.
+/// Use `gltokenizer::Tokenizer`.
+#[deprecated(since = "0.1.164", note = "use `gltokenizer::Tokenizer`")]
+#[allow(deprecated)]
 pub use tokenizer::Tokenizer;
