@@ -40,6 +40,18 @@ pub use vocab::{Style, Vocab, VocabParts, SPM_SPACE};
 
 use std::cell::RefCell;
 
+thread_local! {
+    /// Per-thread scratch buffers.
+    ///
+    /// ⚠️ These were once a `RefCell` field on [`Tokenizer`], which made the
+    /// whole type `!Sync` and therefore unusable inside the engines (which
+    /// require `Sync`). Thread-local storage keeps the buffers reusable —
+    /// steady-state encoding still allocates only the output `Vec` — while
+    /// leaving `Tokenizer` freely shareable across threads, which ARTX16's
+    /// multi-slot serving needs.
+    static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TokError {
     #[error("vocabulary is empty")]
@@ -72,7 +84,6 @@ pub enum TokError {
 /// allocates only the output `Vec<u32>`.
 pub struct Tokenizer {
     v: Vocab,
-    scratch: RefCell<Scratch>,
 }
 
 #[derive(Default)]
@@ -119,10 +130,7 @@ impl bpe::Ranker for SpmRanker<'_> {
 
 impl Tokenizer {
     pub fn new(v: Vocab) -> Self {
-        Tokenizer {
-            v,
-            scratch: RefCell::new(Scratch::default()),
-        }
+        Tokenizer { v }
     }
 
     pub fn vocab(&self) -> &Vocab {
@@ -199,7 +207,8 @@ impl Tokenizer {
     /// SPM: map *every* whitespace run's spaces to `▁`, optionally prepend the
     /// dummy prefix, then merge by score.
     fn encode_spm(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
-        let mut sc = self.scratch.borrow_mut();
+        SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
         let Scratch {
             merger, prepared, ..
         } = &mut *sc;
@@ -251,11 +260,13 @@ impl Tokenizer {
             Some(e) => Err(e),
             None => Ok(()),
         }
+        })
     }
 
     /// Byte-level: pre-tokenize, remap bytes to printable chars, merge by rank.
     fn encode_byte_level(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
-        let mut sc = self.scratch.borrow_mut();
+        SCRATCH.with(|sc| {
+        let mut sc = sc.borrow_mut();
         let Scratch { merger, mapped, .. } = &mut *sc;
 
         let ranker = ByteLevelRanker(&self.v);
@@ -303,6 +314,7 @@ impl Tokenizer {
             Some(e) => Err(e),
             None => Ok(()),
         }
+        })
     }
 
     /// Decode ids to text.
@@ -367,6 +379,84 @@ impl Tokenizer {
             tok: self,
             pending: Vec::new(),
         }
+    }
+
+    // ── convenience surface, mirroring what callers already used ─────────
+
+    /// Load a vocabulary embedded in a GGUF file.
+    pub fn from_gguf_path(path: &str) -> Result<Self, TokError> {
+        let bytes = std::fs::read(path).map_err(|e| TokError::Gguf(format!("{path}: {e}")))?;
+        Ok(Tokenizer::new(gguf::vocab_from_gguf(&bytes)?))
+    }
+
+    /// Load a HuggingFace `tokenizer.json`.
+    pub fn from_hf_json_path(path: &str) -> Result<Self, TokError> {
+        let src = std::fs::read_to_string(path).map_err(|e| TokError::Json(format!("{path}: {e}")))?;
+        Ok(Tokenizer::new(Vocab::from_hf_json(&src)?))
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.v.len()
+    }
+    pub fn eos_id(&self) -> u32 {
+        self.v.eos_id
+    }
+    pub fn bos_id(&self) -> Option<u32> {
+        self.v.bos_id
+    }
+    pub fn add_bos_default(&self) -> bool {
+        self.v.add_bos_default
+    }
+    pub fn is_stop_token(&self, id: u32) -> bool {
+        self.v.stop_ids.contains(&id)
+    }
+    pub fn stop_token_ids(&self) -> &std::collections::HashSet<u32> {
+        &self.v.stop_ids
+    }
+
+    /// Text a single token contributes, decoded independently.
+    ///
+    /// ⛔ **Not correct for streaming.** A multi-byte character routinely spans
+    /// several tokens, so decoding one at a time yields `U+FFFD` for emoji and
+    /// non-Latin scripts. Use [`Tokenizer::incremental`] to emit deltas; this
+    /// is for inspection and debugging, where a lone token is the unit of
+    /// interest.
+    pub fn decode_token_text(&self, id: u32) -> String {
+        let mut b = Vec::new();
+        self.token_bytes_into(id, &mut b);
+        String::from_utf8_lossy(&b).into_owned()
+    }
+
+    /// Encode a single-turn ChatML prompt, emitting `<|im_start|>` /
+    /// `<|im_end|>` as their token ids.
+    ///
+    /// Returns `Ok(None)` when this vocabulary has no ChatML markers, so the
+    /// caller can fall back to raw completion encoding.
+    ///
+    /// ⚠️ This is a *convenience for single-turn use*, not a template engine.
+    /// ARTX13 §3 places real chat templating in the serving layer, where the
+    /// model's own template lives; a hardcoded system prompt cannot be right
+    /// for every model.
+    pub fn encode_chat(&self, user: &str) -> Result<Option<Vec<u32>>, TokError> {
+        let (Some(&im_start), Some(&im_end)) = (
+            self.v.token_to_id.get("<|im_start|>"),
+            self.v.token_to_id.get("<|im_end|>"),
+        ) else {
+            return Ok(None);
+        };
+        let mut ids = Vec::new();
+        for (role, text) in [
+            ("system", "You are a helpful assistant."),
+            ("user", user),
+        ] {
+            ids.push(im_start);
+            self.encode_into(&format!("{role}\n{text}"), &mut ids)?;
+            ids.push(im_end);
+            self.encode_into("\n", &mut ids)?;
+        }
+        ids.push(im_start);
+        self.encode_into("assistant\n", &mut ids)?;
+        Ok(Some(ids))
     }
 }
 

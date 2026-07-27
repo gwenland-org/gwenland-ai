@@ -1,6 +1,6 @@
 //! Which sampled token ids end generation.
 //!
-//! This is **not** a reinvention of [`crate::tokenizer::Tokenizer`]'s own
+//! This is **not** a reinvention of [`gltokenizer::Tokenizer`]'s own
 //! `stop_token_ids`/`is_stop_token` — that resolver (metadata EOS plus every
 //! known stop-marker string found in the vocab) is already correct and
 //! already tested, and stays exactly as it is. What it
@@ -66,7 +66,7 @@ impl StoppingCriteria {
     /// Build from a tokenizer's own resolved stop set — the bridge every
     /// caller that already owns a real `Tokenizer` (glproc's engine, glbench,
     /// `run_package_e2e`) should use, rather than re-deriving EOS ids by hand.
-    pub fn from_tokenizer(tokenizer: &crate::tokenizer::Tokenizer) -> Self {
+    pub fn from_tokenizer(tokenizer: &gltokenizer::Tokenizer) -> Self {
         StoppingCriteria::new(tokenizer.stop_token_ids().iter().copied())
     }
 

@@ -49,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glcore::engine_trait::GlEngine;
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use gltokenizer::Tokenizer;
 use glictus_caliburni::runtime::GllmEngine;
 
 use crate::export::json::Json;
@@ -145,7 +145,7 @@ pub fn run_ppl(args: PplArgs) -> Result<(), String> {
     );
     let gguf = GgufFile::open(args.gguf.to_str().ok_or("--gguf path is not valid UTF-8")?)
         .map_err(|e| format!("opening {}: {e}", args.gguf.display()))?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)
+    let tokenizer = Tokenizer::from_gguf_path(&args.gguf.to_string_lossy())
         .map_err(|e| format!("building tokenizer from {}: {e}", args.gguf.display()))?;
 
     let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false);

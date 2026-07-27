@@ -28,3 +28,13 @@ pub enum GlError {
     #[error("Engine error: {0}")]
     Engine(String),
 }
+
+/// Tokenizer failures surface as parse errors: every one of them means a
+/// vocabulary or an input could not be interpreted, which is what
+/// [`GlError::Parse`] already means for the other model artefacts.
+impl From<gltokenizer::TokError> for GlError {
+    fn from(e: gltokenizer::TokError) -> Self {
+        GlError::Parse(format!("tokenizer: {e}"))
+    }
+}
+

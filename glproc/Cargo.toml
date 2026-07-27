@@ -6,6 +6,7 @@ description = "GwenLand AI CPU inference engine (source of truth)"
 license-file = "../LICENSE"
 
 [dependencies]
+gltokenizer = { path = "../glcore/gltokenizer" }
 glcore = { path = "../glcore" }
 num_cpus = "1.16"
 

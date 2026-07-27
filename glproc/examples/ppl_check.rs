@@ -16,7 +16,7 @@
 //! Run: cargo run --release -p glproc --example ppl_check -- <model.gguf> [context] [stride]
 
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use gltokenizer::Tokenizer;
 use glproc::loader::load_gguf;
 use glproc::runner::Runner;
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("loading {model_path} ...");
     let gguf = GgufFile::open(model_path)?;
-    let tokenizer = Tokenizer::from_gguf(&gguf)?;
+    let tokenizer = Tokenizer::from_gguf_path(model_path)?;
     let model = load_gguf(&gguf)?;
 
     // Respect the model's own `tokenizer.ggml.add_bos_token` metadata rather
@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // different input sequences being scored.
     let add_bos = tokenizer.add_bos_default();
     eprintln!("add_bos (from tokenizer.ggml.add_bos_token): {add_bos}");
-    let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, add_bos);
+    let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, add_bos)?;
     let total_tokens = tokens.len();
     eprintln!("first 20 token ids: {:?}", &tokens[..20.min(tokens.len())]);
     eprintln!("dataset: wikitext2-sample-embedded, {total_tokens} tokens, context={context} stride={stride}");

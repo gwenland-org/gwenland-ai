@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use glcore::engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use gltokenizer::Tokenizer;
 use glcore::GlError;
 
 use crate::gate::resolve_prefer_q4k_native;
@@ -359,7 +359,7 @@ impl GlEngine for GlprocEngine {
         }
 
         let t_parse = Instant::now();
-        self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
+        self.tokenizer = Some(Tokenizer::from_gguf_path(path)?);
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         // GATE, once per session: decide the FFN weight-format policy
