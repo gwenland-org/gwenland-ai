@@ -747,6 +747,48 @@ mod tests {
         }
     }
 
+    /// ⛔ **Why encoding one string cannot simply be split across threads.**
+    ///
+    /// The obvious parallelisation is "cut the input into chunks, tokenize
+    /// them independently, concatenate". It needs a split point that the
+    /// segmentation is invariant under, and the intuitive candidate — right
+    /// after a newline — **is not one**.
+    ///
+    /// `\s+(?!\S)` is the reason. A whitespace run that reaches end-of-input
+    /// is kept whole; one followed by a non-space gives its last character up
+    /// to lead the next chunk. Cutting the input turns the former into the
+    /// latter, so the seam re-segments and the ids change — with nothing to
+    /// signal it.
+    ///
+    /// This test exists so that anyone reaching for chunked threading finds
+    /// the counterexample already written down. Inter-*request* parallelism is
+    /// unaffected and already works: `GllmTokenizer` is `Sync` and its scratch
+    /// is thread-local.
+    #[test]
+    fn splitting_the_input_changes_the_segmentation() {
+        let whole = "a \nb";
+        // Cut immediately after the newline — the most plausible safe point.
+        let (head, tail) = whole.split_at(3);
+        assert_eq!((head, tail), ("a \n", "b"));
+
+        for p in [PreTok::Bpe(BpeSplit::GPT2), QWEN, CL100K] {
+            let joined: Vec<String> = go(p, head).into_iter().chain(go(p, tail)).collect();
+            let direct = go(p, whole);
+            if p == PreTok::Bpe(BpeSplit::GPT2) {
+                // GPT-2 shape: "a", " ", "\n", "b" whole — but "a", " \n", "b"
+                // when cut, because " \n" now reaches end-of-input.
+                assert_eq!(direct, ["a", " ", "\n", "b"]);
+                assert_eq!(joined, ["a", " \n", "b"]);
+                assert_ne!(
+                    direct, joined,
+                    "if this ever matches, re-derive the invariant before threading"
+                );
+            }
+            // Whatever the shape, the split must remain lossless.
+            assert_eq!(joined.concat(), whole);
+        }
+    }
+
     #[test]
     fn digit_triples_are_ascii_only() {
         let mut v = Vec::new();

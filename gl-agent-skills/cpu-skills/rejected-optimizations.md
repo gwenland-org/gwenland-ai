@@ -131,3 +131,68 @@ entry added here. The branch dies; the knowledge doesn't.
 - [threading-model.md](threading-model.md)
 - [memory-bandwidth.md](memory-bandwidth.md)
 - [../bench-skills/measurement-discipline.md](../bench-skills/measurement-discipline.md)
+
+---
+
+## Tokenizer entries (`glcore::tokenizer`, added 2026-07-28)
+
+These follow the same rule as the list above: matched **by mechanism, not by
+name**.
+
+T1. **FxHash / any faster hasher for the tokenizer's lookup tables** —
+    REJECTED: **neutral**, and it adds a hash-flooding surface.
+
+    The reasoning that leads here is sound and still wrong. `merge_ranks.get(piece)`
+    runs once *per candidate pair on every merge*, keys are 1–20 bytes, and
+    SipHash's per-call setup dominates at that size — so a fast hasher looks
+    like an obvious win. Implemented (FxHash with the `rotate_left(20)`
+    finalizer, wired into `token_to_id`, `merge_ranks`, both id sets and the
+    pre-token cache) and A/B'd against SipHash on a **frozen** corpus,
+    three repeats each:
+
+    | | SipHash | FxHash |
+    |---|---|---|
+    | cold cache | 90.68 / 91.12 / 92.35 ns/byte | 90.31 / 90.60 / 89.94 |
+    | cache OFF (merge-heavy) | 173.8 / 153.7 / 154.0 | 153.8 / 154.5 / 155.8 |
+
+    ⛔ **The first measurement said +8–10 % and was wrong.** The bench's default
+    corpus is *files from this repository*, which the same session had been
+    editing — 113 KiB became 120 KiB of different text between the two runs.
+    Freezing the corpus made the difference vanish. Any tokenizer A/B must pin
+    its input.
+
+    What it teaches: **hashing is not the bottleneck.** At ~154 ns/byte with
+    the cache off and ~30 000 pre-tokens over 123 KiB, that is ~600 ns per
+    ~4-byte pre-token — far more than its handful of map lookups can account
+    for. The next attempt should *profile* rather than reason from where the
+    calls are.
+
+    Two by-products worth keeping even though the change was reverted:
+    * `Vocab::specials_by_len` was sorted by length only, **stably**, over a
+      `HashSet` iteration — so equal-length special tokens kept hash order and
+      `find_special` picked between them arbitrarily. A latent bug that any
+      hasher change would have exposed as moved token ids. Now sorted by
+      `(Reverse(len), text)`. **Fixed and kept.**
+    * FxHash's low bits are its weakest (multiplication propagates entropy
+      upward) and `hashbrown` indexes buckets with exactly those. If this is
+      ever revisited, the finalizer matters: measured 814 of 1024 buckets
+      without a final rotate against an ideal of ~885.
+
+T2. **Splitting one input across threads** — REJECTED: **not correct**, not
+    merely unprofitable. See
+    `pretok::tests::splitting_the_input_changes_the_segmentation`. `\s+(?!\S)`
+    keeps a whitespace run whole when it reaches end-of-input and surrenders
+    its last character when it does not, so *any* cut re-segments the seam.
+    The intuitive safe point — immediately after a newline — is a
+    counterexample under the GPT-2 shape: `"a \nb"` segments as
+    `"a" · " " · "\n" · "b"` whole and `"a" · " \n" · "b"` when cut.
+    **Inter-request parallelism is unaffected and already works**:
+    `GllmTokenizer` is `Sync` and its scratch is thread-local.
+
+T3. **SWAR and dual-cursor ILP in the pre-tokenizer** — NOT REJECTED, but
+    **deprioritised, and dual-cursor matches entry 5 above by mechanism.**
+    Gigatoken reports 380 → 1049 MiB/s from these. Pre-tokenization is ~3 % of
+    encoding here (4.9 of ~154 ns/byte), so the ceiling on both together is
+    ~2 % end-to-end. Dual-cursor ILP is the *same shape* as the row-tile GEMM
+    lead this repo has already rejected twice for winning in a probe and going
+    neutral in production.

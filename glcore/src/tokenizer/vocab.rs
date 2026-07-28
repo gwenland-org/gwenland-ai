@@ -169,7 +169,19 @@ impl Vocab {
             })
             .collect();
         // Longest first so `<|im_start|>` wins over a hypothetical `<|im`.
-        specials_by_len.sort_by_key(|s| std::cmp::Reverse(s.0.len()));
+        //
+        // ⛔ The tiebreak is not cosmetic, and it is a latent bug without it.
+        // This list is built by iterating a `HashSet`, so its input order is
+        // whatever the hasher produced; a length-only sort is *stable*, which
+        // means two specials of equal length keep that arbitrary order — and
+        // `find_special` prefers whichever comes first at an equal position.
+        // Any change to the hasher would then move token ids, with nothing to
+        // show for it. Found while evaluating a hash swap; the swap was
+        // rejected, this stays.
+        //
+        // `(Reverse(len), text)` is a total order over distinct tokens, so the
+        // result cannot depend on the hasher at all.
+        specials_by_len.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
 
         let mut stop_ids: std::collections::HashSet<u32> = STOP_TOKEN_STRINGS
             .iter()
