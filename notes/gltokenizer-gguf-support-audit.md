@@ -335,3 +335,84 @@ byte-identical ids before and after.
 `glcore::format` and `runtime::GlprocBackend`, both behind optional features it
 does not declare. It compiles under workspace feature unification, which is why
 the workspace build is green. Untouched by this work.
+
+---
+
+## 8. Addendum 2026-07-28 — pre-token cache
+
+Merging dominates encoding: pre-tokenization measures ~4.9 ns/byte against
+~180 ns/byte for a whole encode, so **the merge loop is ~97 % of the cost**.
+Real text is long-tailed — measured on 113 KiB of this repo's own prose and
+Rust source, **3 460 distinct pre-tokens carry 28 624 occurrences**, so the
+same word is merged to the same ids ~8 times over.
+
+A thread-local `HashMap<pre-token, ids>` replays that result instead.
+
+| | ns/byte | MB/s | vs OFF |
+|---|---:|---:|---:|
+| cache OFF | 176.7 / 186.2 | 5.7 / 5.4 | — |
+| **cold each pass** (fresh document) | 106.9 / 99.4 | 9.4 / 10.1 | **1.65× / 1.87×** |
+| warm (long-lived process) | 51.9 / 50.8 | 19.3 / 19.7 | 3.41× / 3.67× |
+
+⚠️ **Quote the cold number.** The bench encodes one input 40 times; a cache
+left warm across those passes answers "how fast is re-encoding a document you
+have already seen", which no server does. Cold clears before every pass, so the
+only hits are *within* one document — hit rate **87.9 %**.
+
+⛔ **The corpus is the measurement.** An earlier bench built its input by
+repeating one sentence; that scores ~100 % and reports a speedup no real
+workload reproduces. The default corpus is now real repository files.
+
+### Correctness gates
+
+The cache never changes ids — it replays what the merge engine already
+produced for the identical pre-token under the identical vocabulary. Three
+things enforce that rather than assert it:
+
+* `tests/tokenizer_parity.rs` scores **every reference vector twice**, cache on
+  and off, and fails on any difference. All 14 families, not one sampled string.
+* `pretoken_cache_is_transparent` — unit-level, repeated-word inputs.
+* ⛔ `pretoken_cache_does_not_leak_between_tokenizers` — the failure mode this
+  design actually risks. The cache is thread-local, so two tokenizers on one
+  thread share storage; without `Scratch::cache_owner` the second reads the
+  first's ids back. Both tokenizers work perfectly alone, so nothing else in
+  the suite would catch it. **Verified by mutation**: deleting the owner check
+  makes exactly this test fail, with tokenizer B returning A's ids.
+
+### ⭐ Resolved: the "3.4× codegen gap"
+
+Recorded earlier as an unexplained difference between the tokenizer built
+inside `glcore` (2.7 ns/byte) and as a separate crate (9.3 ns/byte), with
+identical source. It is neither LTO nor inlining: `Cargo.toml` carries
+`[profile.release.package.glcore] opt-level = 3`, and the standalone
+`gltokenizer` crate had **no override**, so it inherited the workspace default
+`opt-level = "z"` — optimise for *size*. Rebuilding `gltokenizer` at `da82a27`
+with `opt-level = 3` gives **2.70 / 3.01 ns/byte**, matching glcore's
+2.73 / 3.06.
+
+So the step-4D extraction did make the tokenizer ~3.4× faster in production
+builds, for a mundane and fully explicable reason.
+
+### Where this sits against the state of the art
+
+Gigatoken (Rød, 2026) reports 24.53 GB/s on a 144-core EPYC — **~170 MB/s per
+core**, and its headline "989× faster than HuggingFace" is against HF's
+24.8 MB/s, in a mode that trades exact output parity; its *exact* mode is
+200–300×, and SentencePiece families gain only 7–22×.
+
+Its published techniques, against ours:
+
+| Technique | Here |
+|---|---|
+| Hand-written pre-tokenizer replacing regex (47 → 380 MiB/s) | ✅ since the rewrite |
+| 256-byte class table, O(1) first-byte dispatch | ⚠️ 128-entry ASCII bitmap |
+| Pre-token caching | ✅ this section |
+| SWAR — 8 bytes as a `u64`, branchless class test | ❌ |
+| Dual-cursor ILP (380 → 1049 MiB/s) | ❌ |
+
+Our pre-tokenizer measures ~205 MB/s on this corpus, in the same band as their
+hand-written-state-machine milestone. ⚠️ The remaining two techniques target
+the ~3 % of encoding that pre-tokenization occupies, and dual-cursor ILP is
+the *same shape* as the row-tile GEMM lead this repo has already rejected twice
+for winning in a probe and going neutral in production. Neither is the next
+move.
