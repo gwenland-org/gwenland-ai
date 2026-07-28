@@ -178,15 +178,16 @@ scales, 32-element blocks — all correct to ~2e-05.
 | # | Path | Measured | Verdict |
 |---|---|---|---|
 | **1** | **Host-side dequant** → dense f32 → plain `dot_general` | 848 µs · 17.46 MB | ✅ **Default.** Fastest, works on every backend including unprobed ones, saves no memory |
-| **2** | ⭐ **Tile streaming** — `while` over the contracting dim | **1100 µs · 6.10 MB** | ✅ **The quantized path.** 1.30x the time for 2.86x less memory. Chosen by cost model (§5) |
-| **3** | Blockwise IR over the whole weight, as **arguments** | 3932 µs · 22.36 MB | ⛔ **Never by default.** 4.64x slower than f32 *and* more total memory than path 2. Kept only as the comparison baseline, and as the shape a genuinely-fusing backend would want |
+| **2** | ⭐ **Tile streaming** — `while` over the contracting dim | **decode: 1100 µs · 6.10 MB (1.30x f32)** · prefill M=512: 44 079 µs ⛔ | ✅ **The DECODE path.** 1.30x the time for 2.86x less memory. ⛔ Collapses at scale — 1.86x slower than whole-weight at M=512 |
+| **3** | Blockwise IR over the whole weight, as **arguments** | decode: 3932 µs ⛔ · **prefill M=512: 27 223 µs (1.15x f32)** | ✅ **The PREFILL path.** 4.64x slower than f32 in decode, but nearly free once one materialisation serves 512 tokens |
 | **4** | Blockwise IR, weights as **constants** | folded to f32 | ⛔ **Never.** Same memory as path 1, longer compile, no benefit |
 | **5** | `!quant.uniform` / `uniform_quantize` | PARSE-FAIL | ⛔ **Unrunnable.** Do not emit |
 | **6** | Custom call to a vendor INT8 GEMM | — | ⛔ **Violates P1**; gljax owns no kernels |
 
-⭐ Paths 1 and 2 are both correct and both defensible; **which one wins is a
-property of the deployment, not of the backend.** That is why §5 replaces v1's
-capability enum with a cost model.
+⭐⭐ Paths 1, 2 and 3 are all correct, and **which one wins is a property of
+the phase and the deployment, not of the backend**. There is no single right
+answer to select at load time — that is why §5 replaces v1's capability enum
+with a cost model, and why §3.2 makes delivery per-phase.
 
 ---
 
@@ -261,9 +262,56 @@ model's decision, not a capability flag's** — see §5.
    measured 9.26 MB against reduction tiling's 1.19 MB, because under reduction
    tiling the accumulator stays `[m, n]` and only `[tile_k, n]` is ever live.
 
-⚠️ Measured at **batch 1** only. Prefill amortises a materialised weight across
-many tokens and may invert the ranking — §9 question 3, now the most valuable
-open item rather than a speculative one.
+## 3.2 ⭐⭐ The ranking inverts at scale — delivery is PER-PHASE
+
+The batch-1 result above raised an obvious doubt: a materialised weight is
+built once and reused by every token, so prefill should amortise it. It does,
+and the crossover is sharp
+([`batch_crossover_probe.py`](../probes/batch_crossover_probe.py)):
+
+| M | f32 | whole-weight | tile 32 | tile 128 | winner | vs f32 |
+|---:|---:|---:|---:|---:|---|---:|
+| 1 | 831.6 | 3557.4 | 1095.5 | **1085.6** | tile | 1.31× |
+| 4 | 956.1 | 3898.4 | 1551.2 | **1359.7** | tile | 1.42× |
+| 16 | 1341.2 | 4258.7 | 2428.9 | **2038.2** | tile | 1.52× |
+| 64 | 3611.8 | 6902.4 | 7891.7 | **6169.8** | tile | 1.71× |
+| 256 | 11573.9 | **15072.8** | 44932.2 | 21886.4 | **whole** | 1.30× |
+| 512 | 23760.0 | **27223.5** | 84303.0 | 44079.3 | **whole** | **1.15×** |
+
+*(microseconds, best-of-N, weight `[896, 4864]`, block 32)*
+
+⭐ **Crossover between M = 64 and M = 256.**
+
+* **M ≤ 64 — decode.** Tile streaming wins by up to **3.3×** over whole-weight.
+  Nothing amortises: one token reuses the dequantised weight once.
+* **M ≥ 256 — prefill.** Whole-weight wins by up to **2×** over tiling, and at
+  M = 512 costs only **1.15×** an f32 baseline. One 17.4 MB materialisation
+  serves 512 tokens. ⭐ **Quantization is nearly free in prefill.**
+* ⛔ **Tile streaming degrades badly with M** — 84 303 µs at M = 512, i.e.
+  **3.55× slower than f32**. Each scan step becomes a `[M, tile_k] × [tile_k, N]`
+  dot, and loop overhead plus poor blocking dominate.
+* `tile_k = 128` beats `tile_k = 32` at every M > 1: fewer, larger steps.
+
+⭐⭐ **Therefore `WeightDelivery` is a per-phase choice, not a per-model one:**
+
+```
+   decode  (M small) ─► EmitTileStream { tile_k: 128 }   ~1.3x f32, 2.9x less memory
+   prefill (M large) ─► EmitBlockwise                    ~1.15x f32, 3.6x less memory
+```
+
+⚠️ This also **qualifies §Q4**: "whole-weight dequant is a bandwidth
+regression" is true for decode and **false for prefill**. The v1 mistake was
+assuming one answer; the v2 mistake would be assuming the *opposite* one answer.
+
+⚠️ The crossover is a property of `(weight shape, block, machine)`, not a
+constant. §5's cost model must measure it per deployment — which is exactly
+what this probe does, and why it ships with the engine rather than as a
+one-off.
+
+⭐ Note that glproc reached the same per-stage conclusion independently, for
+its own CPU kernels, from a completely different measurement. Two engines
+converging on it is a reason to treat per-phase dispatch as structural rather
+than as a local optimisation.
 
 This inverts v1, which emitted quantized IR by default and treated fallback as
 the exception.
@@ -572,12 +620,12 @@ pub fn gate(layer: &Layer, probe: ProbeVerdict) -> WeightDelivery {
 2. ⚠️ **Do donated buffers change the CPU verdict?** The measurement used
    ordinary arguments. If donation lets XLA dequantise in place, the temp cost
    changes character. Untested, and cheap to test.
-3. ⭐ **Does batch size move the line?** Measured at batch 1. Prefill amortises
-   a materialised weight across many tokens, so `MaterialisesPerCall` may be
-   acceptable for **prefill** and not for **decode** — which would make delivery
-   a *per-phase* choice, not a per-model one. Worth flagging that glproc reached
-   the same per-stage conclusion independently for its CPU kernels; when two
-   engines converge on it, it is probably structural.
+3. ✅ **ANSWERED — yes, and it inverts the ranking.** Measured across
+   M = 1…512 (§3.2): tile streaming wins below the crossover, whole-weight
+   dequant wins above it, and the crossover sits between M = 64 and M = 256.
+   Delivery is a **per-phase** choice. What remains open is narrower and
+   concrete: **where exactly the crossover lands for other weight shapes and
+   block sizes**, which the cost model measures rather than assumes.
 4. ⚠️ **What does the StableHLO Quantizer emit?** §Q2 unresolved. Only matters
    if gljax ever ingests a Quantizer-produced module, which it does not today.
 5. 🕐 **GQ2A** (2.625 bpw, three scale levels) is not designed here. It extends
