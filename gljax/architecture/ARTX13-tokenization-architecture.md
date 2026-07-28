@@ -1,7 +1,9 @@
 # ARTX13 — Tokenization Architecture
 
 **Series:** gljax (Sanctum Visibilia) Architecture Research
-**Status:** Draft — research-grounded; **§0.2 wave A13.0 IMPLEMENTED and measured** (`glcore/gltokenizer`)
+**Status:** Draft — research-grounded; **§0.2 wave A13.0 IMPLEMENTED, measured, extracted and
+optimised** (`glcore::tokenizer`). See §0.4 for the current state; the sections below preserve the
+investigation that got there, because each mistake in it is one this design invites.
 **Depends on:** ARTX04 (checkpoint loading), ARTX11 §3.2 (cross-vocabulary speculation), ARTX16 §1.2 (request lifecycle)
 **Introduces:** `gljax/src/tok/`
 **Next:** [ARTX14 — Sampling & Logits Processing](ARTX14-sampling-and-logits-processing.md)
@@ -27,8 +29,9 @@ becomes IDs or how IDs become text. ARTX13 closes the input side; ARTX14 closes 
 
 ## 0.2 GwenLand had a tokenizer — it was measured, found wrong, and replaced
 
-`glcore/src/tokenizer.rs` — 796 lines, from scratch, zero ML dependencies. ⚠️ Still present and still
-used by 12 callers; superseded by `glcore/gltokenizer` (§0.2.2). Its own module doc:
+`glcore/src/tokenizer.rs` — 796 lines, from scratch, zero ML dependencies. ⛔ **Deleted.** It was
+superseded by a rewrite (§0.2.2), then every caller was migrated, then the file was removed. Its
+module doc, kept because §0.2.1 is an argument about what it claimed:
 
 > BPE tokenizer, written from scratch. Two vocabulary styles are supported, covering the models GGUF
 > files ship: **SPM style** (llama family) — tokens use `▁` for spaces, merging is driven by
@@ -92,8 +95,8 @@ its inputs wrong**. The round-trip tests passed throughout, because they tested
 `decode(encode(x)) == x` rather than `encode(x) == reference` — and §0.2.1's compensating error made
 the round trip hold while the ids were wrong.
 
-⚠️ **DESIGN DECISION — the tokenizer was rewritten, not hardened.** `glcore/gltokenizer` is a new
-crate: an original BPE implementation written from the algorithm's definition. Three defects only the
+⚠️ **DESIGN DECISION — the tokenizer was rewritten, not hardened.** It began as a new crate
+(`glcore/gltokenizer`, since folded into `glcore::tokenizer` — §0.4): an original BPE implementation written from the algorithm's definition. Three defects only the
 parity harness could find:
 
 1. **Merge rules keyed by concatenation.** A merge list is a list of *pairs*; different splits of the
@@ -116,16 +119,16 @@ parity harness could find:
 ⚠️ Reported per regime rather than as one number: a combined mean is the SPM figure in disguise, and
 the two have different causes.
 
-⚠️ **Four families are refused rather than partially supported**, per §2.3's rule: `command-r`
-(45/46 — diverges on one long-whitespace vector; cause is in merge application, unresolved),
-`falcon` (extra leading punctuation arm), `qwen35` (unknown pre-tokenizer name), `gemma-4`
-(tokenizer model is not BPE). ⛔ **`gemma-4` being unsupported is a live problem for ARTX11 §4**,
-which names Gemma as the multi-architecture target.
+⚠️ Four families were refused at this point rather than partially supported, per §2.3's rule.
+**All four have since been closed** — see §0.4, which also corrects the diagnosis recorded here for
+two of them.
 
-⚠️ **Migration has not happened.** Twelve files still call `glcore::tokenizer`. Switching them
-changes token ids and therefore moves every perplexity number in the repo — including the ~46%
-glproc/llama.cpp gap, whose tokenization was verified for exactly one model. That is a decision to
-take deliberately, one caller at a time.
+⚠️ **Migration had not happened** when this was written; twelve files still called the old module.
+It has since completed, and the result was measured rather than assumed: on Qwen2.5 the ids came out
+**identical** (819/819 on WikiText-2, 201/201 on the glbench prompt) and perplexity landed at 36.19
+against the 36.12 baseline. ⛔ That is neutrality **for Qwen2.5 only**. The old implementation scored
+65.2 %–97.8 % across families, so for Llama-3 and SPM the ids necessarily moved; no model was
+available to measure it.
 
 ## 0.3 What ARTX13 actually specifies
 
@@ -134,6 +137,102 @@ take deliberately, one caller at a time.
 3. **Chat templating** — the layer above encode (§3)
 4. ⭐ **Incremental detokenization** — the streaming problem, and why it is not `decode(one_token)` (§4)
 5. **Cross-vocabulary support** for ARTX11 (§5)
+
+---
+
+## 0.4 ✅ Current state — what gljax can actually depend on
+
+`glcore::tokenizer` (was the `gltokenizer` crate; folded in, and the old module of that name
+deleted). Type: `GllmTokenizer`. Architecture and traps: `glcore/src/tokenizer/README.md`.
+
+| Status | Vocabularies |
+|---|---|
+| ✅ **exact** (14) | qwen2 · qwen35 · llama-bpe · llama-spm · gpt-2 · starcoder · refact · mpt · command-r · phi-3 · gemma-4 · falcon |
+| ⚠️ exact, shape approximated | deepseek-coder · deepseek-llm |
+| ⛔ refused | gpt-neox · aquila |
+| 🕐 loads, unverifiable | baichuan |
+
+⚠️ The two **shape-approximated** entries matter to §5. Both score 46/46, which is the same evidence
+every other entry rests on — but llama.cpp gives each a multi-*expression* pipeline rather than the
+single arm this implementation uses, and `\s?\p{L}+` lets a newline lead a word where the Qwen2 arm's
+`[^\r\n\p{L}\p{N}]?` excludes it. They agree everywhere the corpus reaches and are **known** to
+differ somewhere it does not. A cross-vocabulary claim built on deepseek should say so.
+
+⚠️ `gpt-neox` and `aquila` used to load and **should not have**. Neither carries a
+`tokenizer.ggml.pre` key, so both reach llama.cpp's `default` arm — a four-expression fallback, not
+the GPT-2 shape they were being given. The shape is now expressible; they stay refused because
+neither ships reference vectors, so enabling them would claim support that cannot be measured.
+
+### ⛔ 0.4.1 The defect this document should have predicted
+
+§0.2.2 lists three defects only a parity harness could find. A later audit found a fourth, and it is
+the one most relevant to ARTX13's own design:
+
+> **The pre-tokenizer name table was wrong for 13 of 24 entries**, and *not one of the wrong rows
+> was reachable by any test.*
+
+GGUF names its pre-tokenizer (`tokenizer.ggml.pre`), and the table mapped that name onto a splitter
+shape by grouping names that *look* related. llama.cpp assigns them by which `regex_exprs` arm the
+name reaches, and the two groupings are not the same function — `default` is not the GPT-2 shape,
+`codeshell`/`smollm`/`exaone` are starcoder rather than cl100k, `chatglm-bpe` groups three digits
+not one, and `smaug`/`poro` were not llama.cpp names at all.
+
+**The lesson generalises past tokenizers**, which is why it belongs in an architecture document:
+a lookup table keyed on a *name* rather than on the property that actually varies is a
+silent-wrongness factory, and its wrong rows are exactly the ones no test reaches. §2.3's
+"refuse rather than approximate" rule is necessary but was not sufficient — the table was refusing
+correctly and *mapping* incorrectly.
+
+## 0.5 Measured throughput, and one constraint ARTX16 inherits
+
+i3-1115G4, best-of-40, a **frozen** 120 KiB corpus of prose and Rust source, Qwen2.5 vocabulary.
+
+| | ns/byte | MB/s |
+|---|---:|---:|
+| pre-tokenizer alone | 4.95 | ~205 |
+| full encode, cache OFF | 120–128 | 7.8–8.3 |
+| **full encode, cold cache** | **50–53** | **18.9–20.1** |
+| full encode, warm cache | 14.1 | ~71 |
+
+**Quote the cold number.** Warm answers "how fast is re-encoding a document you have already seen",
+which no server does; it is the upper bound a long-lived process with repetitive traffic approaches.
+
+⭐ **The largest win came from profiling, not from any technique in the literature.** Two rounds of
+reasoning about where the time went were wrong. The actual hot spot was `find_special`, which ran
+one full-text substring search **per special token** — 22 of them for Qwen2.5, so a 120 KiB prompt
+was scanned for 2.6 MiB before a byte was tokenized, at **71 % of a warm encode**. One pass with a
+first-byte skip table took it to ~1 %. `examples/tokenizer_profile.rs` found it in a single run.
+
+⚠️ For ARTX13's purposes the transferable part is the *shape* of that bug: the cost scaled with the
+**vocabulary's** special-token count on input that usually contains none of them. Any design that
+loops over vocabulary entries per input should be checked for the same shape.
+
+### ⛔ 0.5.1 Tokenizing one prompt cannot be parallelised — ARTX16 §2 must assume this
+
+The obvious parallelisation — cut the input into chunks, tokenize independently, concatenate — needs
+a split point the segmentation is invariant under. **There is none**, and the intuitive candidate is
+a counterexample: `\s+(?!\S)` keeps a whitespace run whole when it reaches end-of-input and
+surrenders its last character when it does not, so cutting re-segments the seam. Under the GPT-2
+shape, `"a \nb"` segments as `"a" · " " · "\n" · "b"` whole and `"a" · " \n" · "b"` cut immediately
+after the newline. Pinned by `pretok::tests::splitting_the_input_changes_the_segmentation`.
+
+**Consequences for ARTX16's pipeline (its §2 step 3, "Tokenize prompt — host side"):**
+
+* **Per-request parallelism is free and already works.** `GllmTokenizer` is `Sync` and its scratch
+  and cache are thread-local, so N requests tokenize on N threads with no coordination.
+* **Per-prompt parallelism is unavailable.** A single 1 MB prompt costs ~50 ms of *serialised* host
+  time at the cold-cache rate. For a long-context request that is real time-to-first-token, and it
+  cannot be hidden by adding cores.
+* ⚠️ The cache is **per thread**, so a work-stealing pool spreads one model's traffic across N
+  independent caches. A thread-pinned or thread-affine assignment keeps hit rates up; a naive pool
+  divides them.
+
+Rejected with numbers, recorded in `gl-agent-skills/cpu-skills/rejected-optimizations.md` (T1–T4):
+a faster hasher (neutral — hashing is not the bottleneck), splitting one input across threads
+(incorrect, above), streaming pre-tokens instead of buffering them (8 % slower on the miss path),
+and SWAR/dual-cursor ILP (deprioritised — pre-tokenization is ~38 % of a *warm* encode but the
+techniques cap at ~2 % end-to-end, and dual-cursor is a shape this repo has rejected twice
+elsewhere).
 
 ---
 
@@ -459,7 +558,7 @@ glserve/src/api/
 
 | Wave | Scope | Gate |
 |---|---|---|
-| **A13.0** ✅ | **DONE — rewritten as `glcore/gltokenizer`.** Zero-allocation merge engine, hand-written pre-tokenizer, GGUF vocab reader | ✅ **10 vocabularies at 46/46 exact** against llama.cpp's reference vectors. 4 refused rather than partially supported. `glcore/tests/tokenizer_before_after.rs` holds the before/after. |
+| **A13.0** ✅ | **DONE — rewritten, then extracted to `glcore::tokenizer`.** Zero-allocation merge engine, hand-written pre-tokenizer, exact Unicode category tables, GGUF vocab reader, pre-token cache | ✅ **14 vocabularies exact** against llama.cpp's reference vectors, enforced by `glcore/tests/tokenizer_parity.rs` on every build. Architecture: [`glcore/src/tokenizer/README.md`]. ⚠️ The before/after harness was deleted with the old implementation; its result is recorded in §0.2.2. |
 | **A13.1** ◐ | `Tokenizer` trait + `VocabFingerprint` — ⚠️ **the concrete type exists; the trait and fingerprint do not yet** | Round-trip holds; fingerprint still to build |
 | **A13.2** | `validate.rs` | Vocab/model mismatch is refused at `Session::new`, not at first token |
 | **A13.3** | ⭐ `stream.rs` | **No `�` ever emitted mid-stream** for a corpus of multi-byte text; concatenated deltas == whole-sequence `decode` |
@@ -474,22 +573,32 @@ at once, and it is cheap to assert on every streaming test.
 ## 6.1 Open questions
 
 0. ✅ **ANSWERED — it did not.** Every vocabulary was wrong, worst case 30/46 (§0.2.2). Closed by
-   rewriting rather than hardening. The replacement is at 46/46 on ten families.
-0b. ⛔ **NEW — `gemma-4` is unsupported.** Its `tokenizer.ggml.model` is `gemma4`, not BPE, so the
-   new crate refuses it. ARTX11 §4 names Gemma as *the* multi-architecture target, so this must be
-   closed before A11.0 can claim Gemma support.
-0c. ⚠️ **NEW — `command-r` diverges on one vector** in merge application, not splitting (§0.2.2).
-   Refused for now. Worth understanding, because whatever causes it may affect other vocabularies
-   that simply lack a vector to expose it.
+   rewriting rather than hardening. The replacement is exact on **fourteen** families (§0.4).
+0b. ✅ **CLOSED — `gemma-4` is supported at 46/46.** It was not a pre-tokenizer gap at all: it
+   declares a third *encoding style* (SentencePiece surface form, merge-**list** ranking, no
+   word-level splitting), now `Style::SpmBpe` + `PreTok::Lines`. **This unblocks ARTX11 §4.**
+   ⛔ Its vocabulary ships 262 144 scores *and* 514 906 merges; only the merges are used, and
+   believing the scores produces different ids with no error anywhere.
+0c. ✅ **CLOSED — and the recorded diagnosis was wrong.** `command-r` reaches **46/46** under the
+   starcoder splitter, which is exactly what llama.cpp assigns it. The miss was in *splitting*, not
+   in merge application. ⚠️ Worth keeping as a warning: a plausible cause was written down, believed
+   for a week, and was not the cause.
 1. **SPM window size** (§4.2) — how many trailing tokens must be re-decoded for correct spacing?
    Measure; do not guess.
 2. **Padded vocabularies** (§2.3) — the legitimate `tok.vocab_size() < model.vocab_size` case needs
    ARTX12 Part A's config parsing to distinguish it from a real mismatch.
-3. **Does `glcore::tokenizer` handle Gemma's vocabulary?** ARTX11 §4 requires multi-architecture
-   support; glcore's doc names llama and gpt2/qwen families. Gemma is SentencePiece-based and should
-   fit the SPM path, but this is **unverified**.
-4. **Dependency weight** — does depending on `glcore` pull GGUF parsing and quantization kernels into
-   gljax's build? If so, the tokenizer may need extracting into its own crate.
+3. ✅ **ANSWERED — yes, at 46/46, but not the way this question assumed.** Gemma-4 does *not* fit
+   the SPM path: it uses a merge list, not scores. Running the SPM encoder over it would have
+   produced wrong ids silently. See 0b.
+4. ⛔ **Dependency weight — now the live one, and it got heavier.** The tokenizer was a standalone
+   crate; step 4 folded it **into** `glcore`, so a gljax dependency on `glcore::tokenizer` pulls
+   GGUF parsing and the quantization kernels with it. That trade bought an `opt-level = 3` override
+   the standalone crate never had (**3.4× measured**, §0.5) and one fewer crate to keep in sync. If
+   gljax's build weight becomes a problem, the fix is a Cargo feature that compiles `glcore` down to
+   its tokenizer, not another extraction.
+5. ⚠️ **Does the pre-token cache belong in a multi-tenant server?** It is thread-local and bounded
+   (§0.5), so it cannot leak between requests on one thread — but its *hit rate* is a property of
+   the traffic, and a shared host with adversarial prompts is a case nobody has measured.
 
 ---
 
@@ -497,7 +606,7 @@ at once, and it is cheap to assert on every streaming test.
 
 | # | Decision | Rationale | Reversible? |
 |---|---|---|---|
-| D0 | ⛔ **`glcore::tokenizer` is treated as UNVERIFIED; Wave A13.0 hardening blocks all reuse** | 9 tests, synthetic ~296-token fixtures, ASCII only; both merge paths disabled by construction (`vec![0.0; n]`, "no merges"). One hand-made real-vocab check exists, from an unrelated investigation | N/A |
+| D0 | ✅ **SUPERSEDED — the suspicion was right and the code is gone.** A13.0 ran: every vocabulary was wrong, so the tokenizer was rewritten rather than hardened, and the original file deleted | 9 tests, synthetic ~296-token fixtures, ASCII only; both merge paths disabled by construction (`vec![0.0; n]`, "no merges"). Reuse is now gated on `tokenizer_parity.rs`, which scores 14 families against reference **data** on every build | N/A |
 | D1 | Reuse `glcore::tokenizer` (after D0); do not write a second BPE | 796 lines, both vocab families, both load paths — a third implementation would be a third place for the same bug | Medium |
 | D2 | Depend on a `Tokenizer` **trait**, not on `glcore` directly | ARTX11 needs two live vocabularies simultaneously — real polymorphism | Trivial |
 | D3 | `vocab_fingerprint` is **computed**, never trusted from metadata | ARTX11's `Identical` is a correctness precondition; a name is not evidence | Trivial |

@@ -23,7 +23,9 @@ The series specifies a complete engine. It is a design, and every wave gate in i
 tested, not a result. **Where a document reports a number, that number came from published research
 or from a *different* GwenLand engine — never from gljax.**
 
-What *does* exist in-repo and is referenced: `glcore::tokenizer` (⚠️ unvalidated — ARTX13 §0.2),
+What *does* exist in-repo and is referenced: `glcore::tokenizer` (✅ **14 vocabulary families
+exact** against reference vectors, enforced on every build — ARTX13 §0.4; it was measured wrong and
+rewritten, see §0.2.2),
 `glbench` (KL divergence, validation harnesses), `glproc`/`glcuda` (measured CPU/GPU results, cited
 as method not as evidence — ARTX08 Scope), and `architecture/Pridwen-proposal-v5.md` (GQ4A/GQ2A).
 
@@ -279,10 +281,12 @@ the accumulator is not FP32.**
 
 Ranked by how much downstream work rests on them.
 
-1. ⛔ **Does `glcore::tokenizer`'s merge logic match a reference?** Its 9 tests use synthetic ASCII
-   fixtures with `vec![0.0; n]` uniform scores and a "no merges" byte-level vocab — **both merge
-   paths are disabled by construction.** Every ARTX13 §5 vocabulary-overlap claim inherits this.
-   *(ARTX13 A13.0)*
+1. ✅ **ANSWERED — it did not, and the answer was worse than the question.** Scored against
+   llama.cpp's reference vectors, **not one vocabulary was correct**; the worst got a third of its
+   inputs wrong while every round-trip test passed. Closed by rewriting rather than hardening.
+   `glcore::tokenizer` is now at **14 vocabulary families exact**, enforced on every build.
+   ⚠️ Two carry a stated caveat that ARTX13 §5's overlap claims still inherit — see ARTX13 §0.4.
+   *(ARTX13 §0.2.2, §0.4)*
 2. ⭐ **Does `CudnnFusedMHARewriter` fire for GQA, and for Gemma?** ARTX11's query pre-attention
    scalar and QK-norm insert ops into the matched region. If it does not fire, prefill attention
    memory is bounded only by chunk size. *(ARTX09 §7.1)*
@@ -333,6 +337,11 @@ should not plan to match vLLM's quantized throughput. The bet is portability and
 performance obtained where the backend already provides it.
 
 **"What's most likely to go wrong?"**
-→ §2's P4 and §6's open questions. The tokenizer (unvalidated), the attention rewrite (unverified),
-and the quantization fusion (unprobed) are three load-bearing assumptions that are all currently
-unmeasured.
+→ §2's P4 and §6's open questions. Of the three load-bearing assumptions this once listed, **the
+tokenizer has been measured** — it was wrong, and is now 14 families exact. That leaves the attention
+rewrite (unverified) and the quantization fusion (unprobed).
+
+⚠️ The tokenizer is worth reading as the *calibration* for the other two, not as reassurance. It was
+the assumption that looked safest — an existing, working, from-scratch implementation with passing
+tests — and it was the one that turned out to be wrong in every vocabulary. Neither of the remaining
+two has even that much evidence behind it.
