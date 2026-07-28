@@ -29,9 +29,9 @@ cargo test  -p gltokenizer --release            # enforces it
 | `command-r` | gpt2 / command-r | **46/46** | ✅ supported — **newly closed** |
 | `phi-3` | llama / default | **46/46** | ✅ supported |
 | `gemma-4` | gemma4 / — | **46/46** | ✅ supported — **newly closed** |
+| `falcon` | gpt2 / falcon | **46/46** | ✅ supported — **closed 2026-07-28, §4.1** |
 | `deepseek-coder` | gpt2 / deepseek-coder | **46/46** | ⚠️ supported, *shape approximated* — §3.2 |
 | `deepseek-llm` | gpt2 / deepseek-llm | **46/46** | ⚠️ supported, *shape approximated* — §3.2 |
-| `falcon` | gpt2 / falcon | 44/46 best probe | ⛔ **refused** — §4.1 |
 | `gpt-neox` | gpt2 / *(absent)* | — | ⛔ **refused** — §4.2 |
 | `aquila` | gpt2 / *(absent)* | — | ⛔ **refused** — §4.2 |
 | `baichuan` | llama / *(absent)* | — | 🕐 loads (SPM), **no reference vectors** — §4.3 |
@@ -121,20 +121,21 @@ ARTX11 §4** (Gemma named as the multi-architecture target).
 
 ## 3. Supported, with a stated limit
 
-### 3.1 `qwen35` — passes 50/50, but on an approximation
+### 3.1 ~~`qwen35` — passes 50/50, but on an approximation~~ — **CLOSED**
 
-qwen35's pattern is qwen2's with the letter arm widened from `\p{L}` to
-`[\p{L}\p{M}]` (and `\p{M}` excluded from the punctuation arm). This crate
-carries no `\p{M}` table.
+Was: qwen35 widens the letter arm from `\p{L}` to `[\p{L}\p{M}]`, and the crate
+had no `\p{M}` table — it passed only because `char::is_alphabetic` is a
+superset of `\p{L}` that happens to absorb most combining marks.
 
-It passes anyway because `pretok::is_letter` is `char::is_alphabetic`, an
-already-documented superset of `\p{L}` that absorbs most combining marks. The
-corpus exercises this: vector #45 contains Khmer marks (U+17CB, U+17B7).
+**Closed 2026-07-28** by `src/unicode_tables.rs` (§6). `BpeSplit::QWEN35` now
+carries a real `marks_are_letters` axis over an exact `\p{M}`, and the residual
+case the corpus never covered — U+0301 COMBINING ACUTE, an `Mn` that is *not*
+`Other_Alphabetic` — is pinned by
+`pretok::tests::marks_attach_to_words_only_under_qwen35`.
 
-⚠️ **The residual gap is real and untested.** Marks outside `Other_Alphabetic`
-— e.g. U+0301 COMBINING ACUTE — are punctuation to us and letters to qwen35.
-No reference vector covers that case. Note also that the same approximation
-makes us *too permissive* for plain `qwen2`, in the opposite direction.
+⚠️ The same approximation had also made plain `qwen2` too *permissive*, in the
+opposite direction. That is fixed by the same change, and no family's parity
+moved: all 14 stayed exact across the swap.
 
 ### 3.2 `deepseek-coder` / `deepseek-llm` — measured exact, shape approximated
 
@@ -156,10 +157,12 @@ rather than left implicit.
 
 ## 4. Open items
 
-### 4.1 ⛔ `falcon` — diagnosed, blocked on Unicode tables
+### 4.1 ~~⛔ `falcon` — diagnosed, blocked on Unicode tables~~ — **CLOSED**
 
-Best probe 44/46 (cl100k shape). The cause is exact and known: falcon is a
-**three-stage pipeline**, not one arm.
+**Closed 2026-07-28 at 46/46.** Kept below because the diagnosis is the useful
+part: it was a *pipeline*, and no single arm could ever have reached it.
+
+Falcon is a **three-stage pipeline**, not one arm.
 
 ```
 1.  [\p{P}\$\+<=>\^~\|`]+          ← cut punctuation runs out first
@@ -172,25 +175,25 @@ rather than just adding cuts: on `"\n ="`, splitting `=` off first leaves `"\n "
 at end-of-segment, so `\s+(?!\S)` now keeps the whole whitespace run
 (→ `[1212, 40]`) where the one-pass scan yields `[193, 204, 40]`.
 
-**Blocker: stage 1 needs a real `\p{P}` table.** The crate's `is_punct` is
-"not space, not letter, not number", a superset that also catches emoji and
-symbols. Implementing falcon on that superset would be an approximation of
-exactly the kind refused elsewhere.
+The blocker was that stage 1 needs a **real `\p{P}`**. The crate's `is_punct`
+is the complement class "not space, not letter, not number", which also catches
+emoji and symbols — building falcon on it would have been exactly the kind of
+approximation refused elsewhere. Landing `unicode_tables.rs` (§6) removed the
+blocker, and `BpeSplit::FALCON` + `Passes` express all three stages directly.
 
-⭐ `\p{P}` and `\p{M}` are the *same* blocker: adding both closes falcon
-exactly **and** removes §3.1's caveat. That is the single highest-value next
-step for coverage, and it is a data problem, not a design one.
-
-### 4.2 ⛔ `gpt-neox`, `aquila` — deliberately lost coverage
+### 4.2 ⛔ `gpt-neox`, `aquila` — now a judgement call, not a capability gap
 
 Neither carries a `tokenizer.ggml.pre` key, so both reach llama.cpp's
 `default` arm — which is **not** the GPT-2 shape they were previously loaded
 as, but the 4-expression fallback in §2.1. llama.cpp itself logs
 `GENERATION QUALITY WILL BE DEGRADED` when a GGUF lands there.
 
-Neither has reference vectors, so the mis-split would never have been caught.
-Refusing is the honest response to missing metadata; supporting them means
-implementing the `default` pipeline, which shares falcon's `\p{P}` blocker.
+`BpeSplit::DEFAULT` now expresses that arm exactly (falcon's shape without the
+backtick, plus a `\p{N}+` pass), so the *capability* gap is closed. They stay
+refused for a different reason: **neither ships reference vectors**, so
+enabling them would mean claiming support this crate cannot measure, on models
+the upstream implementation itself calls degraded. A caller that wants them can
+construct the vocabulary directly with `BpeSplit::DEFAULT`.
 
 ### 4.3 🕐 `baichuan` — loads, unverifiable
 
@@ -212,5 +215,57 @@ right" or "it produces coherent text". Two families were added (`command-r`,
 `aquila`) because their status turned out to be "silently guessed".
 
 The audit is enforced, not just written down: `tests/parity.rs` fails the build
-if any of the thirteen regresses, **or** if any of the three refused families
-starts loading silently.
+if any of the fourteen regresses, **or** if either refused family starts
+loading silently.
+
+---
+
+## 6. Addendum 2026-07-28 — exact Unicode categories
+
+`src/unicode_tables.rs`, generated by `tools/gen_unicode_tables.py`, provides
+exact `\p{L}` `\p{M}` `\p{N}` `\p{P}`. This closed §3.1 and §4.1 together, as
+predicted.
+
+**Provenance.** Built from the UCD range table llama.cpp generates from
+`unicode.org/Public/UCD/latest/ucd/UnicodeData.txt`, and cross-checked
+codepoint-by-codepoint against CPython's independent `unicodedata`. The
+generator **aborts** if CPython classifies anything the primary table does not
+— that direction cannot be a version delta, so it would mean the extraction is
+wrong.
+
+⚠️ **Not Unicode 15.1 as the task specified.** This machine's CPython is 3.11 /
+UCD 14.0.0, so the cross-check is one revision behind the primary source. The
+one-directional deltas are reported in the generated file's header (`\p{L}`
+4970 codepoints, `\p{M}` 42, `\p{N}` 40, `\p{P}` 23) and are codepoints
+assigned after 14.0. The exact primary version is whatever UCD-latest the
+vendored llama.cpp checkout was generated from; it is not asserted here because
+nothing in the checkout records it.
+
+**Representation.** 1 298 sorted inclusive ranges plus a 128-entry ASCII
+bitmap: ASCII resolves in one array index, the rest binary-searches. A flat
+bitset over all 1 114 112 codepoints would be 136 KiB per class for no gain.
+
+**Cost.** ⛔ Not measurable on this machine. `examples/tokbench.rs` gave a **5×
+spread** across three back-to-back repeats of the identical binary (73.1 / 33.8
+/ 174.9 ns/byte, same case), which is far larger than any plausible effect of
+the swap. What can be said: the unit counts are byte-identical run to run, all
+14 families stayed exact across the change, and pre-tokenization is a small
+fraction of full encoding either way.
+
+### Relation to Peek2 (arXiv 2601.05833)
+
+The paper is real and its conclusion holds — but ⚠️ **this module was already
+regex-free and single-pass**, by a design decision recorded in `pretok.rs`'s
+header since the rewrite. Peek2's 1.11× is measured against a regex baseline
+this crate never had, so it is not a speedup available here.
+
+What the paper's framing *did* change is the character-class layer: precomputed
+category tables instead of `char::is_alphabetic`. That is a **precision** fix,
+and it is the one that closed falcon and qwen35.
+
+Linearity is asserted structurally rather than by timing —
+`pretok::tests::linear_on_pathological_input` feeds the scanner the uniform
+runs that make a backtracking NFA go quadratic, across all six shapes, and
+checks the split stays lossless. The scanner advances monotonically and never
+revisits a byte, so `O(n)` is a property of its construction, not of a
+measurement this machine cannot resolve.

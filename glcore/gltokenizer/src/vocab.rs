@@ -418,7 +418,16 @@ fn classify_regex(re: &str) -> Result<PreTok, TokError> {
     } else {
         1
     };
-    Ok(PreTok::Bpe(BpeSplit { modern: true, digit_run, space_digit: false }))
+    // Qwen-3.5 widens the letter arm to `[\p{L}\p{M}]`; every other modern
+    // pattern here leaves it at `\p{L}`.
+    let marks_are_letters = re.contains("\\p{L}\\p{M}") || re.contains("\\p{M}\\p{L}");
+    Ok(PreTok::Bpe(BpeSplit {
+        modern: true,
+        digit_run,
+        space_digit: false,
+        marks_are_letters,
+        ..BpeSplit::QWEN2
+    }))
 }
 
 fn find_bytelevel_flag(v: Option<&serde_json::Value>, key: &str) -> Option<bool> {
