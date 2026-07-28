@@ -196,3 +196,16 @@ T3. **SWAR and dual-cursor ILP in the pre-tokenizer** — NOT REJECTED, but
     ~2 % end-to-end. Dual-cursor ILP is the *same shape* as the row-tile GEMM
     lead this repo has already rejected twice for winning in a probe and going
     neutral in production.
+
+T4. **Streaming pre-tokens through the `split` callback instead of collecting
+    them into a `Vec`** — REJECTED: **8 % slower on the miss path.**
+
+    Collecting costs one 16-byte entry per pre-token — ~475 KiB written per
+    120 KiB encoded, for a list read once in order and dropped — so removing it
+    looks strictly free. Measured on a frozen corpus: cold cache 48–51 → 52–55
+    ns/byte, cache off 110–120 → 122–126. Warm improved ~5 %, cold regressed,
+    and **cold is the number that gets quoted**. Presumably `merger.run` stops
+    inlining through two closure layers.
+
+    General shape: *removing an allocation is not automatically a win when the
+    allocation is amortised and the replacement changes inlining.*

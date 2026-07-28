@@ -55,6 +55,11 @@ pub struct Vocab {
     /// containing one of these must yield that token's id rather than being
     /// shredded into pieces.
     pub(crate) specials_by_len: Vec<(Box<str>, u32)>,
+    /// Which bytes can *begin* a special token — the skip table that turns
+    /// [`GllmTokenizer::find_special`] from one full scan per special into one
+    /// scan total. Usually one byte is set (`<`), so most text skips straight
+    /// through.
+    pub(crate) special_first_byte: [bool; 256],
     pub(crate) special_ids: std::collections::HashSet<u32>,
     pub(crate) stop_ids: std::collections::HashSet<u32>,
 
@@ -189,6 +194,13 @@ impl Vocab {
             .collect();
         stop_ids.insert(p.eos_id);
 
+        let mut special_first_byte = [false; 256];
+        for (t, _) in &specials_by_len {
+            if let Some(&b0) = t.as_bytes().first() {
+                special_first_byte[b0 as usize] = true;
+            }
+        }
+
         let (byte_to_char, char_to_byte) = gpt2_byte_map();
 
         Ok(Vocab {
@@ -201,6 +213,7 @@ impl Vocab {
             add_dummy_prefix: p.add_dummy_prefix,
             ignore_merges: p.ignore_merges,
             specials_by_len,
+            special_first_byte,
             special_ids,
             stop_ids,
             bos_id: p.bos_id,
@@ -321,6 +334,14 @@ impl Vocab {
     }
     pub fn is_stop(&self, id: u32) -> bool {
         self.stop_ids.contains(&id)
+    }
+    /// The splitter this vocabulary was built with.
+    ///
+    /// Exposed so `examples/tokenizer_profile.rs` can time the split in
+    /// isolation — the alternative is guessing which shape a GGUF resolved to,
+    /// and guessing is what that tool exists to stop.
+    pub fn pretok(&self) -> PreTok {
+        self.pretok
     }
     pub fn style(&self) -> Style {
         self.style
