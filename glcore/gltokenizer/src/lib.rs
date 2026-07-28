@@ -33,9 +33,10 @@
 pub mod bpe;
 pub mod gguf;
 pub mod pretok;
+pub mod unicode_tables;
 pub mod vocab;
 
-pub use pretok::{BpeSplit, PreTok};
+pub use pretok::{BpeSplit, Passes, PreTok};
 pub use vocab::{Style, Vocab, VocabParts, SPM_SPACE};
 
 use std::cell::RefCell;

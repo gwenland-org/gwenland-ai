@@ -189,22 +189,21 @@ fn reference_token_id_parity() {
     // Vocabularies this crate claims to support must be exact. The claim is
     // deliberately narrow: an unsupported family should show up as a load
     // refusal in the table above, not as a silent partial pass.
-    // Every family the crate claims to support. Listing all thirteen means a
+    // Every family the crate claims to support. Listing all fourteen means a
     // regression in any of them fails the build, not just the headline ones.
     let must_be_exact = [
         "qwen2", "qwen35", "llama-bpe", "llama-spm", "gpt-2", "starcoder", "refact", "mpt",
-        "command-r", "deepseek-coder", "deepseek-llm", "phi-3", "gemma-4",
+        "command-r", "deepseek-coder", "deepseek-llm", "phi-3", "gemma-4", "falcon",
     ];
     // Families that must REFUSE rather than partially work (see gguf.rs).
     //
-    // ⚠️ `gpt-neox` and `aquila` are here for a different reason than
-    // `falcon`: they carry no `tokenizer.ggml.pre` key at all, so they reach
-    // llama.cpp's `default` fallback arm — which is NOT the GPT-2 shape they
-    // were previously loaded as. Refusing them is a deliberate loss of
-    // coverage in exchange for not shipping a silent mis-split; neither has
-    // reference vectors, so the mis-split would never have been caught.
+    // ⚠️ `gpt-neox` and `aquila` carry no `tokenizer.ggml.pre` key, so they
+    // reach llama.cpp's `default` fallback arm. `BpeSplit::DEFAULT` expresses
+    // that shape exactly, so this is no longer a capability gap — it is a
+    // judgement call: neither ships reference vectors, so enabling them would
+    // claim support this crate cannot measure.
     for r in &reports {
-        if matches!(r.vocab, "falcon" | "gpt-neox" | "aquila") {
+        if matches!(r.vocab, "gpt-neox" | "aquila") {
             assert!(
                 r.load_error.is_some(),
                 "{} must be refused, not silently supported",

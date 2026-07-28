@@ -250,20 +250,15 @@ pub fn pretok_from_name(name: &str) -> Result<PreTok, TokError> {
         // withdrawn, and `audit.rs` reports it in a separate tier.
         "deepseek-llm" | "deepseek-coder" => BpeSplit::QWEN2,
 
-        // ⚠️ `qwen35` is the QWEN2 pattern with `\p{L}` widened to
-        // `[\p{L}\p{M}]` in the letter arm (and `\p{M}` excluded from the
-        // punctuation arm). This crate does not carry a `\p{M}` table — but
-        // its letter class is `char::is_alphabetic`, already a documented
-        // superset of `\p{L}` that absorbs most combining marks (see
-        // `pretok::is_letter`). That approximation is *closer* to qwen35 than
-        // to qwen2, and qwen35 scores **50/50** against the reference corpus,
-        // whose vectors include Khmer combining marks.
-        //
-        // So this is measured, not assumed — but the residual gap is real:
-        // marks outside `Other_Alphabetic` (e.g. U+0301 COMBINING ACUTE) are
-        // punctuation to us and letters to qwen35. No reference vector covers
-        // that, which is exactly why it is written down here.
-        "qwen35" => BpeSplit::QWEN2,
+        // ── cl100k arms, single digits, marks folded into the letter class ──
+        // `[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+` and `[^\s\p{L}\p{M}\p{N}]+`.
+        // Exact since `unicode_tables` landed; it previously rode on
+        // `char::is_alphabetic` absorbing most marks by accident.
+        "qwen35" => BpeSplit::QWEN35,
+
+        // ── pipelines: a punctuation-run pass wrapped around the GPT-2 arm ──
+        // See [`pretok::Passes`] for why these cannot be folded into an axis.
+        "falcon" => BpeSplit::FALCON,
 
         // ── everything else is refused ────────────────────────────────────
         //
@@ -272,12 +267,17 @@ pub fn pretok_from_name(name: &str) -> Result<PreTok, TokError> {
         //
         // * `default` — NOT the GPT-2 shape. llama.cpp's fallback arm is a
         //   four-expression pipeline (punct run, GPT-2 arm, `\p{N}+`,
-        //   `[0-9][0-9][0-9]`), and it exists for GGUFs that lost their
-        //   `tokenizer.ggml.pre` key. llama.cpp itself logs "GENERATION
-        //   QUALITY WILL BE DEGRADED" when it lands here. Refusing is the
-        //   honest response to missing metadata.
-        // * `falcon` — same shape as `default` minus `\p{N}+`, plus a
-        //   backtick in the punctuation class. Needs the pipeline.
+        //   `[0-9][0-9][0-9]`), reached only by a GGUF that lost its
+        //   `tokenizer.ggml.pre` key, and llama.cpp logs "GENERATION QUALITY
+        //   WILL BE DEGRADED" when it lands there.
+        //
+        //   ⚠️ [`BpeSplit::DEFAULT`] now *expresses* that shape exactly, so
+        //   this is no longer a capability gap — it stays refused as a
+        //   judgement call. No vocabulary in the reference corpus that reaches
+        //   this arm ships `.inp`/`.out` vectors, so enabling it would mean
+        //   claiming support this crate cannot measure, on models the upstream
+        //   implementation itself considers degraded. Callers that want it
+        //   anyway can build the vocabulary directly with `BpeSplit::DEFAULT`.
         // * `bloom`, `gpt3-finnish`, `poro-chat`, `viking` — a single
         //   `" ?[^(\s|.,!?…。，、।۔،)]+"` expression, unrelated to any arm here.
         // * `gpt-4o`, `llama4`, `tekken`, `tiny_aya`, `youtu` — case-split
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn inexpressible_patterns_stay_refused() {
         for n in [
-            "falcon",       // extra punct-run and 3-digit passes
+            "default",      // expressible now, but has no reference vectors
             "gpt-4o",       // case-split lookahead groups
             "llama4",       // same
             "tekken",       // same
