@@ -47,12 +47,12 @@
 //!
 //! The BPE algorithm is standard and implemented directly from its definition.
 
-pub mod bpe;
+pub(crate) mod bpe;
 pub mod gguf;
 pub mod pretok;
-pub mod spm;
+pub(crate) mod spm;
 pub mod style;
-pub mod unicode_tables;
+pub(crate) mod unicode_tables;
 pub mod vocab;
 
 pub use pretok::{BpeSplit, Passes, PreTok};
