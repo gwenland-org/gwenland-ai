@@ -1,0 +1,262 @@
+{
+  "analysis": {
+    "bottleneck": "compute_bound",
+    "ceiling_basis": "measured",
+    "ceiling_efficiency": 0.4978978524810451,
+    "decode_tps": {
+      "ci95": 5.0409772790856895,
+      "count": 5,
+      "max": 35.211156214707174,
+      "mean": 31.871125595003654,
+      "median": 32.67735500400208,
+      "min": 25.264426767328562,
+      "p95": 35.175709537253546,
+      "p99": 35.20406687921645,
+      "std_dev": 3.6318280108686523
+    },
+    "health": 0.511784232714704,
+    "hypotheses": [
+      "Inter-token latency ended +20% slower but not monotonically — consistent with external interference (scheduler contention, or a clock change from thermal/power state; unconfirmable without sensors) rather than sequence-length growth."
+    ],
+    "notes": [
+      "Decode 31.9 tok/s vs bandwidth ceiling 64.0 tok/s (31 GB/s, measured on this machine, over 0.49 GB weights) = 50% of peak.",
+      "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever.",
+      "Decode throughput is noisy across runs (CV 11%); increase measure_iters for a stabler figure."
+    ],
+    "prefill_tps": {
+      "ci95": 19.898868660268853,
+      "count": 5,
+      "max": 128.47328999423155,
+      "mean": 117.3583429911046,
+      "median": 127.06694602912327,
+      "min": 91.6966667594748,
+      "p95": 128.40523147376746,
+      "p99": 128.45967829013873,
+      "std_dev": 14.336360706245573
+    },
+    "roofline": null
+  },
+  "behavior": {
+    "anomaly": {
+      "drift_frac": 0.19907317039515893,
+      "drift_monotonic": false,
+      "quarter_gap_ms": [
+        43.20797741935484,
+        48.5234741935484,
+        52.50030322580645,
+        51.809526470588246
+      ],
+      "samples": 127,
+      "spike_ratio": 1.2398548667085814,
+      "spike_token": 68
+    },
+    "confidence_divergence": {
+      "max_rank": 3,
+      "mean_confidence_gap": 0.08124500408685915,
+      "mean_rank": 0.2890625,
+      "top_choice_rate": 0.7890625,
+      "uncertain_offpick_rate": 0.0234375
+    },
+    "cot": {
+      "flag": "NORMAL",
+      "thinking_capable": false,
+      "threshold_nats": 0.5,
+      "threshold_top_prob": 0.9
+    },
+    "entropy": {
+      "max": 4.048439025878906,
+      "mean_nats": 1.464504732783098,
+      "mean_top_prob": 0.6235108272521757,
+      "min": 0.0013366718776524067,
+      "p50": 1.3497248888015747,
+      "p95": 3.650010108947754,
+      "std_dev": 1.097871930637206
+    },
+    "ood": {
+      "mean_logprob": -0.8829387302928922,
+      "min_logprob": -3.427753210067749,
+      "p95_surprise": 2.4632601737976074,
+      "perplexity": 2.4179951110514466
+    },
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 128,
+      "unique_1gram_ratio": 0.6953125,
+      "unique_2gram_ratio": 0.905511811023622,
+      "unique_3gram_ratio": 0.9523809523809523
+    },
+    "stall": {
+      "jitter": 0.7902411835686219,
+      "max_ms": 376.4702,
+      "mean_ms": 49.07644330708662,
+      "p50_ms": 32.3158,
+      "p99_ms": 123.4134,
+      "stall_count": 9,
+      "std_dev_ms": 38.78222664433051
+    },
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q4_K_M",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2995,
+        "model": "11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 31.455191178710788
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": 2550956032,
+        "total_bytes": 8382472192
+      },
+      "storage": {
+        "model_file_bytes": 491400032
+      },
+      "thermal": {
+        "avg_mhz": 2995,
+        "end_mhz": 2995,
+        "start_mhz": 2995,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": [
+      {
+        "decode_ms": 3886.0178,
+        "generated_tokens": 128,
+        "prefill_ms": 1880.6384,
+        "prompt_tokens": 220,
+        "total_ms": 5766
+      },
+      {
+        "decode_ms": 3671.7981,
+        "generated_tokens": 128,
+        "prefill_ms": 1712.0996000000002,
+        "prompt_tokens": 220,
+        "total_ms": 5383
+      },
+      {
+        "decode_ms": 3725.1868999999997,
+        "generated_tokens": 128,
+        "prefill_ms": 1650.5436,
+        "prompt_tokens": 220,
+        "total_ms": 5375
+      },
+      {
+        "decode_ms": 4026.3720000000003,
+        "generated_tokens": 128,
+        "prefill_ms": 1955.764,
+        "prompt_tokens": 220,
+        "total_ms": 5982
+      },
+      {
+        "decode_ms": 5212.371700000001,
+        "generated_tokens": 128,
+        "prefill_ms": 2017.6832,
+        "prompt_tokens": 220,
+        "total_ms": 7230
+      }
+    ],
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 3653.6016999999997,
+        "generated_tokens": 128,
+        "prefill_ms": 1974.4787000000001,
+        "prompt_tokens": 220,
+        "total_ms": 5628
+      },
+      {
+        "decode_ms": 3917.0857,
+        "generated_tokens": 128,
+        "prefill_ms": 1712.4182,
+        "prompt_tokens": 220,
+        "total_ms": 5629
+      },
+      {
+        "decode_ms": 3635.2115,
+        "generated_tokens": 128,
+        "prefill_ms": 1731.3708000000001,
+        "prompt_tokens": 220,
+        "total_ms": 5366
+      },
+      {
+        "decode_ms": 4106.6751,
+        "generated_tokens": 128,
+        "prefill_ms": 1716.966,
+        "prompt_tokens": 220,
+        "total_ms": 5823
+      },
+      {
+        "decode_ms": 5066.412200000001,
+        "generated_tokens": 128,
+        "prefill_ms": 2399.2148,
+        "prompt_tokens": 220,
+        "total_ms": 7465
+      }
+    ],
+    "model_bytes": 491400032,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": null
+  },
+  "metadata": {
+    "created_unix": 1784614628,
+    "glbench_version": "0.1.163",
+    "label": "glproc-qwen2.5-0.5b-instruct-q4_k_m",
+    "schema_version": 1
+  },
+  "telemetry": null,
+  "validation": {
+    "findings": [],
+    "passed": true
+  },
+  "workload": {
+    "cold_iters": 5,
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "end_to_end",
+    "max_new_tokens": 128,
+    "measure_iters": 5,
+    "model_path": "C:\\Users\\reyha\\Downloads\\qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "prompt": "Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads.",
+    "seed": 42,
+    "temperature": 0,
+    "verify_against": null,
+    "warmup_iters": 2
+  }
+}
