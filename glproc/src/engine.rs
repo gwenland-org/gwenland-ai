@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use glcore::engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
 use glcore::format::gguf::GgufFile;
-use gltokenizer::Tokenizer;
+use glcore::tokenizer::GllmTokenizer;
 use glcore::GlError;
 
 use crate::gate::resolve_prefer_q4k_native;
@@ -25,7 +25,7 @@ pub struct GlprocConfig {
 #[derive(Default)]
 pub struct GlprocEngine {
     model: Option<GlprocModel>,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<GllmTokenizer>,
     config: GlprocConfig,
     /// Telemetry from the most recent `infer`/`stream`.
     ///
@@ -359,7 +359,7 @@ impl GlEngine for GlprocEngine {
         }
 
         let t_parse = Instant::now();
-        self.tokenizer = Some(Tokenizer::from_gguf_path(path)?);
+        self.tokenizer = Some(GllmTokenizer::from_gguf_path(path)?);
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         // GATE, once per session: decide the FFN weight-format policy

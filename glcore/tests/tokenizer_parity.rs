@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gltokenizer::{gguf, Tokenizer};
+use glcore::tokenizer::{gguf, GllmTokenizer};
 
 const SEP: &str = "__ggml_vocab_test__";
 
@@ -23,11 +23,16 @@ fn corpus_dir() -> Option<PathBuf> {
         return p.is_dir().then_some(p);
     }
     // Sibling checkout, the layout this repo uses.
-    let guess = Path::new(env!("CARGO_MANIFEST_DIR"))
+    //
+    // ⚠️ Searched by walking *up* rather than by a fixed depth. A hardcoded
+    // `nth(3)` silently stopped resolving when this test moved one directory
+    // up during the step-4 extraction — and because a missing corpus skips,
+    // the test kept reporting `ok` while checking nothing at all. A skip that
+    // is indistinguishable from a pass is worse than a failure.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3)?
-        .join("llama.cpp/models");
-    guess.is_dir().then_some(guess)
+        .map(|a| a.join("llama.cpp/models"))
+        .find(|p| p.is_dir())
 }
 
 /// Split an `.inp` file into its test strings.
@@ -85,7 +90,7 @@ fn check(dir: &Path, name: &'static str) -> Report {
             return r;
         }
     };
-    let tok = Tokenizer::new(v);
+    let tok = GllmTokenizer::new(v);
 
     let inp = match std::fs::read_to_string(base.with_extension("gguf.inp")) {
         Ok(s) => s,
@@ -154,15 +159,31 @@ const ALL: &[&str] = &[
 #[test]
 fn reference_token_id_parity() {
     let Some(dir) = corpus_dir() else {
-        eprintln!(
-            "SKIP parity: reference corpus not found. \
-             Set GLTOK_VOCAB_DIR to a llama.cpp `models/` directory."
+        // ⛔ A skip and a pass look identical to `cargo test`, and this one
+        // already hid a real breakage once. `GLTOK_REQUIRE_CORPUS=1` turns the
+        // skip into a failure, which is what CI should set — locally the skip
+        // stays, so the suite still runs without a llama.cpp checkout.
+        let msg = "reference corpus not found; set GLTOK_VOCAB_DIR to a \
+                   llama.cpp `models/` directory";
+        assert!(
+            std::env::var("GLTOK_REQUIRE_CORPUS").is_err(),
+            "GLTOK_REQUIRE_CORPUS is set but {msg}"
         );
+        eprintln!("SKIP parity: {msg}");
         return;
     };
     eprintln!("corpus: {}", dir.display());
 
     let reports: Vec<Report> = ALL.iter().map(|n| check(&dir, n)).collect();
+
+    // A corpus directory that exists but yields nothing is the same silent
+    // no-op as a missing one, one level down.
+    assert!(
+        reports.iter().any(|r| r.total > 0),
+        "corpus at {} produced no test vectors for ANY vocabulary — \
+         the directory resolved but its contents did not",
+        dir.display()
+    );
 
     eprintln!("\n{:<16} {:>8}  note", "vocab", "parity");
     eprintln!("{}", "-".repeat(72));

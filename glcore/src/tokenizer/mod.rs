@@ -1,11 +1,18 @@
-//! BPE tokenizer for GwenLand — SPM and byte-level, with a zero-allocation
-//! merge engine.
+//! GwenLand's tokenizer — SentencePiece and byte-level BPE, with a
+//! zero-allocation merge engine and exact Unicode character classes.
+//!
+//! Fourteen GGUF vocabulary families are verified **exact** against llama.cpp's
+//! reference vectors, and anything this module cannot express is refused at
+//! load time rather than approximated. `notes/gltokenizer-gguf-support-audit.md`
+//! holds the per-family status; `tests/tokenizer_parity.rs` enforces it.
 //!
 //! # What this replaces, and why
 //!
-//! The previous implementation (`glcore::tokenizer`) passed its round-trip
-//! tests while producing token ids that did not match any reference. Six
-//! defects, in the order they matter:
+//! This module *was* the `gltokenizer` crate, which in turn replaced an
+//! earlier `glcore::tokenizer` that passed its round-trip tests while
+//! producing token ids matching no reference. That implementation is gone; the
+//! six defects are kept here because each is a trap the shape of the problem
+//! invites, not a one-off mistake.
 //!
 //! 1. **A compensating error.** `encode` unconditionally prepended `▁`, and
 //!    `decode` stripped a leading space back off "so `decode(encode(text))`
@@ -17,7 +24,7 @@
 //!    runs, punctuation runs and newlines. See [`pretok`].
 //! 3. **Only U+0020 was mapped to `▁`.** Tabs and newlines passed through.
 //! 4. **Special tokens in input text were shredded** into pieces instead of
-//!    resolving to their id. See [`Tokenizer::encode`].
+//!    resolving to their id. See [`GllmTokenizer::encode`].
 //! 5. **Symbols could vanish silently** when a vocabulary had no `unk` token.
 //!    Encoding is now lossless or an explicit error.
 //! 6. **`O(n³)` merging with an allocation per candidate pair.** Now
@@ -25,30 +32,47 @@
 //!
 //! # Layout
 //!
-//! Four modules, no trait objects, no builders: [`bpe`] (the merge engine),
-//! [`pretok`] (the splitter), [`vocab`] (data + loaders), and this file
-//! (encode/decode). The BPE algorithm is standard and implemented directly
-//! from its definition.
+//! No trait objects, no builders. Each module is one decision:
+//!
+//! | Module | Owns |
+//! |---|---|
+//! | [`bpe`] | the merge engine — spans in a heap, zero allocation in the loop |
+//! | [`pretok`] | the splitter: which bytes may ever merge together |
+//! | [`unicode_tables`] | exact `\p{L}` `\p{M}` `\p{N}` `\p{P}`, **generated** |
+//! | [`style`] | which encoding convention a vocabulary uses |
+//! | [`vocab`] | vocabulary data, plus the `tokenizer.json` loader |
+//! | [`gguf`] | GGUF metadata → [`Vocab`], and the pre-tokenizer name table |
+//! | [`spm`] | the two SentencePiece-surface encoders |
+//! | this file | [`GllmTokenizer`]: dispatch, byte-level encode, decode |
+//!
+//! The BPE algorithm is standard and implemented directly from its definition.
 
 pub mod bpe;
 pub mod gguf;
 pub mod pretok;
+pub mod spm;
+pub mod style;
 pub mod unicode_tables;
 pub mod vocab;
 
 pub use pretok::{BpeSplit, Passes, PreTok};
-pub use vocab::{Style, Vocab, VocabParts, SPM_SPACE};
+pub use style::{Style, SPM_SPACE};
+pub use vocab::{Vocab, VocabParts};
+
+// The SentencePiece surface form is written by [`spm`] and read back here, so
+// the `<0xNN>` helpers are shared rather than duplicated.
+use spm::parse_byte_token;
 
 use std::cell::RefCell;
 
 thread_local! {
     /// Per-thread scratch buffers.
     ///
-    /// ⚠️ These were once a `RefCell` field on [`Tokenizer`], which made the
+    /// ⚠️ These were once a `RefCell` field on [`GllmTokenizer`], which made the
     /// whole type `!Sync` and therefore unusable inside the engines (which
     /// require `Sync`). Thread-local storage keeps the buffers reusable —
     /// steady-state encoding still allocates only the output `Vec` — while
-    /// leaving `Tokenizer` freely shareable across threads, which ARTX16's
+    /// leaving `GllmTokenizer` freely shareable across threads, which ARTX16's
     /// multi-slot serving needs.
     static SCRATCH: RefCell<Scratch> = RefCell::new(Scratch::default());
 }
@@ -83,7 +107,7 @@ pub enum TokError {
 ///
 /// Scratch buffers are held internally and reused, so steady-state encoding
 /// allocates only the output `Vec<u32>`.
-pub struct Tokenizer {
+pub struct GllmTokenizer {
     v: Vocab,
 }
 
@@ -111,27 +135,10 @@ impl bpe::Ranker for ByteLevelRanker<'_> {
     }
 }
 
-/// Ranks candidate merges for an SPM vocabulary: higher score wins.
-///
-/// A pair is mergeable only if the concatenation is itself in the vocabulary,
-/// which is what makes SPM vocabulary-driven rather than merge-list-driven.
-struct SpmRanker<'a>(&'a Vocab);
-impl bpe::Ranker for SpmRanker<'_> {
-    #[inline]
-    fn rank(&self, piece: &str, _left_len: usize) -> Option<i64> {
-        // SPM is vocabulary-driven: any split of a vocabulary entry is valid,
-        // so the split point carries no information here.
-        let id = *self.0.token_to_id.get(piece)?;
-        let score = self.0.scores.get(id as usize).copied().unwrap_or(0.0);
-        // f32 → ordered i64. Scores are small and finite in practice; scaling
-        // keeps the heap integral and avoids a float Ord wrapper.
-        Some((score * 1e6) as i64)
-    }
-}
 
-impl Tokenizer {
+impl GllmTokenizer {
     pub fn new(v: Vocab) -> Self {
-        Tokenizer { v }
+        GllmTokenizer { v }
     }
 
     pub fn vocab(&self) -> &Vocab {
@@ -206,136 +213,6 @@ impl Tokenizer {
         }
     }
 
-    /// Gemma-4's shape: SentencePiece surface form, merge-list ranking.
-    ///
-    /// Spaces become `▁` across the *whole* input first, then the text is cut
-    /// at newline runs only — there is no word-level splitting, so a merge may
-    /// legitimately span what other families would call several words.
-    fn encode_spm_bpe(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
-        SCRATCH.with(|sc| {
-            let mut sc = sc.borrow_mut();
-            let Scratch {
-                merger, prepared, ..
-            } = &mut *sc;
-
-            prepared.clear();
-            for ch in text.chars() {
-                prepared.push(if ch == ' ' { SPM_SPACE } else { ch });
-            }
-
-            let v = &self.v;
-            let ranker = ByteLevelRanker(v);
-            let mut err = None;
-
-            let mut chunks: Vec<&str> = Vec::new();
-            PreTok::Lines.split(prepared, |c| chunks.push(c));
-
-            for chunk in chunks {
-                // ⚠️ A run of newlines is looked up whole before merging.
-                // Gemma-4's vocabulary carries multi-newline tokens that
-                // rank-order merging cannot always reach, the same class of
-                // problem `ignore_merges` solves for Llama-3 — but scoped to
-                // newline runs rather than to every pre-token.
-                if chunk.as_bytes()[0] == b'\n' {
-                    if let Some(&id) = v.token_to_id.get(chunk) {
-                        ids.push(id);
-                        continue;
-                    }
-                }
-                merger.run(chunk, &ranker, |piece| {
-                    if err.is_some() {
-                        return;
-                    }
-                    if let Some(&id) = v.token_to_id.get(piece) {
-                        ids.push(id);
-                        return;
-                    }
-                    // Byte fallback is `<0xNN>`, not the GPT-2 remap: this
-                    // style never encoded its bytes as printable chars.
-                    for b in piece.bytes() {
-                        let mut buf = [0u8; 6];
-                        let key = fmt_byte_token(b, &mut buf);
-                        if let Some(&id) = v.token_to_id.get(key) {
-                            ids.push(id);
-                        } else if let Some(unk) = v.unk_id {
-                            ids.push(unk);
-                        } else {
-                            err = Some(TokError::Unencodable {
-                                ch: piece.to_string(),
-                            });
-                            return;
-                        }
-                    }
-                });
-                if err.is_some() {
-                    break;
-                }
-            }
-            match err {
-                Some(e) => Err(e),
-                None => Ok(()),
-            }
-        })
-    }
-
-    /// SPM: map *every* whitespace run's spaces to `▁`, optionally prepend the
-    /// dummy prefix, then merge by score.
-    fn encode_spm(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
-        SCRATCH.with(|sc| {
-        let mut sc = sc.borrow_mut();
-        let Scratch {
-            merger, prepared, ..
-        } = &mut *sc;
-
-        prepared.clear();
-        if self.v.add_dummy_prefix {
-            prepared.push(SPM_SPACE);
-        }
-        // ⚠️ Bug 3: only U+0020 was previously replaced. SentencePiece maps the
-        // space character; other whitespace stays literal and reaches the byte
-        // fallback, which is what a reference implementation does.
-        for ch in text.chars() {
-            if ch == ' ' {
-                prepared.push(SPM_SPACE);
-            } else {
-                prepared.push(ch);
-            }
-        }
-
-        let ranker = SpmRanker(&self.v);
-        let mut err = None;
-        let v = &self.v;
-        merger.run(prepared, &ranker, |piece| {
-            if err.is_some() {
-                return;
-            }
-            if let Some(&id) = v.token_to_id.get(piece) {
-                ids.push(id);
-                return;
-            }
-            // Byte fallback: <0xNN> per byte.
-            for b in piece.bytes() {
-                let mut buf = [0u8; 6];
-                let key = fmt_byte_token(b, &mut buf);
-                if let Some(&id) = v.token_to_id.get(key) {
-                    ids.push(id);
-                } else if let Some(unk) = v.unk_id {
-                    ids.push(unk);
-                } else {
-                    // ⚠️ Bug 5: this used to drop the symbol silently.
-                    err = Some(TokError::Unencodable {
-                        ch: piece.to_string(),
-                    });
-                    return;
-                }
-            }
-        });
-        match err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-        })
-    }
 
     /// Byte-level: pre-tokenize, remap bytes to printable chars, merge by rank.
     fn encode_byte_level(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
@@ -462,13 +339,13 @@ impl Tokenizer {
     /// Load a vocabulary embedded in a GGUF file.
     pub fn from_gguf_path(path: &str) -> Result<Self, TokError> {
         let bytes = std::fs::read(path).map_err(|e| TokError::Gguf(format!("{path}: {e}")))?;
-        Ok(Tokenizer::new(gguf::vocab_from_gguf(&bytes)?))
+        Ok(GllmTokenizer::new(gguf::vocab_from_gguf(&bytes)?))
     }
 
     /// Load a HuggingFace `tokenizer.json`.
     pub fn from_hf_json_path(path: &str) -> Result<Self, TokError> {
         let src = std::fs::read_to_string(path).map_err(|e| TokError::Json(format!("{path}: {e}")))?;
-        Ok(Tokenizer::new(Vocab::from_hf_json(&src)?))
+        Ok(GllmTokenizer::new(Vocab::from_hf_json(&src)?))
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -494,7 +371,7 @@ impl Tokenizer {
     ///
     /// ⛔ **Not correct for streaming.** A multi-byte character routinely spans
     /// several tokens, so decoding one at a time yields `U+FFFD` for emoji and
-    /// non-Latin scripts. Use [`Tokenizer::incremental`] to emit deltas; this
+    /// non-Latin scripts. Use [`GllmTokenizer::incremental`] to emit deltas; this
     /// is for inspection and debugging, where a lone token is the unit of
     /// interest.
     pub fn decode_token_text(&self, id: u32) -> String {
@@ -543,7 +420,7 @@ impl Tokenizer {
 /// emoji and non-Latin scripts. This buffers an incomplete UTF-8 tail and
 /// releases only complete characters.
 pub struct Incremental<'a> {
-    tok: &'a Tokenizer,
+    tok: &'a GllmTokenizer,
     pending: Vec<u8>,
 }
 
@@ -584,30 +461,13 @@ impl Incremental<'_> {
     }
 }
 
-/// Write `<0xNN>` into `buf` without allocating.
-#[inline]
-fn fmt_byte_token(b: u8, buf: &mut [u8; 6]) -> &str {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    buf[0] = b'<';
-    buf[1] = b'0';
-    buf[2] = b'x';
-    buf[3] = HEX[(b >> 4) as usize];
-    buf[4] = HEX[(b & 0xf) as usize];
-    buf[5] = b'>';
-    std::str::from_utf8(buf).expect("ascii")
-}
-
-/// Parse `<0xNN>` back to its byte.
-fn parse_byte_token(tok: &str) -> Option<u8> {
-    let h = tok.strip_prefix("<0x")?.strip_suffix('>')?;
-    (h.len() == 2)
-        .then(|| u8::from_str_radix(h, 16).ok())
-        .flatten()
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the decode side is used outside `spm`, so the encoder's half of the
+    // `<0xNN>` pair is imported here rather than at module scope.
+    use spm::fmt_byte_token;
 
     fn spm_vocab(add_dummy_prefix: bool) -> Vocab {
         let mut toks: Vec<String> = vec!["<unk>".into(), "<s>".into(), "</s>".into()];
@@ -665,7 +525,7 @@ mod tests {
 
     #[test]
     fn spm_round_trip_ascii() {
-        let t = Tokenizer::new(spm_vocab(true));
+        let t = GllmTokenizer::new(spm_vocab(true));
         for s in ["Hello World", "Hello", "abc def", "a  b", " leading"] {
             let ids = t.encode(s, false).unwrap();
             assert_eq!(t.decode(&ids, true), format!(" {s}"), "input {s:?}");
@@ -676,11 +536,11 @@ mod tests {
     /// no phantom leading space, and decode does not compensate for one.
     #[test]
     fn no_dummy_prefix_means_no_phantom_space() {
-        let t = Tokenizer::new(spm_vocab(false));
+        let t = GllmTokenizer::new(spm_vocab(false));
         let ids = t.encode("Hello", false).unwrap();
         assert_eq!(t.decode(&ids, true), "Hello");
 
-        let with = Tokenizer::new(spm_vocab(true));
+        let with = GllmTokenizer::new(spm_vocab(true));
         let ids2 = with.encode("Hello", false).unwrap();
         // The two configurations MUST produce different ids. The old
         // implementation could not express this difference at all.
@@ -689,14 +549,14 @@ mod tests {
 
     #[test]
     fn spm_byte_fallback() {
-        let t = Tokenizer::new(spm_vocab(false));
+        let t = GllmTokenizer::new(spm_vocab(false));
         let ids = t.encode("ab!", false).unwrap();
         assert_eq!(t.decode(&ids, true), "ab!");
     }
 
     #[test]
     fn spm_prefers_higher_score_merges() {
-        let t = Tokenizer::new(spm_vocab(false));
+        let t = GllmTokenizer::new(spm_vocab(false));
         // "Hello" (8.0) must beat "He"(5.0) + "llo"(6.0) as a single token.
         let ids = t.encode("Hello", false).unwrap();
         assert_eq!(ids.len(), 1, "expected one token, got {ids:?}");
@@ -745,7 +605,7 @@ mod tests {
 
     #[test]
     fn byte_level_round_trip() {
-        let t = Tokenizer::new(byte_level_vocab());
+        let t = GllmTokenizer::new(byte_level_vocab());
         for s in ["Hello, World!", "don't stop", "日本語", "hi 👋", "a\n\nb", "1234"] {
             let ids = t.encode(s, false).unwrap();
             assert_eq!(t.decode(&ids, false), s, "input {s:?}");
@@ -755,7 +615,7 @@ mod tests {
     /// ⭐ Bug 4: a literal special token in the input must resolve to its id.
     #[test]
     fn special_tokens_in_text_are_not_shredded() {
-        let t = Tokenizer::new(byte_level_vocab());
+        let t = GllmTokenizer::new(byte_level_vocab());
         let ids = t.encode("a<|endoftext|>b", false).unwrap();
         assert!(ids.contains(&0), "special id missing from {ids:?}");
         // And it must be a single id, not a run of byte tokens.
@@ -782,7 +642,7 @@ mod tests {
             add_bos_default: false,
         })
         .unwrap();
-        let t = Tokenizer::new(v);
+        let t = GllmTokenizer::new(v);
         assert!(matches!(
             t.encode("z", false),
             Err(TokError::Unencodable { .. })
@@ -793,7 +653,7 @@ mod tests {
     /// equal the whole-sequence decode.
     #[test]
     fn incremental_deltas_concatenate_to_whole_decode() {
-        let t = Tokenizer::new(byte_level_vocab());
+        let t = GllmTokenizer::new(byte_level_vocab());
         for s in ["hi 👋 there", "日本語のテキスト", "plain ascii", "mixed 漢字 and 🎉"] {
             let ids = t.encode(s, false).unwrap();
             let mut inc = t.incremental();

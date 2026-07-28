@@ -11,13 +11,13 @@
 //! probe reaching 46/46 is a reason to add a real mapping in `gguf.rs`; it is
 //! not itself support, because nothing outside this file can reach it.
 //!
-//! Run: cargo run -p gltokenizer --example audit --release [-- <models_dir>]
+//! Run: cargo run -p glcore --example tokenizer_audit --release [-- <models_dir>]
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use gltokenizer::gguf::{self, Meta};
-use gltokenizer::{BpeSplit, PreTok, Style, Tokenizer, Vocab, VocabParts};
+use glcore::tokenizer::gguf::{self, Meta};
+use glcore::tokenizer::{BpeSplit, PreTok, Style, GllmTokenizer, Vocab, VocabParts};
 
 const SEP: &str = "__ggml_vocab_test__";
 
@@ -72,7 +72,7 @@ fn parse_out(raw: &str) -> Vec<Vec<u32>> {
 
 /// Score a tokenizer against the reference vectors; also return the first
 /// mismatch, which is what actually points at a cause.
-fn score(tok: &Tokenizer, tests: &[String], want: &[Vec<u32>]) -> (usize, usize, Option<String>) {
+fn score(tok: &GllmTokenizer, tests: &[String], want: &[Vec<u32>]) -> (usize, usize, Option<String>) {
     let n = tests.len().min(want.len());
     let mut passed = 0;
     let mut first: Option<String> = None;
@@ -188,11 +188,12 @@ fn corpus_dir() -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return p.is_dir().then_some(p);
     }
-    let guess = Path::new(env!("CARGO_MANIFEST_DIR"))
+    // Walk up rather than index a fixed depth; see the note in
+    // `tests/tokenizer_parity.rs` for what the magic number cost.
+    Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
-        .nth(3)?
-        .join("llama.cpp/models");
-    guess.is_dir().then_some(guess)
+        .map(|a| a.join("llama.cpp/models"))
+        .find(|p| p.is_dir())
 }
 
 /// Audit one real model file rather than the corpus.
@@ -229,7 +230,7 @@ fn audit_one(path: &Path) {
     }
     match gguf::vocab_from_gguf(&bytes) {
         Ok(v) => {
-            let tok = Tokenizer::new(v);
+            let tok = GllmTokenizer::new(v);
             // A fixed probe string, so two runs of this tool are comparable.
             const S: &str = "Hello, World! 123 don't\n\nstop 日本語 🎉";
             match tok.encode(S, false) {
@@ -299,7 +300,7 @@ fn main() {
 
         match gguf::vocab_from_gguf(&bytes) {
             Ok(v) => {
-                let tok = Tokenizer::new(v);
+                let tok = GllmTokenizer::new(v);
                 match &vectors {
                     Some((tests, want)) => {
                         let (p, n, first) = score(&tok, tests, want);
@@ -322,7 +323,7 @@ fn main() {
                     let mut results: Vec<(usize, usize, &str)> = Vec::new();
                     for (label, split) in PROBES {
                         if let Ok(v) = probe_vocab(&meta, *split) {
-                            let (p, n, first) = score(&Tokenizer::new(v), tests, want);
+                            let (p, n, first) = score(&GllmTokenizer::new(v), tests, want);
                             results.push((p, n, label));
                             if p == n {
                                 deferred.push((

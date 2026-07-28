@@ -37,7 +37,7 @@ use std::time::Instant;
 
 use glcore::engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
 use glcore::format::gguf::GgufFile;
-use gltokenizer::Tokenizer;
+use glcore::tokenizer::GllmTokenizer;
 use glcore::GlError;
 
 use driver::Cuda;
@@ -69,7 +69,7 @@ pub struct GlcudaEngine {
     /// time per engine — the single-GPU invariant, enforced.
     model: Option<Mutex<GpuModel>>,
     kernels: Option<KernelSet>,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<GllmTokenizer>,
     config: GlcudaConfig,
     /// Owns the CUDA context; released on drop. Declared last so it drops after
     /// everything above that holds CUDA resources.
@@ -229,7 +229,7 @@ impl GlEngine for GlcudaEngine {
         }
         let gguf = GgufFile::open(path)?;
         let t_parse = Instant::now();
-        self.tokenizer = Some(Tokenizer::from_gguf_path(path)?);
+        self.tokenizer = Some(GllmTokenizer::from_gguf_path(path)?);
         let parse_s = t_parse.elapsed().as_secs_f64();
 
         let t_stage = Instant::now();

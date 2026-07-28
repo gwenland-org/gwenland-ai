@@ -16,16 +16,12 @@ pub mod runtime;
 pub mod stopping;
 pub mod telemetry;
 pub mod tensor;
-/// ⛔ **Superseded by the `gltokenizer` crate.** Zero production callers
-/// remain; it is kept only so `tests/tokenizer_before_after.rs` can still
-/// measure what it replaced.
+/// The tokenizer: SentencePiece and byte-level BPE, 14 GGUF vocabulary
+/// families verified exact against reference vectors.
 ///
-/// Measured against llama.cpp's reference vectors it scored 65.2%–97.8% per
-/// vocabulary — *no* vocabulary was fully correct. Do not build on it.
-#[deprecated(
-    since = "0.1.164",
-    note = "use the `gltokenizer` crate; this scored 65-98% against reference vectors"
-)]
+/// ⚠️ This module *name* previously held a different implementation, which
+/// scored 65.2%–97.8% per vocabulary with none fully correct. That code was
+/// deleted in step 4; nothing here descends from it.
 pub mod tokenizer;
 pub mod trace;
 
@@ -38,9 +34,4 @@ pub use trace::{TokenTrace, TraceConfig};
 pub use error::GlError;
 pub use runtime::Runtime;
 pub use tensor::{DType, Tensor};
-/// ⛔ Re-export of the superseded tokenizer. Zero users; kept only so the
-/// deprecation is visible at the crate root rather than silently vanishing.
-/// Use `gltokenizer::Tokenizer`.
-#[deprecated(since = "0.1.164", note = "use `gltokenizer::Tokenizer`")]
-#[allow(deprecated)]
-pub use tokenizer::Tokenizer;
+pub use tokenizer::{GllmTokenizer, TokError};

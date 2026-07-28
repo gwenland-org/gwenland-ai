@@ -6,7 +6,6 @@ description = "GwenLand AI NVIDIA CUDA engine (M2 — SIMT backend per ArchGLML_
 license-file = "../LICENSE"
 
 [dependencies]
-gltokenizer = { path = "../glcore/gltokenizer" }
 glcore = { path = "../glcore" }
 
 [target.'cfg(unix)'.dependencies]

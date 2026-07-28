@@ -4,7 +4,7 @@
 //! This deliberately does not parse tensor data. A vocabulary lives entirely
 //! in the key-value block, so reading stops once that block is consumed.
 //! Keeping it here rather than depending on a general GGUF crate means
-//! `gltokenizer` stays self-sufficient for the two vocabulary sources that
+//! `glcore::tokenizer` stays self-sufficient for the two vocabulary sources that
 //! actually exist (`tokenizer.json` and GGUF) without pulling in a tensor
 //! stack it has no use for.
 //!
@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 
-use crate::pretok::{BpeSplit, PreTok};
-use crate::vocab::{Style, Vocab, VocabParts};
-use crate::TokError;
+use crate::tokenizer::pretok::{BpeSplit, PreTok};
+use crate::tokenizer::vocab::{Style, Vocab, VocabParts};
+use crate::tokenizer::TokError;
 
 /// A decoded metadata value. Only the shapes a vocabulary needs.
 #[derive(Debug, Clone)]

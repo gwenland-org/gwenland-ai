@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Generate `src/unicode_tables.rs` — exact `\\p{L}` `\\p{M}` `\\p{N}` `\\p{P}`.
+"""Generate `src/tokenizer/unicode_tables.rs` — exact `\\p{L}` `\\p{M}` `\\p{N}` `\\p{P}`.
 
-Run from the crate root:
+Run from anywhere:
 
-    python tools/gen_unicode_tables.py > src/unicode_tables.rs
+    python glcore/tools/gen_unicode_tables.py > src/tokenizer/unicode_tables.rs
 
 # Why two sources
 
@@ -32,6 +32,7 @@ re-derivation of it.
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import unicodedata
@@ -54,8 +55,15 @@ CLASSES = {
     "P": (PUNCTUATION, ("Pc", "Pd", "Ps", "Pe", "Pi", "Pf", "Po")),
 }
 
+# Resolved relative to this script, not to the working directory, so the
+# generator works from anywhere. `llama.cpp` is checked out as a sibling of the
+# repository root; `GLTOK_UNICODE_DATA` overrides for any other layout.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 LLAMA_DATA = Path(
-    "../../../llama.cpp/src/unicode-data.cpp"
+    os.environ.get(
+        "GLTOK_UNICODE_DATA",
+        _REPO_ROOT.parent / "llama.cpp" / "src" / "unicode-data.cpp",
+    )
 )
 
 
@@ -107,7 +115,7 @@ def to_ranges(members: set[int]) -> list[tuple[int, int]]:
 
 def main() -> None:
     if not LLAMA_DATA.exists():
-        sys.exit(f"missing {LLAMA_DATA} — run from the crate root")
+        sys.exit(f"missing {LLAMA_DATA} — set GLTOK_UNICODE_DATA to a llama.cpp unicode-data.cpp")
 
     llama = load_llama_flags()
     tables: dict[str, list[tuple[int, int]]] = {}
@@ -158,8 +166,8 @@ def emit(tables, deltas, ascii_bits) -> None:
     w(
         "//! Exact Unicode general-category tests — **generated, do not edit**.\n"
         "//!\n"
-        "//! Regenerate with `python tools/gen_unicode_tables.py > "
-        "src/unicode_tables.rs`.\n"
+        "//! Regenerate with `python glcore/tools/gen_unicode_tables.py > "
+        "src/tokenizer/unicode_tables.rs`.\n"
         "//! That script documents the two independent UCD sources it "
         "cross-checks and\n"
         "//! aborts rather than emit a table the two disagree on.\n"

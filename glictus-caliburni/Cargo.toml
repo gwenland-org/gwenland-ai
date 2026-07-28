@@ -6,7 +6,6 @@ description = "GLLM (GwenLand Language Model Format) — Ictus Caliburni"
 license = "MIT"
 
 [dependencies]
-gltokenizer = { path = "../glcore/gltokenizer" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

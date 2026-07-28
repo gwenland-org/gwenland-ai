@@ -33,7 +33,7 @@
 //! module was regex-free and single-pass before the paper was read; that part
 //! is convergent design, not an implementation of it. What the paper's framing
 //! *did* change is the character-class layer: category tests now come from
-//! precomputed [`crate::unicode_tables`] — an ASCII bitmap plus range binary
+//! precomputed [`crate::tokenizer::unicode_tables`] — an ASCII bitmap plus range binary
 //! search — instead of `char::is_alphabetic`, which is the `Alphabetic`
 //! property and a strict superset of `\p{L}`. That swap is a **precision**
 //! fix, not a speed one; the 1.11× in the paper is measured against a regex
@@ -170,7 +170,7 @@ impl BpeSplit {
     };
 }
 
-use crate::unicode_tables::{is_letter, is_mark, is_number, is_punctuation};
+use crate::tokenizer::unicode_tables::{is_letter, is_mark, is_number, is_punctuation};
 
 /// `\s` — Unicode whitespace.
 ///

@@ -1,6 +1,6 @@
 //! Exact Unicode general-category tests — **generated, do not edit**.
 //!
-//! Regenerate with `python tools/gen_unicode_tables.py > src/unicode_tables.rs`.
+//! Regenerate with `python glcore/tools/gen_unicode_tables.py > src/tokenizer/unicode_tables.rs`.
 //! That script documents the two independent UCD sources it cross-checks and
 //! aborts rather than emit a table the two disagree on.
 //!
