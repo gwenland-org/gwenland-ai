@@ -109,6 +109,8 @@ pub enum TokError {
 /// allocates only the output `Vec<u32>`.
 pub struct GllmTokenizer {
     v: Vocab,
+    /// Identity for the thread-local pre-token cache; see `Scratch::cache_owner`.
+    id: u64,
 }
 
 #[derive(Default)]
@@ -118,6 +120,38 @@ struct Scratch {
     mapped: String,
     /// SPM: the whole input with spaces replaced by `▁`.
     prepared: String,
+    /// Pre-token → token ids, for the byte-level path. See [`PRETOK_CACHE_CAP`].
+    cache: std::collections::HashMap<Box<str>, Box<[u32]>>,
+    /// Which [`GllmTokenizer`] `cache` was filled for.
+    ///
+    /// ⛔ Load-bearing for correctness, not an optimisation. The cache lives in
+    /// thread-local storage, so a thread that encodes with two different
+    /// vocabularies would otherwise read the first one's ids back for the
+    /// second — producing plausible output that is silently wrong for the
+    /// model actually being run. `0` is "no owner yet"; ids start at 1.
+    cache_owner: u64,
+    hits: u64,
+    misses: u64,
+}
+
+/// Maximum pre-tokens held per thread. Word frequency is long-tailed, so a
+/// modest cache captures nearly all of the hits; past the cap this stops
+/// inserting rather than evicting, because the entries earned early are the
+/// frequent ones and churning them is worse than missing the rare ones.
+const PRETOK_CACHE_CAP: usize = 16_384;
+
+/// Pre-tokens longer than this are not cached: they are rare, they are the
+/// ones least likely to recur, and they are what would make the cap expensive
+/// in memory rather than in entries.
+const PRETOK_CACHE_MAX_KEY: usize = 64;
+
+/// Distinguishes tokenizers within a thread's cache. Wraps at `u64::MAX`,
+/// which would take longer than any process lives.
+static NEXT_TOKENIZER_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    /// Benchmark switch — see [`GllmTokenizer::set_pretoken_cache`].
+    static CACHE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 /// Ranks candidate merges for a byte-level vocabulary: lower merge rank wins,
@@ -138,7 +172,41 @@ impl bpe::Ranker for ByteLevelRanker<'_> {
 
 impl GllmTokenizer {
     pub fn new(v: Vocab) -> Self {
-        GllmTokenizer { v }
+        GllmTokenizer {
+            v,
+            id: NEXT_TOKENIZER_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        }
+    }
+
+    /// Turn the pre-token cache off for the current thread.
+    ///
+    /// ⚠️ **Diagnostic only.** The cache never changes the ids produced — it
+    /// replays ids the merge engine already produced for the identical
+    /// pre-token under the identical vocabulary — so switching it off is only
+    /// useful for measuring what it is worth. Kept because an in-process A/B
+    /// removes the build and thermal differences that make two separate
+    /// binaries hard to compare on this hardware.
+    pub fn set_pretoken_cache(on: bool) {
+        CACHE_ON.with(|c| c.set(on));
+    }
+
+    /// `(hits, misses)` for the current thread since the last reset.
+    pub fn pretoken_cache_stats() -> (u64, u64) {
+        SCRATCH.with(|sc| {
+            let s = sc.borrow();
+            (s.hits, s.misses)
+        })
+    }
+
+    /// Drop the current thread's cache and its counters.
+    pub fn reset_pretoken_cache() {
+        SCRATCH.with(|sc| {
+            let mut s = sc.borrow_mut();
+            s.cache.clear();
+            s.cache_owner = 0;
+            s.hits = 0;
+            s.misses = 0;
+        });
     }
 
     pub fn vocab(&self) -> &Vocab {
@@ -215,10 +283,32 @@ impl GllmTokenizer {
 
 
     /// Byte-level: pre-tokenize, remap bytes to printable chars, merge by rank.
+    ///
+    /// ⭐ Merging dominates: pre-tokenization measures ~2.7 ns/byte against
+    /// ~103 ns/byte for the whole encode, so the merge loop is ~97 % of the
+    /// cost. Real text is long-tailed, though — the same few hundred words
+    /// carry most of a document — so the same pre-token is merged over and
+    /// over to the identical result. The cache below replays that result
+    /// instead, which is the only change that can move this path materially.
     fn encode_byte_level(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
         SCRATCH.with(|sc| {
         let mut sc = sc.borrow_mut();
-        let Scratch { merger, mapped, .. } = &mut *sc;
+        // ⛔ A cache filled for a different vocabulary must never be read.
+        // Same thread, two models, plausible-looking garbage — exactly the
+        // silent-wrongness class this crate exists to remove.
+        if sc.cache_owner != self.id {
+            sc.cache.clear();
+            sc.cache_owner = self.id;
+        }
+        let caching = CACHE_ON.with(|c| c.get());
+        let Scratch {
+            merger,
+            mapped,
+            cache,
+            hits,
+            misses,
+            ..
+        } = &mut *sc;
 
         let ranker = ByteLevelRanker(&self.v);
         let v = &self.v;
@@ -234,12 +324,27 @@ impl GllmTokenizer {
             for b in chunk.bytes() {
                 mapped.push(v.byte_to_char[b as usize]);
             }
+
+            if caching {
+                if let Some(cached) = cache.get(mapped.as_str()) {
+                    ids.extend_from_slice(cached);
+                    *hits += 1;
+                    continue;
+                }
+                *misses += 1;
+            }
+            // Where this chunk's ids begin, so they can be captured below.
+            let start = ids.len();
+
             // Llama-3's `ignore_merges`: a pre-token already in the vocabulary
             // is emitted whole, because rank-order BPE may not be able to
             // reach it (see `gguf::ignore_merges_for`).
             if v.ignore_merges {
                 if let Some(&id) = v.token_to_id.get(mapped.as_str()) {
                     ids.push(id);
+                    if caching && mapped.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
+                        cache.insert(mapped.as_str().into(), Box::new([id]));
+                    }
                     continue;
                 }
             }
@@ -259,6 +364,12 @@ impl GllmTokenizer {
             });
             if err.is_some() {
                 break;
+            }
+            // ⚠️ Recorded only on the success path. Caching a partial result
+            // from a chunk that errored would hand back a truncated id list on
+            // the next occurrence, with no error to show for it.
+            if caching && mapped.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
+                cache.insert(mapped.as_str().into(), ids[start..].into());
             }
         }
         match err {
@@ -609,6 +720,87 @@ mod tests {
         for s in ["Hello, World!", "don't stop", "日本語", "hi 👋", "a\n\nb", "1234"] {
             let ids = t.encode(s, false).unwrap();
             assert_eq!(t.decode(&ids, false), s, "input {s:?}");
+        }
+    }
+
+    /// The pre-token cache must be invisible in the output.
+    #[test]
+    fn pretoken_cache_is_transparent() {
+        let t = GllmTokenizer::new(byte_level_vocab());
+        for s in [
+            "the cat sat on the mat, the cat sat",
+            "don't don't don't",
+            "日本語 日本語 日本語",
+            "a a a a a a a a",
+            "",
+            "\n\n\n",
+            "1234 1234 1234",
+        ] {
+            GllmTokenizer::set_pretoken_cache(false);
+            GllmTokenizer::reset_pretoken_cache();
+            let uncached = t.encode(s, false).unwrap();
+
+            GllmTokenizer::set_pretoken_cache(true);
+            GllmTokenizer::reset_pretoken_cache();
+            // Twice: the first fills the cache, the second reads it.
+            let _ = t.encode(s, false).unwrap();
+            let cached = t.encode(s, false).unwrap();
+
+            assert_eq!(uncached, cached, "cache changed the ids for {s:?}");
+        }
+        GllmTokenizer::set_pretoken_cache(true);
+    }
+
+    /// ⛔ The failure mode this cache actually risks.
+    ///
+    /// The cache is thread-local, so two tokenizers used on one thread share
+    /// the storage. Without an owner check the second would read the first's
+    /// ids back — same pre-token, different vocabulary, plausible-looking
+    /// output that is silently wrong for the model being run. Nothing else in
+    /// the suite would catch that: both tokenizers work perfectly alone.
+    ///
+    /// This test fails on any implementation that omits `Scratch::cache_owner`.
+    #[test]
+    fn pretoken_cache_does_not_leak_between_tokenizers() {
+        // Same surface forms, ids shifted by one: identical text, different ids.
+        let shifted = {
+            let base = byte_level_vocab();
+            let mut toks = vec!["<|pad|>".to_string()];
+            for i in 0..base.len() {
+                toks.push(base.token_str(i as u32).unwrap().to_string());
+            }
+            Vocab::from_parts(VocabParts {
+                id_to_token: toks,
+                scores: vec![],
+                merges: vec![],
+                special_ids: vec![1],
+                style: Style::ByteLevel,
+                pretok: PreTok::Bpe(BpeSplit::QWEN2),
+                add_dummy_prefix: false,
+                ignore_merges: false,
+                bos_id: None,
+                eos_id: 1,
+                unk_id: None,
+                add_bos_default: false,
+            })
+            .unwrap()
+        };
+        let a = GllmTokenizer::new(byte_level_vocab());
+        let b = GllmTokenizer::new(shifted);
+        const S: &str = "the cat sat on the mat";
+
+        GllmTokenizer::set_pretoken_cache(false);
+        GllmTokenizer::reset_pretoken_cache();
+        let want_a = a.encode(S, false).unwrap();
+        let want_b = b.encode(S, false).unwrap();
+        assert_ne!(want_a, want_b, "fixture is broken: vocabs must differ");
+
+        // Interleave them on this thread, repeatedly, so a leak would show.
+        GllmTokenizer::set_pretoken_cache(true);
+        GllmTokenizer::reset_pretoken_cache();
+        for _ in 0..4 {
+            assert_eq!(a.encode(S, false).unwrap(), want_a, "tokenizer A polluted");
+            assert_eq!(b.encode(S, false).unwrap(), want_b, "tokenizer B polluted");
         }
     }
 

@@ -1,99 +1,121 @@
 //! Throughput of the pre-tokenizer and of full encoding.
 //!
-//! Exists to answer one question: **did making the character classes exact
-//! cost throughput?** The scanner was already regex-free and single-pass; what
-//! `unicode_tables` changed is that `\p{L}` went from `char::is_alphabetic`
-//! (one inlined property lookup) to an ASCII bitmap plus a binary search. That
-//! is strictly more work per non-ASCII character, so the cost is worth a
-//! number rather than an assumption.
+//! # ⛔ The corpus decides whether this tool lies
 //!
-//! ⛔ **Read the noise floor before believing a number from this.** Measured
-//! on the i3-1115G4 this repo is developed on, three back-to-back repeats of
-//! the identical binary gave 73.1, 33.8 and 174.9 ns/byte for the same qwen2
-//! case — a **5× spread**. Anything smaller than that is not a result here.
-//! Reporting best-of-N below reduces but does not remove it. Machines with
-//! stable clocks will do better; this one will not.
+//! An earlier version of this file built its input by repeating one sentence
+//! until it reached the target size. That is tolerable for the pre-tokenizer,
+//! whose cost per byte does not depend on what came before — and
+//! **catastrophic** for measuring the pre-token cache, which would score a
+//! ~100 % hit rate on text made of one repeated sentence and report a speedup
+//! no real workload can reproduce.
 //!
-//! What *is* trustworthy from this tool is the unit count, which is
-//! deterministic, and the ratio to full encoding — pre-tokenization is a small
-//! fraction of it, so even a real regression here moves end-to-end encoding
-//! little.
+//! So the default corpus is **real files from this repository**: prose from the
+//! audit note and Rust source from the tokenizer itself. Pass a path to use
+//! your own. Neither substitutes for measuring your actual workload — the hit
+//! rate *is* the result, and it is a property of your text, not of this code.
+//!
+//! # ⛔ And the machine decides whether you can trust the number
+//!
+//! On the i3-1115G4 this repo is developed on, best-of-5 gave a **5× spread**
+//! across identical runs. Best-of-40 brings the same case to within a few
+//! percent. Noise only ever *adds* time, so the minimum over many passes is the
+//! closest thing to the true cost this hardware can report — but if the
+//! `spread` column is not near 1.0, the number beside it means nothing.
+//!
+//! ⚠️ Build profile is part of the measurement: `glcore` carries
+//! `[profile.release.package.glcore] opt-level = 3`. Measured under the
+//! workspace default `opt-level = "z"` the same scanner runs **3.4× slower**.
 //!
 //! Linearity is a structural property of the scanner (single forward pass, no
 //! backtracking), asserted by `pretok::tests::linear_on_pathological_input`
-//! rather than inferred from these timings, which cache effects dominate long
-//! before any algorithmic term would show.
+//! rather than inferred from these timings.
 //!
-//! Run: cargo run -p glcore --example tokenizer_bench --release -- <model.gguf>
+//! Run: cargo run -p glcore --example tokenizer_bench --release -- <model.gguf> [corpus]
 
 use std::time::Instant;
 
-use glcore::tokenizer::{BpeSplit, PreTok, GllmTokenizer};
+use glcore::tokenizer::{BpeSplit, GllmTokenizer, PreTok};
 
-/// Mixed-script text: ASCII takes the bitmap path, the rest binary-searches.
-const SEED: &str = "The quick brown fox jumps over 13 lazy dogs, don't you think? \
-     日本語のテキストも含めて、混合スクリプトで測定する。 Ünïcödé àccênts, emoji 🎉🚀, \
-     numbers 1234567890, punctuation …—''\"\" and code: fn main() { let x = 1 + 2; }\n\n";
+/// Files that exist in every checkout, chosen for *shape*: English prose with
+/// tables and punctuation, plus dense Rust with identifiers and symbols. Real
+/// long-tailed word distributions, which is the whole point.
+const CORPUS_FILES: &[&str] = &[
+    "notes/gltokenizer-gguf-support-audit.md",
+    "glcore/src/tokenizer/mod.rs",
+    "glcore/src/tokenizer/pretok.rs",
+    "glcore/src/tokenizer/vocab.rs",
+    "glcore/src/tokenizer/gguf.rs",
+];
 
-fn corpus(target_bytes: usize) -> String {
-    let mut s = String::with_capacity(target_bytes + SEED.len());
-    while s.len() < target_bytes {
-        s.push_str(SEED);
+fn load_corpus() -> String {
+    if let Some(p) = std::env::args().nth(2) {
+        return std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p}: {e}"));
     }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate has a parent directory");
+    let mut s = String::new();
+    for f in CORPUS_FILES {
+        if let Ok(t) = std::fs::read_to_string(root.join(f)) {
+            s.push_str(&t);
+            s.push('\n');
+        }
+    }
+    assert!(
+        s.len() > 32 * 1024,
+        "corpus is only {} bytes — run from the repo, or pass a file",
+        s.len()
+    );
     s
 }
 
-/// Best-of-N: report the fastest pass, and the spread alongside it so a reader
-/// can see immediately whether the fastest number means anything.
-fn bench(label: &str, text: &str, reps: usize, mut f: impl FnMut(&str) -> usize) {
-    // One untimed pass so the first run's page faults are not in the sample.
-    let units = f(text);
-    let mut best = f64::MAX;
-    let mut worst: f64 = 0.0;
-    for _ in 0..reps.max(5) {
+const REPS: usize = 40;
+
+/// Best-of-N, reporting the spread so the reader can see whether to believe it.
+fn bench(label: &str, bytes: usize, mut f: impl FnMut() -> usize) {
+    let units = f();
+    let (mut best, mut worst) = (f64::MAX, 0.0f64);
+    for _ in 0..REPS {
         let t = Instant::now();
-        std::hint::black_box(f(text));
+        std::hint::black_box(f());
         let el = t.elapsed().as_secs_f64();
         best = best.min(el);
         worst = worst.max(el);
     }
     println!(
-        "  {label:<28} {:>9.2} MB/s  {:>7.2} ns/byte  spread {:>4.1}x  ({units} units)",
-        text.len() as f64 / best / 1e6,
-        best * 1e9 / text.len() as f64,
+        "  {label:<26} {:>8.2} ns/byte  {:>8.2} MB/s  spread {:>4.1}x  ({units} units)",
+        best * 1e9 / bytes as f64,
+        bytes as f64 / best / 1e6,
         worst / best,
     );
 }
 
 fn main() {
-    let sizes = [64 * 1024usize, 256 * 1024, 1024 * 1024];
+    let text = load_corpus();
+    println!(
+        "corpus: {} KiB of real repo prose + Rust source\n",
+        text.len() / 1024
+    );
 
-    println!("pre-tokenizer only (no vocabulary, no merges)\n");
-    for &n in &sizes {
-        let text = corpus(n);
-        println!("{} KiB:", text.len() / 1024);
-        // Enough repetitions at every size that the timer resolution is not
-        // the thing being measured.
-        let reps = (8 * 1024 * 1024 / text.len()).max(3);
-        for (name, sp) in [
-            ("qwen2", BpeSplit::QWEN2),
-            ("qwen35 (marks in words)", BpeSplit::QWEN35),
-            ("llama-bpe / cl100k", BpeSplit::LLAMA3),
-            ("gpt-2", BpeSplit::GPT2),
-            ("falcon (3-stage pipeline)", BpeSplit::FALCON),
-        ] {
-            let p = PreTok::Bpe(sp);
-            bench(name, &text, reps, |t| {
-                let mut n = 0usize;
-                p.split(t, |_| n += 1);
-                n
-            });
-        }
-        println!();
+    println!("pre-tokenizer only (no vocabulary, no merges)");
+    for (name, sp) in [
+        ("gpt-2", BpeSplit::GPT2),
+        ("starcoder", BpeSplit::STARCODER),
+        ("llama-bpe / cl100k", BpeSplit::LLAMA3),
+        ("qwen2", BpeSplit::QWEN2),
+        ("qwen35 (marks in words)", BpeSplit::QWEN35),
+        ("falcon (3-stage pipeline)", BpeSplit::FALCON),
+    ] {
+        let p = PreTok::Bpe(sp);
+        bench(name, text.len(), || {
+            let mut n = 0usize;
+            p.split(&text, |_| n += 1);
+            n
+        });
     }
 
     let Some(path) = std::env::args().nth(1) else {
-        println!("(pass a .gguf to also measure full encoding)");
+        println!("\n(pass a .gguf to also measure full encoding)");
         return;
     };
     let tok = match GllmTokenizer::from_gguf_path(&path) {
@@ -103,15 +125,50 @@ fn main() {
             return;
         }
     };
-    println!("full encode — {path}\n");
-    for &n in &sizes {
-        let text = corpus(n);
-        let reps = (2 * 1024 * 1024 / text.len()).max(3);
-        bench(
-            &format!("{} KiB", text.len() / 1024),
-            &text,
-            reps,
-            |t| tok.encode(t, false).map(|v| v.len()).unwrap_or(0),
-        );
-    }
+
+    println!("\nfull encode — {path}");
+    // ⭐ In-process A/B. Two separate binaries would differ in build layout and
+    // in thermal state; the same process, seconds apart, differs in neither.
+    GllmTokenizer::set_pretoken_cache(false);
+    GllmTokenizer::reset_pretoken_cache();
+    bench("cache OFF", text.len(), || {
+        tok.encode(&text, false).map(|v| v.len()).unwrap_or(0)
+    });
+
+    // ⛔ COLD is the number to quote. `bench` runs the same input 40 times, so
+    // a cache left warm is being asked "how fast is re-encoding a document you
+    // have already seen" — which no server does. Clearing before every pass
+    // measures the realistic case: a fresh document against a fresh cache,
+    // where the only hits are *within* that document.
+    GllmTokenizer::set_pretoken_cache(true);
+    bench("cache ON, cold each pass", text.len(), || {
+        GllmTokenizer::reset_pretoken_cache();
+        GllmTokenizer::set_pretoken_cache(true);
+        tok.encode(&text, false).map(|v| v.len()).unwrap_or(0)
+    });
+    let (h, m) = GllmTokenizer::pretoken_cache_stats();
+    println!(
+        "  {:<26} hit rate {:.1}%  — {m} distinct pre-tokens in {} total",
+        "",
+        100.0 * h as f64 / (h + m).max(1) as f64,
+        h + m
+    );
+
+    // WARM is the upper bound: a long-lived process whose traffic repeats.
+    // Real serving sits between the two, nearer cold for varied prompts.
+    GllmTokenizer::reset_pretoken_cache();
+    GllmTokenizer::set_pretoken_cache(true);
+    let _ = tok.encode(&text, false);
+    bench("cache ON, warm (upper bound)", text.len(), || {
+        tok.encode(&text, false).map(|v| v.len()).unwrap_or(0)
+    });
+
+    // The claim that matters more than any timing above.
+    GllmTokenizer::set_pretoken_cache(false);
+    let cold = tok.encode(&text, false).expect("encode");
+    GllmTokenizer::set_pretoken_cache(true);
+    GllmTokenizer::reset_pretoken_cache();
+    let warm = tok.encode(&text, false).expect("encode");
+    assert_eq!(cold, warm, "the cache changed the ids — this is a bug");
+    println!("\ncache produces byte-identical ids: {} tokens", warm.len());
 }

@@ -122,6 +122,26 @@ fn check(dir: &Path, name: &'static str) -> Report {
                 continue;
             }
         };
+
+        // ⭐ Every vector is also scored with the pre-token cache disabled, so
+        // the whole corpus — not one hand-picked string — gates the claim that
+        // the cache is invisible in the output. Ordering matters: the cached
+        // run above is warm from previous vectors, which is the state a leak
+        // or a stale entry would show up in.
+        GllmTokenizer::set_pretoken_cache(false);
+        let uncached = tok.encode(&tests[i], false);
+        GllmTokenizer::set_pretoken_cache(true);
+        if uncached.as_deref().ok() != Some(&got[..]) {
+            if r.first_fail.is_none() {
+                r.first_fail = Some(format!(
+                    "#{i} {:?}\n      PRE-TOKEN CACHE CHANGED THE IDS\n      \
+                     uncached {uncached:?}\n      cached   {got:?}",
+                    tests[i]
+                ));
+            }
+            continue;
+        }
+
         if got == want[i] {
             r.passed += 1;
         } else if r.first_fail.is_none() {
