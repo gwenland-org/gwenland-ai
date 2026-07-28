@@ -13,7 +13,11 @@
 //! short corpus, not something this file claims is decode-loop-representative
 //! of glproc's normal throughput.
 //!
-//! Run: cargo run --release -p glproc --example ppl_check -- <model.gguf> [context] [stride]
+//! Run: cargo run --release -p glproc --example ppl_check -- <model.gguf> [context] [stride] [first]
+//!
+//! ⛔ To compare against `llama-perplexity`, pass `first = context/2`. Without
+//! it the two tools score different token sets and the numbers are not
+//! comparable — see the `first` argument below.
 
 use glcore::format::gguf::GgufFile;
 use glcore::tokenizer::GllmTokenizer;
@@ -38,6 +42,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_path = args.get(1).ok_or("usage: ppl_check <model.gguf> [context] [stride]")?;
     let context: usize = args.get(2).map(|s| s.parse()).transpose()?.unwrap_or(256);
     let stride: usize = args.get(3).map(|s| s.parse()).transpose()?.unwrap_or(128);
+    // ⛔ How many leading positions of EVERY window to exclude from scoring.
+    //
+    // This is the parameter that makes a llama.cpp comparison valid, and its
+    // absence made an earlier one invalid. `llama-perplexity` scores only the
+    // *last half* of each window — `const int first = n_ctx/2` in
+    // `tools/perplexity/perplexity.cpp`, commented "so the model always has
+    // some context to predict the token". A token at position 0 of a window
+    // is being predicted from a single preceding token; its perplexity is
+    // enormous and averaging it in inflates the result.
+    //
+    // Default 0 preserves this harness's own historical behaviour. Pass
+    // `context/2` to replicate llama.cpp.
+    let first: usize = args.get(4).map(|s| s.parse()).transpose()?.unwrap_or(0);
 
     eprintln!("loading {model_path} ...");
     let gguf = GgufFile::open(model_path)?;
@@ -82,7 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Index into THIS window (0..context) at which positions stop being
         // "already scored by the previous overlapping window" — matches
         // `glbench::ppl::sliding_window_log_probs`'s `new_start` exactly.
-        let new_start = if window_start == 0 { 0 } else { context - stride };
+        let new_start = if window_start == 0 { first } else { (context - stride).max(first) };
         let mut window_log_probs = Vec::new();
 
         for i in 0..(extended_end - window_start - 1) {
@@ -107,7 +124,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("model: {model_path}");
     println!("dataset: wikitext2-sample-embedded ({total_tokens} tokens, {evaluated_tokens} scored)");
-    println!("context={context} stride={stride}");
+    println!("context={context} stride={stride} first={first}");
+    if first == 0 {
+        println!(
+            "⚠️  first=0 scores every position, including ones with almost no              context. llama-perplexity uses first=n_ctx/2; pass {} to compare.",
+            context / 2
+        );
+    }
     println!("cross_entropy_mean: {cross_entropy_mean:.6}");
     println!("perplexity: {perplexity:.6}");
 
