@@ -24,11 +24,11 @@
 //! rather than inferred from these timings, which cache effects dominate long
 //! before any algorithmic term would show.
 //!
-//! Run: cargo run -p gltokenizer --example tokbench --release -- <model.gguf>
+//! Run: cargo run -p glcore --example tokenizer_bench --release -- <model.gguf>
 
 use std::time::Instant;
 
-use gltokenizer::{BpeSplit, PreTok, Tokenizer};
+use glcore::tokenizer::{BpeSplit, PreTok, GllmTokenizer};
 
 /// Mixed-script text: ASCII takes the bitmap path, the rest binary-searches.
 const SEED: &str = "The quick brown fox jumps over 13 lazy dogs, don't you think? \
@@ -96,7 +96,7 @@ fn main() {
         println!("(pass a .gguf to also measure full encoding)");
         return;
     };
-    let tok = match Tokenizer::from_gguf_path(&path) {
+    let tok = match GllmTokenizer::from_gguf_path(&path) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("{path}: {e}");

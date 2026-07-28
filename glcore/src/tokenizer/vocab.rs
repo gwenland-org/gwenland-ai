@@ -1,42 +1,15 @@
 //! Vocabulary data and its loaders.
 //!
-//! The vocabulary is deliberately *data* — this crate never opens a file it
-//! was not handed. GGUF lives in `glcore`, so `glcore` builds a [`Vocab`]
-//! from its own parsed metadata via [`Vocab::from_parts`]; only the
-//! HuggingFace `tokenizer.json` loader lives here, because it needs nothing
-//! but `serde_json`.
+//! The vocabulary is deliberately *data* — this module never opens a file it
+//! was not handed, which is what lets [`Vocab::from_parts`] serve GGUF, the
+//! HuggingFace `tokenizer.json` loader below, and any future container without
+//! any of them knowing about the others.
 
 use std::collections::HashMap;
 
-use crate::pretok::{BpeSplit, PreTok};
-use crate::TokError;
-
-/// Which encoding convention a vocabulary uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Style {
-    /// SentencePiece-like: `▁` marks spaces, per-token scores drive merges,
-    /// unknown bytes fall back to `<0xNN>`.
-    Spm,
-    /// GPT-2-like: bytes are remapped to printable chars, an explicit merge
-    /// list drives merges.
-    ByteLevel,
-    /// The hybrid Gemma-4 and Sarvam use: SentencePiece *surface form* — `▁`
-    /// for spaces, raw UTF-8 rather than the GPT-2 byte remap, `<0xNN>` byte
-    /// fallback — but merges driven by an explicit **merge list**, as
-    /// byte-level does, not by per-token scores.
-    ///
-    /// ⚠️ It is worth naming this rather than bending [`Spm`](Style::Spm),
-    /// because the two disagree on the thing that decides token ids: SPM will
-    /// merge any pair whose concatenation is in the vocabulary, ranked by
-    /// score; this style merges only pairs that appear in the merge list,
-    /// ranked by position. A vocabulary carrying both (Gemma-4 ships 262 144
-    /// scores *and* 514 906 merges) silently produces different ids depending
-    /// on which one is believed.
-    SpmBpe,
-}
-
-/// The SentencePiece space marker.
-pub const SPM_SPACE: char = '\u{2581}';
+use crate::tokenizer::pretok::{BpeSplit, PreTok};
+pub use crate::tokenizer::style::Style;
+use crate::tokenizer::TokError;
 
 /// Token strings that end generation, across the families GGUF ships.
 const STOP_TOKEN_STRINGS: &[&str] = &[
@@ -58,7 +31,7 @@ pub struct Vocab {
     pub(crate) scores: Vec<f32>,
     /// Byte-level merge rules, keyed by concatenation and disambiguated by
     /// the left symbol's byte length. ⚠️ A plain concatenation key collapses
-    /// distinct rules together; see [`crate::bpe::Ranker::rank`].
+    /// distinct rules together; see [`crate::tokenizer::bpe::Ranker::rank`].
     pub(crate) merge_ranks: HashMap<Box<str>, Box<[(u32, u32)]>>,
 
     pub(crate) style: Style,
@@ -347,7 +320,7 @@ impl Vocab {
 }
 
 /// Recognise the pre-tokenizer families this crate supports (see
-/// [`crate::pretok`]); refuse anything else.
+/// [`crate::tokenizer::pretok`]); refuse anything else.
 fn parse_pretok(v: Option<&serde_json::Value>) -> Result<PreTok, TokError> {
     let Some(v) = v else {
         return Ok(PreTok::None);

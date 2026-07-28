@@ -16,7 +16,7 @@
 //! Run: cargo run --release -p glproc --example ppl_check -- <model.gguf> [context] [stride]
 
 use glcore::format::gguf::GgufFile;
-use gltokenizer::Tokenizer;
+use glcore::tokenizer::GllmTokenizer;
 use glproc::loader::load_gguf;
 use glproc::runner::Runner;
 
@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("loading {model_path} ...");
     let gguf = GgufFile::open(model_path)?;
-    let tokenizer = Tokenizer::from_gguf_path(model_path)?;
+    let tokenizer = GllmTokenizer::from_gguf_path(model_path)?;
     let model = load_gguf(&gguf)?;
 
     // Respect the model's own `tokenizer.ggml.add_bos_token` metadata rather
@@ -55,38 +55,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let total_tokens = tokens.len();
     eprintln!("first 20 token ids: {:?}", &tokens[..20.min(tokens.len())]);
 
-    // ── tokenizer A/B ───────────────────────────────────────────────────
-    //
     // ⚠️ The recorded baseline for this model (PPL 36.12, see
     // notes/issues/glproc-precision-gap-vs-llamacpp.md) was measured with the
-    // OLD tokenizer. If the ids moved, the number below scores a *different*
-    // token sequence and is not directly comparable to it. Say so up front
-    // rather than letting a reader assume continuity.
-    #[allow(deprecated)]
-    if let Ok(old) = glcore::tokenizer::Tokenizer::from_gguf(&gguf) {
-        let old_ids = old.encode(WIKITEXT2_SAMPLE, add_bos);
-        let n = old_ids.len().min(tokens.len());
-        let agree = (0..n).filter(|&i| old_ids[i] == tokens[i]).count();
-        eprintln!(
-            "tokenizer A/B: old={} tokens, new={} tokens, prefix agreement {}/{} ({:.1}%)",
-            old_ids.len(),
-            tokens.len(),
-            agree,
-            n,
-            100.0 * agree as f64 / n.max(1) as f64
-        );
-        if old_ids == tokens {
-            eprintln!("  -> IDENTICAL: comparable to the recorded 36.12 baseline");
-        } else {
-            eprintln!("  -> DIFFERENT: this PPL scores a different token sequence");
-            if let Some(i) = (0..n).find(|&i| old_ids[i] != tokens[i]) {
-                let (lo, hi) = (i.saturating_sub(3), (i + 4).min(n));
-                eprintln!("     first divergence @{i}");
-                eprintln!("       old {:?} = {:?}", &old_ids[lo..hi], old.decode(&old_ids[lo..hi], false));
-                eprintln!("       new {:?} = {:?}", &tokens[lo..hi], tokenizer.decode(&tokens[lo..hi], false));
-            }
-        }
-    }
+    // tokenizer that `glcore::tokenizer` replaced. An old-vs-new A/B ran here
+    // until step 4 deleted that implementation; its result is recorded rather
+    // than re-derivable: on Qwen2.5 the ids came out **identical** (819/819 on
+    // this corpus, 201/201 on the glbench prompt) and the perplexity landed at
+    // 36.19 against the 36.12 baseline. So this number is comparable *for
+    // Qwen2.5*. It is not for Llama-3 or SPM families, where the old
+    // implementation scored 65.2%–97.8% and the ids necessarily moved.
     eprintln!("dataset: wikitext2-sample-embedded, {total_tokens} tokens, context={context} stride={stride}");
     if total_tokens <= context {
         return Err(format!("only {total_tokens} tokens, need more than context ({context})").into());

@@ -1,15 +1,20 @@
-# GGUF tokenizer support audit — `gltokenizer`
+# GGUF tokenizer support audit — `glcore::tokenizer`
 
-**Date:** 2026-07-28 · **Crate:** `glcore/gltokenizer` · **Oracle:** llama.cpp
-reference vectors (`models/ggml-vocab-*.gguf.inp` / `.out`), whose expected ids
-were produced by HuggingFace `tokenizers` — i.e. comparison is against *data*,
-not against another implementation.
+**Date:** 2026-07-28 · **Module:** `glcore/src/tokenizer/` · **Oracle:**
+llama.cpp reference vectors (`models/ggml-vocab-*.gguf.inp` / `.out`), whose
+expected ids were produced by HuggingFace `tokenizers` — i.e. comparison is
+against *data*, not against another implementation.
+
+⚠️ This was the standalone `gltokenizer` crate until step 4 folded it into
+`glcore` (§7). Older references to `gltokenizer::Tokenizer` mean
+`glcore::tokenizer::GllmTokenizer`.
 
 Regenerate this table at any time:
 
 ```
-cargo run -p gltokenizer --example audit --release
-cargo test  -p gltokenizer --release            # enforces it
+cargo run  -p glcore --example tokenizer_audit --release
+cargo test -p glcore --release                    # enforces it
+GLTOK_REQUIRE_CORPUS=1 cargo test -p glcore       # and fails if it cannot
 ```
 
 ---
@@ -19,7 +24,7 @@ cargo test  -p gltokenizer --release            # enforces it
 | Vocabulary | GGUF `model` / `pre` | Parity | Status |
 |---|---|---:|---|
 | `qwen2` | gpt2 / qwen2 | **46/46** | ✅ supported |
-| `qwen35` | gpt2 / qwen35 | **50/50** | ✅ supported ⚠️ *see §3.1* |
+| `qwen35` | gpt2 / qwen35 | **50/50** | ✅ supported — *§3.1 closed* |
 | `llama-bpe` | gpt2 / llama-bpe | **46/46** | ✅ supported |
 | `llama-spm` | llama / default | **46/46** | ✅ supported |
 | `gpt-2` | gpt2 / gpt-2 | **46/46** | ✅ supported |
@@ -38,9 +43,10 @@ cargo test  -p gltokenizer --release            # enforces it
 | `bert-bge` | bert / bert-bge | — | ⛔ out of scope — WordPiece, not BPE |
 | `nomic-bert-moe` | t5 / default | — | ⛔ out of scope — Unigram, not BPE |
 
-**13 families verified exact, up from 10.** The two closures (`command-r`,
-`gemma-4`) are described in §2. `gpt-neox` and `aquila` moved the other way —
-they used to load, and should not have; see §4.2.
+**14 families verified exact, up from 10.** `command-r` and `gemma-4` are
+described in §2; `falcon` closed later the same day once exact Unicode tables
+landed (§6). `gpt-neox` and `aquila` moved the other way — they used to load,
+and should not have; see §4.2.
 
 ---
 
@@ -269,3 +275,63 @@ runs that make a backtracking NFA go quadratic, across all six shapes, and
 checks the split stays lossless. The scanner advances monotonically and never
 revisits a byte, so `O(n)` is a property of its construction, not of a
 measurement this machine cannot resolve.
+
+---
+
+## 7. Addendum 2026-07-28 — extracted into `glcore::tokenizer`
+
+The `gltokenizer` crate is gone; its contents are now
+`glcore/src/tokenizer/`, and the deprecated `glcore/src/tokenizer.rs` it once
+coexisted with has been **deleted**. No new dependencies: glcore already had
+`thiserror` and `serde_json`, and every crate that used `gltokenizer` already
+depended on `glcore`.
+
+| Was | Is now |
+|---|---|
+| `gltokenizer::Tokenizer` | `glcore::tokenizer::GllmTokenizer` |
+| crate `src/lib.rs` | `src/tokenizer/mod.rs` |
+| — | `src/tokenizer/style.rs` (`Style` out of `vocab`) |
+| — | `src/tokenizer/spm.rs` (the two SPM-surface encoders) |
+| `tests/parity.rs` | `glcore/tests/tokenizer_parity.rs` |
+| `examples/audit.rs` | `glcore/examples/tokenizer_audit.rs` |
+| `examples/tokbench.rs` | `glcore/examples/tokenizer_bench.rs` |
+| `tools/gen_unicode_tables.py` | `glcore/tools/gen_unicode_tables.py` |
+
+All moves are `git mv`, so history follows the files.
+
+### ⛔ What the move broke, and what it cost
+
+**A silent skip.** `tests/parity.rs` located the reference corpus by
+`ancestors().nth(3)`. The move changed the crate root by one directory, so that
+resolved to the wrong place — and because a missing corpus *skips*, the test
+kept reporting `ok` in 0.00s while checking **nothing**. It was caught only by
+noticing the runtime had dropped.
+
+Two fixes, because the magic number was the symptom and the silent skip was the
+disease:
+
+* the corpus is now found by walking *up* until `llama.cpp/models` exists, so
+  no future move can break it;
+* `GLTOK_REQUIRE_CORPUS=1` turns the skip into a failure (for CI), and the test
+  now also fails if the directory resolves but yields no vectors at all.
+
+**Three deliberate deletions.** `glcore/tests/tokenizer_before_after.rs`,
+`glproc/examples/tok_ab_file.rs`, and `ppl_check.rs`'s inline A/B block all
+existed to compare the old implementation against the new one. Deleting the old
+implementation makes them unbuildable. Their result is recorded rather than
+re-derivable, and is restated in `ppl_check.rs` where it matters: on Qwen2.5 the
+ids were **identical** (819/819, 201/201) and PPL landed at 36.19 against the
+36.12 baseline.
+
+### Verification
+
+101 tests in `glcore` (55 pre-existing + 46 tokenizer), parity green in 3.7 s
+against the real corpus, `cargo build --workspace --all-targets` exit 0, clippy
+clean for `glcore`. All three Qwen models on this machine load with
+byte-identical ids before and after.
+
+⚠️ `cargo build -p glictus-caliburni --all-targets` fails on
+`examples/diff_dump.rs` — **pre-existing**, unrelated: that file imports
+`glcore::format` and `runtime::GlprocBackend`, both behind optional features it
+does not declare. It compiles under workspace feature unification, which is why
+the workspace build is green. Untouched by this work.

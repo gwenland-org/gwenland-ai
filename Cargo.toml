@@ -1,7 +1,6 @@
 [workspace]
 members = [
     "glcore",
-    "glcore/gltokenizer",
     "glproc",
     "glcuda",
     "glvulkan",

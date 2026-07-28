@@ -30,7 +30,7 @@
 //!
 //! A `.gllm` package does not package a tokenizer yet (ARTX1 OQ3 is decided
 //! — a `GLLMTokenizer.gllm` unit — but the converter does not emit one). The
-//! only tokenizer this workspace has is `glcore::tokenizer::Tokenizer`,
+//! only tokenizer this workspace has is `glcore::tokenizer::GllmTokenizer`,
 //! built from GGUF metadata — so this command asks for the *original* source
 //! GGUF the package was converted from, exactly as
 //! `glictus-caliburni/examples/run_package_e2e.rs` does.
@@ -49,7 +49,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use glcore::engine_trait::GlEngine;
 use glcore::format::gguf::GgufFile;
-use gltokenizer::Tokenizer;
+use glcore::tokenizer::GllmTokenizer;
 use glictus_caliburni::runtime::GllmEngine;
 
 use crate::export::json::Json;
@@ -145,7 +145,7 @@ pub fn run_ppl(args: PplArgs) -> Result<(), String> {
     );
     let gguf = GgufFile::open(args.gguf.to_str().ok_or("--gguf path is not valid UTF-8")?)
         .map_err(|e| format!("opening {}: {e}", args.gguf.display()))?;
-    let tokenizer = Tokenizer::from_gguf_path(&args.gguf.to_string_lossy())
+    let tokenizer = GllmTokenizer::from_gguf_path(&args.gguf.to_string_lossy())
         .map_err(|e| format!("building tokenizer from {}: {e}", args.gguf.display()))?;
 
     let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false);
