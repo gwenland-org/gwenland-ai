@@ -403,7 +403,7 @@ fn in_ranges(ranges: &[(u32, u32)], c: u32) -> bool {
 
 /// `\p{L}` — Unicode general category L (letter).
 #[inline]
-pub fn is_letter(c: char) -> bool {
+pub(crate) fn is_letter(c: char) -> bool {
     let u = c as u32;
     if u < 128 {
         return ASCII[u as usize] & ASCII_L != 0;
@@ -413,7 +413,7 @@ pub fn is_letter(c: char) -> bool {
 
 /// `\p{M}` — Unicode general category M (combining mark).
 #[inline]
-pub fn is_mark(c: char) -> bool {
+pub(crate) fn is_mark(c: char) -> bool {
     let u = c as u32;
     if u < 128 {
         return ASCII[u as usize] & ASCII_M != 0;
@@ -423,7 +423,7 @@ pub fn is_mark(c: char) -> bool {
 
 /// `\p{N}` — Unicode general category N (number).
 #[inline]
-pub fn is_number(c: char) -> bool {
+pub(crate) fn is_number(c: char) -> bool {
     let u = c as u32;
     if u < 128 {
         return ASCII[u as usize] & ASCII_N != 0;
@@ -433,7 +433,7 @@ pub fn is_number(c: char) -> bool {
 
 /// `\p{P}` — Unicode general category P (punctuation).
 #[inline]
-pub fn is_punctuation(c: char) -> bool {
+pub(crate) fn is_punctuation(c: char) -> bool {
     let u = c as u32;
     if u < 128 {
         return ASCII[u as usize] & ASCII_P != 0;
@@ -441,3 +441,118 @@ pub fn is_punctuation(c: char) -> bool {
     in_ranges(&P_RANGES, u)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ Structural invariants come first: `in_ranges` is a binary search, so
+    /// an unsorted or overlapping table does not error — it returns the wrong
+    /// answer for some codepoints and the right one for others. That is the
+    /// failure mode a generator bug actually produces.
+    #[test]
+    fn ranges_are_sorted_disjoint_and_non_empty() {
+        for (name, r) in [
+            ("L", &L_RANGES[..]),
+            ("M", &M_RANGES[..]),
+            ("N", &N_RANGES[..]),
+            ("P", &P_RANGES[..]),
+        ] {
+            assert!(!r.is_empty(), "{name} table is empty");
+            for (i, &(lo, hi)) in r.iter().enumerate() {
+                assert!(lo <= hi, "{name}[{i}] = ({lo:#x}, {hi:#x}) is inverted");
+                assert!(hi <= 0x10FFFF, "{name}[{i}] exceeds the Unicode range");
+                if i > 0 {
+                    let prev = r[i - 1].1;
+                    assert!(
+                        prev < lo,
+                        "{name}[{}]..{prev:#x} overlaps or abuts {name}[{i}] at {lo:#x} \
+                         — abutting ranges should have been merged",
+                        i - 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The binary search must agree with an exhaustive linear scan. Cheap
+    /// insurance that the comparator's inverted `Greater`/`Less` is right.
+    #[test]
+    fn binary_search_agrees_with_linear_scan() {
+        for r in [&L_RANGES[..], &M_RANGES[..], &N_RANGES[..], &P_RANGES[..]] {
+            // Every boundary, one inside, and both neighbours of every range.
+            for &(lo, hi) in r.iter() {
+                for c in [lo.saturating_sub(1), lo, lo + (hi - lo) / 2, hi, hi + 1] {
+                    let linear = r.iter().any(|&(a, b)| c >= a && c <= b);
+                    assert_eq!(in_ranges(r, c), linear, "disagreement at {c:#x}");
+                }
+            }
+        }
+    }
+
+    /// The ASCII fast path is a second copy of the data; it must not drift.
+    #[test]
+    fn ascii_bitmap_matches_the_ranges() {
+        for u in 0u32..128 {
+            for (bit, r) in [
+                (ASCII_L, &L_RANGES[..]),
+                (ASCII_M, &M_RANGES[..]),
+                (ASCII_N, &N_RANGES[..]),
+                (ASCII_P, &P_RANGES[..]),
+            ] {
+                let via_bitmap = ASCII[u as usize] & bit != 0;
+                let via_ranges = r.iter().any(|&(a, b)| u >= a && u <= b);
+                assert_eq!(via_bitmap, via_ranges, "ASCII {u:#x} bit {bit:#x}");
+            }
+        }
+    }
+
+    #[test]
+    fn punctuation_spot_checks() {
+        for c in ['.', ',', '?', '!', '-', '_', '(', ')', '[', ']', '"', '\''] {
+            assert!(is_punctuation(c), "{c:?} must be \\p{{P}}");
+        }
+        // U+060C ARABIC COMMA, U+3001 IDEOGRAPHIC COMMA, U+2014 EM DASH.
+        for c in ['\u{060C}', '\u{3001}', '\u{2014}'] {
+            assert!(is_punctuation(c), "{c:?} must be \\p{{P}}");
+        }
+        // Letters, digits, whitespace, and SYMBOLS are not punctuation.
+        for c in ['a', 'Z', '0', '9', ' ', '\n', '+', '<', '=', '$', '`', '\u{1F600}'] {
+            assert!(!is_punctuation(c), "{c:?} must NOT be \\p{{P}}");
+        }
+    }
+
+    #[test]
+    fn mark_spot_checks() {
+        // U+0300 COMBINING GRAVE (Mn), U+093E DEVANAGARI VOWEL SIGN AA (Mc),
+        // U+20DD COMBINING ENCLOSING CIRCLE (Me) — one from each subcategory.
+        for c in ['\u{0300}', '\u{093E}', '\u{20DD}'] {
+            assert!(is_mark(c), "{c:?} must be \\p{{M}}");
+        }
+        for c in ['a', '0', '.', ' ', '\u{4E00}'] {
+            assert!(!is_mark(c), "{c:?} must NOT be \\p{{M}}");
+        }
+    }
+
+    /// ⭐ The classes this crate previously conflated. `char::is_alphabetic` is
+    /// true for all three of these; only the first is `\p{L}`.
+    #[test]
+    fn letter_number_and_mark_do_not_overlap_where_std_says_they_do() {
+        assert!(is_letter('a') && !is_mark('a') && !is_number('a'));
+        // U+2167 ROMAN NUMERAL EIGHT is Nl — a number, not a letter.
+        assert!(is_number('\u{2167}') && !is_letter('\u{2167}'));
+        // U+093E is Mc — a mark, not a letter.
+        assert!(is_mark('\u{093E}') && !is_letter('\u{093E}'));
+        // U+00BD VULGAR FRACTION ONE HALF is No.
+        assert!(is_number('\u{00BD}') && !is_punctuation('\u{00BD}'));
+    }
+
+    #[test]
+    fn non_bmp_codepoints_resolve() {
+        // U+10400 DESERET CAPITAL LONG I (Lu), U+1D165 MUSICAL SYMBOL COMBINING
+        // STEM (Mc), U+1D7CE MATHEMATICAL BOLD DIGIT ZERO (Nd).
+        assert!(is_letter('\u{10400}'));
+        assert!(is_mark('\u{1D165}'));
+        assert!(is_number('\u{1D7CE}'));
+    }
+}
