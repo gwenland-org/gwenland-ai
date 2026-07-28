@@ -20,11 +20,19 @@ in which case XLA materialises the full f32 weight into scratch on every call
 weight), or they are constants, in which case XLA constant-folds the
 dequantisation at compile time and the executable carries dense f32 weights
 (measured: `%constant.6 = f32[896,4864] constant({…})`). The first is *worse*
-than an f32 model for a bandwidth-bound decode — it writes and then reads
-17.4 MB where f32 only reads it. The second saves nothing. ⭐ **ARTX10 v2
-therefore treats quantization as a host-side storage concern by default, and
-emits quantized IR only where a probe has measured the backend doing something
-better with it.**
+than an f32 model for a bandwidth-bound decode — 4.64x slower, measured. The
+second saves nothing.
+
+⭐⭐ **But there is a third way, and it works: never dequantise more than a
+tile.** Emitting a `stablehlo.while` over the contracting dimension — slice,
+dequantise, dot, accumulate — is **3.58x faster than the naive quantized path**
+and costs **1.30x** an f32 baseline while using **2.86x less memory** (§3.1).
+Quantization stops being catastrophic and becomes a memory-for-time trade whose
+sign depends on whether the model fits.
+
+⭐ **ARTX10 v2 therefore defaults to host-side dequant, offers tile streaming as
+the quantized path, and picks between them with a cost model rather than a
+capability flag** — because the right answer genuinely differs per model.
 
 ---
 
@@ -167,16 +175,18 @@ scales, 32-element blocks — all correct to ~2e-05.
 
 # 2. Viable paths, ranked by confidence
 
-| # | Path | Evidence | Verdict |
+| # | Path | Measured | Verdict |
 |---|---|---|---|
-| **1** | **Host-side dequant at load** → dense f32/bf16 → plain `dot_general` | probe `(b)`; §Q4 reference row | ✅ **Default.** Works on every backend including unprobed ones; costs nothing at runtime; saves nothing in RAM |
-| **2** | **Blockwise IR**, weights as **arguments** | probe `(h)`/`(i)` correct; §Q4 temp measurement | ⚠️ **Opt-in per backend.** Correct everywhere, profitable only where a probe shows the multiply fusing into the dot |
-| **3** | Blockwise IR, weights as **constants** | §Q4 constant row | ⛔ **Never.** Folded to dense f32 — same memory as path 1, longer compile |
-| **4** | `!quant.uniform` / `uniform_quantize` | §Q1 PARSE-FAIL | ⛔ **Unrunnable.** Do not emit |
-| **5** | Custom call to a vendor INT8 GEMM | — | ⛔ **Violates P1**; gljax owns no kernels |
+| **1** | **Host-side dequant** → dense f32 → plain `dot_general` | 848 µs · 17.46 MB | ✅ **Default.** Fastest, works on every backend including unprobed ones, saves no memory |
+| **2** | ⭐ **Tile streaming** — `while` over the contracting dim | **1100 µs · 6.10 MB** | ✅ **The quantized path.** 1.30x the time for 2.86x less memory. Chosen by cost model (§5) |
+| **3** | Blockwise IR over the whole weight, as **arguments** | 3932 µs · 22.36 MB | ⛔ **Never by default.** 4.64x slower than f32 *and* more total memory than path 2. Kept only as the comparison baseline, and as the shape a genuinely-fusing backend would want |
+| **4** | Blockwise IR, weights as **constants** | folded to f32 | ⛔ **Never.** Same memory as path 1, longer compile, no benefit |
+| **5** | `!quant.uniform` / `uniform_quantize` | PARSE-FAIL | ⛔ **Unrunnable.** Do not emit |
+| **6** | Custom call to a vendor INT8 GEMM | — | ⛔ **Violates P1**; gljax owns no kernels |
 
-⚠️ Path 2's **correctness is settled and its profitability is not.** That
-distinction is what the rest of this document is built around.
+⭐ Paths 1 and 2 are both correct and both defensible; **which one wins is a
+property of the deployment, not of the backend.** That is why §5 replaces v1's
+capability enum with a cost model.
 
 ---
 
@@ -208,9 +218,55 @@ distinction is what the rest of this document is built around.
                    └──────────────────────────────┘
 ```
 
-**The default is MATERIALISE**, and `EMIT_BLOCKWISE` is reached only from a
-measurement. On the CPU plugin as of jaxlib 0.10.2, it never is. This inverts
-v1, which emitted quantized IR by default and treated fallback as the exception.
+**The default is MATERIALISE**, and the quantized paths are reached only from a
+measurement.
+
+## 3.1 ⭐⭐ Tile streaming — the reason a quantized path exists at all
+
+§Q4 measured that dequantising a *whole* weight is catastrophic. The fix is not
+to give up on quantized IR but to **never dequantise more than a tile**:
+slice the reduction dimension, dequantise one slice, dot it, accumulate.
+Measured, decode-shaped matvec `[1,896] × [896,4864]`, block 32, best-of-30
+([`tile_streaming_probe.py`](../probes/tile_streaming_probe.py)):
+
+| variant | time | vs f32 | temp | argument |
+|---|---:|---:|---:|---:|
+| f32 weights (reference) | **848 µs** | 1.00× | 0.02 MB | 17.44 MB |
+| quant, whole-weight dequant | 3932 µs | ⛔ **4.64×** | 17.45 MB | 4.91 MB |
+| quant, reduction tiles of 128 | 1108 µs | 1.31× | 2.51 MB | 4.91 MB |
+| ⭐ **quant, reduction tiles of 32** | **1100 µs** | **1.30×** | 1.19 MB | 4.91 MB |
+
+⭐ **3.58× faster than the naive quantized path**, and scratch falls
+17.45 → 1.19 MB. Quantization goes from catastrophic to a ~30 % tax.
+
+⭐⭐ **The trade is now real and its sign depends on the model:**
+
+```
+   f32          17.46 MB working set,   848 us
+   tiled quant   6.10 MB working set,  1100 us
+                 2.86x less memory  for  1.30x the time
+```
+
+A win when the model does not fit in RAM; a loss when it does. **That is a cost
+model's decision, not a capability flag's** — see §5.
+
+### ⛔ Two implementation constraints the measurement forced
+
+1. **The loop must survive into the compiled program.** An *unrolled* tile loop
+   (a Rust/Python `for` emitting one dot per tile) measured **17.43 MB — no
+   improvement at all.** XLA fuses it straight back into a whole-weight
+   dequant. Only a real `stablehlo.while` (what `lax.scan` lowers to) holds.
+   ⚠️ Any emitter that unrolls has silently reverted to the broken path.
+2. **Tile the reduction dimension, not the output dimension.** Output tiling
+   measured 9.26 MB against reduction tiling's 1.19 MB, because under reduction
+   tiling the accumulator stays `[m, n]` and only `[tile_k, n]` is ever live.
+
+⚠️ Measured at **batch 1** only. Prefill amortises a materialised weight across
+many tokens and may invert the ranking — §9 question 3, now the most valuable
+open item rather than a speculative one.
+
+This inverts v1, which emitted quantized IR by default and treated fallback as
+the exception.
 
 ---
 
@@ -234,13 +290,26 @@ pub enum WeightDelivery {
     Materialise { as_dtype: DType },
 
     /// Upload integer quants and scales as separate arguments; emit
-    /// `convert · reshape · broadcast_in_dim · multiply · dot_general`.
+    /// `convert · reshape · broadcast_in_dim · multiply · dot_general` over
+    /// the **whole** weight.
     ///
-    /// ⚠️ Only correct to *choose* once a probe measured the multiply fusing
-    /// into the dot. Without fusion this is slower than `Materialise`: the
-    /// dequantised matrix is written to scratch and read back, so the pass
-    /// moves ~2x the bytes an f32 model would (§Q4).
+    /// ⛔ Measured 4.64x slower than f32 on the CPU plugin (§Q4). Retained
+    /// only as the thing `EmitTileStream` is compared against, and as the
+    /// shape a backend that genuinely fuses would want. Never a default.
     EmitBlockwise { block: u32, levels: ScaleLevels },
+
+    /// ⭐ Emit a `stablehlo.while` over the contracting dimension: slice,
+    /// dequantise one tile, dot, accumulate. The dequantised weight never
+    /// exists in full.
+    ///
+    /// Measured 3.58x faster than `EmitBlockwise` and 1.30x slower than f32,
+    /// at 2.86x less memory (§3.1). This is the only quantized delivery worth
+    /// selecting on a backend that does not fuse.
+    ///
+    /// ⛔ `tile_k` must divide the contracting dim AND be a multiple of
+    /// `block`. ⛔ The emitter must produce a real while-loop — unrolling it
+    /// measured *zero* improvement, because XLA folds it back.
+    EmitTileStream { block: u32, tile_k: u32, levels: ScaleLevels },
 }
 
 /// GQ4A has two levels: f16 per 32 elements, f32 per 256. GQ2A adds a third.
