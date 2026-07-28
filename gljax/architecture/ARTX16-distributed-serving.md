@@ -99,6 +99,27 @@ would push `tokio` into `gljax`. Rejected.
 11. Slot freed, telemetry recorded          ARTX7 retire + metrics.rs
 ```
 
+### ⛔ Step 3 is serialised per request, and cannot be split
+
+Tokenizing **one** prompt cannot be parallelised. The pre-tokenizer's `\s+(?!\S)` keeps a
+whitespace run whole when it reaches end-of-input and surrenders its last character when it does
+not, so cutting the input re-segments at the seam and changes token ids — there is no safe split
+point, and the intuitive one (right after a newline) is a measured counterexample. ARTX13 §0.5.1
+carries the derivation and the pinning test.
+
+What this costs the design:
+
+* ✅ **Across requests it is free.** `GllmTokenizer` is `Sync`, and its scratch and pre-token cache
+  are thread-local, so N concurrent requests tokenize on N threads with no coordination and no
+  shared state to contend on.
+* ⚠️ **Within one request it is a serial host cost of ~50 ns/KiB** (cold cache, measured — ARTX13
+  §0.5). A 1 MB long-context prompt is therefore **~50 ms of time-to-first-token that no amount of
+  hardware removes**. Budget it in §5.4's admission control rather than discovering it as tail
+  latency.
+* ⚠️ **The cache is per *thread*, not per model.** A work-stealing pool scatters one model's traffic
+  across N independent caches, each warming separately; thread-affine assignment keeps the hit rate
+  where §0.5's warm figure assumes it is. This is a scheduling decision, not a tokenizer one.
+
 ## 1.3 Core types
 
 ```rust
