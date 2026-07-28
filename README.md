@@ -28,6 +28,16 @@ blowing the RAM budget. A GPU is optional.
 
 - **From-scratch everything** — GGUF and safetensors parsers, BPE tokenizer,
   attention, KV cache, sampler. No `llama.cpp` bindings, no candle, no torch.
+- **Tokenizer validated against reference data** — `glcore::tokenizer` scores
+  **14 vocabulary families exact** against llama.cpp's own reference vectors
+  (not against another implementation), enforced on every build. A family this
+  crate cannot express is refused at load time, never silently approximated.
+  Architecture: [`glcore/src/tokenizer/README.md`](glcore/src/tokenizer/README.md).
+- **Precision measured against llama.cpp, not assumed** — on identical GGUF
+  weights, `glproc` at native Q4_K sits at perplexity **24.19** against
+  llama.cpp's **24.78 ± 3.69** (WikiText-2, teacher-forced) — inside its own
+  error bar. The production default (Q4_K→Q8_0 repack) is ~7.5% behind; that
+  gap is the documented repack trade, not an unexplained defect.
 - **Runs on small machines** — mmap zero-copy weight loading keeps the working
   set inside an 8 GB RAM budget.
 - **Hand-authored GPU kernels** — `glcuda` talks to the CUDA *driver* directly
@@ -76,6 +86,24 @@ There is also a `packages/` group (`packages/core`, `packages/mcp`) — an
 in-progress training-arm crate and an MCP server. `gltui` (the terminal UI)
 was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL
 engines — and is no longer a workspace member.
+
+## Research: gljax (design only, zero code)
+
+[`gljax/`](gljax/architecture/Overall-Architecture.md) is a from-scratch
+StableHLO/PJRT engine design — **17 architecture documents, no `src/`, not a
+workspace member.** Every wave gate in it is a claim to be tested, not a
+result; where a document reports a number, it came from published research or
+a *different* GwenLand engine, never from gljax itself. Start at
+[`Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md).
+
+[`gljax/probes/`](gljax/probes/) is the one exception: three small,
+reproducible Python scripts (`python <script>.py`, no gljax code required)
+that settled real questions about what a PJRT CPU plugin actually does with
+quantized weights — e.g. that dequantised weights get fully materialised
+per call unless the dot is tiled over the contracting dimension, at which
+point quantization goes from a 4.6× slowdown to a ~30% tax in decode (and is
+nearly free in prefill). Full write-up:
+[`ARTX10-quantized-runtime-architecture.md`](gljax/architecture/ARTX10-quantized-runtime-architecture.md).
 
 ## Building
 

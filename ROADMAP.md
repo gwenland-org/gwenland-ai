@@ -10,7 +10,7 @@
 > selects and routes but owns zero compute, and `glproc` (CPU) as the
 > numerical ground truth every other engine is validated against.
 
-Last updated: **2026-07-17**. Agents: read
+Last updated: **2026-07-28**. Agents: read
 [`gl-agent-skills/`](gl-agent-skills/README.md) before touching anything.
 
 ---
@@ -19,7 +19,7 @@ Last updated: **2026-07-17**. Agents: read
 
 | Crate | Role | Status |
 |-------|------|--------|
-| `glcore` | parsers (GGUF/safetensors), BPE tokenizer, tensor types, `GlEngine` trait, runtime | ✅ shipped |
+| `glcore` | parsers (GGUF/safetensors), BPE tokenizer (14 vocab families exact vs reference, see below), tensor types, `GlEngine` trait, runtime | ✅ shipped |
 | `glproc` | CPU engine — SIMD (AVX2) + threading, Q8_0 hot path, Q4_K→Q8_0 repack | ✅ M1 + M1.5 done |
 | `glcuda` | CUDA engine — driver FFI, hand-written PTX, arena VRAM, CUDA-graph decode, INT8-MMA prefill | ✅ **M2 passed** (T4-validated) |
 | `glbench` | profiler/benchmark — telemetry roofline, behavior signals, A/B, archives | ✅ v2 "Mensura Veritatis" shipped |
@@ -54,6 +54,34 @@ Passed the full Definition of Done on a Tesla T4: 14/14 tensor parity vs
 glproc, zero post-init allocations, no VRAM leaks; decode 29.2 tok/s (88 %
 of card bandwidth), prefill 73 tok/s (batched GEMM + INT8 tensor cores).
 Reproducible: `notebooks/glcuda_t4_validation.ipynb`.
+
+### Tokenizer rewrite — `glcore::tokenizer`, 14 vocab families exact
+The previous BPE tokenizer passed its own round-trip tests while scoring
+65.2%–97.8% against llama.cpp's reference vectors (worst case: a third of
+inputs wrong on `llama-bpe`) — round-trip tests hide compensating errors that
+reference-*data* comparison does not. Rewritten from the algorithm's
+definition (never from llama.cpp's code), then extracted from a standalone
+crate into `glcore::tokenizer`. Now **14 vocabulary families exact**, enforced
+by `glcore/tests/tokenizer_parity.rs` on every build; a family the crate
+cannot express is refused at load rather than approximated. A pre-token cache
+(1.9–3.6× on real text) and a `find_special` fix (71% → ~1% of a warm encode)
+followed once precision was settled. Architecture, the traps found along the
+way, and measured throughput:
+[`glcore/src/tokenizer/README.md`](glcore/src/tokenizer/README.md).
+
+### Precision vs llama.cpp — measured, at parity (native Q4_K)
+A previously "confirmed real" ~46% perplexity gap on identical GGUF weights
+turned out to be **~85% a scoring-protocol mismatch**: `llama-perplexity`
+scores only the last half of each context window, and the comparison hadn't
+matched that. Re-measured with the two tools reading the same token set,
+same session: glproc native Q4_K **24.19** vs llama.cpp **24.78 ± 3.69** —
+inside llama.cpp's own error bar. The production default (Q4_K→Q8_0 repack)
+is ~7.5% behind, which is the documented repack trade. One genuine formula
+difference was found and fixed along the way (RMSNorm's sum-of-squares
+accumulator, f32 → f64 to match `ggml_float`); it moved nothing measurably.
+Throughput (decode/prefill) is a separate, still-open gap — see
+[`gl-agent-skills/cpu-skills/rejected-optimizations.md`](gl-agent-skills/cpu-skills/rejected-optimizations.md)
+for what has already been tried and rejected on this hardware tier.
 
 ### Observability — glbench v2 "Mensura Veritatis"
 Pull-based engine telemetry → bucket roofline vs measured ceiling, cold/warm
@@ -137,6 +165,27 @@ platform features):
    archived glbench session behind it.
 6. **Dependency additions follow the policy in
    [`CONTRIBUTING.md`](CONTRIBUTING.md)** — reason, impact, use cases, or no.
+
+## Research track: gljax (separate from the M1–M4 line above)
+
+A from-scratch StableHLO/PJRT engine, explored as a design track rather than
+folded into the gl-stack milestones — it targets a different execution model
+(compiled IR through XLA/PJRT vs. the gl-stack's hand-written kernels) and
+isn't on the gl-stack's critical path. **Status: 17 architecture documents,
+zero code, not a workspace member.** Start at
+[`gljax/architecture/Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md).
+
+The one exception is [`gljax/probes/`](gljax/probes/) — three small,
+independently reproducible Python scripts that settled real open questions
+(what a PJRT CPU plugin does with quantized weights; where tile-streamed
+dequantisation stops winning over whole-weight dequant, measured at the
+M≈64–256 crossover). Those are measurements, not gljax code, and they don't
+require gljax to exist to run.
+
+**Next step, when picked up:** implementation starts at ARTX01 (PJRT FFI
+bring-up on the CPU plugin) per the build order in `Overall-Architecture.md`
+§3.1 — not at ARTX10, whose design is complete but frozen until ARTX01–05
+produce a real generated token.
 
 ## Non-goals
 

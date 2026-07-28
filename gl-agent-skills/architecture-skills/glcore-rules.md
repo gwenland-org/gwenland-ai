@@ -2,7 +2,7 @@
 
 > **Domain:** architecture-skills
 > **Applies to:** [`glcore/`](../../glcore/)
-> **Last updated:** 2026-07-17
+> **Last updated:** 2026-07-28
 
 ## BEFORE YOU START
 
@@ -73,6 +73,14 @@ glproc = { path = "../glproc" }   // reversed dependency — forbidden even
 - The tokenizer and parsers being in glcore is deliberate: tokenization and
   file decoding must be bit-identical regardless of engine, and they run
   once per request/load — not per token.
+- **Tokenizer work specifically:** read
+  [`glcore/src/tokenizer/README.md`](../../glcore/src/tokenizer/README.md)
+  first — it documents the merge engine, the pre-tokenizer's regex-arm
+  grouping (not model-family grouping — a table keyed on the wrong axis is
+  how 13/24 entries went wrong once), and the pre-token cache's correctness
+  gate. `glcore/tests/tokenizer_parity.rs` scores every claimed vocabulary
+  family against llama.cpp's reference vectors on every build; a family this
+  crate cannot express is refused at load, never approximated.
 - Telemetry stays **pull-based** (`GlEngine::telemetry()` snapshot): glcore
   defines the types, engines fill them, glbench reads them. glcore never
   pushes callbacks into engines.
