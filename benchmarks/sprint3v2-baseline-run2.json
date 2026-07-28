@@ -1,0 +1,266 @@
+{
+  "analysis": {
+    "bottleneck": "compute_bound",
+    "ceiling_basis": "measured",
+    "ceiling_efficiency": 0.43163989647604095,
+    "decode_tps": {
+      "ci95": 9.021422401325799,
+      "count": 5,
+      "max": 36.08127781394362,
+      "mean": 27.310795745439822,
+      "median": 24.86856767697036,
+      "min": 18.95459878993249,
+      "p95": 35.59256512176485,
+      "p99": 35.98353527550787,
+      "std_dev": 6.4995838626266575
+    },
+    "health": 0.3165648669790777,
+    "hypotheses": [],
+    "notes": [
+      "Decode 27.3 tok/s vs bandwidth ceiling 63.3 tok/s (31 GB/s, measured on this machine, over 0.49 GB weights) = 43% of peak.",
+      "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever.",
+      "Decode throughput is noisy across runs (CV 24%); increase measure_iters for a stabler figure."
+    ],
+    "prefill_tps": {
+      "ci95": 14.63597228797636,
+      "count": 5,
+      "max": 124.31363335185607,
+      "mean": 109.75844796665885,
+      "median": 104.98678144839668,
+      "min": 96.96884642201925,
+      "p95": 123.45382543640545,
+      "p99": 124.14167176876595,
+      "std_dev": 10.544648622461356
+    },
+    "roofline": null
+  },
+  "behavior": {
+    "anomaly": {
+      "drift_frac": -0.09970348963471583,
+      "drift_monotonic": false,
+      "quarter_gap_ms": [
+        34.922925806451616,
+        28.960822580645168,
+        28.82563870967741,
+        31.440988235294117
+      ],
+      "samples": 127,
+      "spike_ratio": 1.2398548667085814,
+      "spike_token": 68
+    },
+    "confidence_divergence": {
+      "max_rank": 3,
+      "mean_confidence_gap": 0.08124500408685915,
+      "mean_rank": 0.2890625,
+      "top_choice_rate": 0.7890625,
+      "uncertain_offpick_rate": 0.0234375
+    },
+    "cot": {
+      "flag": "NORMAL",
+      "thinking_capable": false,
+      "threshold_nats": 0.5,
+      "threshold_top_prob": 0.9
+    },
+    "entropy": {
+      "max": 4.048439025878906,
+      "mean_nats": 1.464504732783098,
+      "mean_top_prob": 0.6235108272521757,
+      "min": 0.0013366718776524067,
+      "p50": 1.3497248888015747,
+      "p95": 3.650010108947754,
+      "std_dev": 1.097871930637206
+    },
+    "ood": {
+      "mean_logprob": -0.8829387302928922,
+      "min_logprob": -3.427753210067749,
+      "p95_surprise": 2.4632601737976074,
+      "perplexity": 2.4179951110514466
+    },
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 128,
+      "unique_1gram_ratio": 0.6953125,
+      "unique_2gram_ratio": 0.905511811023622,
+      "unique_3gram_ratio": 0.9523809523809523
+    },
+    "stall": {
+      "jitter": 0.30095376679167335,
+      "max_ms": 85.0954,
+      "mean_ms": 31.047122834645666,
+      "p50_ms": 29.0985,
+      "p99_ms": 80.9284,
+      "stall_count": 0,
+      "std_dev_ms": 9.343748565130388
+    },
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q4_K_M",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2995,
+        "model": "11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 31.091949592290586
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": 1948512256,
+        "total_bytes": 8382472192
+      },
+      "storage": {
+        "model_file_bytes": 491400032
+      },
+      "thermal": {
+        "avg_mhz": 2995,
+        "end_mhz": 2995,
+        "start_mhz": 2995,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": [
+      {
+        "decode_ms": 3764.3450000000003,
+        "generated_tokens": 128,
+        "prefill_ms": 2547.0731,
+        "prompt_tokens": 220,
+        "total_ms": 6311
+      },
+      {
+        "decode_ms": 3621.6296999999995,
+        "generated_tokens": 128,
+        "prefill_ms": 1735.865,
+        "prompt_tokens": 220,
+        "total_ms": 5357
+      },
+      {
+        "decode_ms": 3569.9791,
+        "generated_tokens": 128,
+        "prefill_ms": 1700.8873,
+        "prompt_tokens": 220,
+        "total_ms": 5270
+      },
+      {
+        "decode_ms": 3848.7513,
+        "generated_tokens": 128,
+        "prefill_ms": 1715.4241,
+        "prompt_tokens": 220,
+        "total_ms": 5564
+      },
+      {
+        "decode_ms": 3577.9063,
+        "generated_tokens": 128,
+        "prefill_ms": 1746.9711000000002,
+        "prompt_tokens": 220,
+        "total_ms": 5324
+      }
+    ],
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 3547.5462,
+        "generated_tokens": 128,
+        "prefill_ms": 1833.1104,
+        "prompt_tokens": 220,
+        "total_ms": 5380
+      },
+      {
+        "decode_ms": 5562.3588,
+        "generated_tokens": 128,
+        "prefill_ms": 2095.5018999999998,
+        "prompt_tokens": 220,
+        "total_ms": 7657
+      },
+      {
+        "decode_ms": 6752.9786,
+        "generated_tokens": 128,
+        "prefill_ms": 2146.1659,
+        "prompt_tokens": 220,
+        "total_ms": 8899
+      },
+      {
+        "decode_ms": 5147.0596000000005,
+        "generated_tokens": 128,
+        "prefill_ms": 2268.7699000000002,
+        "prompt_tokens": 220,
+        "total_ms": 7415
+      },
+      {
+        "decode_ms": 3805.2526000000003,
+        "generated_tokens": 128,
+        "prefill_ms": 1769.7174,
+        "prompt_tokens": 220,
+        "total_ms": 5574
+      }
+    ],
+    "model_bytes": 491400032,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": null
+  },
+  "metadata": {
+    "created_unix": 1784614401,
+    "glbench_version": "0.1.163",
+    "label": "glproc-qwen2.5-0.5b-instruct-q4_k_m",
+    "schema_version": 1
+  },
+  "telemetry": null,
+  "validation": {
+    "findings": [
+      {
+        "check": "integrity",
+        "message": "decode throughput varies 24% run-to-run; results are noisy",
+        "severity": "warning"
+      }
+    ],
+    "passed": true
+  },
+  "workload": {
+    "cold_iters": 5,
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "end_to_end",
+    "max_new_tokens": 128,
+    "measure_iters": 5,
+    "model_path": "C:\\Users\\reyha/Downloads/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+    "prompt": "Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads. Explain how a modern GPU executes a matrix multiplication, covering threads, warps, shared memory, and coalesced loads.",
+    "seed": 42,
+    "temperature": 0,
+    "verify_against": null,
+    "warmup_iters": 2
+  }
+}
