@@ -254,23 +254,47 @@ impl GllmTokenizer {
 
     /// Earliest special-token occurrence, preferring the longest match at a
     /// given position (`specials_by_len` is sorted longest-first).
+    ///
+    /// ⭐ **This used to be 71 % of a warm encode.** The obvious formulation —
+    /// `s.find(tok)` for each special, keep the earliest — searches the entire
+    /// remaining text once *per special token*. Qwen2.5 has 22 of them, so a
+    /// 120 KiB prompt was scanned for **2.6 MiB** before a single byte was
+    /// tokenized, and the cost grows with the vocabulary's special count for
+    /// input that usually contains none of them. Measured: 37.6 of 52.8
+    /// ns/byte.
+    ///
+    /// One left-to-right pass instead. Almost every special begins with the
+    /// same byte (`<` for the ChatML and Llama families), so a 256-entry table
+    /// skips the text until a byte that could begin one, and only then are the
+    /// candidates tried. Returning at the first match is what makes it
+    /// *earliest*; trying longest-first at that position is what makes it
+    /// prefer `<|im_start|>` over a hypothetical `<|im`.
+    ///
+    /// ⚠️ Byte offsets are safe to slice at because UTF-8 is
+    /// self-synchronising: a valid UTF-8 needle cannot match starting inside a
+    /// multi-byte character of a valid UTF-8 haystack. The previous
+    /// `str::find` relied on exactly the same property.
     fn find_special(&self, s: &str) -> Option<(usize, usize, u32)> {
-        let mut best: Option<(usize, usize, u32)> = None;
-        for (tok, id) in &self.v.specials_by_len {
-            if tok.is_empty() {
+        if self.v.specials_by_len.is_empty() {
+            return None;
+        }
+        let b = s.as_bytes();
+        let table = &self.v.special_first_byte;
+        let mut i = 0usize;
+        while i < b.len() {
+            if !table[b[i] as usize] {
+                i += 1;
                 continue;
             }
-            if let Some(at) = s.find(&**tok) {
-                let cand = (at, tok.len(), *id);
-                best = Some(match best {
-                    None => cand,
-                    // Earlier wins; at equal position the longer token wins.
-                    Some(b) if cand.0 < b.0 || (cand.0 == b.0 && cand.1 > b.1) => cand,
-                    Some(b) => b,
-                });
+            let rest = &b[i..];
+            for (tok, id) in &self.v.specials_by_len {
+                if !tok.is_empty() && rest.starts_with(tok.as_bytes()) {
+                    return Some((i, tok.len(), *id));
+                }
             }
+            i += 1;
         }
-        best
+        None
     }
 
     fn encode_plain(&self, text: &str, ids: &mut Vec<u32>) -> Result<(), TokError> {
@@ -314,24 +338,36 @@ impl GllmTokenizer {
         let v = &self.v;
         let mut err = None;
 
-        // Collect chunk boundaries first: `split` borrows `text`, and the
-        // closure below needs `&mut` scratch.
+        // ⚠️ Collected, not streamed — and that is measured, not incidental.
+        // Buffering costs one 16-byte entry per pre-token (~475 KiB per 120 KiB
+        // encoded) for a list read once and dropped, so streaming through the
+        // `split` callback looks strictly better. It is not: the closure form
+        // measured **8 % slower on the miss path** (cold cache 48-51 → 52-55
+        // ns/byte, cache off 110-120 → 122-126), presumably because `merger.run`
+        // no longer inlines through two closure layers. Warm improved slightly;
+        // cold is the number that matters. Reverted.
         let mut chunks: Vec<&str> = Vec::new();
         v.pretok.split(text, |c| chunks.push(c));
 
         for chunk in chunks {
-            mapped.clear();
-            for b in chunk.bytes() {
-                mapped.push(v.byte_to_char[b as usize]);
-            }
-
+            // ⭐ The cache is keyed on the **raw** pre-token, not its
+            // byte-mapped form. `byte_to_char` is a fixed bijection that does
+            // not depend on the vocabulary, so the two keys are equivalent —
+            // and this one is already a slice of the input, so a hit costs no
+            // string building at all. Measured at 64 % of a warm encode before
+            // the change; the mapping now runs only on the ~12 % that miss.
             if caching {
-                if let Some(cached) = cache.get(mapped.as_str()) {
+                if let Some(cached) = cache.get(chunk) {
                     ids.extend_from_slice(cached);
                     *hits += 1;
                     continue;
                 }
                 *misses += 1;
+            }
+
+            mapped.clear();
+            for b in chunk.bytes() {
+                mapped.push(v.byte_to_char[b as usize]);
             }
             // Where this chunk's ids begin, so they can be captured below.
             let start = ids.len();
@@ -342,8 +378,8 @@ impl GllmTokenizer {
             if v.ignore_merges {
                 if let Some(&id) = v.token_to_id.get(mapped.as_str()) {
                     ids.push(id);
-                    if caching && mapped.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
-                        cache.insert(mapped.as_str().into(), Box::new([id]));
+                    if caching && chunk.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
+                        cache.insert(chunk.into(), Box::new([id]));
                     }
                     continue;
                 }
@@ -368,8 +404,8 @@ impl GllmTokenizer {
             // ⚠️ Recorded only on the success path. Caching a partial result
             // from a chunk that errored would hand back a truncated id list on
             // the next occurrence, with no error to show for it.
-            if caching && mapped.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
-                cache.insert(mapped.as_str().into(), ids[start..].into());
+            if caching && chunk.len() <= PRETOK_CACHE_MAX_KEY && cache.len() < PRETOK_CACHE_CAP {
+                cache.insert(chunk.into(), ids[start..].into());
             }
         }
         match err {

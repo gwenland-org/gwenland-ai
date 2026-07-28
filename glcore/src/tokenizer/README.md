@@ -228,15 +228,24 @@ by mutation**: deleting the owner check makes exactly that test fail.
 
 ## Measured
 
-i3-1115G4, best-of-40, 113 KiB of real repository prose + Rust source.
+i3-1115G4, best-of-40, a **frozen** 120 KiB corpus of repository prose + Rust
+source. Qwen2.5 vocabulary (22 special tokens).
 
 | | ns/byte | MB/s |
 |---|---:|---:|
-| pre-tokenizer (gpt-2 / qwen2 / llama-bpe) | 4.8–5.0 | ~205 |
-| pre-tokenizer (falcon, 3-stage) | 9.8 | ~102 |
-| full encode, cache OFF | 177–186 | 5.4–5.7 |
-| **full encode, cold cache** | 99–107 | **9.4–10.1** |
-| full encode, warm cache | 51–52 | 19.3–19.7 |
+| pre-tokenizer alone | 4.95 | ~205 |
+| full encode, cache OFF | 120–128 | 7.8–8.3 |
+| **full encode, cold cache** | **50–53** | **18.9–20.1** |
+| full encode, warm cache | 14.1 | ~71 |
+
+Where a **warm** encode goes, measured by
+`examples/tokenizer_profile.rs` rather than argued about:
+
+| stage | ns/byte | share |
+|---|---:|---:|
+| special-token scan | 0.02–0.79 | ~1–6 % |
+| pre-tokenizer split | 4.95 | ~38 % |
+| byte remap + cache hit + push | 8.06 | ~62 % |
 
 ⚠️ **Quote the cold number.** The bench encodes one input 40 times; a warm cache
 across those passes answers "how fast is re-encoding a document you have already
@@ -244,7 +253,9 @@ seen", which no server does.
 
 ⚠️ **The corpus is the measurement.** An earlier bench repeated one sentence to
 reach its target size — that scores a ~100 % hit rate and reports a speedup no
-real workload reproduces.
+real workload reproduces. A *drifting* corpus is just as bad: an A/B that
+"showed" +8–10 % turned out to be 113 KiB of repo files becoming 120 KiB of
+different repo files between the two runs. **Freeze the corpus.**
 
 ⚠️ **The build profile is part of it.** `glcore` carries
 `[profile.release.package.glcore] opt-level = 3`. Under the workspace default
