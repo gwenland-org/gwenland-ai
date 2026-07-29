@@ -63,6 +63,7 @@ pub mod ops;
 pub mod pjrt;
 pub mod precision;
 pub mod runtime;
+pub mod sample;
 pub mod stablehlo;
 pub mod sys;
 pub mod tensor;

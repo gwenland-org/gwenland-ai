@@ -14,6 +14,14 @@ glcore = { path = "../glcore" }
 # actually argues for is on the *plugin binary*, not on this.
 libloading = "0.8"
 log = "0.4"
+# ARTX14 Wave A14.1's sampler chain needs a seedable, reproducible PRNG for
+# top-p/min-p/typical sampling (a generation's seed must be replayable, per
+# the chain's own "order is DATA... serialized into telemetry so a generation
+# can be explained and reproduced" design decision). Hand-rolling a PRNG for
+# this is more dangerous than depending on one — `packages/core` already
+# depends on the same "0.8" line, so this does not add a second major version
+# to the workspace's dependency tree.
+rand = { version = "0.8", features = ["small_rng"] }
 
 [dev-dependencies]
 # none — Wave A1 tests need no fixtures
