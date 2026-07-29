@@ -18,7 +18,8 @@
 
 use crate::graph::{BuiltFunc, TraceCx};
 use crate::ops::{
-    causal_mask, emit_rope_tables, gather_embed, gqa_attention, rms_norm, rope_neox, swiglu_ffn,
+    causal_mask, emit_rope_tables, gather_embed, gqa_attention, linear, rms_norm, rope_neox,
+    swiglu_ffn,
 };
 use crate::ops::rope::QWEN2_ROPE_BASE;
 use crate::stablehlo::ops::DotDimensionNumbers;
@@ -221,15 +222,20 @@ fn trace_layer(
     let normed = rms_norm(x, &ln1, cfg.rms_eps);
 
     let attn_out = cx.scope("self_attn", |cx| {
-        // Projections are stored [in, out]; the bias is [out].
-        let q_w = cx.weight("q_proj.weight", Shape::new([h, nh * hd], wt));
-        let k_w = cx.weight("k_proj.weight", Shape::new([h, kv_width], wt));
-        let v_w = cx.weight("v_proj.weight", Shape::new([h, kv_width], wt));
-        let o_w = cx.weight("o_proj.weight", Shape::new([nh * hd, h], wt));
+        // ⛔ HuggingFace layout: `nn.Linear` stores `[out_features, in_features]`.
+        // ⚠️ q_proj and o_proj are both [896, 896] on Qwen2-0.5B, so they are
+        // orientation-blind — a wrong layout here is invisible to every shape
+        // check. Only k/v/gate/up/down are narrow enough to catch it, which is
+        // exactly how the real checkpoint reported 120 disagreements while
+        // these two were equally wrong. See ops::linear.
+        let q_w = cx.weight("q_proj.weight", Shape::new([nh * hd, h], wt));
+        let k_w = cx.weight("k_proj.weight", Shape::new([kv_width, h], wt));
+        let v_w = cx.weight("v_proj.weight", Shape::new([kv_width, h], wt));
+        let o_w = cx.weight("o_proj.weight", Shape::new([h, nh * hd], wt));
 
-        let mut q = normed.matmul(&q_w);
-        let mut k = normed.matmul(&k_w);
-        let mut v = normed.matmul(&v_w);
+        let mut q = linear(&normed, &q_w);
+        let mut k = linear(&normed, &k_w);
+        let mut v = linear(&normed, &v_w);
 
         if cfg.attn_bias {
             let q_b = cx.weight("q_proj.bias", Shape::new([nh * hd], wt));
@@ -253,9 +259,10 @@ fn trace_layer(
         // error: shapes match, output stays fluent.
         let attn = gqa_attention(&q, &k, &v, mask);
 
-        attn.transpose(vec![0, 2, 1, 3])
-            .reshape(vec![1, seq_len, nh * hd])
-            .matmul(&o_w)
+        let merged = attn
+            .transpose(vec![0, 2, 1, 3])
+            .reshape(vec![1, seq_len, nh * hd]);
+        linear(&merged, &o_w)
     });
 
     let h1 = x + &attn_out;
@@ -266,9 +273,10 @@ fn trace_layer(
     let normed2 = rms_norm(&h1, &ln2, cfg.rms_eps);
 
     let mlp_out = cx.scope("mlp", |cx| {
-        let gate = cx.weight("gate_proj.weight", Shape::new([h, cfg.ffn], wt));
-        let up = cx.weight("up_proj.weight", Shape::new([h, cfg.ffn], wt));
-        let down = cx.weight("down_proj.weight", Shape::new([cfg.ffn, h], wt));
+        // HuggingFace layout again: [out, in].
+        let gate = cx.weight("gate_proj.weight", Shape::new([cfg.ffn, h], wt));
+        let up = cx.weight("up_proj.weight", Shape::new([cfg.ffn, h], wt));
+        let down = cx.weight("down_proj.weight", Shape::new([h, cfg.ffn], wt));
         swiglu_ffn(&normed2, &gate, &up, &down)
     });
 

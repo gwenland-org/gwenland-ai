@@ -110,23 +110,31 @@ fn qwen2_signature_lists_every_weight_a_layer_needs() {
             .find(|w| w.name == n)
             .unwrap_or_else(|| panic!("no {n}"))
     };
+    // ⛔ Every projection is HuggingFace `[out_features, in_features]` — the
+    // layout safetensors actually stores. Tracing `[in, out]` made the real
+    // checkpoint report 120 transposed tensors. See ops::linear.
     assert_eq!(by_name("model.embed_tokens.weight").shape.dims, vec![151936, 896]);
     assert_eq!(
         by_name("model.layers.0.self_attn.q_proj.weight").shape.dims,
-        vec![896, 896]
+        vec![896, 896],
+        "square, so orientation-blind — it cannot be checked here"
     );
-    // 2 kv heads × 64 = 128, not 896 — the GQA narrowing.
+    // 2 kv heads × 64 = 128 out-features. The narrow axis comes FIRST.
     assert_eq!(
         by_name("model.layers.0.self_attn.k_proj.weight").shape.dims,
-        vec![896, 128]
+        vec![128, 896]
     );
     assert_eq!(
         by_name("model.layers.0.self_attn.k_proj.bias").shape.dims,
         vec![128]
     );
     assert_eq!(
-        by_name("model.layers.0.mlp.down_proj.weight").shape.dims,
+        by_name("model.layers.0.mlp.gate_proj.weight").shape.dims,
         vec![4864, 896]
+    );
+    assert_eq!(
+        by_name("model.layers.0.mlp.down_proj.weight").shape.dims,
+        vec![896, 4864]
     );
 }
 
@@ -278,9 +286,9 @@ fn embedding_lookup_and_swiglu_compose_at_qwen2_shapes() {
     let x = gather_embed(&table, &ids);
     assert_eq!(x.shape().dims, vec![1, 32, 896]);
 
-    let gate = cx.weight("g", Shape::new([896, 4864], DType::F32));
-    let up = cx.weight("u", Shape::new([896, 4864], DType::F32));
-    let down = cx.weight("d", Shape::new([4864, 896], DType::F32));
+    let gate = cx.weight("g", Shape::new([4864, 896], DType::F32));
+    let up = cx.weight("u", Shape::new([4864, 896], DType::F32));
+    let down = cx.weight("d", Shape::new([896, 4864], DType::F32));
     let y = swiglu_ffn(&x, &gate, &up, &down);
     assert_eq!(y.shape().dims, vec![1, 32, 896]);
 
