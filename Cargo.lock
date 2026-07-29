@@ -2507,6 +2507,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "gljax"
+version = "0.1.0"
+dependencies = [
+ "glcore",
+ "libloading",
+ "log",
+]
+
+[[package]]
 name = "glmetal"
 version = "0.1.155"
 dependencies = [

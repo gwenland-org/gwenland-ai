@@ -1,0 +1,249 @@
+//! Grouped-query causal attention (ARTX03 §4).
+
+use crate::ops::softmax::softmax;
+use crate::ops::util::{dense_const_f32, expect_rank4, splat_like};
+use crate::stablehlo::ops::DotDimensionNumbers;
+use crate::stablehlo::types::{DType, Shape};
+use crate::tensor::Tensor;
+use crate::GlError;
+
+/// Builds the causal mask as a dense `[1, 1, S, S]` constant: `0` on and below
+/// the diagonal, `−∞` above it.
+///
+/// ⚠️ This is O(S²) *text*. At S=512 it is ~2 MB of MLIR; at ARTX05's 2048
+/// bucket it is 4.2 M elements and [`dense_const_f32`] refuses it outright. See
+/// [`crate::stablehlo::ops::MAX_DENSE_CONSTANT_ELEMS`] — a mask at that scale
+/// wants to be a runtime input, not a baked constant, and that decision belongs
+/// to Wave A5 where the bucket grid is chosen.
+pub fn causal_mask(like: &Tensor, seq_len: usize, dtype: DType) -> Result<Tensor, GlError> {
+    let mut data = vec![0.0f32; seq_len * seq_len];
+    for i in 0..seq_len {
+        for j in (i + 1)..seq_len {
+            data[i * seq_len + j] = f32::NEG_INFINITY;
+        }
+    }
+    let shape = Shape::new([1, 1, seq_len, seq_len], DType::F32);
+    let mask = dense_const_f32(like, &data, shape)?;
+    Ok(mask.to_dtype(dtype))
+}
+
+/// Scaled dot-product attention with GQA head expansion and an additive mask.
+///
+/// * `q`: `[B, n_heads, S_q, head_dim]`
+/// * `k`, `v`: `[B, n_kv_heads, S_kv, head_dim]`
+/// * `mask`: `[1, 1, S_q, S_kv]`, additive (`0` / `−∞`)
+/// * output: `[B, n_heads, S_q, head_dim]`
+///
+/// ⛔ **KV head expansion is interleave-sensitive.** ARTX11 §7 records the
+/// failure directly: grouping KV heads in blocks instead of interleaved gives
+/// identical shapes and corrupted attention. Query head `h` must read KV head
+/// `h / repeat` — which is what `reshape → broadcast → reshape` produces, in
+/// that order, when the repeat axis is inserted *after* the KV-head axis.
+pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Tensor {
+    let [b, n_heads, s_q, head_dim] = expect_rank4(q, "gqa_attention: q");
+    let [bk, n_kv_heads, s_kv, dk] = expect_rank4(k, "gqa_attention: k");
+    let [bv, n_kv_v, s_v, dv] = expect_rank4(v, "gqa_attention: v");
+
+    assert!(
+        b == bk && b == bv,
+        "gqa_attention: batch disagrees between q/k/v ({b}, {bk}, {bv})"
+    );
+    assert!(
+        n_kv_heads == n_kv_v,
+        "gqa_attention: k has {n_kv_heads} kv heads, v has {n_kv_v}"
+    );
+    assert!(
+        s_kv == s_v,
+        "gqa_attention: k has {s_kv} positions, v has {s_v}"
+    );
+    assert!(
+        head_dim == dk && head_dim == dv,
+        "gqa_attention: head_dim disagrees ({head_dim}, {dk}, {dv})"
+    );
+    assert!(
+        n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
+        "gqa_attention: {n_heads} query heads is not a multiple of {n_kv_heads} kv heads"
+    );
+    assert_eq!(
+        mask.shape().dims,
+        vec![1, 1, s_q, s_kv],
+        "gqa_attention: mask must be [1, 1, S_q, S_kv]"
+    );
+
+    let repeat = n_heads / n_kv_heads;
+    let k_exp = expand_kv_heads(k, repeat);
+    let v_exp = expand_kv_heads(v, repeat);
+
+    // Scale Q by 1/sqrt(head_dim) before the product. Scaling Q rather than the
+    // scores is one fewer S×S-sized elementwise pass.
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let scale_t = splat_like(q, scale, q.shape().dims.clone(), q.dtype());
+    let q_scaled = q.mul(&scale_t);
+
+    // QKᵀ: [B,H,S_q,D] · [B,H,S_kv,D] contracting D on both sides. Expressed
+    // directly rather than as transpose-then-matmul — dot_general can contract
+    // the last axis of both operands, so the transpose would be dead weight.
+    let scores = q_scaled.dot_general(
+        &k_exp,
+        &DotDimensionNumbers {
+            lhs_batching: vec![0, 1],
+            rhs_batching: vec![0, 1],
+            lhs_contracting: vec![3],
+            rhs_contracting: vec![3],
+        },
+    );
+
+    // Additive mask, broadcast over batch and heads.
+    let mask_bc = mask
+        .to_dtype(scores.dtype())
+        .broadcast_to(vec![0, 1, 2, 3], vec![b, n_heads, s_q, s_kv]);
+    let masked = scores.add(&mask_bc);
+
+    let weights = softmax(&masked, 3);
+
+    // Weights · V: [B,H,S_q,S_kv] · [B,H,S_kv,D] -> [B,H,S_q,D]
+    weights.dot_general(
+        &v_exp,
+        &DotDimensionNumbers {
+            lhs_batching: vec![0, 1],
+            rhs_batching: vec![0, 1],
+            lhs_contracting: vec![3],
+            rhs_contracting: vec![2],
+        },
+    )
+}
+
+/// `[B, n_kv, S, D]` → `[B, n_kv · repeat, S, D]`, each KV head repeated
+/// `repeat` times **consecutively**.
+///
+/// The repeat axis is inserted directly after the KV-head axis, so flattening
+/// puts head `h`'s copies at output positions `h·repeat ..< (h+1)·repeat`. That
+/// is the layout query head `q` expects when it reads KV head `q / repeat`.
+fn expand_kv_heads(kv: &Tensor, repeat: usize) -> Tensor {
+    if repeat == 1 {
+        return kv.clone_ref();
+    }
+    let [b, n_kv, s, d] = expect_rank4(kv, "expand_kv_heads");
+    kv.reshape(vec![b, n_kv, 1, s, d])
+        .broadcast_to(vec![0, 1, 2, 3, 4], vec![b, n_kv, repeat, s, d])
+        .reshape(vec![b, n_kv * repeat, s, d])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::TraceCx;
+
+    #[test]
+    fn causal_mask_is_zero_on_and_below_the_diagonal() {
+        let mut cx = TraceCx::new("main", "mask");
+        let x = cx.input("x", Shape::new([1], DType::F32));
+        let m = causal_mask(&x, 3, DType::F32).expect("mask");
+        assert_eq!(m.shape().dims, vec![1, 1, 3, 3]);
+        let mlir = cx.finish(&[&m]).mlir;
+
+        // Row-major f32 little-endian: 0.0 is 00000000, -inf is 000080FF.
+        let zero = "00000000";
+        let ninf = "000080FF";
+        let expected = format!(
+            "{zero}{ninf}{ninf}{zero}{zero}{ninf}{zero}{zero}{zero}"
+        );
+        assert!(
+            mlir.contains(&expected),
+            "mask must be upper-triangular -inf:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn causal_mask_refuses_a_bucket_that_would_emit_tens_of_megabytes() {
+        let mut cx = TraceCx::new("main", "mask");
+        let x = cx.input("x", Shape::new([1], DType::F32));
+        // 2048² = 4.2M elements.
+        let err = causal_mask(&x, 2048, DType::F32).expect_err("must refuse");
+        assert!(err.to_string().contains("runtime weight"), "{err}");
+        let _ = cx;
+    }
+
+    /// ⛔ ARTX11 §7's silent-corruption case. Query head `h` must map to KV
+    /// head `h / repeat`; block grouping (`h % n_kv`) has the same shape.
+    #[test]
+    fn kv_head_expansion_repeats_each_head_consecutively() {
+        let mut cx = TraceCx::new("main", "gqa");
+        // Qwen2-0.5B: 14 query heads, 2 KV heads, repeat 7.
+        let k = cx.input("k", Shape::new([1, 2, 8, 64], DType::F32));
+        let expanded = expand_kv_heads(&k, 7);
+        assert_eq!(expanded.shape().dims, vec![1, 14, 8, 64]);
+
+        let mlir = cx.finish(&[&expanded]).mlir;
+        // The repeat axis goes at index 2 — after the kv-head axis, before S.
+        assert!(
+            mlir.contains("(tensor<1x2x8x64xf32>) -> tensor<1x2x1x8x64xf32>"),
+            "the repeat axis must be inserted after the kv-head axis:\n{mlir}"
+        );
+        assert!(
+            mlir.contains("(tensor<1x2x1x8x64xf32>) -> tensor<1x2x7x8x64xf32>"),
+            "{mlir}"
+        );
+        assert!(
+            mlir.contains("(tensor<1x2x7x8x64xf32>) -> tensor<1x14x8x64xf32>"),
+            "{mlir}"
+        );
+    }
+
+    #[test]
+    fn mha_needs_no_expansion() {
+        let mut cx = TraceCx::new("main", "mha");
+        let k = cx.input("k", Shape::new([1, 4, 8, 64], DType::F32));
+        let same = expand_kv_heads(&k, 1);
+        assert_eq!(same.value(), k.value(), "repeat=1 must emit nothing");
+        let mlir = cx.finish(&[&same]).mlir;
+        assert!(!mlir.contains("stablehlo."), "{mlir}");
+    }
+
+    #[test]
+    fn gqa_attention_produces_query_shaped_output() {
+        let mut cx = TraceCx::new("main", "attn");
+        let q = cx.input("q", Shape::new([1, 14, 16, 64], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 16, 64], DType::F32));
+        let v = cx.input("v", Shape::new([1, 2, 16, 64], DType::F32));
+        let mask = causal_mask(&q, 16, DType::F32).expect("mask");
+        let out = gqa_attention(&q, &k, &v, &mask);
+        assert_eq!(out.shape().dims, vec![1, 14, 16, 64]);
+
+        let mlir = cx.finish(&[&out]).mlir;
+        // Scores contract head_dim on both operands, producing [B,H,S,S].
+        assert!(
+            mlir.contains("(tensor<1x14x16x64xf32>, tensor<1x14x16x64xf32>) -> tensor<1x14x16x16xf32>"),
+            "QK^T must contract head_dim:\n{mlir}"
+        );
+        // AV contracts S_kv against V's position axis.
+        assert!(
+            mlir.contains("(tensor<1x14x16x16xf32>, tensor<1x14x16x64xf32>) -> tensor<1x14x16x64xf32>"),
+            "AV must contract the key axis:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn attention_scales_queries_by_one_over_sqrt_head_dim() {
+        let mut cx = TraceCx::new("main", "attn");
+        let q = cx.input("q", Shape::new([1, 2, 4, 64], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 4, 64], DType::F32));
+        let v = cx.input("v", Shape::new([1, 2, 4, 64], DType::F32));
+        let mask = causal_mask(&q, 4, DType::F32).expect("mask");
+        let out = gqa_attention(&q, &k, &v, &mask);
+        let mlir = cx.finish(&[&out]).mlir;
+        // 1/sqrt(64) = 0.125, exactly representable.
+        assert!(mlir.contains("dense<0.125>"), "{mlir}");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a multiple of")]
+    fn gqa_rejects_a_head_count_that_does_not_divide() {
+        let mut cx = TraceCx::new("main", "attn");
+        let q = cx.input("q", Shape::new([1, 5, 4, 8], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 4, 8], DType::F32));
+        let v = cx.input("v", Shape::new([1, 2, 4, 8], DType::F32));
+        let mask = causal_mask(&q, 4, DType::F32).expect("mask");
+        let _ = gqa_attention(&q, &k, &v, &mask);
+    }
+}

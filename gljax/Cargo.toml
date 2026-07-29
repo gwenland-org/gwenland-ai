@@ -1,0 +1,19 @@
+[package]
+name = "gljax"
+version = "0.1.0"
+edition = "2021"
+description = "GwenLand AI gljax: pure-Rust XLA/PJRT client — StableHLO emission, zero kernels"
+license-file = "../LICENSE"
+
+[dependencies]
+glcore = { path = "../glcore" }
+# The PJRT plugin is loaded at runtime, never linked; libloading is the
+# portable `dlopen`/`LoadLibrary`. ARTX01 §5.4 writes this as `=0.8.5`, but
+# that exact pin is now a superseded patch of a crate whose whole job is
+# loading foreign code — the 0.8 line is tracked instead. The pin ARTX01
+# actually argues for is on the *plugin binary*, not on this.
+libloading = "0.8"
+log = "0.4"
+
+[dev-dependencies]
+# none — Wave A1 tests need no fixtures
