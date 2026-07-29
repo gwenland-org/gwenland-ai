@@ -630,4 +630,60 @@ mod tests {
         let v = Vocab::from_hf_json(src).expect("must load");
         assert_eq!(v.id_to_token[1], "b");
     }
+
+    /// ⭐ The actual reported failure, reproduced directly: `Qwen/Qwen2-0.5B`
+    /// has `added_tokens` at ids *past* `model.vocab`'s own length (151643
+    /// entries, added tokens at 151643..=151645). Neither existing
+    /// `from_hf_json` test above exercises this — both use an added-token id
+    /// already inside the vocab's range. This is the scenario this function's
+    /// own doc comment describes failing with "eos id N is outside a
+    /// vocabulary of M" before the fix that resizes `id_to_token`.
+    #[test]
+    fn hf_json_added_token_past_model_vocab_length_extends_id_to_token() {
+        let src = r#"{
+          "model": {
+            "type": "BPE",
+            "vocab": {"a": 0, "b": 1, "c": 2, "d": 3, "e": 4},
+            "merges": []
+          },
+          "pre_tokenizer": {"type": "ByteLevel"},
+          "added_tokens": [
+            {"id": 5, "content": "<|endoftext|>"},
+            {"id": 6, "content": "<|im_end|>"}
+          ]
+        }"#;
+        let v = Vocab::from_hf_json(src).expect("must load");
+        assert_eq!(v.len(), 7, "id_to_token must extend to cover the added tokens");
+        assert_eq!(v.token_str(5), Some("<|endoftext|>"));
+        assert_eq!(v.token_str(6), Some("<|im_end|>"));
+        // The documented heuristic: EOS defaults to the last added token.
+        assert_eq!(v.eos_id(), 6);
+    }
+
+    #[test]
+    fn hf_json_refuses_a_non_bpe_model_type() {
+        let src = r#"{"model": {"type": "WordPiece", "vocab": {}}}"#;
+        match Vocab::from_hf_json(src) {
+            Err(TokError::UnsupportedModel(_)) => {}
+            other => panic!("expected UnsupportedModel, got {}", other.is_ok()),
+        }
+    }
+
+    /// `merges` appears in the wild as either `["a b", ...]` or
+    /// `[["a","b"], ...]` — both must parse to the same pairs.
+    #[test]
+    fn hf_json_merges_accept_both_the_string_and_array_pair_forms() {
+        let string_form = r#"{
+          "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": ["a b"]},
+          "pre_tokenizer": {"type": "ByteLevel"}
+        }"#;
+        let array_form = r#"{
+          "model": {"type": "BPE", "vocab": {"a": 0, "b": 1, "ab": 2}, "merges": [["a", "b"]]},
+          "pre_tokenizer": {"type": "ByteLevel"}
+        }"#;
+        let v1 = Vocab::from_hf_json(string_form).expect("string-form merges must parse");
+        let v2 = Vocab::from_hf_json(array_form).expect("array-form merges must parse");
+        assert_eq!(v1.len(), v2.len());
+        assert_eq!(v1.style(), v2.style());
+    }
 }
