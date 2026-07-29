@@ -55,6 +55,7 @@
 pub mod checkpoint;
 pub mod error;
 pub mod graph;
+pub mod matrix;
 pub mod model;
 pub mod ops;
 pub mod pjrt;
@@ -66,6 +67,7 @@ pub mod tensor;
 
 pub use error::GlError;
 pub use graph::{BuiltFunc, FuncBuilder, Signature, SsaValue, TraceCx};
+pub use matrix::{DotAlgorithm, DotNumerics, MatmulOpts};
 pub use precision::{with_policy, PrecisionPolicy};
 pub use stablehlo::{DType, Shape};
 pub use tensor::Tensor;

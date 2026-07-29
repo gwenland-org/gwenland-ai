@@ -20,6 +20,7 @@
 //! do not.
 
 use crate::graph::value::SsaValue;
+use crate::matrix::MatmulOpts;
 use crate::stablehlo::emitter::{MlirEmitter, SsaName};
 use crate::stablehlo::ops::{self, DotDimensionNumbers};
 use crate::stablehlo::types::{DType, ParamDesc, ParamKind, Shape};
@@ -463,8 +464,20 @@ impl FuncBuilder {
         rhs: &SsaValue,
         dnums: &DotDimensionNumbers,
     ) -> SsaValue {
+        self.dot_general_with(lhs, rhs, dnums, &MatmulOpts::default())
+    }
+
+    /// `dot_general` with explicit numerics (ARTX08 §A8.α). `MatmulOpts::default()`
+    /// makes this byte-identical to [`FuncBuilder::dot_general`].
+    pub fn dot_general_with(
+        &mut self,
+        lhs: &SsaValue,
+        rhs: &SsaValue,
+        dnums: &DotDimensionNumbers,
+        opts: &MatmulOpts,
+    ) -> SsaValue {
         let (lhs, rhs) = self.reconcile_dtypes(lhs, rhs);
-        let out_shape = infer_dot_general_shape(lhs.shape(), rhs.shape(), dnums);
+        let out_shape = infer_dot_general_shape(lhs.shape(), rhs.shape(), dnums, opts.accumulate);
         let name = ops::emit_dot_general(
             &mut self.emitter,
             lhs.ssa(),
@@ -473,6 +486,8 @@ impl FuncBuilder {
             lhs.shape(),
             rhs.shape(),
             &out_shape,
+            opts.numerics,
+            opts.accumulate,
         );
         SsaValue::new(name, out_shape)
     }
@@ -494,6 +509,11 @@ impl FuncBuilder {
     /// | `[B,S,D]` | `[D,F]` | none | projection against a weight matrix |
     /// | `[B,H,S,D]` | `[B,H,D,S]` | `[0,1]` | attention scores |
     pub fn matmul(&mut self, lhs: &SsaValue, rhs: &SsaValue) -> SsaValue {
+        self.matmul_with(lhs, rhs, &MatmulOpts::default())
+    }
+
+    /// [`FuncBuilder::matmul`] with explicit numerics (ARTX08 §A8.α).
+    pub fn matmul_with(&mut self, lhs: &SsaValue, rhs: &SsaValue, opts: &MatmulOpts) -> SsaValue {
         assert!(
             lhs.rank() >= 2 && rhs.rank() >= 2,
             "matmul: both operands must be at least rank 2, got {lhs} and {rhs}"
@@ -512,7 +532,7 @@ impl FuncBuilder {
             lhs_contracting: vec![lhs.rank() - 1],
             rhs_contracting: vec![rhs.rank() - 2],
         };
-        self.dot_general(lhs, rhs, &dnums)
+        self.dot_general_with(lhs, rhs, &dnums, opts)
     }
 
     /// Widens whichever operand is narrower so both share an element type.
@@ -726,8 +746,17 @@ fn promote(a: DType, b: DType) -> Option<DType> {
 }
 
 /// Output shape of a `dot_general`: batch dims, then lhs free dims, then rhs
-/// free dims. Output dtype is the (already reconciled) lhs dtype.
-fn infer_dot_general_shape(lhs: &Shape, rhs: &Shape, dnums: &DotDimensionNumbers) -> Shape {
+/// free dims. Output dtype is `accumulate` (`preferred_element_type`) if the
+/// caller named one, else the (already reconciled) lhs dtype — ARTX08 §A8.α:
+/// before this, `preferred_element_type` could be emitted but the shape
+/// inference ignored it, so the *stated* accumulation type and the *inferred*
+/// result type could silently disagree.
+fn infer_dot_general_shape(
+    lhs: &Shape,
+    rhs: &Shape,
+    dnums: &DotDimensionNumbers,
+    accumulate: Option<DType>,
+) -> Shape {
     assert_eq!(
         dnums.lhs_batching.len(),
         dnums.rhs_batching.len(),
@@ -763,7 +792,7 @@ fn infer_dot_general_shape(lhs: &Shape, rhs: &Shape, dnums: &DotDimensionNumbers
 
     Shape::new(
         batch.chain(lhs_free).chain(rhs_free).collect::<Vec<_>>(),
-        lhs.dtype,
+        accumulate.unwrap_or(lhs.dtype),
     )
 }
 
@@ -785,7 +814,12 @@ mod tests {
             lhs_contracting: vec![3],
             rhs_contracting: vec![2],
         };
-        let out = infer_dot_general_shape(&f32([1, 16, 512, 128]), &f32([1, 16, 128, 512]), &dnums);
+        let out = infer_dot_general_shape(
+            &f32([1, 16, 512, 128]),
+            &f32([1, 16, 128, 512]),
+            &dnums,
+            None,
+        );
         assert_eq!(out.dims, vec![1, 16, 512, 512]);
     }
 
@@ -797,7 +831,63 @@ mod tests {
             rhs_contracting: vec![0],
             ..Default::default()
         };
-        let _ = infer_dot_general_shape(&f32([4, 8]), &f32([9, 16]), &dnums);
+        let _ = infer_dot_general_shape(&f32([4, 8]), &f32([9, 16]), &dnums, None);
+    }
+
+    #[test]
+    fn preferred_element_type_overrides_the_inferred_output_dtype() {
+        let dnums = DotDimensionNumbers {
+            lhs_contracting: vec![1],
+            rhs_contracting: vec![0],
+            ..Default::default()
+        };
+        let out = infer_dot_general_shape(
+            &f32([4, 8]),
+            &f32([8, 16]),
+            &dnums,
+            Some(DType::F64),
+        );
+        assert_eq!(out.dtype, DType::F64, "accumulate must win over lhs's dtype");
+    }
+
+    #[test]
+    fn matmul_with_default_opts_matches_plain_matmul() {
+        let mut default_b = FuncBuilder::new("main", "t");
+        let x = default_b.input("x", f32([1, 512, 2048]));
+        let w = default_b.weight("w", f32([2048, 5504]));
+        let plain = default_b.matmul(&x, &w);
+
+        let mut opts_b = FuncBuilder::new("main", "t");
+        let x2 = opts_b.input("x", f32([1, 512, 2048]));
+        let w2 = opts_b.weight("w", f32([2048, 5504]));
+        let with_opts = opts_b.matmul_with(&x2, &w2, &MatmulOpts::default());
+
+        assert_eq!(plain.shape(), with_opts.shape());
+        assert_eq!(default_b.emitter.body(), opts_b.emitter.body());
+    }
+
+    #[test]
+    fn matmul_with_algorithm_emits_a_mutually_exclusive_algorithm_attribute() {
+        use crate::matrix::{DotAlgorithm, DotNumerics};
+
+        let mut b = FuncBuilder::new("main", "t");
+        let x = b.input("x", Shape::new([4, 8], DType::BF16));
+        let w = b.weight("w", Shape::new([8, 16], DType::BF16));
+        let opts = MatmulOpts {
+            numerics: DotNumerics::Algorithm(DotAlgorithm::Bf16Bf16F32X3),
+            accumulate: Some(DType::F32),
+        };
+        let y = b.matmul_with(&x, &w, &opts);
+
+        assert_eq!(y.dtype(), DType::F32, "preferred_element_type must drive the output dtype");
+        let body = b.emitter.body();
+        assert!(body.contains("algorithm = #stablehlo.dot_algorithm<"), "{body}");
+        assert!(body.contains("num_primitive_operations = 3"), "{body}");
+        assert!(
+            !body.contains("precision_config"),
+            "algorithm and precision_config are mutually exclusive:\n{body}"
+        );
+        assert!(body.contains("preferred_element_type = f32"), "{body}");
     }
 
     /// ⛔ Regression test for ARTX02 §7's `matmul`, which would batch a rank-2
