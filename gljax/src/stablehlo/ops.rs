@@ -502,11 +502,11 @@ pub struct DotDimensionNumbers {
 /// Emits `stablehlo.dot_general` — every matmul, projection, and attention
 /// score product in the engine.
 ///
-/// ⚠️ `precision_config` is hardcoded to `DEFAULT`. ARTX08 A8.α flags
-/// `precision_config` / `preferred_element_type` plumbing as a **hard gate**
-/// that blocks ARTX10 entirely, because quantization is a numerics contract.
-/// This is where that plumbing will attach; until then, DEFAULT is what JAX
-/// emits for an unannotated matmul, so gljax is not doing anything unusual.
+/// `numerics`/`accumulate` are the ARTX08 A8.α knobs (`precision_config` /
+/// `algorithm` / `preferred_element_type`) — landed, no longer a gap. Every
+/// existing caller passes `DotNumerics::Default, None`, which reproduces the
+/// `precision_config = [DEFAULT, DEFAULT]` this function hardcoded before
+/// A8.α, byte for byte.
 #[allow(clippy::too_many_arguments)]
 pub fn emit_dot_general(
     e: &mut MlirEmitter,

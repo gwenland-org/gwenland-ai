@@ -29,10 +29,10 @@ pub mod rope;
 pub mod softmax;
 pub(crate) mod util;
 
-pub use attention::{causal_mask, causal_mask_row, gqa_attention};
-pub use embedding::gather_embed;
-pub use ffn::swiglu_ffn;
+pub use attention::{apply_qk_norm, causal_mask, causal_mask_row, gqa_attention, gqa_attention_with_scale};
+pub use embedding::{gather_embed, gather_embed_scaled};
+pub use ffn::{geglu_ffn, swiglu_ffn};
 pub use linear::linear;
-pub use norm::rms_norm;
+pub use norm::{rms_norm, rms_norm_zero_centered};
 pub use rope::{emit_rope_tables, rope_neox, rope_neox_at, rope_tables, DEFAULT_ROPE_BASE};
 pub use softmax::softmax;
