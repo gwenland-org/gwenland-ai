@@ -22,6 +22,14 @@ log = "0.4"
 # depends on the same "0.8" line, so this does not add a second major version
 # to the workspace's dependency tree.
 rand = { version = "0.8", features = ["small_rng"] }
+# ARTX15 SS1.4's decision, taken as-is: LLGuidance is a cargo dependency (pure
+# Rust, unlike XGrammar's C++ FFI surface) computing grammar masks in ~50us/
+# token for a 128k-token vocabulary, with negligible per-schema startup cost.
+# Default features (lark, rayon, referencing, ahash) are used as-is rather
+# than pared down — `jsonschema_validation` (the one heavy, ~2.5M-binary
+# feature) is NOT a default and is not enabled here.
+llguidance = "1.7"
+serde_json = "1"
 
 [dev-dependencies]
 # none — Wave A1 tests need no fixtures

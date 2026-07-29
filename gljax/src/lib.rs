@@ -55,6 +55,7 @@
 pub mod arch;
 pub mod checkpoint;
 pub mod error;
+pub mod grammar;
 pub mod graph;
 pub mod matrix;
 pub mod model;
