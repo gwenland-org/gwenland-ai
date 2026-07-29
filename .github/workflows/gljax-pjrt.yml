@@ -1,0 +1,180 @@
+# gljax — run the PJRT tests against a real plugin.
+#
+# Why this exists separately from ci.yml
+# --------------------------------------
+# `ci.yml` already builds and tests the whole workspace, gljax included — but
+# with no PJRT plugin on the runner, gljax's three plugin tests SKIP. A SKIP is
+# not a pass: those are the tests that decide whether the hand-written PJRT C
+# API bindings in `gljax/src/sys/` are right, and skipping them decides nothing.
+#
+# This workflow downloads the plugin and runs them for real. It is the only
+# place in the repo where `gljax::pjrt` has ever executed: there is no PJRT
+# plugin for Windows, which is the development machine (`gljax/README.md`).
+#
+# The plugin is pinned, not floated
+# ---------------------------------
+# ARTX01 §1.4: "Pin a specific pjrt-artifacts tag. Do not auto-upgrade plugins.
+# Treat them like a compiler dependency." A serialized executable is
+# plugin-version-specific and the C API has had breaking changes, so a floating
+# `latest` would turn an upstream release into a mystery CI failure.
+#
+# The SHA-256 is checked too. Pinning a tag says which artifact you meant;
+# checking the digest says you got it.
+name: gljax PJRT
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gljax/**"
+      - "glcore/**"
+      - ".github/workflows/gljax-pjrt.yml"
+      - "Cargo.lock"
+  # ⚠️ No `branches:` filter here on purpose. For `pull_request` that key
+  # filters on the *base* branch, and gljax work lands on integration branches
+  # (`docs/gljax-artx-series`) before it reaches main — a `[main]` filter would
+  # silently skip this job on exactly the PRs that introduce the code it
+  # exists to test. Gate every PR that touches gljax, whatever it targets.
+  pull_request:
+    paths:
+      - "gljax/**"
+      - "glcore/**"
+      - ".github/workflows/gljax-pjrt.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+
+concurrency:
+  group: gljax-pjrt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # ── The pinned plugin ──────────────────────────────────────────────────────
+  # Verified 2026-07-29 by downloading and inspecting the artifact:
+  #   * ELF 64-bit LSB, 274,739,056 bytes extracted
+  #   * exports GetPjrtApi
+  #   * the tarball contains exactly one file: ./libpjrt_cpu.so
+  #
+  # ⚠️ That filename is NOT what ARTX01 §1.4/§5.1 says. The docs call it
+  # `pjrt_c_api_cpu_plugin.so`; zml ships `libpjrt_cpu.so`. ARTX01's "~80MB"
+  # is stale too — it is 64 MB compressed, 274 MB on disk.
+  PJRT_ARTIFACTS_TAG: manual-2026-07-28T12-29-00Z
+  PJRT_ASSET: pjrt-cpu_linux-amd64.tar.gz
+  PJRT_ASSET_SHA256: a00125365f1fb04c164d4dc63941e7b002d29f376be0bdc45557cc62efd19d60
+  PJRT_SO_NAME: libpjrt_cpu.so
+
+jobs:
+  pjrt-cpu:
+    name: gljax on the PJRT CPU plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gljax-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gljax-cargo-
+
+      # 64 MB compressed, and the tag is pinned, so the cache key never goes
+      # stale on its own — it changes only when someone bumps the pin.
+      - name: Cache the PJRT plugin
+        id: pjrt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/pjrt
+          key: pjrt-cpu-${{ env.PJRT_ARTIFACTS_TAG }}-${{ env.PJRT_ASSET_SHA256 }}
+
+      - name: Download and verify the PJRT CPU plugin
+        if: steps.pjrt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/pjrt
+          url="https://github.com/zml/pjrt-artifacts/releases/download/${PJRT_ARTIFACTS_TAG}/${PJRT_ASSET}"
+          echo "Downloading $url"
+          curl -sSfL -o /tmp/pjrt.tar.gz "$url"
+
+          echo "${PJRT_ASSET_SHA256}  /tmp/pjrt.tar.gz" | sha256sum -c -
+
+          tar -xzf /tmp/pjrt.tar.gz -C ~/pjrt
+          test -f "$HOME/pjrt/${PJRT_SO_NAME}"
+
+      # The plugin is useless if it does not export the one symbol gljax
+      # resolves. Checking here turns "GetPjrtApi not found" from a confusing
+      # test failure into an obvious infrastructure failure.
+      # Also publishes the path, so the runner's home directory is never
+      # hardcoded and the cache-hit path gets it too.
+      - name: Verify the plugin exports GetPjrtApi
+        run: |
+          set -euo pipefail
+          so="$HOME/pjrt/${PJRT_SO_NAME}"
+          ls -la "$so"
+          file "$so"
+          if ! nm -D --defined-only "$so" | grep -qw GetPjrtApi; then
+            echo "::error::${PJRT_SO_NAME} does not export GetPjrtApi — not a PJRT plugin"
+            nm -D --defined-only "$so" | head -20
+            exit 1
+          fi
+          echo "GetPjrtApi found"
+          echo "PJRT_PLUGIN_CPU=$so" >> "$GITHUB_ENV"
+
+      - name: Clippy
+        run: cargo clippy -p gljax --all-targets --locked -- -D warnings
+
+      # ⭐ The point of the whole workflow. `--nocapture` so the SKIP lines are
+      # visible in the log, and the guard below turns a silent skip into a
+      # failure — a green run that skipped the plugin tests would be worse than
+      # no run at all, because it would look like coverage.
+      - name: Run gljax tests against the plugin
+        env:
+          # PJRT_PLUGIN_CPU comes from $GITHUB_ENV, set in the verify step.
+          RUST_LOG: gljax=debug
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --locked -- --nocapture 2>&1 | tee /tmp/gljax-test.log
+
+      - name: Fail if any PJRT test skipped
+        run: |
+          set -euo pipefail
+          if grep -q '^SKIP ' /tmp/gljax-test.log; then
+            echo "::error::A PJRT test skipped even though a plugin was configured."
+            echo "A SKIP is not a pass — these are the tests that exercise gljax::sys."
+            grep '^SKIP ' /tmp/gljax-test.log
+            exit 1
+          fi
+          echo "No PJRT test skipped."
+
+      # The offline verifier that found two emitter bugs on the dev machine
+      # (`array<i64: >` and `dense<1e-6>`). It needs no plugin and is fast, so
+      # it runs here too — a parse failure is a much clearer signal than the
+      # compile error PJRT would report for the same module.
+      - name: Set up Python for the MLIR verifier
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify emitted StableHLO parses
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet "jax[cpu]"
+          python gljax/tools/verify_mlir.py
+
+      - name: Upload the test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gljax-test-log
+          path: /tmp/gljax-test.log
+          if-no-files-found: warn
