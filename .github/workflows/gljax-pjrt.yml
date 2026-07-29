@@ -30,8 +30,12 @@ on:
       - "glcore/**"
       - ".github/workflows/gljax-pjrt.yml"
       - "Cargo.lock"
+  # ⚠️ No `branches:` filter here on purpose. For `pull_request` that key
+  # filters on the *base* branch, and gljax work lands on integration branches
+  # (`docs/gljax-artx-series`) before it reaches main — a `[main]` filter would
+  # silently skip this job on exactly the PRs that introduce the code it
+  # exists to test. Gate every PR that touches gljax, whatever it targets.
   pull_request:
-    branches: [main]
     paths:
       - "gljax/**"
       - "glcore/**"
