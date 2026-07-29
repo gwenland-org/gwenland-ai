@@ -1,8 +1,11 @@
 //! Grouped-query causal attention (ARTX03 §4).
 
+use std::rc::Rc;
+
+use crate::graph::value::SsaValue;
 use crate::ops::softmax::softmax;
 use crate::ops::util::{dense_const_f32, expect_rank4, splat_like};
-use crate::stablehlo::ops::DotDimensionNumbers;
+use crate::stablehlo::ops::{emit_dynamic_slice, DotDimensionNumbers};
 use crate::stablehlo::types::{DType, Shape};
 use crate::tensor::Tensor;
 use crate::GlError;
@@ -25,6 +28,56 @@ pub fn causal_mask(like: &Tensor, seq_len: usize, dtype: DType) -> Result<Tensor
     let shape = Shape::new([1, 1, seq_len, seq_len], DType::F32);
     let mask = dense_const_f32(like, &data, shape)?;
     Ok(mask.to_dtype(dtype))
+}
+
+/// Extracts row `pos` of a precomputed `[1, 1, W, W]` causal mask as the
+/// `[1, 1, 1, W]` position mask a decode step needs.
+///
+/// ⭐ The static causal mask already encodes exactly the rule ARTX05 §3
+/// describes computing from scratch via `iota` + `compare` + `select`:
+/// `causal_mask[pos, j] = 0` if `j <= pos` else `-inf` — decode's "attend to
+/// real history, mask the unwritten tail of the bucket" is just row `pos` of
+/// the same matrix `causal_mask` already builds. Reusing it needs one
+/// `dynamic_slice` on a mask that's already emitted and parse-verified,
+/// instead of three new StableHLO op emitters that would each carry their own
+/// syntax risk (the reduce-region-braces and empty-`array<i64>` bugs were
+/// exactly this kind of first use).
+pub fn causal_mask_row(mask: &Tensor, pos: &Tensor, zero: &Tensor) -> Tensor {
+    assert_eq!(
+        mask.rank(),
+        4,
+        "causal_mask_row: mask must be [1, 1, W, W], got rank {}",
+        mask.rank()
+    );
+    assert_eq!(
+        (mask.dim(0), mask.dim(1)),
+        (1, 1),
+        "causal_mask_row: mask must be [1, 1, W, W], got {:?}",
+        mask.shape().dims
+    );
+    let w = mask.dim(3);
+    assert_eq!(
+        mask.dim(2),
+        w,
+        "causal_mask_row: mask must be square, got [{}, {}]",
+        mask.dim(2),
+        w
+    );
+
+    let idx = |t: &Tensor| (t.value().ssa(), t.shape().clone());
+    let out_shape = Shape::new([1, 1, 1, w], mask.dtype());
+    let name = {
+        let mut b = mask.builder().borrow_mut();
+        emit_dynamic_slice(
+            b.emitter_mut(),
+            mask.value().ssa(),
+            &[idx(zero), idx(zero), idx(pos), idx(zero)],
+            &[1, 1, 1, w],
+            mask.shape(),
+            &out_shape,
+        )
+    };
+    Tensor::new(SsaValue::new(name, out_shape), Rc::clone(mask.builder()))
 }
 
 /// Scaled dot-product attention with GQA head expansion and an additive mask.
@@ -234,6 +287,50 @@ mod tests {
         let mlir = cx.finish(&[&out]).mlir;
         // 1/sqrt(64) = 0.125, exactly representable.
         assert!(mlir.contains("dense<0.125>"), "{mlir}");
+    }
+
+    #[test]
+    fn causal_mask_row_slices_out_one_row_at_a_runtime_position() {
+        let mut cx = TraceCx::new("main", "mask_row");
+        let x = cx.input("x", Shape::new([1], DType::F32));
+        let mask = causal_mask(&x, 8, DType::F32).expect("mask");
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let row = causal_mask_row(&mask, &pos, &zero);
+        assert_eq!(row.shape().dims, vec![1, 1, 1, 8]);
+
+        let mlir = cx.finish(&[&row]).mlir;
+        assert!(mlir.contains(r#""stablehlo.dynamic_slice""#), "{mlir}");
+        assert!(mlir.contains("slice_sizes = array<i64: 1, 1, 1, 8>"), "{mlir}");
+    }
+
+    #[test]
+    #[should_panic(expected = "must be square")]
+    fn causal_mask_row_rejects_a_non_square_mask() {
+        let mut cx = TraceCx::new("main", "mask_row");
+        let mask = cx.input("mask", Shape::new([1, 1, 4, 8], DType::F32));
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let _ = causal_mask_row(&mask, &pos, &zero);
+    }
+
+    /// The whole point of `causal_mask_row`: its output must be a drop-in
+    /// `[1, 1, S_q, S_kv]` mask for a decode-shaped `gqa_attention` call
+    /// (`S_q = 1`), with no dynamic-shape gymnastics on the attention side.
+    #[test]
+    fn causal_mask_row_is_usable_as_a_decode_step_attention_mask() {
+        let mut cx = TraceCx::new("main", "mask_row");
+        let x = cx.input("x", Shape::new([1], DType::F32));
+        let mask = causal_mask(&x, 8, DType::F32).expect("mask");
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let row = causal_mask_row(&mask, &pos, &zero);
+
+        let q = cx.input("q", Shape::new([1, 2, 1, 4], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 8, 4], DType::F32));
+        let v = cx.input("v", Shape::new([1, 2, 8, 4], DType::F32));
+        let out = gqa_attention(&q, &k, &v, &row);
+        assert_eq!(out.shape().dims, vec![1, 2, 1, 4]);
     }
 
     #[test]

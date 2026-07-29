@@ -43,6 +43,9 @@ pub struct Signature {
     pub inputs: Vec<ParamDesc>,
     /// Checkpoint weights in declaration order. `name` is the checkpoint key.
     pub weights: Vec<ParamDesc>,
+    /// KV cache buffers (ARTX05) in declaration order. `alias_output` on each
+    /// says which output it is donated to.
+    pub kv_caches: Vec<ParamDesc>,
     /// Every parameter in the exact order `func.func` declares them — this is
     /// the order PJRT will read `argument_lists` in.
     pub param_order: Vec<ParamDesc>,
@@ -89,6 +92,7 @@ impl FuncBuilder {
             shape: shape.clone(),
             kind,
             ssa,
+            alias_output: None,
         });
         SsaValue::new(ssa, shape)
     }
@@ -99,6 +103,55 @@ impl FuncBuilder {
 
     pub fn weight(&mut self, name: impl Into<String>, shape: Shape) -> SsaValue {
         self.param(name, shape, ParamKind::Weight)
+    }
+
+    /// Declares a KV cache buffer: a resident, per-call input that a decode
+    /// step writes to (ARTX05). Not scope-qualified — like [`FuncBuilder::input`],
+    /// this is the caller's ABI, not a checkpoint key.
+    pub fn kv_cache(&mut self, name: impl Into<String>, shape: Shape) -> SsaValue {
+        self.param(name, shape, ParamKind::KvCache)
+    }
+
+    /// Declares that `param` — which must have been created by
+    /// [`FuncBuilder::kv_cache`] — is donated to output `output_index`: XLA
+    /// aliases the same buffer instead of copying (ARTX05 §6).
+    ///
+    /// Emitted as a `tf.aliasing_output` argument attribute on `func.func`,
+    /// which is the syntax `jax.jit(..., donate_argnums=...)` itself lowers
+    /// to — confirmed by round-tripping a hand-written module through
+    /// jaxlib's MLIR parser, since there is no PJRT plugin on this machine to
+    /// check it against directly.
+    ///
+    /// Restricted to `KvCache` params on purpose: aliasing a weight or a plain
+    /// input would let PJRT overwrite it in place, corrupting a checkpoint
+    /// tensor or a caller-owned buffer that was never meant to be mutated.
+    ///
+    /// The output-index bound and the shape match against the aliased output
+    /// are checked in [`FuncBuilder::finish`], where the output list is final.
+    ///
+    /// # Panics
+    /// If `param` was not declared via `kv_cache`, or is already aliased.
+    pub fn alias_output(&mut self, param: &SsaValue, output_index: usize) {
+        let p = self
+            .params
+            .iter_mut()
+            .find(|p| p.ssa == param.ssa())
+            .unwrap_or_else(|| panic!("alias_output: {} is not a declared parameter", param.ssa()));
+        assert_eq!(
+            p.kind,
+            ParamKind::KvCache,
+            "alias_output: {:?} ({}) is not a kv-cache parameter — only kv-cache \
+             buffers may be donated",
+            p.kind,
+            p.name
+        );
+        assert!(
+            p.alias_output.is_none(),
+            "alias_output: {} is already aliased to output {}",
+            p.name,
+            p.alias_output.unwrap()
+        );
+        p.alias_output = Some(output_index);
     }
 
     /// Direct emitter access, for ops that need to emit a region body.
@@ -566,10 +619,40 @@ impl FuncBuilder {
             "FuncBuilder::finish: no outputs declared — call set_outputs first"
         );
 
+        // Buffer donation (ARTX05 §6): the output list is only final here, so
+        // this is the first point that can check an alias against it.
+        for p in &self.params {
+            if let Some(idx) = p.alias_output {
+                assert!(
+                    idx < self.outputs.len(),
+                    "finish: {} aliases output {idx}, but only {} outputs are declared",
+                    p.name,
+                    self.outputs.len()
+                );
+                assert_eq!(
+                    self.outputs[idx].shape(),
+                    &p.shape,
+                    "finish: {} (shape {}) aliases output {idx} (shape {}) — a donated \
+                     buffer must have identical shape on both sides, or XLA would be \
+                     aliasing mismatched memory",
+                    p.name,
+                    p.shape.mlir_type(),
+                    self.outputs[idx].shape().mlir_type()
+                );
+            }
+        }
+
         let params: Vec<String> = self
             .params
             .iter()
-            .map(|p| format!("{}: {}", p.ssa, p.shape.mlir_type()))
+            .map(|p| match p.alias_output {
+                Some(idx) => format!(
+                    "{}: {} {{tf.aliasing_output = {idx} : i32}}",
+                    p.ssa,
+                    p.shape.mlir_type()
+                ),
+                None => format!("{}: {}", p.ssa, p.shape.mlir_type()),
+            })
             .collect();
         let out_types: Vec<String> = self
             .outputs
@@ -604,6 +687,12 @@ impl FuncBuilder {
                 .params
                 .iter()
                 .filter(|p| p.kind == ParamKind::Weight)
+                .cloned()
+                .collect(),
+            kv_caches: self
+                .params
+                .iter()
+                .filter(|p| p.kind == ParamKind::KvCache)
                 .cloned()
                 .collect(),
             param_order: self.params.clone(),
@@ -872,6 +961,82 @@ mod tests {
     #[should_panic(expected = "no outputs declared")]
     fn finish_without_outputs_panics() {
         let b = FuncBuilder::new("main", "m");
+        let _ = b.finish();
+    }
+
+    // ── Buffer donation (ARTX05 §6) ──────────────────────────────────────────
+
+    #[test]
+    fn alias_output_emits_a_tf_aliasing_output_attribute() {
+        let mut b = FuncBuilder::new("main", "t");
+        let cache = b.kv_cache("k_cache", f32([2, 4]));
+        let other = b.input("x", f32([2, 4]));
+        let updated = b.add(&cache, &other);
+        b.alias_output(&cache, 0);
+        b.set_outputs(vec![updated]);
+        let built = b.finish();
+
+        assert!(
+            built
+                .mlir
+                .contains("tensor<2x4xf32> {tf.aliasing_output = 0 : i32}"),
+            "{}",
+            built.mlir
+        );
+        // Every other parameter must be unaffected.
+        assert!(
+            !built.mlir.contains("%v1: tensor<2x4xf32> {"),
+            "only the kv-cache param may carry the attribute:\n{}",
+            built.mlir
+        );
+        assert_eq!(built.signature.kv_caches.len(), 1);
+        assert_eq!(built.signature.kv_caches[0].alias_output, Some(0));
+        assert_eq!(built.signature.inputs.len(), 1, "kv_cache is not an input");
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a kv-cache parameter")]
+    fn alias_output_rejects_a_plain_input() {
+        let mut b = FuncBuilder::new("main", "t");
+        let x = b.input("x", f32([2, 4]));
+        b.alias_output(&x, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a kv-cache parameter")]
+    fn alias_output_rejects_a_weight() {
+        let mut b = FuncBuilder::new("main", "t");
+        let w = b.weight("w", f32([2, 4]));
+        b.alias_output(&w, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "already aliased")]
+    fn alias_output_rejects_a_second_alias_on_the_same_param() {
+        let mut b = FuncBuilder::new("main", "t");
+        let cache = b.kv_cache("k_cache", f32([2, 4]));
+        b.alias_output(&cache, 0);
+        b.alias_output(&cache, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "but only")]
+    fn finish_rejects_an_alias_output_index_out_of_range() {
+        let mut b = FuncBuilder::new("main", "t");
+        let cache = b.kv_cache("k_cache", f32([2, 4]));
+        b.alias_output(&cache, 3);
+        b.set_outputs(vec![cache]);
+        let _ = b.finish();
+    }
+
+    #[test]
+    #[should_panic(expected = "must have identical shape")]
+    fn finish_rejects_an_alias_output_shape_mismatch() {
+        let mut b = FuncBuilder::new("main", "t");
+        let cache = b.kv_cache("k_cache", f32([2, 4]));
+        let other = b.input("y", f32([4, 2]));
+        b.alias_output(&cache, 0);
+        b.set_outputs(vec![other]);
         let _ = b.finish();
     }
 

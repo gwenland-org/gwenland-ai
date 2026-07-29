@@ -102,15 +102,18 @@ impl Shape {
     }
 }
 
-/// Whether a `func.func` parameter carries activations or weights.
+/// Whether a `func.func` parameter carries activations, weights, or a KV cache.
 ///
 /// The distinction matters at runtime, not in the emitted type: ARTX01 §8.2's
 /// compile/weight separation means weights are uploaded once and reused across
-/// calls, while inputs change every call.
+/// calls, while inputs change every call. `KvCache` is ARTX05's third kind — a
+/// resident buffer that, unlike a weight, is written every decode step, which
+/// is why it is the only kind [`FuncBuilder::alias_output`] permits donating.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParamKind {
     Input,
     Weight,
+    KvCache,
 }
 
 /// A declared `func.func` parameter: what it is called, what shape it has, and
@@ -127,6 +130,11 @@ pub struct ParamDesc {
     pub shape: Shape,
     pub kind: ParamKind,
     pub ssa: crate::stablehlo::emitter::SsaName,
+    /// ARTX05 §6 buffer donation: `Some(i)` means this parameter aliases
+    /// output `i` — XLA gives the output the same buffer as the input instead
+    /// of copying. Only ever set on [`ParamKind::KvCache`] params; see
+    /// [`FuncBuilder::alias_output`](crate::graph::builder::FuncBuilder::alias_output).
+    pub alias_output: Option<usize>,
 }
 
 #[cfg(test)]

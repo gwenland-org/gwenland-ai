@@ -323,6 +323,36 @@ jobs:
             exit 1
           fi
 
+      # ⭐⭐ ARTX05's headline risk, checked for real: a KV cache reading one
+      # position off produces fluent, wrong text with no error anywhere, and
+      # Gate A5's coherence check below would very likely still pass on
+      # exactly that bug — it checks the output is real, on-topic language,
+      # not that it matches a known-good run. This is the one check that
+      # catches an off-by-one cache read: token-for-token diff against the
+      # unchanged recomputation oracle. Runs before Gate A5's long sweep so a
+      # plumbing failure here is cheap to see.
+      - name: Run KV cache parity test
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --release --locked --test wave_a5_kv_cache -- --nocapture \
+            2>&1 | tee /tmp/kv-cache-parity.log
+          if grep -q '^SKIP cached_decode_matches' /tmp/kv-cache-parity.log; then
+            echo "::error::the KV cache parity test skipped despite plugin and model being configured"
+            exit 1
+          fi
+
+      - name: Upload the KV cache parity log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-cache-parity-log
+          path: /tmp/kv-cache-parity.log
+          if-no-files-found: warn
+
       # ⭐ The gate. `--release` is not optional: a debug build of an XLA
       # client is fast enough to compile and far too slow to generate.
       - name: Run Gate A5

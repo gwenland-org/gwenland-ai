@@ -53,10 +53,28 @@ fn main() {
             gljax::model::trace_forward(&cfg, 128, 0).expect("qwen2 block trace")
         }),
         // The ARTX05 KV-cache primitives: a write at a runtime position and a
-        // static-window read. Not wired into the model — see ops/kv_cache.rs.
+        // static-window read, with the cache buffer donated.
         "kv" => with_policy(policy, || trace_kv_cache(policy)),
+        // ARTX05's prefill function: a real Qwen2 block that also fills a KV
+        // cache (bulk write, one dynamic_update_slice per layer per tensor).
+        "prefill_cache" => with_policy(policy, || {
+            let mut cfg = gljax::model::Qwen2Config::qwen2_0_5b();
+            cfg.n_layers = 1;
+            gljax::model::trace_prefill_with_cache(&cfg, 128, 256)
+                .expect("qwen2 prefill-with-cache trace")
+        }),
+        // ARTX05's decode function: one new token, a runtime `pos`, cache
+        // read+write per layer, RoPE at a dynamic offset, a sliced mask row.
+        "decode" => with_policy(policy, || {
+            let mut cfg = gljax::model::Qwen2Config::qwen2_0_5b();
+            cfg.n_layers = 1;
+            gljax::model::trace_decode(&cfg, 256).expect("qwen2 decode trace")
+        }),
         other => {
-            eprintln!("unknown module {other:?} — expected mlp, ops, tiny, block or kv");
+            eprintln!(
+                "unknown module {other:?} — expected mlp, ops, tiny, block, kv, prefill_cache \
+                 or decode"
+            );
             std::process::exit(2);
         }
     };
@@ -96,13 +114,14 @@ fn trace_mlp(policy: PrecisionPolicy) -> BuiltFunc {
 }
 
 /// A KV cache write followed by a read, exercising `dynamic_update_slice` and
-/// `dynamic_slice` with runtime start indices.
+/// `dynamic_slice` with runtime start indices, and donating the cache buffer
+/// so the write is in-place rather than a full-tensor copy (ARTX05 §6).
 fn trace_kv_cache(policy: PrecisionPolicy) -> BuiltFunc {
     use gljax::ops::kv_cache;
     let dt = policy.activation;
     let mut cx = TraceCx::new("main", "kv_cache");
 
-    let cache = cx.input("k_cache", kv_cache::cache_shape(2, 16, 2, 8, dt));
+    let cache = cx.kv_cache("k_cache", kv_cache::cache_shape(2, 16, 2, 8, dt));
     let update = cx.input("k_new", Shape::new([1, 1, 2, 8], dt));
     let layer = cx.input("layer", Shape::scalar(DType::I32));
     let pos = cx.input("pos", Shape::scalar(DType::I32));
@@ -110,7 +129,11 @@ fn trace_kv_cache(policy: PrecisionPolicy) -> BuiltFunc {
 
     let written = kv_cache::write_at(&cache, &update, &layer, &pos, &zero);
     let window = kv_cache::read_window(&written, &layer, &zero, &zero, 16);
-    cx.finish(&[&window])
+    // Output 1 (the updated cache) is declared to reuse input `cache`'s
+    // buffer, so XLA aliases it in place instead of allocating a fresh
+    // [2,16,2,8] tensor every call.
+    cx.alias_output(&cache, 1);
+    cx.finish(&[&window, &written])
 }
 
 /// One module touching every op emitted in Wave A2.

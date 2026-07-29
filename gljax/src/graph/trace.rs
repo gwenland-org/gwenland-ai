@@ -87,6 +87,21 @@ impl TraceCx {
         Tensor::new(value, Rc::clone(&self.builder))
     }
 
+    /// Declares a KV cache buffer (ARTX05). Not scope-qualified — see
+    /// [`FuncBuilder::kv_cache`](crate::graph::builder::FuncBuilder::kv_cache).
+    pub fn kv_cache(&mut self, name: impl Into<String>, shape: Shape) -> Tensor {
+        let value = self.builder.borrow_mut().kv_cache(name, shape);
+        Tensor::new(value, Rc::clone(&self.builder))
+    }
+
+    /// Donates `param` to output `output_index` — see
+    /// [`FuncBuilder::alias_output`](crate::graph::builder::FuncBuilder::alias_output).
+    pub fn alias_output(&mut self, param: &Tensor, output_index: usize) {
+        self.builder
+            .borrow_mut()
+            .alias_output(param.value(), output_index);
+    }
+
     /// The builder, for ops that need to emit directly.
     pub fn builder(&self) -> &Rc<RefCell<FuncBuilder>> {
         &self.builder
