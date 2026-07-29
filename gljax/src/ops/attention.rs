@@ -93,6 +93,22 @@ pub fn causal_mask_row(mask: &Tensor, pos: &Tensor, zero: &Tensor) -> Tensor {
 /// `h / repeat` — which is what `reshape → broadcast → reshape` produces, in
 /// that order, when the repeat axis is inserted *after* the KV-head axis.
 pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Tensor {
+    let head_dim = expect_rank4(q, "gqa_attention: q")[3];
+    let default_scale = 1.0 / (head_dim as f64).sqrt();
+    gqa_attention_with_scale(q, k, v, mask, default_scale)
+}
+
+/// [`gqa_attention`] with an explicit query scale, overriding the default
+/// `1/sqrt(head_dim)` (ARTX11 §4.2's "custom query pre-attention scalar" —
+/// Gemma scales by a value tied to the *un-grouped* head count rather than
+/// `head_dim` itself).
+pub fn gqa_attention_with_scale(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: &Tensor,
+    scale: f64,
+) -> Tensor {
     let [b, n_heads, s_q, head_dim] = expect_rank4(q, "gqa_attention: q");
     let [bk, n_kv_heads, s_kv, dk] = expect_rank4(k, "gqa_attention: k");
     let [bv, n_kv_v, s_v, dv] = expect_rank4(v, "gqa_attention: v");
@@ -127,9 +143,8 @@ pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Tenso
     let k_exp = expand_kv_heads(k, repeat);
     let v_exp = expand_kv_heads(v, repeat);
 
-    // Scale Q by 1/sqrt(head_dim) before the product. Scaling Q rather than the
-    // scores is one fewer S×S-sized elementwise pass.
-    let scale = 1.0 / (head_dim as f64).sqrt();
+    // Scale Q before the product. Scaling Q rather than the scores is one
+    // fewer S×S-sized elementwise pass.
     let scale_t = splat_like(q, scale, q.shape().dims.clone(), q.dtype());
     let q_scaled = q.mul(&scale_t);
 
@@ -164,6 +179,28 @@ pub fn gqa_attention(q: &Tensor, k: &Tensor, v: &Tensor, mask: &Tensor) -> Tenso
             rhs_contracting: vec![2],
         },
     )
+}
+
+/// Per-head RMSNorm on Q and K before RoPE (ARTX11 §4.2's QK-norm).
+///
+/// * `q`: `[B, n_heads, S, head_dim]`, `q_norm_weight`: `[head_dim]`
+/// * `k`: `[B, n_kv_heads, S, head_dim]`, `k_norm_weight`: `[head_dim]`
+///
+/// [`crate::ops::norm::rms_norm`] already reduces over *the last axis
+/// regardless of rank* — `head_dim` is q/k's last axis whether the tensor is
+/// rank 2 (a single head, in a unit test) or rank 4 (the real `[B,H,S,D]`
+/// shape), so this needs no new reduction machinery, only the right weight
+/// shape at the call site.
+pub fn apply_qk_norm(
+    q: &Tensor,
+    k: &Tensor,
+    q_norm_weight: &Tensor,
+    k_norm_weight: &Tensor,
+    eps: f64,
+) -> (Tensor, Tensor) {
+    let q_normed = crate::ops::norm::rms_norm(q, q_norm_weight, eps);
+    let k_normed = crate::ops::norm::rms_norm(k, k_norm_weight, eps);
+    (q_normed, k_normed)
 }
 
 /// `[B, n_kv, S, D]` → `[B, n_kv · repeat, S, D]`, each KV head repeated
@@ -331,6 +368,65 @@ mod tests {
         let v = cx.input("v", Shape::new([1, 2, 8, 4], DType::F32));
         let out = gqa_attention(&q, &k, &v, &row);
         assert_eq!(out.shape().dims, vec![1, 2, 1, 4]);
+    }
+
+    #[test]
+    fn gqa_attention_with_scale_overrides_the_default_head_dim_scale() {
+        let mut cx = TraceCx::new("main", "attn");
+        let q = cx.input("q", Shape::new([1, 2, 4, 64], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 4, 64], DType::F32));
+        let v = cx.input("v", Shape::new([1, 2, 4, 64], DType::F32));
+        let mask = causal_mask(&q, 4, DType::F32).expect("mask");
+        // Gemma-style: a custom scalar unrelated to 1/sqrt(head_dim) (0.125).
+        let out = gqa_attention_with_scale(&q, &k, &v, &mask, 0.0625);
+        let mlir = cx.finish(&[&out]).mlir;
+        assert!(mlir.contains("dense<0.0625>"), "{mlir}");
+        assert!(!mlir.contains("dense<0.125>"), "{mlir}");
+    }
+
+    #[test]
+    fn gqa_attention_and_gqa_attention_with_scale_agree_at_the_default() {
+        let mut default_cx = TraceCx::new("main", "attn");
+        let q1 = default_cx.input("q", Shape::new([1, 2, 4, 64], DType::F32));
+        let k1 = default_cx.input("k", Shape::new([1, 2, 4, 64], DType::F32));
+        let v1 = default_cx.input("v", Shape::new([1, 2, 4, 64], DType::F32));
+        let mask1 = causal_mask(&q1, 4, DType::F32).expect("mask");
+        let out1 = gqa_attention(&q1, &k1, &v1, &mask1);
+        let mlir1 = default_cx.finish(&[&out1]).mlir;
+
+        let mut explicit_cx = TraceCx::new("main", "attn");
+        let q2 = explicit_cx.input("q", Shape::new([1, 2, 4, 64], DType::F32));
+        let k2 = explicit_cx.input("k", Shape::new([1, 2, 4, 64], DType::F32));
+        let v2 = explicit_cx.input("v", Shape::new([1, 2, 4, 64], DType::F32));
+        let mask2 = causal_mask(&q2, 4, DType::F32).expect("mask");
+        let out2 = gqa_attention_with_scale(&q2, &k2, &v2, &mask2, 1.0 / (64f64).sqrt());
+        let mlir2 = explicit_cx.finish(&[&out2]).mlir;
+
+        assert_eq!(mlir1, mlir2, "gqa_attention must be gqa_attention_with_scale at the default");
+    }
+
+    #[test]
+    fn apply_qk_norm_normalizes_over_head_dim_not_the_head_axis() {
+        let mut cx = TraceCx::new("main", "qknorm");
+        let q = cx.input("q", Shape::new([1, 14, 16, 64], DType::F32));
+        let k = cx.input("k", Shape::new([1, 2, 16, 64], DType::F32));
+        let qw = cx.weight("q_norm.weight", Shape::new([64], DType::F32));
+        let kw = cx.weight("k_norm.weight", Shape::new([64], DType::F32));
+        let (q_normed, k_normed) = apply_qk_norm(&q, &k, &qw, &kw, 1e-6);
+        assert_eq!(q_normed.shape().dims, vec![1, 14, 16, 64]);
+        assert_eq!(k_normed.shape().dims, vec![1, 2, 16, 64]);
+
+        let mlir = cx.finish(&[&q_normed, &k_normed]).mlir;
+        // One reduce per tensor (q, k), each over the last axis (index 3).
+        // The reduce op's own `{dimensions = ...}` attribute is distinguished
+        // from `broadcast_dimensions = ...` (which also contains axis 3, for
+        // the weight broadcast) by matching the braced reduce-attribute form.
+        assert_eq!(mlir.matches(r#""stablehlo.reduce""#).count(), 2, "{mlir}");
+        assert_eq!(
+            mlir.matches("{dimensions = array<i64: 3>}").count(),
+            2,
+            "QK-norm must reduce head_dim, not the head axis:\n{mlir}"
+        );
     }
 
     #[test]
