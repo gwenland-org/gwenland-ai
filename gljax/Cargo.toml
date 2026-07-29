@@ -1,6 +1,6 @@
 [package]
 name = "gljax"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "GwenLand AI gljax: pure-Rust XLA/PJRT client — StableHLO emission, zero kernels"
 license-file = "../LICENSE"

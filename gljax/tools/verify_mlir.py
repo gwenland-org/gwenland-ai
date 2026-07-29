@@ -42,6 +42,10 @@ CASES = [
     ("block", "f32"),
     ("kv", "bf16"),
     ("kv", "f32"),
+    ("prefill_cache", "bf16"),
+    ("prefill_cache", "f32"),
+    ("decode", "bf16"),
+    ("decode", "f32"),
 ]
 
 

@@ -12,9 +12,11 @@
 //! | [`sample`] | ✅ pure host-side logic |
 //! | [`hf`] | ⚠️ checkpoint reading tested; `Session` construction ⛔ |
 //! | [`session`] | ⛔ compiles, never constructed |
+//! | [`cached_session`] | ⛔ compiles, never constructed — see its module docs |
 
 pub mod bucket;
 pub mod cache;
+pub mod cached_session;
 pub mod digest;
 pub mod hf;
 pub mod plan;
@@ -23,6 +25,7 @@ pub mod session;
 
 pub use bucket::{bucket_for, pad_to_bucket, BUCKETS};
 pub use cache::{CompileCache, CompileKey};
+pub use cached_session::CachedSession;
 pub use sample::{argmax, argmax_at};
 pub use hf::HfCheckpoint;
 pub use plan::PlanSignature;

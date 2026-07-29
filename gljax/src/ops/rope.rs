@@ -26,8 +26,12 @@
 //! This is P4 in its purest form: both pairings have identical shapes, both
 //! produce fluent-looking text, and only one is right.
 
+use std::rc::Rc;
+
+use crate::graph::value::SsaValue;
 use crate::ops::util::dense_const_f32;
 use crate::precision;
+use crate::stablehlo::ops::emit_dynamic_slice;
 use crate::stablehlo::types::{DType, Shape};
 use crate::tensor::Tensor;
 use crate::GlError;
@@ -179,6 +183,88 @@ pub fn rope_neox(
         vec![b, h, s, head_dim],
         vec![1, 1, 1, 1],
     );
+    let rotated_half = Tensor::concat(&[&second.neg(), &first], 3);
+
+    let out = &x_acc.mul(&cos) + &rotated_half.mul(&sin);
+    out.to_dtype(x.dtype())
+}
+
+/// Applies NeoX RoPE to a decode step's `[B, H, 1, head_dim]` tensor at a
+/// **runtime** position — the decode counterpart to [`rope_neox`]'s
+/// compile-time `seq_offset`.
+///
+/// `pos` and `zero` are rank-0 `i32` tensors; `zero` fills the table's
+/// head_dim-axis start index, which is always 0. Same caller-supplies-the-zero
+/// convention as [`crate::ops::kv_cache`] — one shared constant threaded
+/// through every dynamic-index op in a trace, rather than a fresh one each
+/// call.
+///
+/// The table read is `stablehlo.dynamic_slice`, not the static `slice`
+/// [`rope_neox`] uses — the whole point being that `pos` is not known until
+/// the decode step runs, so the offset must be a runtime value while the
+/// amount read (one row) stays static (P3).
+pub fn rope_neox_at(
+    x: &Tensor,
+    cos_table: &Tensor,
+    sin_table: &Tensor,
+    pos: &Tensor,
+    zero: &Tensor,
+) -> Tensor {
+    let [b, h, s, head_dim] = crate::ops::util::expect_rank4(x, "rope_neox_at");
+    assert_eq!(
+        s, 1,
+        "rope_neox_at is the decode path: exactly one position, got {s} — \
+         use rope_neox for a multi-position prefill"
+    );
+    assert!(
+        head_dim.is_multiple_of(2),
+        "rope_neox_at: head_dim must be even, got {head_dim}"
+    );
+    let half = head_dim / 2;
+
+    let table_dims = cos_table.shape().dims.clone();
+    assert_eq!(
+        table_dims.len(),
+        2,
+        "rope_neox_at: cos table must be [max_seq_len, head_dim], got {table_dims:?}"
+    );
+    assert_eq!(
+        table_dims[1], head_dim,
+        "rope_neox_at: table head_dim {} does not match x's {head_dim}",
+        table_dims[1]
+    );
+
+    let acc = precision::current().rope;
+
+    // Read row `pos` of the table (dynamic offset, static [1, head_dim] size),
+    // then broadcast over batch and heads exactly as the static path does.
+    let take = |t: &Tensor| {
+        let idx = |v: &Tensor| (v.value().ssa(), v.shape().clone());
+        let out_shape = Shape::new([1, head_dim], t.dtype());
+        let name = {
+            let mut b = t.builder().borrow_mut();
+            emit_dynamic_slice(
+                b.emitter_mut(),
+                t.value().ssa(),
+                &[idx(pos), idx(zero)],
+                &[1, head_dim],
+                t.shape(),
+                &out_shape,
+            )
+        };
+        Tensor::new(SsaValue::new(name, out_shape), Rc::clone(t.builder()))
+            .broadcast_to(vec![2, 3], vec![b, h, s, head_dim])
+            .to_dtype(acc)
+    };
+    let cos = take(cos_table);
+    let sin = take(sin_table);
+
+    let x_acc = x.to_dtype(acc);
+
+    // rotate_half(x) = concat(-x[..., half:], x[..., :half]) — identical to
+    // rope_neox's static path; only the table read is dynamic.
+    let first = x_acc.slice(vec![0, 0, 0, 0], vec![b, h, s, half], vec![1, 1, 1, 1]);
+    let second = x_acc.slice(vec![0, 0, 0, half], vec![b, h, s, head_dim], vec![1, 1, 1, 1]);
     let rotated_half = Tensor::concat(&[&second.neg(), &first], 3);
 
     let out = &x_acc.mul(&cos) + &rotated_half.mul(&sin);
@@ -339,5 +425,49 @@ mod tests {
         let q = cx.input("q", Shape::new([1, 2, 4, 8], DType::F32));
         let (cos, sin) = emit_rope_tables(&q, 8, 8, DEFAULT_ROPE_BASE).expect("tables");
         let _ = rope_neox(&q, &cos, &sin, 6); // 6 + 4 > 8
+    }
+
+    #[test]
+    fn rope_neox_at_reads_the_table_at_a_runtime_position() {
+        let mut cx = TraceCx::new("main", "rope_at");
+        let q = cx.input("q", Shape::new([1, 2, 1, 8], DType::F32));
+        let (cos, sin) = emit_rope_tables(&q, 16, 8, DEFAULT_ROPE_BASE).expect("tables");
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let out = rope_neox_at(&q, &cos, &sin, &pos, &zero);
+        assert_eq!(out.shape().dims, vec![1, 2, 1, 8]);
+
+        let mlir = cx.finish(&[&out]).mlir;
+        assert!(mlir.contains(r#""stablehlo.dynamic_slice""#), "{mlir}");
+        assert!(mlir.contains("slice_sizes = array<i64: 1, 8>"), "{mlir}");
+    }
+
+    #[test]
+    #[should_panic(expected = "exactly one position")]
+    fn rope_neox_at_refuses_more_than_one_position() {
+        let mut cx = TraceCx::new("main", "rope_at");
+        let q = cx.input("q", Shape::new([1, 2, 4, 8], DType::F32));
+        let (cos, sin) = emit_rope_tables(&q, 16, 8, DEFAULT_ROPE_BASE).expect("tables");
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let _ = rope_neox_at(&q, &cos, &sin, &pos, &zero);
+    }
+
+    /// The dynamic table read is a different op from the static path's slice —
+    /// the rotation arithmetic around it must not be.
+    #[test]
+    fn rope_neox_at_emits_the_same_arithmetic_shape_as_the_static_path() {
+        let mut cx = TraceCx::new("main", "rope_at");
+        let q = cx.input("q", Shape::new([1, 2, 1, 8], DType::F32));
+        let (cos, sin) = emit_rope_tables(&q, 16, 8, DEFAULT_ROPE_BASE).expect("tables");
+        let pos = cx.input("pos", Shape::scalar(DType::I32));
+        let zero = cx.input("zero", Shape::scalar(DType::I32));
+        let out = rope_neox_at(&q, &cos, &sin, &pos, &zero);
+        let mlir = cx.finish(&[&out]).mlir;
+
+        assert_eq!(mlir.matches(r#""stablehlo.negate""#).count(), 1, "{mlir}");
+        assert_eq!(mlir.matches(r#""stablehlo.concatenate""#).count(), 1, "{mlir}");
+        assert_eq!(mlir.matches(r#""stablehlo.multiply""#).count(), 2, "{mlir}");
+        assert_eq!(mlir.matches(r#""stablehlo.add""#).count(), 1, "{mlir}");
     }
 }
