@@ -58,6 +58,7 @@ pub mod error;
 pub mod graph;
 pub mod matrix;
 pub mod model;
+pub mod oracle;
 pub mod ops;
 pub mod pjrt;
 pub mod precision;
