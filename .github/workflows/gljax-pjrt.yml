@@ -163,16 +163,26 @@ jobs:
           set -euo pipefail
           cargo test -p gljax --locked -- --nocapture 2>&1 | tee /tmp/gljax-test.log
 
-      - name: Fail if any PJRT test skipped
+      # ⚠️ Only *plugin* skips are failures here. This job configures a plugin
+      # and deliberately does not download a model, so the checkpoint test
+      # skipping is correct behaviour — the `gate-a5` job below is what covers
+      # it. An earlier version grepped bare `^SKIP ` and failed on exactly that.
+      #
+      # The rule is "no test may skip for something this job supplied", and
+      # what this job supplies is the plugin.
+      - name: Fail if a PJRT plugin test skipped
         run: |
           set -euo pipefail
-          if grep -q '^SKIP ' /tmp/gljax-test.log; then
+          if grep -E '^SKIP .*(PJRT|plugin)' /tmp/gljax-test.log; then
             echo "::error::A PJRT test skipped even though a plugin was configured."
             echo "A SKIP is not a pass — these are the tests that exercise gljax::sys."
-            grep '^SKIP ' /tmp/gljax-test.log
             exit 1
           fi
-          echo "No PJRT test skipped."
+          echo "No PJRT plugin test skipped."
+          # Everything else that skipped, for the record rather than as a gate.
+          if grep -E '^SKIP ' /tmp/gljax-test.log; then
+            echo "(the skips above need a model, which the gate-a5 job supplies)"
+          fi
 
       # The offline verifier that found two emitter bugs on the dev machine
       # (`array<i64: >` and `dense<1e-6>`). It needs no plugin and is fast, so
