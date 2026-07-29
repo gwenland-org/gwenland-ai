@@ -353,6 +353,37 @@ jobs:
           path: /tmp/kv-cache-parity.log
           if-no-files-found: warn
 
+      # ⚠️ Correctness only tells half the story — this measures the other
+      # half: CachedSession's actual tok/s, compared against Session's
+      # already-measured (not re-run — see bench_kv_cache.rs's module docs on
+      # why) numbers from this same workflow. Runs before Gate A5's long sweep
+      # since it should be fast (decode is meant to be O(1) per token).
+      - name: Run KV cache throughput benchmark
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo run -p gljax --release --locked --example bench_kv_cache \
+            2>&1 | tee /tmp/kv-cache-bench.log
+
+      - name: Fail if the KV cache benchmark skipped
+        run: |
+          set -euo pipefail
+          if grep -q '^SKIP bench_kv_cache' /tmp/kv-cache-bench.log; then
+            echo "::error::the KV cache throughput benchmark skipped despite plugin and model being configured"
+            exit 1
+          fi
+
+      - name: Upload the KV cache benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-cache-bench-log
+          path: /tmp/kv-cache-bench.log
+          if-no-files-found: warn
+
       # ⭐ The gate. `--release` is not optional: a debug build of an XLA
       # client is fast enough to compile and far too slow to generate.
       - name: Run Gate A5
