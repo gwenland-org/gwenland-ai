@@ -145,6 +145,18 @@ pub fn gqa_attention_with_scale(
 
     // Scale Q before the product. Scaling Q rather than the scores is one
     // fewer S×S-sized elementwise pass.
+    //
+    // ⚠️ ARTX09 §3.4 flags this specific choice as a possible risk to GPU
+    // flash-attention reachability: XLA:GPU's `CudnnFusedMHARewriter` pattern-
+    // matches `bmm1 -> scale -> mask -> softmax -> bmm2` (scale AFTER the
+    // first dot), and ARTX09 states outright that scaling Q beforehand "may
+    // defeat the rewriter's pattern match" — unmeasured, in either direction,
+    // on real GPU hardware, which does not exist in this environment. This is
+    // NOT changed here: it is the ARTX03-verified path (Gate A5 has run it
+    // against real PJRT hardware; scale-after-bmm1 has not), and ARTX09 itself
+    // requires a measurement before treating either form as the right default
+    // — "any deviation must be justified against a measurement," and neither
+    // direction has one yet. See `gljax/docs/flash_attention_reachability.md`.
     let scale_t = splat_like(q, scale, q.shape().dims.clone(), q.dtype());
     let q_scaled = q.mul(&scale_t);
 
@@ -278,6 +290,26 @@ mod tests {
             mlir.contains("(tensor<1x2x7x8x64xf32>) -> tensor<1x14x8x64xf32>"),
             "{mlir}"
         );
+    }
+
+    /// ⭐ ARTX09 §4.1's explicit design decision: the GQA expansion must stay
+    /// `broadcast_in_dim` + `reshape`, never `concatenate`/`repeat_interleave`
+    /// — a materialized concat would multiply decode's KV read by `G` (7× at
+    /// Qwen2-0.5B's head geometry), on exactly the phase ARTX08 already
+    /// established is bandwidth-bound. `expand_kv_heads` already does this;
+    /// this pins it so a future "simplify this reshape dance" pass can't
+    /// regress it back to a concat and still pass every *shape* test.
+    #[test]
+    fn kv_head_expansion_never_materializes_via_concatenate() {
+        let mut cx = TraceCx::new("main", "gqa");
+        let k = cx.input("k", Shape::new([1, 2, 8, 64], DType::F32));
+        let expanded = expand_kv_heads(&k, 7);
+        let mlir = cx.finish(&[&expanded]).mlir;
+        assert!(
+            !mlir.contains("stablehlo.concatenate"),
+            "GQA expansion must be a broadcast, not a materialized concat (ARTX09 §4.1):\n{mlir}"
+        );
+        assert!(mlir.contains(r#""stablehlo.broadcast_in_dim""#), "{mlir}");
     }
 
     #[test]
