@@ -7,6 +7,8 @@
 //! than spread through `ops/` — is what makes it a retrofit rather than a
 //! rewrite.
 
+pub mod hf_config;
 pub mod qwen2;
 
+pub use hf_config::eos_token_id;
 pub use qwen2::{trace_forward, Qwen2Config};

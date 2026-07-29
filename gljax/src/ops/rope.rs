@@ -32,8 +32,22 @@ use crate::stablehlo::types::{DType, Shape};
 use crate::tensor::Tensor;
 use crate::GlError;
 
-/// Qwen2's default RoPE base frequency.
+/// The classic RoPE base frequency (Llama, Mistral, GPT-NeoX).
+///
+/// ⛔ **This is NOT Qwen2's.** `Qwen/Qwen2-0.5B`'s `config.json` sets
+/// `"rope_theta": 1000000.0` — a hundred times larger. Using 1e4 for a
+/// 1e6-trained model rotates every position by the wrong angle, and the
+/// failure is P4-shaped: shapes match, no error, output degrades into
+/// plausible-looking nonsense that gets worse further into the sequence.
+///
+/// Always read `rope_theta` from the checkpoint's config
+/// ([`crate::model::Qwen2Config::from_hf_config_json`]). This constant exists
+/// for tests and for models that genuinely use it.
 pub const DEFAULT_ROPE_BASE: f32 = 10_000.0;
+
+/// `Qwen/Qwen2-0.5B`'s `rope_theta`, verified against the published
+/// `config.json` at revision `91d2aff3f957f99e4c74c962f2f408dcc88a18d8`.
+pub const QWEN2_ROPE_BASE: f32 = 1_000_000.0;
 
 /// Builds the cos/sin tables as `[max_seq_len, head_dim]` F32 data.
 ///

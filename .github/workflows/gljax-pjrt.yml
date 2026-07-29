@@ -64,6 +64,25 @@ env:
   PJRT_ASSET_SHA256: a00125365f1fb04c164d4dc63941e7b002d29f376be0bdc45557cc62efd19d60
   PJRT_SO_NAME: libpjrt_cpu.so
 
+  # ── The pinned model ───────────────────────────────────────────────────────
+  # ⚠️ A revision, never `main`. Model weights that move under CI turn a
+  # coherence regression into an unreproducible mystery — and coherence is the
+  # entire signal Gate A5 produces.
+  QWEN2_REPO: Qwen/Qwen2-0.5B
+  QWEN2_REVISION: 91d2aff3f957f99e4c74c962f2f408dcc88a18d8
+  QWEN2_DIR: /home/runner/qwen2-0.5b
+
+  # ⛔ Stops at 128 on purpose. `Session::generate` has no KV cache, so n
+  # tokens costs n full forward passes at the bucket width, and the bucket
+  # grows with n. Qwen2-0.5B is 494 M MACs/position → 1102 GFLOP per forward at
+  # bucket 1024. On 4 vCPUs at an optimistic 60 GFLOP/s that is 2.6 h for the
+  # 512-token run alone; at a realistic 30 GFLOP/s the full 7-length sweep is
+  # 6.9 h against GitHub's 6 h job limit.
+  #
+  # Lengths ≤ 128 are minutes. 256/512 are opt-in via workflow_dispatch. The
+  # fix is a KV cache, not a longer timeout.
+  GATE_A5_LENGTHS: "8,16,32,64,128"
+
 jobs:
   pjrt-cpu:
     name: gljax on the PJRT CPU plugin
@@ -171,10 +190,131 @@ jobs:
           python -m pip install --quiet "jax[cpu]"
           python gljax/tools/verify_mlir.py
 
+      # ── Gate A5 — coherence on a real model ───────────────────────────────
+      #
+      # Everything above proves the plumbing. This proves the model: real
+      # weights, a real tokenizer, and output a human can read.
+      #
+      # It runs in a separate job so a plumbing failure and a coherence
+      # failure are distinguishable at a glance, and so the ~1 GB model
+      # download only happens when the plumbing already passed.
       - name: Upload the test log
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: gljax-test-log
           path: /tmp/gljax-test.log
+          if-no-files-found: warn
+
+  gate-a5:
+    name: Gate A5 — coherence on Qwen2-0.5B
+    runs-on: ubuntu-latest
+    needs: pjrt-cpu
+    # Generous but bounded: the 128-token run is the long pole at ~9-37 min
+    # depending on how the runner's FLOP/s land, plus one XLA compile per
+    # bucket. If this trips, read the tok/s table before raising it — a
+    # timeout here usually means throughput moved, not that the limit is wrong.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gljax-a5-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gljax-a5-
+
+      - name: Cache the PJRT plugin
+        id: pjrt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/pjrt
+          key: pjrt-cpu-${{ env.PJRT_ARTIFACTS_TAG }}-${{ env.PJRT_ASSET_SHA256 }}
+
+      - name: Download and verify the PJRT CPU plugin
+        if: steps.pjrt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/pjrt
+          url="https://github.com/zml/pjrt-artifacts/releases/download/${PJRT_ARTIFACTS_TAG}/${PJRT_ASSET}"
+          curl -sSfL -o /tmp/pjrt.tar.gz "$url"
+          echo "${PJRT_ASSET_SHA256}  /tmp/pjrt.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/pjrt.tar.gz -C ~/pjrt
+          test -f "$HOME/pjrt/${PJRT_SO_NAME}"
+
+      - name: Cache Qwen2-0.5B
+        id: qwen2-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QWEN2_DIR }}
+          key: qwen2-0.5b-${{ env.QWEN2_REVISION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `revision` is pinned, so the cache key is exact and this runs once.
+      # Only the four files gljax reads — the repo also carries vocab.json and
+      # merges.txt, which `tokenizer.json` already subsumes.
+      - name: Download Qwen2-0.5B
+        if: steps.qwen2-cache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet huggingface_hub
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          path = snapshot_download(
+              repo_id=os.environ["QWEN2_REPO"],
+              revision=os.environ["QWEN2_REVISION"],
+              local_dir=os.environ["QWEN2_DIR"],
+              allow_patterns=["config.json", "tokenizer.json",
+                              "tokenizer_config.json", "model.safetensors"],
+              token=os.environ.get("HF_TOKEN") or None,
+          )
+          print("downloaded to", path)
+          PY
+          ls -la "$QWEN2_DIR"
+
+      # ⭐ The gate. `--release` is not optional: a debug build of an XLA
+      # client is fast enough to compile and far too slow to generate.
+      - name: Run Gate A5
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo run -p gljax --release --locked --example gate_a5 \
+            2>&1 | tee /tmp/gate-a5.log
+
+      # `gate_a5` prints SKIP and exits 0 when its inputs are missing, which is
+      # right for a local run and wrong here — CI configured both.
+      - name: Fail if Gate A5 skipped
+        run: |
+          set -euo pipefail
+          if grep -q '^SKIP gate_a5' /tmp/gate-a5.log; then
+            echo "::error::Gate A5 skipped despite plugin and model being configured."
+            grep '^SKIP gate_a5' /tmp/gate-a5.log
+            exit 1
+          fi
+          grep -q 'Gate A5: PASSED' /tmp/gate-a5.log
+
+      - name: Upload the Gate A5 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-a5-log
+          path: /tmp/gate-a5.log
           if-no-files-found: warn

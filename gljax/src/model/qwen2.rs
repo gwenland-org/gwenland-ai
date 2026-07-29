@@ -19,8 +19,8 @@
 use crate::graph::{BuiltFunc, TraceCx};
 use crate::ops::{
     causal_mask, emit_rope_tables, gather_embed, gqa_attention, rms_norm, rope_neox, swiglu_ffn,
-    DEFAULT_ROPE_BASE,
 };
+use crate::ops::rope::QWEN2_ROPE_BASE;
 use crate::stablehlo::ops::DotDimensionNumbers;
 use crate::stablehlo::types::{DType, Shape};
 use crate::tensor::Tensor;
@@ -64,8 +64,12 @@ impl Qwen2Config {
             ffn: 4864,
             vocab: 151_936,
             rms_eps: 1e-6,
-            rope_base: DEFAULT_ROPE_BASE,
-            max_seq_len: 32_768,
+            // ⛔ 1e6, not 1e4 — see QWEN2_ROPE_BASE.
+            rope_base: QWEN2_ROPE_BASE,
+            // config.json says 131072. gljax's largest traceable bucket is
+            // 1024 (the causal mask is a dense O(S²) constant), so the real
+            // ceiling is the bucket grid, not this.
+            max_seq_len: 131_072,
             tie_word_embeddings: true,
             attn_bias: true,
         }
@@ -83,7 +87,7 @@ impl Qwen2Config {
             ffn: 64,
             vocab: 128,
             rms_eps: 1e-6,
-            rope_base: DEFAULT_ROPE_BASE,
+            rope_base: crate::ops::DEFAULT_ROPE_BASE,
             max_seq_len: 64,
             tie_word_embeddings: true,
             attn_bias: true,
