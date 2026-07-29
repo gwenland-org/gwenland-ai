@@ -66,6 +66,7 @@ pub mod runtime;
 pub mod stablehlo;
 pub mod sys;
 pub mod tensor;
+pub mod tok;
 
 pub use error::GlError;
 pub use graph::{BuiltFunc, FuncBuilder, Signature, SsaValue, TraceCx};
