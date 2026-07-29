@@ -32,6 +32,9 @@ pub struct Session {
     weights: Vec<PjrtBufferHandle>,
     config: Qwen2Config,
     seq_len: usize,
+    /// Set by [`Session::from_hf_dir`]; absent for a hand-assembled session.
+    tokenizer: Option<glcore::GllmTokenizer>,
+    eos_id: Option<u32>,
 }
 
 impl Session {
@@ -91,7 +94,67 @@ impl Session {
             weights: buffers,
             config,
             seq_len,
+            tokenizer: None,
+            eos_id: None,
         })
+    }
+
+    pub(crate) fn attach_tokenizer(&mut self, tokenizer: glcore::GllmTokenizer, eos_id: u32) {
+        self.tokenizer = Some(tokenizer);
+        self.eos_id = Some(eos_id);
+    }
+
+    /// Text in, text out. Requires a session built by
+    /// [`Session::from_hf_dir`].
+    ///
+    /// Greedy (argmax) only — ARTX14's sampler chain is not built.
+    ///
+    /// # Errors
+    /// If no tokenizer is attached, or the prompt does not fit the compiled
+    /// bucket alongside `max_new_tokens`.
+    pub fn generate_text(
+        &self,
+        prompt: &str,
+        max_new_tokens: usize,
+    ) -> Result<String, GlError> {
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            GlError::Engine(
+                "generate_text: no tokenizer attached — build the session with \
+                 Session::from_hf_dir"
+                    .to_owned(),
+            )
+        })?;
+
+        let prompt_ids: Vec<i32> = tokenizer
+            .encode(prompt, tokenizer.add_bos_default())?
+            .into_iter()
+            .map(|id| id as i32)
+            .collect();
+
+        if prompt_ids.len() + max_new_tokens > self.seq_len {
+            return Err(GlError::Engine(format!(
+                "generate_text: {} prompt tokens + {max_new_tokens} new exceeds the \
+                 compiled bucket of {}. Without a KV cache every step re-runs the \
+                 whole padded sequence, so the bucket must cover both",
+                prompt_ids.len(),
+                self.seq_len
+            )));
+        }
+
+        let eos = self.eos_id.map(|e| e as i32);
+        // Pad with EOS: it is the conventional pad for Qwen2 (config.json sets
+        // pad_token == eos_token), and with right padding plus a causal mask no
+        // real position ever attends to it.
+        let pad = eos.unwrap_or(0);
+        let generated = self.generate(&prompt_ids, max_new_tokens, eos, pad)?;
+
+        let ids: Vec<u32> = generated.iter().map(|&t| t as u32).collect();
+        Ok(tokenizer.decode(&ids, true))
+    }
+
+    /// The tokenizer, if one is attached.
+    pub fn tokenizer(&self) -> Option<&glcore::GllmTokenizer> {
+        self.tokenizer.as_ref()
     }
 
     pub fn config(&self) -> &Qwen2Config {
