@@ -2513,6 +2513,7 @@ dependencies = [
  "glcore",
  "libloading",
  "log",
+ "rand 0.8.6",
 ]
 
 [[package]]
