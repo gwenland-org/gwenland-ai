@@ -3,6 +3,7 @@
 use std::rc::Rc;
 
 use crate::graph::value::SsaValue;
+use crate::ops::util::splat_like;
 use crate::stablehlo::ops::{emit_gather, GatherDimensionNumbers};
 use crate::stablehlo::types::{DType, Shape};
 use crate::tensor::Tensor;
@@ -71,6 +72,22 @@ pub fn gather_embed(table: &Tensor, indices: &Tensor) -> Tensor {
     gathered.reshape(vec![b, s, d])
 }
 
+/// [`gather_embed`], scaled by a constant factor (ARTX11 §4.2's "scaled word
+/// embedding" — Gemma multiplies the looked-up embedding by
+/// `sqrt(hidden_size)` so the residual stream enters the first block at the
+/// same rough magnitude convention its RMSNorms and attention scaling assume).
+///
+/// The scale is a caller-supplied `f64`, not derived from `table`'s shape:
+/// deriving it from `d` (the hidden size) would make an in-the-weeds shape
+/// assumption ("column count is always the scaling basis") that ARTX11 §4.2
+/// doesn't actually specify as universal — better to have the architecture
+/// descriptor state the number it means, per [`EmbeddingKind::ScaledBySqrtHidden`](crate::arch::EmbeddingKind).
+pub fn gather_embed_scaled(table: &Tensor, indices: &Tensor, scale: f64) -> Tensor {
+    let embedded = gather_embed(table, indices);
+    let scale_t = splat_like(&embedded, scale, embedded.shape().dims.clone(), embedded.dtype());
+    embedded.mul(&scale_t)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +123,33 @@ mod tests {
         let table = cx.weight("t", Shape::new([16, 4], DType::F32));
         let ids = cx.input("ids", Shape::new([1, 2], DType::F32));
         let _ = gather_embed(&table, &ids);
+    }
+
+    #[test]
+    fn gather_embed_scaled_multiplies_by_the_given_factor() {
+        let mut cx = TraceCx::new("main", "embed");
+        let table = cx.weight("model.embed_tokens.weight", Shape::new([128, 32], DType::F32));
+        let ids = cx.input("input_ids", Shape::new([1, 8], DType::I32));
+        // sqrt(32) — Gemma-shaped hidden size.
+        let out = gather_embed_scaled(&table, &ids, 32f64.sqrt());
+        assert_eq!(out.shape().dims, vec![1, 8, 32]);
+
+        let mlir = cx.finish(&[&out]).mlir;
+        assert!(mlir.contains(r#""stablehlo.multiply""#), "{mlir}");
+        assert!(mlir.contains("dense<5.65685"), "{mlir}");
+    }
+
+    #[test]
+    fn gather_embed_scaled_by_one_still_multiplies_rather_than_special_casing() {
+        // No special-casing scale=1.0 to a no-op: the descriptor already
+        // distinguishes Plain from ScaledBySqrtHidden at the type level
+        // (EmbeddingKind), so this op does not need to guess intent from a
+        // magic constant.
+        let mut cx = TraceCx::new("main", "embed");
+        let table = cx.weight("t", Shape::new([16, 4], DType::F32));
+        let ids = cx.input("ids", Shape::new([1, 2], DType::I32));
+        let out = gather_embed_scaled(&table, &ids, 1.0);
+        let mlir = cx.finish(&[&out]).mlir;
+        assert!(mlir.contains(r#""stablehlo.multiply""#), "{mlir}");
     }
 }

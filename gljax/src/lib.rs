@@ -52,6 +52,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod arch;
 pub mod checkpoint;
 pub mod error;
 pub mod graph;

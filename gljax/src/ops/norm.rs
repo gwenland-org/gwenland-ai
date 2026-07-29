@@ -27,6 +27,26 @@ use crate::tensor::Tensor;
 /// matters more here than almost anywhere else: squaring a BF16 activation and
 /// summing thousands of them in BF16 loses the low bits of every term.
 pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
+    rms_norm_impl(x, weight, eps, false)
+}
+
+/// RMSNorm with Gemma's zero-centered weight convention (ARTX11 §4.2):
+///
+/// ```text
+/// RMSNormZeroCentered(x, w) = x / sqrt(mean(x²) + ε) · (1 + w)
+/// ```
+///
+/// ⛔ Everything [`rms_norm`]'s doc comment says about ε placement applies
+/// unchanged here — this only changes the final scale from `w` to `1 + w`.
+/// Gemma's checkpoints store norm weights centered at 0 (so an untrained/
+/// identity norm is `weight = 0`, not `weight = 1`); applying them as a plain
+/// `rms_norm` scale is shape-valid and silently wrong (P4) — every norm in
+/// every layer would be scaled by a value near 0 instead of near 1.
+pub fn rms_norm_zero_centered(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
+    rms_norm_impl(x, weight, eps, true)
+}
+
+fn rms_norm_impl(x: &Tensor, weight: &Tensor, eps: f64, zero_centered: bool) -> Tensor {
     let rank = x.rank();
     assert!(rank >= 1, "rms_norm: x must have at least rank 1");
     let d = x.dim(rank - 1);
@@ -58,9 +78,16 @@ pub fn rms_norm(x: &Tensor, weight: &Tensor, eps: f64) -> Tensor {
     let rrms_bc = broadcast_keepdim_to(&rrms, x_acc.shape().dims.clone());
     let normed = x_acc.mul(&rrms_bc);
 
-    // 5. Back to the activation dtype, then scale by the weight.
+    // 5. Back to the activation dtype, then scale by the weight — `1 + w`
+    // under the zero-centered convention, `w` otherwise.
     let normed_out = normed.to_dtype(orig_dtype);
     let w = weight.to_dtype(orig_dtype);
+    let w = if zero_centered {
+        let one = splat_like(&w, 1.0, w.shape().dims.clone(), orig_dtype);
+        w.add(&one)
+    } else {
+        w
+    };
     let w_bc = w.broadcast_to(vec![rank - 1], x.shape().dims.clone());
     normed_out.mul(&w_bc)
 }
@@ -198,5 +225,52 @@ mod tests {
         let x = cx.input("x", Shape::new([2, 8], DType::F32));
         let w = cx.weight("w", Shape::new([16], DType::F32));
         let _ = rms_norm(&x, &w, 1e-6);
+    }
+
+    /// ⛔ The whole point of the zero-centered variant: a weight of all zeros
+    /// (Gemma's "untrained"/identity initialization) must scale by 1, not by
+    /// 0. Plain `rms_norm` on the same weight would zero every output.
+    #[test]
+    fn rms_norm_zero_centered_treats_a_zero_weight_as_the_identity_scale() {
+        let mut cx = TraceCx::new("main", "rms");
+        let x = cx.input("x", Shape::new([2, 8], DType::F32));
+        let w = cx.weight("w", Shape::new([8], DType::F32));
+        let y = rms_norm_zero_centered(&x, &w, 1e-6);
+        let mlir = cx.finish(&[&y]).mlir;
+        // The weight must be added to a constant dense<1.0> before the final
+        // multiply — the literal signature of "(1 + weight)".
+        assert!(mlir.contains("dense<1.0>"), "must add a literal 1 to the weight:\n{mlir}");
+        assert!(
+            mlir.contains(r#""stablehlo.add"(%v1, "#),
+            "the weight (%v1) itself must be an add operand:\n{mlir}"
+        );
+    }
+
+    #[test]
+    fn rms_norm_zero_centered_emits_one_more_add_than_plain_rms_norm() {
+        let mut plain_cx = TraceCx::new("main", "rms");
+        let x1 = plain_cx.input("x", Shape::new([2, 8], DType::F32));
+        let w1 = plain_cx.weight("w", Shape::new([8], DType::F32));
+        let plain = rms_norm(&x1, &w1, 1e-6);
+        let plain_mlir = plain_cx.finish(&[&plain]).mlir;
+
+        let mut zc_cx = TraceCx::new("main", "rms");
+        let x2 = zc_cx.input("x", Shape::new([2, 8], DType::F32));
+        let w2 = zc_cx.weight("w", Shape::new([8], DType::F32));
+        let zc = rms_norm_zero_centered(&x2, &w2, 1e-6);
+        let zc_mlir = zc_cx.finish(&[&zc]).mlir;
+
+        let plain_adds = plain_mlir.matches(r#""stablehlo.add""#).count();
+        let zc_adds = zc_mlir.matches(r#""stablehlo.add""#).count();
+        assert_eq!(zc_adds, plain_adds + 1, "plain:\n{plain_mlir}\nzero-centered:\n{zc_mlir}");
+    }
+
+    #[test]
+    #[should_panic(expected = "weight must be [D]")]
+    fn rms_norm_zero_centered_rejects_a_weight_that_does_not_match_the_last_axis() {
+        let mut cx = TraceCx::new("main", "rms");
+        let x = cx.input("x", Shape::new([2, 8], DType::F32));
+        let w = cx.weight("w", Shape::new([16], DType::F32));
+        let _ = rms_norm_zero_centered(&x, &w, 1e-6);
     }
 }
