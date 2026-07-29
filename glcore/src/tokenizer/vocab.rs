@@ -280,21 +280,68 @@ impl Vocab {
             Style::ByteLevel
         };
 
-        let added: Vec<u32> = v
+        // ⛔ `added_tokens` carry BOTH an id and their text, and that text is
+        // **not** in `model.vocab`. An earlier version collected only the ids,
+        // which left every special token registered-but-textless:
+        //
+        //   * `id_to_token` stayed at `model.vocab`'s length, so ids past it
+        //     were out of range — `Qwen/Qwen2-0.5B` has 151643 vocab entries
+        //     and added tokens at 151643..=151645, so loading it failed
+        //     outright with `eos id 151645 is outside a vocabulary of 151643`;
+        //   * `specials_by_len` in `from_parts` looks each special id up in
+        //     `id_to_token`, so they would have matched the empty string;
+        //   * `<|endoftext|>` — the EOS of every Qwen2 base model — could
+        //     neither be encoded nor decoded.
+        //
+        // ⚠️ This path had **no test coverage at all**. `tokenizer_parity.rs`'s
+        // 14-vocabulary reference suite exercises `from_gguf_path` only, so
+        // "14 vocabulary families exact" was never a statement about this
+        // function. Found by loading a real HuggingFace checkpoint.
+        let added_entries: Vec<(u32, String)> = v
             .get("added_tokens")
             .and_then(|a| a.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|t| t.get("id")?.as_u64().map(|i| i as u32))
+                    .filter_map(|t| {
+                        let id = t.get("id")?.as_u64()? as u32;
+                        let content = t.get("content")?.as_str()?.to_string();
+                        Some((id, content))
+                    })
                     .collect()
             })
             .unwrap_or_default();
+
+        for (id, content) in &added_entries {
+            let id = *id as usize;
+            if id >= id_to_token.len() {
+                id_to_token.resize(id + 1, String::new());
+            }
+            // An added token that also appears in `model.vocab` keeps the
+            // vocab spelling; they agree in practice, and `model.vocab` is the
+            // one the merge table is written against.
+            if id_to_token[id].is_empty() {
+                id_to_token[id] = content.clone();
+            }
+        }
+
+        let added: Vec<u32> = added_entries.iter().map(|(id, _)| *id).collect();
 
         // ByteLevel's `add_prefix_space`, when present, is the HF spelling of
         // SentencePiece's `add_dummy_prefix`.
         let add_dummy_prefix = find_bytelevel_flag(v.get("pre_tokenizer"), "add_prefix_space")
             .unwrap_or(style == Style::Spm);
 
+        // ⚠️ A heuristic, and a weak one: "the last added token" is positional,
+        // not semantic. For `Qwen/Qwen2-0.5B` it picks `<|im_end|>` (151645) —
+        // the *chat* terminator — while the model's own `config.json` declares
+        // `eos_token_id: 151643` (`<|endoftext|>`). A base model that stops on
+        // `<|im_end|>` never stops at all.
+        //
+        // `tokenizer.json` has no unambiguous EOS field, so this cannot be
+        // resolved here. Callers that have the model's `config.json` should
+        // prefer its `eos_token_id`, which is what `gljax::runtime::hf` does.
+        // Keying off token *names* instead would be the mistake recorded in
+        // the 13-of-24 pre-tokenizer table: a name table drifts silently.
         let eos_id = added.last().copied().unwrap_or(0);
 
         Vocab::from_parts(VocabParts {
@@ -524,5 +571,63 @@ mod tests {
             add_bos_default: true,
         });
         assert!(matches!(e, Err(TokError::ScoreCountMismatch { .. })));
+    }
+
+    /// ⛔ Regression: `added_tokens` must enter the vocabulary, not just the
+    /// special-id set.
+    ///
+    /// Shaped after `Qwen/Qwen2-0.5B/tokenizer.json`, whose `model.vocab` ends
+    /// at id 151642 and whose three added tokens sit at 151643..=151645. Before
+    /// this, loading it failed with `eos id 151645 is outside a vocabulary of
+    /// 151643`; the added tokens had ids but no text.
+    #[test]
+    fn hf_json_added_tokens_join_the_vocabulary() {
+        let src = r#"{
+          "added_tokens": [
+            {"id": 3, "content": "<|endoftext|>", "special": true},
+            {"id": 4, "content": "<|im_start|>", "special": true},
+            {"id": 5, "content": "<|im_end|>", "special": true}
+          ],
+          "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+          "model": {
+            "type": "BPE",
+            "vocab": {"a": 0, "b": 1, "ab": 2},
+            "merges": ["a b"]
+          }
+        }"#;
+        let v = Vocab::from_hf_json(src).expect("must load");
+
+        assert_eq!(v.len(), 6, "3 vocab entries + 3 added tokens");
+        assert_eq!(v.id_to_token[3], "<|endoftext|>");
+        assert_eq!(v.id_to_token[4], "<|im_start|>");
+        assert_eq!(v.id_to_token[5], "<|im_end|>");
+        // And they resolve in the other direction, which is what makes them
+        // encodable at all.
+        assert_eq!(v.token_to_id.get("<|endoftext|>").copied(), Some(3));
+    }
+
+    /// A file with no `added_tokens` must be unaffected.
+    #[test]
+    fn hf_json_without_added_tokens_keeps_the_plain_vocab_length() {
+        let src = r#"{
+          "pre_tokenizer": {"type": "ByteLevel"},
+          "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": ["a b"]}
+        }"#;
+        let v = Vocab::from_hf_json(src).expect("must load");
+        assert_eq!(v.len(), 2);
+        assert_eq!(v.eos_id(), 0, "no added tokens -> the fallback");
+    }
+
+    /// An added token that duplicates a `model.vocab` entry must not clobber
+    /// the vocab spelling the merge table was written against.
+    #[test]
+    fn hf_json_added_token_does_not_overwrite_an_existing_vocab_entry() {
+        let src = r#"{
+          "added_tokens": [{"id": 1, "content": "OVERWRITTEN", "special": true}],
+          "pre_tokenizer": {"type": "ByteLevel"},
+          "model": {"type": "BPE", "vocab": {"a": 0, "b": 1}, "merges": []}
+        }"#;
+        let v = Vocab::from_hf_json(src).expect("must load");
+        assert_eq!(v.id_to_token[1], "b");
     }
 }

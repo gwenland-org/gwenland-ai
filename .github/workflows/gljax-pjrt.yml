@@ -297,6 +297,21 @@ jobs:
           PY
           ls -la "$QWEN2_DIR"
 
+      # Metadata first — seconds, and it is where the cheap-to-get-wrong things
+      # live: rope_theta, the EOS id, whether added_tokens made it into the
+      # vocabulary. Failing here beats failing after a multi-minute XLA compile.
+      - name: Check checkpoint metadata
+        env:
+          QWEN2_META_DIR: ${{ env.QWEN2_DIR }}
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --locked --lib runtime::hf -- --nocapture \
+            2>&1 | tee /tmp/hf-meta.log
+          if grep -q '^SKIP real_qwen2_metadata' /tmp/hf-meta.log; then
+            echo "::error::the metadata test skipped despite QWEN2_META_DIR being set"
+            exit 1
+          fi
+
       # ⭐ The gate. `--release` is not optional: a debug build of an XLA
       # client is fast enough to compile and far too slow to generate.
       - name: Run Gate A5

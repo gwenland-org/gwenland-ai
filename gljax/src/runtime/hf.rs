@@ -44,8 +44,20 @@ pub struct HfCheckpoint {
     pub eos_id: u32,
 }
 
-impl HfCheckpoint {
-    /// Reads `config.json`, `tokenizer.json` and `model.safetensors`.
+/// `config.json` + `tokenizer.json`, without the weights.
+///
+/// Split out because the weights are ~1 GB and the metadata is where the
+/// interesting failures live — a wrong `rope_theta`, an EOS that stops nothing,
+/// a vocabulary that lost its added tokens. A test that needs a 1 GB download
+/// is a test that does not run.
+pub struct HfMetadata {
+    pub config: Qwen2Config,
+    pub tokenizer: GllmTokenizer,
+    pub eos_id: u32,
+}
+
+impl HfMetadata {
+    /// Reads `config.json` and `tokenizer.json`.
     pub fn open(dir: &Path) -> Result<Self, GlError> {
         let config_path = dir.join("config.json");
         let config = Qwen2Config::from_hf_config_json(&config_path)?;
@@ -60,19 +72,75 @@ impl HfCheckpoint {
                 .ok_or_else(|| GlError::Parse("tokenizer path is not UTF-8".into()))?,
         )?;
 
-        // ⚠️ The tokenizer's own EOS wins. `config.json` and the tokenizer can
-        // disagree, and the tokenizer is the thing that will actually be
-        // decoding — trusting the other one produces generation that never
-        // stops, or stops on the wrong token.
-        let eos_id = tokenizer.eos_id();
-        if let Some(from_config) = config_eos {
-            if from_config != eos_id {
-                log::warn!(
-                    "eos_token_id disagrees: config.json says {from_config}, \
-                     tokenizer.json says {eos_id} — using the tokenizer's"
-                );
+        // ⛔ **`config.json` wins on EOS**, and this is not a preference.
+        //
+        // `tokenizer.json` has no unambiguous EOS field, so
+        // `Vocab::from_hf_json` falls back to "the last added token". For
+        // `Qwen/Qwen2-0.5B` that is `<|im_end|>` (151645) — the *chat*
+        // terminator — while the model's own `config.json` declares
+        // `eos_token_id: 151643` (`<|endoftext|>`).
+        //
+        // A base model generating until it emits a chat terminator it was
+        // never trained to emit does not stop: every run would burn the full
+        // `max_new_tokens` and the transcript would run past the answer. The
+        // model's own config is the authority on which token ends its output.
+        let tokenizer_eos = tokenizer.eos_id();
+        let eos_id = match config_eos {
+            Some(from_config) => {
+                if from_config != tokenizer_eos {
+                    log::info!(
+                        "eos_token_id: config.json says {from_config}, tokenizer.json's \
+                         heuristic says {tokenizer_eos} — using config.json's"
+                    );
+                }
+                from_config
             }
+            None => {
+                log::warn!(
+                    "config.json has no eos_token_id; falling back to the tokenizer's \
+                     heuristic ({tokenizer_eos}), which is positional and may be wrong"
+                );
+                tokenizer_eos
+            }
+        };
+
+        // ⚠️ `config.vocab` is padded for tensor alignment (Qwen2: 151936)
+        // while the tokenizer holds the real tokens (151646). The logits axis
+        // follows config.json — the embedding matrix really is that wide — so
+        // the tokenizer being *smaller* is expected. It being larger is not.
+        if tokenizer.vocab_size() > config.vocab {
+            return Err(GlError::Engine(format!(
+                "tokenizer has {} tokens but config.json's vocab_size is {} — \
+                 the tokenizer cannot be wider than the embedding matrix",
+                tokenizer.vocab_size(),
+                config.vocab
+            )));
         }
+
+        Ok(HfMetadata {
+            config,
+            tokenizer,
+            eos_id,
+        })
+    }
+
+    /// Encodes a prompt to token ids.
+    pub fn encode(&self, text: &str) -> Result<Vec<u32>, GlError> {
+        // Qwen2 has no BOS in completion mode — `add_bos_default` carries what
+        // the vocabulary itself declares rather than a guess.
+        Ok(self.tokenizer.encode(text, self.tokenizer.add_bos_default())?)
+    }
+
+    /// Decodes token ids back to text.
+    pub fn decode(&self, ids: &[u32]) -> String {
+        self.tokenizer.decode(ids, true)
+    }
+}
+
+impl HfCheckpoint {
+    /// Reads the metadata, then mmaps `model.safetensors`.
+    pub fn open(dir: &Path) -> Result<Self, GlError> {
+        let meta = HfMetadata::open(dir)?;
 
         let weights_path = dir.join("model.safetensors");
         if !weights_path.exists() {
@@ -88,28 +156,16 @@ impl HfCheckpoint {
                 .ok_or_else(|| GlError::Parse("weights path is not UTF-8".into()))?,
         )?;
 
-        // Fail here rather than after a multi-minute XLA compile.
-        if tokenizer.vocab_size() != config.vocab {
-            log::warn!(
-                "vocab size disagrees: config.json says {}, tokenizer has {} — \
-                 the logits axis follows config.json",
-                config.vocab,
-                tokenizer.vocab_size()
-            );
-        }
-
         Ok(HfCheckpoint {
-            config,
-            tokenizer,
+            config: meta.config,
+            tokenizer: meta.tokenizer,
             weights,
-            eos_id,
+            eos_id: meta.eos_id,
         })
     }
 
     /// Encodes a prompt to token ids.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, GlError> {
-        // Qwen2 has no BOS in completion mode — `add_bos_default` carries what
-        // the vocabulary itself declares rather than a guess.
         Ok(self.tokenizer.encode(text, self.tokenizer.add_bos_default())?)
     }
 
@@ -193,26 +249,43 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A real HF directory, if one is configured. SKIPs loudly otherwise —
-    /// `model.safetensors` is ~1 GB and is not committed.
+    /// ⭐ The metadata half against the **real** `Qwen/Qwen2-0.5B` files.
+    ///
+    /// Needs only `config.json` + `tokenizer.json` (~7 MB), not the 1 GB of
+    /// weights, so it is cheap enough to actually run. Point
+    /// `QWEN2_META_DIR` at a directory holding those two.
     #[test]
-    fn a_real_checkpoint_opens_and_encodes_the_gate_prompt() {
-        let Ok(dir) = std::env::var("QWEN2_HF_DIR") else {
-            eprintln!("SKIP a_real_checkpoint_opens_and_encodes_the_gate_prompt: QWEN2_HF_DIR not set");
+    fn real_qwen2_metadata_loads_with_the_right_rope_base_and_eos() {
+        let Ok(dir) = std::env::var("QWEN2_META_DIR") else {
+            eprintln!("SKIP real_qwen2_metadata_loads...: QWEN2_META_DIR not set");
             return;
         };
-        let checkpoint = HfCheckpoint::open(Path::new(&dir)).expect("open checkpoint");
+        let meta = HfMetadata::open(Path::new(&dir)).expect("metadata must load");
 
-        assert_eq!(checkpoint.config.hidden, 896);
-        assert_eq!(checkpoint.config.rope_base, 1_000_000.0, "Qwen2 uses 1e6");
+        // ⛔ The bug this whole path exists to prevent.
+        assert_eq!(meta.config.rope_base, 1_000_000.0, "Qwen2 uses 1e6, not 1e4");
+        assert_eq!(meta.config.hidden, 896);
+        assert_eq!(meta.config.n_heads, 14);
+        assert_eq!(meta.config.n_kv_heads, 2);
+        assert_eq!(meta.config.vocab, 151_936);
 
-        let ids = checkpoint.encode("The capital of France is").expect("encode");
+        // ⛔ config.json's eos wins over the tokenizer's positional guess:
+        // 151643 <|endoftext|>, not 151645 <|im_end|>.
+        assert_eq!(meta.eos_id, 151_643, "base model stops on <|endoftext|>");
+
+        // ⛔ added_tokens must be in the vocabulary. Before the glcore fix this
+        // loader failed outright: "eos id 151645 is outside a vocabulary of
+        // 151643".
+        assert_eq!(
+            meta.tokenizer.vocab_size(),
+            151_646,
+            "151643 vocab entries + 3 added tokens"
+        );
+
+        let ids = meta.encode("The capital of France is").expect("encode");
         assert!(!ids.is_empty());
-        eprintln!("prompt encodes to {} tokens: {ids:?}", ids.len());
-
-        // Round-tripping the prompt is a weak check, but a decoder that is
-        // wired to the wrong vocabulary fails it immediately.
-        let back = checkpoint.decode(&ids);
+        eprintln!("prompt -> {} tokens {ids:?}", ids.len());
+        let back = meta.decode(&ids);
         assert!(
             back.contains("capital") && back.contains("France"),
             "round trip lost the prompt: {back:?}"
