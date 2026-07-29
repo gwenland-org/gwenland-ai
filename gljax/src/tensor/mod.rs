@@ -212,6 +212,16 @@ impl Tensor {
         self.wrap(v)
     }
 
+    /// [`Tensor::matmul`] with explicit numerics (ARTX08 §A8.α) — the
+    /// `precision_config`/`algorithm`/`preferred_element_type` knobs that
+    /// `stablehlo.dot_general` supports but plain `matmul` leaves at gljax's
+    /// historical default. `MatmulOpts::default()` makes this identical to
+    /// `matmul`.
+    pub fn matmul_with(&self, rhs: &Tensor, opts: crate::matrix::MatmulOpts) -> Tensor {
+        let v = self.b().matmul_with(&self.value, &rhs.value, &opts);
+        self.wrap(v)
+    }
+
     // ── Reduce ─────────────────────────────────────────────────────────────
 
     /// Sums over `dims`, dropping them from the result.

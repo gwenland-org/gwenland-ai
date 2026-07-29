@@ -507,6 +507,7 @@ pub struct DotDimensionNumbers {
 /// that blocks ARTX10 entirely, because quantization is a numerics contract.
 /// This is where that plumbing will attach; until then, DEFAULT is what JAX
 /// emits for an unannotated matmul, so gljax is not doing anything unusual.
+#[allow(clippy::too_many_arguments)]
 pub fn emit_dot_general(
     e: &mut MlirEmitter,
     lhs: SsaName,
@@ -515,7 +516,11 @@ pub fn emit_dot_general(
     lhs_shape: &Shape,
     rhs_shape: &Shape,
     out_shape: &Shape,
+    numerics: crate::matrix::DotNumerics,
+    accumulate: Option<DType>,
 ) -> SsaName {
+    use crate::matrix::DotNumerics;
+
     let out = e.fresh();
     e.line(format!(r#"{out} = "stablehlo.dot_general"({lhs}, {rhs}) {{"#));
     e.push_indent();
@@ -539,7 +544,23 @@ pub fn emit_dot_general(
     ));
     e.pop_indent();
     e.line(">,");
-    e.line("precision_config = [#stablehlo<precision DEFAULT>, #stablehlo<precision DEFAULT>]");
+    // `algorithm` and `precision_config` are mutually exclusive on
+    // `stablehlo.dot_general` — exactly one of these arms fires.
+    let numerics_trailer = if accumulate.is_some() { "," } else { "" };
+    match numerics {
+        DotNumerics::Default => e.line(format!(
+            "precision_config = [#stablehlo<precision DEFAULT>, #stablehlo<precision DEFAULT>]{numerics_trailer}"
+        )),
+        DotNumerics::Highest => e.line(format!(
+            "precision_config = [#stablehlo<precision HIGHEST>, #stablehlo<precision HIGHEST>]{numerics_trailer}"
+        )),
+        DotNumerics::Algorithm(alg) => {
+            e.line(format!("algorithm = {}{numerics_trailer}", alg.mlir_str()))
+        }
+    }
+    if let Some(acc) = accumulate {
+        e.line(format!("preferred_element_type = {}", acc.mlir_str()));
+    }
     e.pop_indent();
     e.line(format!(
         r#"}} : ({}, {}) -> {}"#,
@@ -1082,6 +1103,8 @@ mod tests {
             &Shape::new([4, 8], DType::F32),
             &Shape::new([8, 16], DType::F32),
             &Shape::new([4, 16], DType::F32),
+            crate::matrix::DotNumerics::Default,
+            None,
         );
         let body = e.into_body();
         assert!(body.contains("lhs_batching_dimensions = [],"), "{body}");
