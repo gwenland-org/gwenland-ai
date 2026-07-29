@@ -42,6 +42,13 @@ on:
       - ".github/workflows/gljax-pjrt.yml"
       - "Cargo.lock"
   workflow_dispatch:
+    inputs:
+      gate_a5_lengths:
+        description: >-
+          Gate A5 output lengths, comma-separated. The full 8,16,32,64,128,256,512
+          sweep measured 76 min; the PR default stops at 128.
+        required: false
+        default: "8,16,32,64,128"
 
 concurrency:
   group: gljax-pjrt-${{ github.ref }}
@@ -72,16 +79,20 @@ env:
   QWEN2_REVISION: 91d2aff3f957f99e4c74c962f2f408dcc88a18d8
   QWEN2_DIR: /home/runner/qwen2-0.5b
 
-  # ⛔ Stops at 128 on purpose. `Session::generate` has no KV cache, so n
-  # tokens costs n full forward passes at the bucket width, and the bucket
-  # grows with n. Qwen2-0.5B is 494 M MACs/position → 1102 GFLOP per forward at
-  # bucket 1024. On 4 vCPUs at an optimistic 60 GFLOP/s that is 2.6 h for the
-  # 512-token run alone; at a realistic 30 GFLOP/s the full 7-length sweep is
-  # 6.9 h against GitHub's 6 h job limit.
+  # ⭐ Running the full sweep to close the gate. See the note below before
+  # putting this back to "8,16,32,64,128" for routine PR runs.
   #
-  # Lengths ≤ 128 are minutes. 256/512 are opt-in via workflow_dispatch. The
-  # fix is a KV cache, not a longer timeout.
-  GATE_A5_LENGTHS: "8,16,32,64,128"
+  # `Session::generate` has no KV cache, so n tokens costs n full forward
+  # passes at the bucket width, and the bucket grows with n — the cost is
+  # superlinear. Qwen2-0.5B is 494 M MACs/position: 128 GFLOP per forward at
+  # bucket 128, 1102 GFLOP at bucket 1024.
+  #
+  # ⚠️ MEASURED, not estimated: run 30433602366 gave **163 GFLOP/s** on this
+  # runner (consistent across buckets 128 and 256). A pre-run estimate of
+  # 15-60 GFLOP/s was pessimistic by ~5x. At the measured rate the full
+  # 7-length sweep is ~76 min, inside the 120-min job timeout — where the
+  # estimate had predicted 6.9 h against GitHub's 6 h limit.
+  GATE_A5_LENGTHS: "8,16,32,64,128,256,512"
 
 jobs:
   pjrt-cpu:
@@ -318,6 +329,8 @@ jobs:
         env:
           PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
           QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          # A workflow_dispatch input wins; otherwise the workflow default.
+          GATE_A5_LENGTHS: ${{ inputs.gate_a5_lengths || env.GATE_A5_LENGTHS }}
           RUST_LOG: info
         run: |
           set -euo pipefail
