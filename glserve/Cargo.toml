@@ -1,0 +1,32 @@
+[package]
+name = "glserve"
+version = "0.1.0"
+edition = "2021"
+description = "GwenLand AI glserve: OpenAI-compatible HTTP serving for gljax"
+license-file = "../LICENSE"
+
+# ARTX16's own design decision, kept: glserve is a separate crate, not a
+# module of gljax. gljax stays a library with zero HTTP/async dependencies
+# (no tokio, no axum) so it stays embeddable (glcli, glbench, tests) without
+# dragging in a web stack. glserve depends on gljax; never the reverse.
+[dependencies]
+gljax = { path = "../gljax" }
+glcore = { path = "../glcore" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+axum = "0.7"
+# ReceiverStream turns a tokio::sync::mpsc::Receiver into a futures Stream —
+# the one extra dependency past the sprint brief's pre-approved list (tokio,
+# axum, serde, serde_json), needed for SSE §1.5's exact pattern
+# (ReceiverStream::new(rx).map(...)) rather than hand-rolling a Stream impl.
+tokio-stream = "0.1"
+futures-util = { version = "0.3", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+
+[dev-dependencies]
+# tower::ServiceExt::oneshot drives the axum Router directly, in-process, no
+# socket bind — real HTTP-shaped requests through real routing/serialization
+# code, without needing a PJRT plugin or a listening port.
+tower = { version = "0.4", features = ["util"] }
+http-body-util = "0.1"
