@@ -8,6 +8,7 @@ members = [
     "glbench",
     "glcli",
     "gljax",
+    "glserve",
     "glictus-caliburni",
     "packages/core",
     "packages/mcp",
