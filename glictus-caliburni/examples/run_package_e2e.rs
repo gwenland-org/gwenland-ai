@@ -18,7 +18,6 @@
 //! ```
 
 use glcore::engine_trait::{GlEngine, InferInput};
-use glcore::format::gguf::GgufFile;
 use glcore::tokenizer::GllmTokenizer;
 use glictus_caliburni::runtime::GllmEngine;
 
@@ -63,14 +62,20 @@ fn main() {
     let args = parse_args();
 
     eprintln!("loading tokenizer from {} ...", args.gguf_path);
-    let gguf = GgufFile::open(&args.gguf_path).expect("open source GGUF for tokenizer");
-    let tokenizer = GllmTokenizer::from_gguf_path(&gguf_path).expect("build tokenizer from GGUF metadata");
+    let tokenizer =
+        GllmTokenizer::from_gguf_path(&args.gguf_path).expect("build tokenizer from GGUF metadata");
 
     eprintln!("loading .gllm package from {} ...", args.package_dir);
     let mut engine = GllmEngine::new();
     engine.load_model(&args.package_dir).expect("load .gllm package");
 
-    let prompt_ids = tokenizer.encode_chat(&args.prompt).unwrap_or_else(|| tokenizer.encode(&args.prompt, true));
+    // `encode_chat` returns `Result<Option<..>>`: the outer `Result` is a real
+    // tokenizer failure, the inner `None` just means this vocabulary carries no
+    // chat template — in which case fall back to a plain BOS-prefixed encode.
+    let prompt_ids = tokenizer
+        .encode_chat(&args.prompt)
+        .expect("apply the tokenizer's chat template")
+        .unwrap_or_else(|| tokenizer.encode(&args.prompt, true).expect("encode prompt"));
     eprintln!("prompt: {:?} -> {} tokens", args.prompt, prompt_ids.len());
 
     let input = InferInput {
