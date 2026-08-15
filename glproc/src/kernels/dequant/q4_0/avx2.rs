@@ -1,6 +1,13 @@
 use std::arch::x86_64::*;
 use glcore::format::gguf::f16_to_f32;
 
+/// # Safety
+/// Requires AVX2 and FMA. The only sanctioned caller is the
+/// `SimdStrategy::Avx2` arm of `kernels::dequant_q4_0`, whose match on the
+/// cached CPU probe is what proves the features are present; calling this
+/// directly bypasses that proof and is UB on a CPU without them.
+///
+/// `data` is read as 18-byte Q4_0 blocks (2-byte f16 scale + 16 packed nibble bytes -> 32 weights). Any length is accepted: `chunks_exact` drops any trailing partial block, and the output is sized from that same whole-block count.
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn run(data: &[u8]) -> Vec<f32> {
     let numel = (data.len() / 18) * 32;

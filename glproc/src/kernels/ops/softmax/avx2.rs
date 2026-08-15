@@ -3,6 +3,11 @@
 use std::arch::x86_64::*;
 
 /// Horizontal max of 8 f32 lanes.
+/// # Safety
+/// Requires AVX2.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2")]
 unsafe fn hmax(v: __m256) -> f32 {
     let lo = _mm256_castps256_ps128(v);
@@ -14,6 +19,11 @@ unsafe fn hmax(v: __m256) -> f32 {
 }
 
 /// Horizontal sum of 8 f32 lanes.
+/// # Safety
+/// Requires AVX2.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2")]
 unsafe fn hsum(v: __m256) -> f32 {
     let lo = _mm256_castps256_ps128(v);

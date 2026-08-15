@@ -41,6 +41,12 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// # Safety
+/// Requires AVX2 and FMA.
+/// Every `a`/`b`/`c` access is taken through a bounds-checked slice
+/// (`a[i*k..]`, `b[p*n..]`, `c[i*n..]`) *before* any pointer arithmetic, so
+/// `m`/`k`/`n` that disagree with the buffers panic rather than read out of
+/// bounds.
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn run(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
@@ -66,6 +72,12 @@ pub unsafe fn run(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     }
 }
 
+/// # Safety
+/// Requires AVX2 and FMA.
+/// Slices `a` and `c` per row (bounds-checked) and hands `run_matvec` an
+/// `a`-row of length exactly `k` as its `x` with `in_dim = k`, discharging
+/// that function's unchecked-`x` precondition internally. Callers of *this*
+/// function owe only the ISA.
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn run_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
@@ -73,8 +85,21 @@ pub unsafe fn run_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: 
     }
 }
 
+/// # Safety
+/// Requires AVX2 and FMA — that is now the *only* obligation on the caller.
+///
+/// `x` is walked by raw pointer to `in_dim`, which used to be an unchecked
+/// out-of-bounds read on a short `x`. It is enforced here by a real `assert!`
+/// rather than left to the caller: a `debug_assert` would vanish from release
+/// builds, which is exactly where this runs. `w` is sliced per output row and
+/// `y[o]` is indexed, so those two were already bounds-checked.
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn run_matvec(w: &[f32], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    assert!(
+        x.len() >= in_dim,
+        "run_matvec: x has {} elements, need at least in_dim = {in_dim}",
+        x.len()
+    );
     for o in 0..out_dim {
         let mut acc = _mm256_setzero_ps();
         let row = w[o * in_dim .. (o + 1) * in_dim].as_ptr();

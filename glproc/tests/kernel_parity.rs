@@ -924,3 +924,22 @@ fn dequant_gq2a_stream_dispatcher_matches_scalar_and_avx2() {
         }
     }
 }
+
+/// Regression: `matvec` with an `x` shorter than `in_dim` must panic, not read
+/// out of bounds.
+///
+/// The SIMD `run_matvec` kernels walk `x` through a raw pointer to `in_dim`.
+/// That was previously guarded only by a `debug_assert` in the scalar path and
+/// by nothing at all in the AVX2/AVX-512 paths, so a short `x` in a release
+/// build was an out-of-bounds read (UB) rather than a crash. Both SIMD kernels
+/// now open with a real `assert!`, which this locks in.
+#[test]
+#[should_panic(expected = "x")]
+fn matvec_rejects_short_activation_instead_of_reading_past_it() {
+    let out_dim = 2;
+    let in_dim = 64;
+    let w = vec![1.0f32; out_dim * in_dim];
+    let x = vec![1.0f32; in_dim - 8]; // deliberately short
+    let mut y = vec![0.0f32; out_dim];
+    glproc::kernels::matvec(&w, &x, &mut y, out_dim, in_dim);
+}

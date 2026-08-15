@@ -112,6 +112,14 @@ pub unsafe fn fused_swiglu_f32(gate_row: &[u8], up_row: &[u8], act: &Q8KActivati
 
 /// One super-block of the f32-domain dot: dequant 256 weights to f32 and FMA
 /// them against the dequantized activation, accumulating in `acc`.
+///
+/// # Safety
+/// Requires AVX2, FMA and F16C. `act` must carry a scale and 256 quantized
+/// activations for super-block `b`, since both are indexed by `b` without a
+/// further check. The weight read itself is bounds-checked — `row` is sliced
+/// as `row[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES]` before any pointer
+/// arithmetic, so a `row` too short for `b` panics rather than reading past
+/// the end.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn dequant_dot_block(
     row: &[u8],
@@ -159,6 +167,11 @@ unsafe fn dequant_dot_block(
 }
 
 /// Extract lanes `[k*8 .. k*8+8]` of a 32-byte register as i32×8.
+/// # Safety
+/// Requires AVX2.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2")]
 unsafe fn extract8(v: std::arch::x86_64::__m256i, k: usize) -> std::arch::x86_64::__m256i {
     use std::arch::x86_64::*;
@@ -172,6 +185,10 @@ unsafe fn extract8(v: std::arch::x86_64::__m256i, k: usize) -> std::arch::x86_64
 }
 
 /// Load 8 i8 activations and widen to f32×8.
+/// # Safety
+/// Requires AVX2.
+/// Reads exactly 8 `i8` from `p`, so the caller must guarantee `p` is valid
+/// for 8 readable bytes. Alignment is not required — the load is unaligned.
 #[target_feature(enable = "avx2")]
 unsafe fn load8_i8_to_f32(p: *const i8) -> std::arch::x86_64::__m256 {
     use std::arch::x86_64::*;
@@ -183,6 +200,11 @@ unsafe fn load8_i8_to_f32(p: *const i8) -> std::arch::x86_64::__m256 {
 }
 
 /// Horizontal sum of a f32×8 register.
+/// # Safety
+/// Requires AVX2.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2")]
 unsafe fn hsum256(v: std::arch::x86_64::__m256) -> f32 {
     use std::arch::x86_64::*;

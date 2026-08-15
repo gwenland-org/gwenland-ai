@@ -1,10 +1,18 @@
 use std::arch::x86_64::*;
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW.
+/// Takes and returns an `f32` by value; no caller memory is reached.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run(x: f32) -> f32 {
     crate::kernels::ops::fast_exp::avx2::run(x)
 }
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run_vec(x: __m512) -> __m512 {
     let log2e = _mm512_set1_ps(std::f32::consts::LOG2_E);

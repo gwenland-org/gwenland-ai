@@ -128,6 +128,12 @@ pub fn dequant_gq4a(block: &GQ4ABlock, out: &mut [f32; 256]) {
 /// corrupt-package problem, not this function's to paper over).
 pub fn dequant_gq4a_stream(data: &[u8]) -> Vec<f32> {
     match SimdStrategy::detect() {
+        // SAFETY: the arm is the AVX2 proof — `detect()` returns `Avx2` only
+        // where AVX2 probed present, and `Avx512` only on hardware that is a
+        // strict superset of it, so the 256-bit kernel is legal under both.
+        // `run_stream` sizes its output from `data.len() / GQ4ABlock::BYTES`
+        // and iterates `chunks_exact`, so a ragged tail is dropped rather than
+        // read past — no length precondition falls on the caller.
         SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { avx2::run_stream(data) },
         SimdStrategy::Scalar => scalar::run_stream(data),
     }
@@ -146,6 +152,8 @@ pub fn dequant_gq2a(block: &GQ2ABlock, out: &mut [f32; 256]) {
 /// [`dequant_gq4a_stream`]).
 pub fn dequant_gq2a_stream(data: &[u8]) -> Vec<f32> {
     match SimdStrategy::detect() {
+        // SAFETY: same AVX2 proof and the same `chunks_exact` sizing as
+        // [`dequant_gq4a_stream`], over 84-byte GQ2A superblocks instead.
         SimdStrategy::Avx512 | SimdStrategy::Avx2 => unsafe { gq2a_avx2::run_stream(data) },
         SimdStrategy::Scalar => gq2a_scalar::run_stream(data),
     }

@@ -1,6 +1,13 @@
 use std::arch::x86_64::*;
 use glcore::format::gguf::f16_to_f32;
 
+/// # Safety
+/// Requires AVX-512F and F16C. The only sanctioned caller is the
+/// `SimdStrategy::Avx512` arm of `kernels::dequant_f16`, whose match on the
+/// cached CPU probe is what proves the features are present; calling this
+/// directly bypasses that proof and is UB on a CPU without them.
+///
+/// `data` is read as 2-byte IEEE half lanes. Any length is accepted: the vector loop stops 8 lanes short of the end and a scalar tail finishes the remainder.
 #[target_feature(enable = "avx512f", enable = "f16c")]
 pub unsafe fn run(data: &[u8]) -> Vec<f32> {
     let numel = data.len() / 2;

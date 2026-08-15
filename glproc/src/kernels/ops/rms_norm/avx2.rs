@@ -1,5 +1,11 @@
 use std::arch::x86_64::*;
 
+/// # Safety
+/// Requires AVX2 and FMA.
+/// Allocates its own output at `x.len()` and delegates to `run_into`, which
+/// strides `x` and `w` together to `x.len()`. The caller must guarantee
+/// `w.len() >= x.len()` — the only check is a `debug_assert`, so release
+/// builds will not catch a short `w`.
 #[target_feature(enable = "avx2", enable = "fma")]
 pub unsafe fn run(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
     let mut out = vec![0f32; x.len()];
