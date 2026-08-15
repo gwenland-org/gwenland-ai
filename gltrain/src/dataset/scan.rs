@@ -67,6 +67,11 @@ const FEMALE_INDICATORS: &[&str] = &[
 
 // @INFO: All regexes and the injection pattern set are compiled once at first use via lazy_static.
 // @WARNING: Do not move these into per-call scope — repeated Regex::new() is expensive at scale.
+// INFALLIBLE (every `.expect` in this block): each pattern is a string
+// literal fixed at compile time, so compilation cannot depend on scanned
+// data. `lazy_static` forces them on first use, meaning a malformed pattern
+// would fail deterministically on the first scan in any test run rather than
+// on some particular dataset — and the `expect` label names which pattern.
 lazy_static! {
     // PII patterns — all Warning severity, never Error.
     static ref EMAIL_RE: Regex = Regex::new(
@@ -296,11 +301,10 @@ pub fn run_scan(path: &Path, opts: &ScanOptions) -> Result<DatasetScanResult, St
         let mut female_count = 0usize;
 
         for (_, row) in &rows {
-            if run_balance {
-                if let Some(cat) = &row.category {
+            if run_balance
+                && let Some(cat) = &row.category {
                     *category_counts.entry(cat.clone()).or_insert(0) += 1;
                 }
-            }
 
             if run_bias {
                 let combined = format!("{} {}", row.input, row.output).to_lowercase();

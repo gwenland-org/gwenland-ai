@@ -7,6 +7,12 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 // Compiled once, shared across threads.
+//
+// INFALLIBLE (all four `unwrap`s below): each pattern is a four-character
+// literal tag with a case-insensitive flag, fixed at compile time. Regex
+// compilation here cannot depend on the rows being validated, so a bad
+// pattern would fail on the first call in any test run, not on a user's
+// dataset.
 fn re_think_open() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| Regex::new(r"(?i)<think>").unwrap())

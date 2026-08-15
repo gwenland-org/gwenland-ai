@@ -462,6 +462,9 @@ impl LayerLoader {
         let mmap_range = if layer_slices.is_empty() {
             0..0
         } else {
+            // INFALLIBLE: this is the `else` of `layer_slices.is_empty()` five
+            // lines up, so the iterator yields at least one element and
+            // `min`/`max` are necessarily `Some`.
             let start = layer_slices
                 .iter()
                 .map(|s| s.byte_offset as usize)
@@ -485,6 +488,11 @@ impl LayerLoader {
                     // SAFETY: tensor_name is stored in self.index which lives
                     // for 'a; the String's backing memory is stable.
                     // We return &str by re-borrowing through the LayerIndex.
+                    // INFALLIBLE: the range sliced here is the *same*
+                    // expression `LayerIndex::layer_slices(n)` computes
+                    // (`partition_point(< n) .. partition_point(<= n)`), and
+                    // `s` was drawn from `layer_slices` above — so `s` itself
+                    // is in the range being searched and `find` cannot miss.
                     &self.index.slices[self.index.slices.partition_point(|x| x.layer_idx < n)
                         ..self.index.slices.partition_point(|x| x.layer_idx <= n)]
                         .iter()
