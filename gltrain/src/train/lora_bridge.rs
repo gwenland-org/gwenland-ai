@@ -64,7 +64,7 @@ impl LoraAdapter {
 
         if b_shape.len() != 2 || b_shape[1] != self.rank {
             return Err(GwenError::InvalidLoraShape {
-                expected: vec![b_shape.get(0).copied().unwrap_or(0), self.rank],
+                expected: vec![b_shape.first().copied().unwrap_or(0), self.rank],
                 actual: b_shape,
             });
         }

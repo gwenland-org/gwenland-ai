@@ -148,7 +148,7 @@ const Q8_0_BLOCK: usize = 32;
 /// matching the original GGML Q8_0 spec.
 /// @TODO Add support for Q4_0 and Q4_K if finer memory control is needed.
 pub fn quantize_q8_0(weights: &[f32]) -> candle_core::Result<Vec<u8>> {
-    if weights.len() % Q8_0_BLOCK != 0 {
+    if !weights.len().is_multiple_of(Q8_0_BLOCK) {
         return Err(CandleError::Msg(format!(
             "quantize_q8_0: weight length {} is not a multiple of {}",
             weights.len(),
@@ -193,7 +193,7 @@ pub fn quantize_q8_0(weights: &[f32]) -> candle_core::Result<Vec<u8>> {
 /// pulling in the `half` crate as a direct dependency.
 pub fn dequantize_q8_0(bytes: &[u8]) -> candle_core::Result<Vec<f32>> {
     let block_bytes = 2 + Q8_0_BLOCK;
-    if bytes.len() % block_bytes != 0 {
+    if !bytes.len().is_multiple_of(block_bytes) {
         return Err(CandleError::Msg(format!(
             "dequantize_q8_0: byte length {} is not a multiple of {}",
             bytes.len(),
@@ -466,7 +466,7 @@ impl LoraMerger {
                 // to the next block boundary (should never happen with valid models).
                 let remainder = merged.len() % Q8_0_BLOCK;
                 if remainder != 0 {
-                    merged.extend(std::iter::repeat(0.0f32).take(Q8_0_BLOCK - remainder));
+                    merged.extend(std::iter::repeat_n(0.0f32, Q8_0_BLOCK - remainder));
                 }
 
                 let out =
@@ -582,7 +582,7 @@ fn load_adapter_safetensors(
 
         // Decode F32 little-endian bytes.
         let byte_slice = &data_blob[start..end];
-        if byte_slice.len() % 4 != 0 {
+        if !byte_slice.len().is_multiple_of(4) {
             return Err(GwenError::CandleError(format!(
                 "{tensor_key}: data byte length {} not f32-aligned",
                 byte_slice.len()
@@ -839,7 +839,7 @@ fn skip_kv_value_cursor(c: &mut std::io::Cursor<&[u8]>, vtype: u32) -> Option<()
         2 | 3 => {
             c.seek(SeekFrom::Current(2)).ok()?;
         } // UINT16 / INT16
-        4 | 5 | 6 => {
+        4..=6 => {
             c.seek(SeekFrom::Current(4)).ok()?;
         } // UINT32 / INT32 / F32
         8 => {
@@ -852,7 +852,7 @@ fn skip_kv_value_cursor(c: &mut std::io::Cursor<&[u8]>, vtype: u32) -> Option<()
                 skip_kv_value_cursor(c, elem_type)?;
             }
         }
-        10 | 11 | 12 => {
+        10..=12 => {
             c.seek(SeekFrom::Current(8)).ok()?;
         } // UINT64 / INT64 / F64
         _ => return None, // unknown type — bail
@@ -1260,7 +1260,7 @@ mod tests {
         let pos = buf.len();
         let remainder = pos % 32;
         if remainder != 0 {
-            buf.extend(std::iter::repeat(0u8).take(32 - remainder));
+            buf.extend(std::iter::repeat_n(0u8, 32 - remainder));
         }
 
         // Tensor data.

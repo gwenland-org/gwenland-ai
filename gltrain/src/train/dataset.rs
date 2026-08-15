@@ -6,7 +6,6 @@
 
 pub use crate::train::samples::{load_jsonl, Sample, DEFAULT_MAX_LEN};
 
-use std::path::Path;
 
 use anyhow::{Context, Result};
 use candle_core::{Device, Tensor};

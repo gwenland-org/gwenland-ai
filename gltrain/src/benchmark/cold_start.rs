@@ -143,7 +143,7 @@ fn aggregate(mut samples: Vec<f64>) -> ColdStartResult {
 
     // For even N: average the two middle values (unbiased median estimator).
     // For odd N: take the middle element.
-    let median_ms = if n % 2 == 0 {
+    let median_ms = if n.is_multiple_of(2) {
         (samples[n / 2 - 1] + samples[n / 2]) / 2.0
     } else {
         samples[n / 2]

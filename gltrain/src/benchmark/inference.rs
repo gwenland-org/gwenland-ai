@@ -97,11 +97,10 @@ pub fn run_inference_bench() -> Option<InferenceResult> {
     let mut total_content = String::new();
     for line in text.lines() {
         let data = line.strip_prefix("data: ").unwrap_or(line);
-        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data) {
-            if let Some(msg) = chunk.message {
+        if let Ok(chunk) = serde_json::from_str::<ChatChunk>(data)
+            && let Some(msg) = chunk.message {
                 total_content.push_str(&msg.content);
             }
-        }
     }
 
     // 4-chars/token heuristic — same as eval/metrics.rs.

@@ -62,19 +62,16 @@ pub fn scan_workspace(root: &Path, ignore: Option<&GwenIgnore>) -> ScanResult {
         if entry.file_type().is_dir() {
             if path != root {
                 let mut must_skip = false;
-                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                    if name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist" {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                    && (name.starts_with('.') || name == "node_modules" || name == "target" || name == "dist") {
                         must_skip = true;
                     }
-                }
 
-                if !must_skip {
-                    if let Some(rules) = ignore {
-                        if should_ignore(path, rules) {
+                if !must_skip
+                    && let Some(rules) = ignore
+                        && should_ignore(path, rules) {
                             must_skip = true;
                         }
-                    }
-                }
 
                 if must_skip {
                     it.skip_current_dir();
@@ -86,11 +83,10 @@ pub fn scan_workspace(root: &Path, ignore: Option<&GwenIgnore>) -> ScanResult {
 
         // Only process files
         if entry.file_type().is_file() {
-            if let Some(rules) = ignore {
-                if should_ignore(path, rules) {
+            if let Some(rules) = ignore
+                && should_ignore(path, rules) {
                     continue;
                 }
-            }
 
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,

@@ -125,11 +125,10 @@ fn main() {
         let tensor_name = parts[0].trim().to_string();
 
         // Apply --tensor filter if set.
-        if let Some(ref filter) = filter_tensor {
-            if &tensor_name != filter {
+        if let Some(ref filter) = filter_tensor
+            && &tensor_name != filter {
                 continue;
             }
-        }
 
         ref_rows.push(RefRow { tensor_name, element_idx, expected });
     }

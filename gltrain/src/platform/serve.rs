@@ -129,11 +129,10 @@ pub async fn wait_for_ready(port: u16, timeout_secs: u64) -> bool {
         + std::time::Duration::from_secs(timeout_secs);
 
     while tokio::time::Instant::now() < deadline {
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success() {
                 return true;
             }
-        }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
     false

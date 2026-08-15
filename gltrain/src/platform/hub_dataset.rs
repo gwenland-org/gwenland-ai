@@ -80,18 +80,15 @@ const KEYRING_USER: &str = "hf_token";
 
 /// Resolve HF token: keyring → HF_TOKEN env var → hf-hub cache file.
 pub fn resolve_token() -> Option<String> {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        if let Ok(token) = entry.get_password() {
-            if !token.trim().is_empty() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        && let Ok(token) = entry.get_password()
+            && !token.trim().is_empty() {
                 return Some(token.trim().to_string());
             }
-        }
-    }
-    if let Ok(tok) = std::env::var("HF_TOKEN") {
-        if !tok.trim().is_empty() {
+    if let Ok(tok) = std::env::var("HF_TOKEN")
+        && !tok.trim().is_empty() {
             return Some(tok.trim().to_string());
         }
-    }
     Cache::from_env().token()
 }
 

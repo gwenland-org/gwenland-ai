@@ -277,10 +277,10 @@ pub fn find_last_crashed_session() -> Option<CrashedSession> {
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
-            p.extension().map_or(false, |ext| ext == "txt")
+            p.extension().is_some_and(|ext| ext == "txt")
                 && p.file_name()
                     .and_then(|n| n.to_str())
-                    .map_or(false, |n| n.starts_with("session_"))
+                    .is_some_and(|n| n.starts_with("session_"))
         })
         .collect();
 

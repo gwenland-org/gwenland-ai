@@ -223,7 +223,7 @@ fn run_quantized_loop(
         }
 
         // GWEN-208: RAM check every 16 tokens to avoid sysinfo overhead per token.
-        if token_count % 16 == 0 {
+        if token_count.is_multiple_of(16) {
             sys.refresh_memory();
             if memory_guard.check(sys) {
                 let used_pct = memory_used_pct(sys);

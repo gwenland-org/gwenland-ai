@@ -39,7 +39,7 @@ const SUPPORTED_ARCHITECTURES: &[&str] = &["llama", "qwen2", "phi3"];
 /// Returns `GwenError::ModelLoad` with a descriptive message on any violation.
 pub fn validate_gguf(path: &Path) -> Result<GgufFile, GwenError> {
     let gguf = parse(path)
-        .map_err(|e| GwenError::ModelLoad(e))?;
+        .map_err(GwenError::ModelLoad)?;
 
     // Requirement 22.1 — tensor count
     if gguf.tensors.len() > MAX_TENSOR_COUNT {
@@ -229,7 +229,7 @@ fn read_kv_metadata(path: &Path) -> Result<HashMap<String, KvValue>, GwenError> 
 
     // Magic
     let magic = read_u32_le(&mut r)
-        .map_err(|e| GwenError::ModelLoad(e))?;
+        .map_err(GwenError::ModelLoad)?;
     if magic != 0x4647_4755 {
         return Err(GwenError::ModelLoad(format!(
             "'{}' is not a GGUF file (magic 0x{:08X})", path.display(), magic
@@ -238,22 +238,22 @@ fn read_kv_metadata(path: &Path) -> Result<HashMap<String, KvValue>, GwenError> 
 
     // Version
     let _version = read_u32_le(&mut r)
-        .map_err(|e| GwenError::ModelLoad(e))?;
+        .map_err(GwenError::ModelLoad)?;
 
     // Tensor count + KV count
     let _tensor_count = read_u64_le(&mut r)
-        .map_err(|e| GwenError::ModelLoad(e))?;
+        .map_err(GwenError::ModelLoad)?;
     let kv_count = read_u64_le(&mut r)
-        .map_err(|e| GwenError::ModelLoad(e))? as usize;
+        .map_err(GwenError::ModelLoad)? as usize;
 
     let mut map = HashMap::with_capacity(kv_count);
     for _ in 0..kv_count {
         let key = read_gguf_string(&mut r)
-            .map_err(|e| GwenError::ModelLoad(e))?;
+            .map_err(GwenError::ModelLoad)?;
         let vtype = read_u32_le(&mut r)
-            .map_err(|e| GwenError::ModelLoad(e))?;
+            .map_err(GwenError::ModelLoad)?;
         let value = read_kv_value(&mut r, vtype)
-            .map_err(|e| GwenError::ModelLoad(e))?;
+            .map_err(GwenError::ModelLoad)?;
         map.insert(key, value);
     }
 

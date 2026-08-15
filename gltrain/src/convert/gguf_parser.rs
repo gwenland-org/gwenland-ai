@@ -213,7 +213,7 @@ fn parse_header_inner<R: Read + Seek>(r: &mut R, path: &Path) -> Result<GgufHead
         ));
     }
     let version = read_u32_le(r)?;
-    if version < GGUF_VERSION_MIN || version > GGUF_VERSION_MAX {
+    if !(GGUF_VERSION_MIN..=GGUF_VERSION_MAX).contains(&version) {
         return Err(format!(
             "unsupported GGUF version {} in '{}' (supported: {}-{})",
             version, path.display(), GGUF_VERSION_MIN, GGUF_VERSION_MAX
@@ -391,42 +391,42 @@ fn raw_size_bytes(dtype: GgufDtype, n_elements: usize) -> usize {
         GgufDtype::F16 => n_elements * 2,
         GgufDtype::Q8_0 => {
             // Each block: 2 bytes (f16 scale) + 32 bytes (i8 values) = 34 bytes per 32 elements.
-            let n_blocks = (n_elements + GGML_QK - 1) / GGML_QK;
+            let n_blocks = n_elements.div_ceil(GGML_QK);
             n_blocks * (2 + GGML_QK)
         }
         GgufDtype::Q4_0 => {
             // Each block: 2 bytes (f16 scale) + 16 bytes (nibble-packed i4 values) = 18 bytes per 32 elements.
-            let n_blocks = (n_elements + GGML_QK - 1) / GGML_QK;
+            let n_blocks = n_elements.div_ceil(GGML_QK);
             n_blocks * (2 + GGML_QK / 2)
         }
         GgufDtype::Q2_K => {
             // Superblock of 256 elements: 16 (scales) + 64 (qs) + 2 (d) + 2 (dmin) = 84 bytes.
             const SB: usize = 256;
-            let n_blocks = (n_elements + SB - 1) / SB;
+            let n_blocks = n_elements.div_ceil(SB);
             n_blocks * 84
         }
         GgufDtype::Q3_K => {
             // Superblock of 256 elements: 64 (qs) + 32 (hmask) + 12 (scales) + 2 (d) = 110 bytes.
             const SB: usize = 256;
-            let n_blocks = (n_elements + SB - 1) / SB;
+            let n_blocks = n_elements.div_ceil(SB);
             n_blocks * 110
         }
         GgufDtype::Q4_K => {
             // Superblock of 256 elements: 2 (d) + 2 (dmin) + 12 (scales) + 128 (nibbles) = 144 bytes.
             const SB: usize = 256;
-            let n_blocks = (n_elements + SB - 1) / SB;
+            let n_blocks = n_elements.div_ceil(SB);
             n_blocks * 144
         }
         GgufDtype::Q5_K => {
             // Superblock of 256 elements: 2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (ql) = 176 bytes.
             const SB: usize = 256;
-            let n_blocks = (n_elements + SB - 1) / SB;
+            let n_blocks = n_elements.div_ceil(SB);
             n_blocks * 176
         }
         GgufDtype::Q6_K => {
             // Superblock of 256 elements: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210 bytes.
             const SB: usize = 256;
-            let n_blocks = (n_elements + SB - 1) / SB;
+            let n_blocks = n_elements.div_ceil(SB);
             n_blocks * 210
         }
     }

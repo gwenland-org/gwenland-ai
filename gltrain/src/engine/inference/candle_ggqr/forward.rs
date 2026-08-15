@@ -340,7 +340,7 @@ mod tests {
         let seq = 2usize;
         let hidden = 8usize;
         let n_heads = 2usize;
-        let head_dim = hidden / n_heads;
+        let _head_dim = hidden / n_heads;
 
         let cfg = ModelConfig {
             architecture: "llama".to_string(),

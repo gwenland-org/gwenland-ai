@@ -152,12 +152,11 @@ impl AdapterShapeValidator {
         // candle layer name → (d_out, d_in) for each base projection tensor.
         let mut base_dims: HashMap<String, (usize, usize)> = HashMap::new();
         for tensor in &header.tensors {
-            if let Some((layer_idx, proj)) = parse_gguf_key(&tensor.name) {
-                if let Ok((d_out, d_in)) = shape_to_2d(&tensor.shape) {
+            if let Some((layer_idx, proj)) = parse_gguf_key(&tensor.name)
+                && let Ok((d_out, d_in)) = shape_to_2d(&tensor.shape) {
                     base_dims
                         .insert(format!("lora_layer_{layer_idx}_{proj}_proj"), (d_out, d_in));
                 }
-            }
         }
 
         for adapter in adapters {

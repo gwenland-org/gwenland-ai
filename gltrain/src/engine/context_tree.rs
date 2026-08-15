@@ -146,11 +146,11 @@ pub fn build_context_tree(root: &Path, ignore: &GwenIgnore) -> WorkspaceContext 
 
             // Register this directory
             known_dirs.insert(relative.clone(), name.clone());
-            dir_children.entry(relative.clone()).or_insert_with(Vec::new);
+            dir_children.entry(relative.clone()).or_default();
 
             // Add a directory node to its parent's children list
             let parent_rel = parent_relative(&relative);
-            dir_children.entry(parent_rel).or_insert_with(Vec::new).push(TreeNode {
+            dir_children.entry(parent_rel).or_default().push(TreeNode {
                 name,
                 path: relative,
                 is_dir: true,
@@ -191,7 +191,7 @@ pub fn build_context_tree(root: &Path, ignore: &GwenIgnore) -> WorkspaceContext 
             total_size_bytes += size;
 
             let parent_rel = parent_relative(&relative);
-            dir_children.entry(parent_rel).or_insert_with(Vec::new).push(TreeNode {
+            dir_children.entry(parent_rel).or_default().push(TreeNode {
                 name,
                 path: relative,
                 is_dir: false,

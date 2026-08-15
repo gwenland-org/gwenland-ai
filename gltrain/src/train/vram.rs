@@ -106,7 +106,7 @@ pub fn vram_suggestions(config: &TrainConfig, estimate: &VramEstimate) -> Vec<St
         suggestions.push("→ Enable QLoRA (4-bit): add `qlora: true` to config".to_string());
     }
     if config.batch_size > 1 {
-        suggestions.push(format!("→ Reduce batch size: `batch_size: 1`"));
+        suggestions.push("→ Reduce batch size: `batch_size: 1`".to_string());
     }
     if estimate.base_gb > 15.0 {
         suggestions.push("→ Try a smaller model: Mistral 7B or LLaMA 3.1 8B fit on most GPUs".to_string());
@@ -162,11 +162,10 @@ fn parse_param_billions(model_name: &str) -> f32 {
             while j < chars.len() && (chars[j].is_ascii_digit() || chars[j] == '.') {
                 j += 1;
             }
-            if j < chars.len() && chars[j] == 'b' {
-                if let Ok(val) = lower[i..j].parse::<f32>() {
+            if j < chars.len() && chars[j] == 'b'
+                && let Ok(val) = lower[i..j].parse::<f32>() {
                     return val;
                 }
-            }
             i = j;
         } else {
             i += 1;

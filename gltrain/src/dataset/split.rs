@@ -58,11 +58,10 @@ pub fn run_split(opts: &SplitOptions) -> Result<SplitResult, String> {
         if val_path.exists() {
             collisions.push(val_path.display().to_string());
         }
-        if let Some(tp) = &test_path {
-            if tp.exists() {
+        if let Some(tp) = &test_path
+            && tp.exists() {
                 collisions.push(tp.display().to_string());
             }
-        }
         if !collisions.is_empty() {
             return Err(format!(
                 "{} already exists.\n  Use --overwrite / -w to force overwrite.",

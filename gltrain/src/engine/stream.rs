@@ -217,15 +217,14 @@ pub async fn stream_chat(
             }
 
             // @INFO — parse OpenAI-style delta JSON from the native proxy stream
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
-                if let Some(content) = v
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(data)
+                && let Some(content) = v
                     .get("choices")
                     .and_then(|c| c.get(0))
                     .and_then(|c| c.get("delta"))
                     .and_then(|d| d.get("content"))
                     .and_then(|c| c.as_str())
-                {
-                    if !content.is_empty()
+                    && !content.is_empty()
                         && tx
                             .send(StreamEvent::Token(content.to_string()))
                             .await
@@ -234,8 +233,6 @@ pub async fn stream_chat(
                         // Receiver dropped — ChatPane was closed; abort silently
                         return Ok(());
                     }
-                }
-            }
         }
     }
 

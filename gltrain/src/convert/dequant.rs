@@ -131,7 +131,7 @@ fn dequant_q8_0_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     const BLOCK_ELEMENTS: usize = 32;
     const BLOCK_BYTES: usize = 2 + BLOCK_ELEMENTS; // 2 for f16 scale, 32 for i8 values
 
-    let n_blocks = (n_elements + BLOCK_ELEMENTS - 1) / BLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(BLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q8_0 data truncated: need {} bytes, got {}",
@@ -165,7 +165,7 @@ fn dequant_q8_0_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const BLOCK_ELEMENTS: usize = 32;
     const BLOCK_BYTES: usize = 2 + BLOCK_ELEMENTS;
 
-    let n_blocks = (n_elements + BLOCK_ELEMENTS - 1) / BLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(BLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q8_0 data truncated: need {} bytes, got {}",
@@ -213,7 +213,7 @@ fn dequant_q4_0_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // 2 bytes scale + 16 bytes nibble-packed values (32 values at 4 bits each).
     const BLOCK_BYTES: usize = 2 + BLOCK_ELEMENTS / 2;
 
-    let n_blocks = (n_elements + BLOCK_ELEMENTS - 1) / BLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(BLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q4_0 data truncated: need {} bytes, got {}",
@@ -256,7 +256,7 @@ fn dequant_q4_0_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const BLOCK_ELEMENTS: usize = 32;
     const BLOCK_BYTES: usize = 2 + BLOCK_ELEMENTS / 2;
 
-    let n_blocks = (n_elements + BLOCK_ELEMENTS - 1) / BLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(BLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q4_0 data truncated: need {} bytes, got {}",
@@ -375,7 +375,7 @@ fn dequant_q2_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // Layout: 16 (scales) + 64 (qs) + 2 (d) + 2 (dmin) = 84 bytes.
     const BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q2_K data truncated: need {} bytes, got {}",
@@ -432,7 +432,7 @@ fn dequant_q2_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const SUPERBLOCK_ELEMENTS: usize = 256;
     const BLOCK_BYTES: usize = 16 + 64 + 2 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q2_K data truncated: need {} bytes, got {}",
@@ -519,7 +519,7 @@ fn dequant_q3_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // Layout: 64 (qs) + 32 (hmask) + 12 (scales) + 2 (d) = 110 bytes.
     const BLOCK_BYTES: usize = 64 + 32 + 12 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q3_K data truncated: need {} bytes, got {}",
@@ -573,7 +573,7 @@ fn dequant_q3_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const SUPERBLOCK_ELEMENTS: usize = 256;
     const BLOCK_BYTES: usize = 64 + 32 + 12 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q3_K data truncated: need {} bytes, got {}",
@@ -652,7 +652,7 @@ fn dequant_q4_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // Layout: 2 (d) + 2 (dmin) + 12 (scales) + 128 (nibbles) = 144 bytes.
     const BLOCK_BYTES: usize = 2 + 2 + 12 + (SUPERBLOCK_ELEMENTS / 2);
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q4_K data truncated: need {} bytes, got {}",
@@ -683,7 +683,7 @@ fn dequant_q4_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
                 sub_mins[j]   = sc[j + 4] & 0x3F;
             } else {
                 sub_scales[j] = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
-                sub_mins[j]   = (sc[j + 4] >> 4)   | ((sc[j - 0] >> 6) << 4);
+                sub_mins[j]   = (sc[j + 4] >> 4)   | ((sc[j] >> 6) << 4);
             }
         }
 
@@ -738,7 +738,7 @@ fn dequant_q4_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const SUBBLOCK_ELEMENTS: usize = SUPERBLOCK_ELEMENTS / N_SUBBLOCKS;
     const BLOCK_BYTES: usize = 2 + 2 + 12 + (SUPERBLOCK_ELEMENTS / 2);
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q4_K data truncated: need {} bytes, got {}",
@@ -825,7 +825,7 @@ fn dequant_q6_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // Layout: 128 (ql) + 64 (qh) + 16 (scales) + 2 (d) = 210 bytes.
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q6_K data truncated: need {} bytes, got {}",
@@ -883,7 +883,7 @@ fn dequant_q6_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const SUPERBLOCK_ELEMENTS: usize = 256;
     const BLOCK_BYTES: usize = 128 + 64 + 16 + 2;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q6_K data truncated: need {} bytes, got {}",
@@ -947,7 +947,7 @@ fn dequant_q5_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
     // Layout: 2 (d) + 2 (dmin) + 12 (scales) + 32 (qh) + 128 (ql) = 176 bytes.
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q5_K data truncated: need {} bytes, got {}",
@@ -977,7 +977,7 @@ fn dequant_q5_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
                 sub_mins[j]   = sc[j + 4] & 0x3F;
             } else {
                 sub_scales[j] = (sc[j + 4] & 0x0F) | ((sc[j - 4] >> 6) << 4);
-                sub_mins[j]   = (sc[j + 4] >> 4)   | ((sc[j - 0] >> 6) << 4);
+                sub_mins[j]   = (sc[j + 4] >> 4)   | ((sc[j] >> 6) << 4);
             }
         }
 
@@ -1002,7 +1002,7 @@ fn dequant_q5_k_standard(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, Stri
 
                 // Low 4 bits: same nibble layout as Q4_K.
                 let ql_byte = ql_base + i / 2;
-                let low4 = if i % 2 == 0 {
+                let low4 = if i.is_multiple_of(2) {
                     raw[ql_byte] & 0x0F
                 } else {
                     raw[ql_byte] >> 4
@@ -1033,7 +1033,7 @@ fn dequant_q5_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
     const SUBBLOCK_ELEMENTS: usize = SUPERBLOCK_ELEMENTS / N_SUBBLOCKS;
     const BLOCK_BYTES: usize = 2 + 2 + 12 + 32 + 128;
 
-    let n_blocks = (n_elements + SUPERBLOCK_ELEMENTS - 1) / SUPERBLOCK_ELEMENTS;
+    let n_blocks = n_elements.div_ceil(SUPERBLOCK_ELEMENTS);
     if raw.len() < n_blocks * BLOCK_BYTES {
         return Err(format!(
             "Q5_K data truncated: need {} bytes, got {}",
@@ -1064,7 +1064,7 @@ fn dequant_q5_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
                 let i = sub_elem_start + k;
 
                 let ql_byte = ql_base + i / 2;
-                let low4 = if i % 2 == 0 {
+                let low4 = if i.is_multiple_of(2) {
                     raw[ql_byte] & 0x0F
                 } else {
                     raw[ql_byte] >> 4
@@ -1456,7 +1456,7 @@ mod tests {
         let out = dequant_q4_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
-                w >= -0.619 && w <= 0.619,
+                (-0.619..=0.619).contains(&w),
                 "Euler output out of bounds: {w}"
             );
         }
@@ -1468,7 +1468,7 @@ mod tests {
         let out = dequant_q6_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
-                w >= -0.619 && w <= 0.619,
+                (-0.619..=0.619).contains(&w),
                 "Euler output out of bounds: {w}"
             );
         }
@@ -1480,7 +1480,7 @@ mod tests {
         let out = dequant_q5_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
-                w >= -0.619 && w <= 0.619,
+                (-0.619..=0.619).contains(&w),
                 "Euler output out of bounds: {w}"
             );
         }
@@ -1568,7 +1568,7 @@ mod tests {
         let out = dequant_q2_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
-                w >= -0.619 && w <= 0.619,
+                (-0.619..=0.619).contains(&w),
                 "Euler output out of bounds: {w}"
             );
         }
@@ -1690,7 +1690,7 @@ mod tests {
         let out = dequant_q3_k_euler(&raw, 256).unwrap();
         for &w in &out {
             assert!(
-                w >= -0.619 && w <= 0.619,
+                (-0.619..=0.619).contains(&w),
                 "Euler output out of bounds: {w}"
             );
         }

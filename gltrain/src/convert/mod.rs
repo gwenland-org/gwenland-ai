@@ -97,7 +97,7 @@ pub fn convert_gguf(
             // model may lose precision under GwenTensor inference).
             for &w in &weights {
                 euler_total_weights += 1;
-                if w < -0.309 || w > 0.309 {
+                if !(-0.309..=0.309).contains(&w) {
                     euler_outside_sweet += 1;
                 }
             }

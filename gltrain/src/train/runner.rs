@@ -388,11 +388,10 @@ fn is_local_model_path(model: &str) -> bool {
 /// Resolve a local model path: expand `~` to home dir and make relative paths absolute
 /// relative to the current working directory.
 fn resolve_local_model_path(model: &str) -> PathBuf {
-    if let Some(rest) = model.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+    if let Some(rest) = model.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
-    }
     PathBuf::from(model)
 }
 
@@ -440,15 +439,14 @@ fn check_output_dir(output: &Path) -> Result<()> {
     const MIN_FREE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
     let free = crate::platform::hardware::check_disk_space(output);
-    if let Some((free_bytes, _total)) = free {
-        if free_bytes < MIN_FREE_BYTES {
+    if let Some((free_bytes, _total)) = free
+        && free_bytes < MIN_FREE_BYTES {
             bail!(
                 "insufficient disk space at '{}': {:.1} GB free, need at least 10 GB.",
                 output.display(),
                 free_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
-    }
     // If check_disk_space returns None we allow it — platform may not support the query.
     Ok(())
 }

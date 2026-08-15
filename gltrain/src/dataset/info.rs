@@ -24,7 +24,7 @@ pub fn run_info(path: &Path, model: Option<&str>) -> Result<DatasetInfo, String>
     let mut think_count = 0usize;
     let mut category_counts: HashMap<String, usize> = HashMap::new();
 
-    let use_tokenizer = model.is_some();
+    let _use_tokenizer = model.is_some();
 
     // Optionally load HF tokenizer once before iterating.
     let tokenizer = if let Some(model_id) = model {
