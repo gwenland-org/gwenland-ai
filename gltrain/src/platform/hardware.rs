@@ -139,6 +139,12 @@ pub struct LiveMonitor {
     gpus: Vec<GpuProfile>,
 }
 
+impl Default for LiveMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LiveMonitor {
     pub fn new() -> Self {
         let mut sys = System::new_all();
@@ -164,7 +170,7 @@ impl LiveMonitor {
 
 fn sample_gpu_usage(gpus: &[GpuProfile]) -> Vec<GpuUsageSample> {
     let mut samples = Vec::new();
-    for (_idx, gpu) in gpus.iter().enumerate() {
+    for gpu in gpus.iter() {
         let mut busy_percent = None;
         let mut vram_used_bytes = None;
         let mut vram_total_bytes = None;
@@ -199,8 +205,8 @@ fn sample_gpu_usage(gpus: &[GpuProfile]) -> Vec<GpuUsageSample> {
         let cards = [0, 1];
         for card in &cards {
             let busy_path = format!("/sys/class/drm/card{}/device/gpu_busy_percent", card);
-            if let Ok(content) = std::fs::read_to_string(&busy_path) {
-                if let Ok(val) = content.trim().parse::<f64>() {
+            if let Ok(content) = std::fs::read_to_string(&busy_path)
+                && let Ok(val) = content.trim().parse::<f64>() {
                     busy_percent = Some(val);
 
                     // Also try to read VRAM info for this card
@@ -215,7 +221,6 @@ fn sample_gpu_usage(gpus: &[GpuProfile]) -> Vec<GpuUsageSample> {
                     }
                     break;
                 }
-            }
         }
 
         samples.push(GpuUsageSample {

@@ -149,11 +149,10 @@ pub(crate) fn load_adamw_state(weight_ckpt_path: &Path) -> Result<Option<(Moment
             if let Some(varmap_key) = adamw_prefix_to_varmap_key(prefix) {
                 first_moments.insert(varmap_key, tensor);
             }
-        } else if let Some(prefix) = key.strip_suffix(".m2") {
-            if let Some(varmap_key) = adamw_prefix_to_varmap_key(prefix) {
+        } else if let Some(prefix) = key.strip_suffix(".m2")
+            && let Some(varmap_key) = adamw_prefix_to_varmap_key(prefix) {
                 second_moments.insert(varmap_key, tensor);
             }
-        }
     }
 
     let mut store = MomentStore::new();

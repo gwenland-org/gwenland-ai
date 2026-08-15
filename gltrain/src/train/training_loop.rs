@@ -199,10 +199,7 @@ impl TrainingLoop {
                 // Clone the batch references out of self so the immutable
                 // borrow on self.batches does not overlap with the mutable
                 // borrows taken below for the optimiser step.
-                let batch: Vec<Tensor> = self.batches[batch_idx]
-                    .iter()
-                    .map(|t| t.clone())
-                    .collect();
+                let batch: Vec<Tensor> = self.batches[batch_idx].to_vec();
 
                 // Stack the variable-length token sequences in the batch into
                 // a single (batch, max_seq) padded tensor so the model sees a
@@ -241,7 +238,7 @@ impl TrainingLoop {
                 // ── optimiser step (every grad_accum batches) ───────────────
 
                 let is_accum_boundary =
-                    global_batch % grad_accum == 0
+                    global_batch.is_multiple_of(grad_accum)
                     || global_batch == total_batches_all_epochs; // flush at end
 
                 if is_accum_boundary && !grad_stores.is_empty() {
@@ -258,7 +255,7 @@ impl TrainingLoop {
                     grad_stores.clear();
 
                     // ── checkpoint every 500 optimiser steps ────────────────
-                    if optimizer_steps % 500 == 0 {
+                    if optimizer_steps.is_multiple_of(500) {
                         self.save_checkpoint(optimizer_steps)?;
                     }
                 }

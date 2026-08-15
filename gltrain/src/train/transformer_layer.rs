@@ -27,14 +27,14 @@ impl AttentionConfig {
         if self.n_heads == 0 || self.n_kv_heads == 0 {
             bail!("attention head counts must be positive");
         }
-        if self.hidden_size % self.n_heads != 0 {
+        if !self.hidden_size.is_multiple_of(self.n_heads) {
             bail!(
                 "hidden_size {} is not divisible by n_heads {}",
                 self.hidden_size,
                 self.n_heads
             );
         }
-        if self.n_heads % self.n_kv_heads != 0 {
+        if !self.n_heads.is_multiple_of(self.n_kv_heads) {
             bail!(
                 "n_heads {} is not divisible by n_kv_heads {}",
                 self.n_heads,

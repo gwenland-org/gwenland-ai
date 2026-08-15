@@ -73,20 +73,17 @@ const KEYRING_USER: &str = "hf_token";
 /// Returns None if no token is available (public access only).
 pub fn resolve_token() -> Option<String> {
     // 1. OS keyring
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        if let Ok(token) = entry.get_password() {
-            if !token.trim().is_empty() {
+    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        && let Ok(token) = entry.get_password()
+            && !token.trim().is_empty() {
                 return Some(token.trim().to_string());
             }
-        }
-    }
 
     // 2. Environment variable
-    if let Ok(tok) = std::env::var("HF_TOKEN") {
-        if !tok.trim().is_empty() {
+    if let Ok(tok) = std::env::var("HF_TOKEN")
+        && !tok.trim().is_empty() {
             return Some(tok.trim().to_string());
         }
-    }
 
     // 3. hf-hub cache file (~/.cache/huggingface/token)
     Cache::from_env().token()

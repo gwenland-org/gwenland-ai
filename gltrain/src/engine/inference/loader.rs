@@ -128,11 +128,9 @@ fn expand_tilde(model: &str) -> PathBuf {
     if let Some(rest) = model
         .strip_prefix("~/")
         .or_else(|| model.strip_prefix("~\\"))
-    {
-        if let Some(home) = dirs::home_dir() {
+        && let Some(home) = dirs::home_dir() {
             return home.join(rest);
         }
-    }
     PathBuf::from(model)
 }
 

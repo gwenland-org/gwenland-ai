@@ -135,46 +135,56 @@ mod tests {
 
     #[test]
     fn validate_accepts_candle() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir(); // guaranteed to exist
-        cfg.backend = "candle".to_string();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(), // guaranteed to exist
+            backend: "candle".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_accepts_candle_ggqr() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
-        cfg.backend = "candle-ggqr".to_string();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            backend: "candle-ggqr".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_accepts_mistralrs() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
-        cfg.backend = "mistralrs".to_string();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            backend: "mistralrs".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_accepts_auto() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
-        cfg.backend = "auto".to_string();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            backend: "auto".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
     #[test]
     fn validate_rejects_unknown_backend() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
-        cfg.backend = "llama.cpp".to_string();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            backend: "llama.cpp".to_string(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
@@ -182,17 +192,21 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_model() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "".to_string();
-        cfg.model_path = std::env::temp_dir();
+        let cfg = InferenceConfig {
+            model: "".to_string(),
+            model_path: std::env::temp_dir(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_non_empty_model() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
@@ -200,17 +214,21 @@ mod tests {
 
     #[test]
     fn validate_rejects_nonexistent_model_path() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = PathBuf::from("/nonexistent/path/that/should/never/exist");
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: PathBuf::from("/nonexistent/path/that/should/never/exist"),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_existing_model_path() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
+        let cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            ..Default::default()
+        };
         assert!(cfg.validate().is_ok());
     }
 
@@ -218,18 +236,22 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_params() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
+        let mut cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            ..Default::default()
+        };
         cfg.params.temperature = 0.0; // invalid
         assert!(cfg.validate().is_err());
     }
 
     #[test]
     fn validate_accepts_valid_params() {
-        let mut cfg = InferenceConfig::default();
-        cfg.model = "test.gguf".to_string();
-        cfg.model_path = std::env::temp_dir();
+        let mut cfg = InferenceConfig {
+            model: "test.gguf".to_string(),
+            model_path: std::env::temp_dir(),
+            ..Default::default()
+        };
         cfg.params.temperature = 0.7;
         assert!(cfg.validate().is_ok());
     }

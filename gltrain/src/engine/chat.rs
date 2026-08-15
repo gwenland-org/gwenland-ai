@@ -255,12 +255,11 @@ pub async fn stream_chat(
 
             match serde_json::from_str::<StreamChunk>(data) {
                 Ok(chunk) => {
-                    if let Some(msg) = &chunk.message {
-                        if !msg.content.is_empty() {
+                    if let Some(msg) = &chunk.message
+                        && !msg.content.is_empty() {
                             assistant_buf.push_str(&msg.content);
                             let _ = tx.send(ChatEvent::Token(msg.content.clone()));
                         }
-                    }
                     if chunk.done {
                         session.finalize_assistant_turn(std::mem::take(&mut assistant_buf));
                         let _ = tx.send(ChatEvent::Done);
@@ -364,11 +363,10 @@ pub async fn stream_chat_json(
                     }
 
                     if let Ok(chunk) = serde_json::from_str::<StreamChunk>(&data) {
-                        if let Some(msg) = &chunk.message {
-                            if !msg.content.is_empty() {
+                        if let Some(msg) = &chunk.message
+                            && !msg.content.is_empty() {
                                 let _ = tx.send(ChatEvent::Token(msg.content.clone()));
                             }
-                        }
                         if chunk.done {
                             let _ = tx.send(ChatEvent::Done);
                             return;

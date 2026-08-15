@@ -108,7 +108,7 @@ async fn check_cuda() -> CheckResult {
             if line.contains("CUDA Version:") {
                 let parts: Vec<&str> = line.split("CUDA Version:").collect();
                 if parts.len() > 1 {
-                    let v: Vec<&str> = parts[1].trim().split_whitespace().collect();
+                    let v: Vec<&str> = parts[1].split_whitespace().collect();
                     return v.first().map(|s| s.to_string());
                 }
             }
@@ -143,7 +143,7 @@ async fn check_vram() -> CheckResult {
     }
 
     let output = Command::new("nvidia-smi")
-        .args(&["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits"])
         .output();
 
     match output {

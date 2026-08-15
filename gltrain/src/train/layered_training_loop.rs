@@ -273,15 +273,14 @@ impl LayeredTrainingLoop {
         let layer0_slices = layer_loader.index_slices_for(0);
         let mut proj_keys: Vec<(ProjectionKind, usize, usize)> = Vec::new();
         for slice in layer0_slices {
-            if let Some(kind) = classify_tensor(&slice.tensor_name) {
-                if let Ok((d_out, d_in)) = shape_to_2d(&slice.shape) {
+            if let Some(kind) = classify_tensor(&slice.tensor_name)
+                && let Ok((d_out, d_in)) = shape_to_2d(&slice.shape) {
                     // Avoid duplicates (some models have multiple tensors with
                     // the same projection name due to sharding — take the first).
                     if !proj_keys.iter().any(|(k, _, _)| *k == kind) {
                         proj_keys.push((kind, d_in, d_out));
                     }
                 }
-            }
         }
 
         // Fallback: if no projections classified (e.g. test fixtures with
@@ -528,7 +527,7 @@ impl LayeredTrainingLoop {
                 accum_count += 1;
 
                 let at_end = global_batch == total_inner;
-                let is_boundary = global_batch % grad_accum == 0 || at_end;
+                let is_boundary = global_batch.is_multiple_of(grad_accum) || at_end;
                 if is_boundary {
                     let mut grads = accum_grads
                         .take()
@@ -546,7 +545,7 @@ impl LayeredTrainingLoop {
                     accum_loss_sum = 0.0;
                     accum_count = 0;
 
-                    if optimizer_steps % 500 == 0 {
+                    if optimizer_steps.is_multiple_of(500) {
                         self.save_checkpoint_and_adamw_state(optimizer_steps);
                     }
                 }
@@ -564,11 +563,10 @@ impl LayeredTrainingLoop {
                     tx.send(json).ok();
                 }
 
-                if let Some(cap) = max_steps {
-                    if optimizer_steps >= cap {
+                if let Some(cap) = max_steps
+                    && optimizer_steps >= cap {
                         break 'outer;
                     }
-                }
             }
         }
 
@@ -2674,7 +2672,7 @@ mod tests {
         };
 
         let total_inner = num_batches * epochs;
-        let expected_steps = (total_inner + grad_accum - 1) / grad_accum;
+        let expected_steps = total_inner.div_ceil(grad_accum);
         result.total_steps == expected_steps
     }
 

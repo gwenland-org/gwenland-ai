@@ -24,7 +24,7 @@ pub fn rope_tables(
     dtype: DType,
     device: &candle_core::Device,
 ) -> Result<(Tensor, Tensor)> {
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         candle_core::bail!("RoPE head_dim must be positive and even, got {head_dim}");
     }
     if !rope_theta.is_finite() || rope_theta <= 0.0 {
@@ -63,7 +63,7 @@ pub fn apply_rope(x: &Tensor, rope_theta: f32, position_offset: usize) -> Result
 /// `[batch, query_heads, seq, head_dim]`.
 pub fn repeat_kv(x: &Tensor, query_heads: usize) -> Result<Tensor> {
     let (batch, kv_heads, seq_len, head_dim) = x.dims4()?;
-    if kv_heads == 0 || query_heads == 0 || query_heads % kv_heads != 0 {
+    if kv_heads == 0 || query_heads == 0 || !query_heads.is_multiple_of(kv_heads) {
         candle_core::bail!(
             "query_heads ({query_heads}) must be divisible by kv_heads ({kv_heads})"
         );

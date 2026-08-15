@@ -106,7 +106,7 @@ fn skip_kv_value<R: Read>(r: &mut R, vtype: u32) -> Result<()> {
     match vtype {
         0 | 1 | 7 => { read_byte(r)?; }          // UINT8/INT8/BOOL
         2 | 3     => { read_exact(r, 2)?; }       // UINT16/INT16
-        4 | 5 | 6 => { read_exact(r, 4)?; }       // UINT32/INT32/FLOAT32
+        4..=6 => { read_exact(r, 4)?; }       // UINT32/INT32/FLOAT32
         8         => { read_gguf_string(r).map_err(|e| anyhow::anyhow!("{}", e))?; } // STRING
         9         => {                             // ARRAY
             let elem_type = read_u32_le(r).map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -115,7 +115,7 @@ fn skip_kv_value<R: Read>(r: &mut R, vtype: u32) -> Result<()> {
                 skip_kv_value(r, elem_type)?;
             }
         }
-        10 | 11 | 12 => { read_exact(r, 8)?; }   // UINT64/INT64/FLOAT64
+        10..=12 => { read_exact(r, 8)?; }   // UINT64/INT64/FLOAT64
         other => bail!("unknown KV value type {} in GGUF metadata", other),
     }
     Ok(())

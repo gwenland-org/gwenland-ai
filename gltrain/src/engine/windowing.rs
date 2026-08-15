@@ -356,11 +356,10 @@ pub fn format_windowed_output(
     }
 
     // ── Trailing omission marker ──────────────────────────────────────────────
-    if let Some(pe) = prev_end {
-        if pe + 1 < total_lines {
+    if let Some(pe) = prev_end
+        && pe + 1 < total_lines {
             out.push_str("... (rest of file omitted) ...\n");
         }
-    }
 
     out
 }
