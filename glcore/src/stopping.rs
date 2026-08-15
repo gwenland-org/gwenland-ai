@@ -1,14 +1,14 @@
 //! Which sampled token ids end generation.
 //!
-//! This is **not** a reinvention of [`crate::tokenizer::Tokenizer`]'s own
+//! This is **not** a reinvention of [`crate::tokenizer::GllmTokenizer`]'s own
 //! `stop_token_ids`/`is_stop_token` — that resolver (metadata EOS plus every
 //! known stop-marker string found in the vocab) is already correct and
 //! already tested, and stays exactly as it is. What it
 //! cannot do is cross the [`crate::engine_trait::GlEngine`] boundary: an
-//! engine that has no `Tokenizer` of its own (a `.gllm` package has none —
+//! engine that has no `GllmTokenizer` of its own (a `.gllm` package has none —
 //! ARTX1 OQ3 is still open) has no way to ask one what its stop ids are.
 //! `StoppingCriteria` is that bridge — a thin, tokenizer-independent value
-//! any caller can build (from a real `Tokenizer` via [`Self::from_tokenizer`],
+//! any caller can build (from a real `GllmTokenizer` via [`Self::from_tokenizer`],
 //! or from any other source of ids) and hand to an engine through
 //! [`crate::engine_trait::InferInput`].
 //!
@@ -35,9 +35,9 @@
 //! An engine that can draw stop ids from two sources (e.g. `GllmEngine`:
 //! manifest-embedded ids *and* a caller-supplied `InferInput::stopping`)
 //! should [`Self::merge`] them rather than pick one — real GGUF metadata is
-//! routinely *less* complete than a full `Tokenizer`'s vocab-scanned resolve
+//! routinely *less* complete than a full `GllmTokenizer`'s vocab-scanned resolve
 //! (measured: Qwen2.5-0.5B's GGUF declares only `tokenizer.ggml.eos_token_id
-//! = 151645`, never the `<|endoftext|>` = 151643 a real `Tokenizer` also
+//! = 151645`, never the `<|endoftext|>` = 151643 a real `GllmTokenizer` also
 //! resolves), so neither source alone is safe to treat as authoritative.
 //!
 //! `ignore_eos` (named after vLLM's identically-purposed sampling parameter)
@@ -64,9 +64,9 @@ impl StoppingCriteria {
     }
 
     /// Build from a tokenizer's own resolved stop set — the bridge every
-    /// caller that already owns a real `Tokenizer` (glproc's engine, glbench,
+    /// caller that already owns a real `GllmTokenizer` (glproc's engine, glbench,
     /// `run_package_e2e`) should use, rather than re-deriving EOS ids by hand.
-    pub fn from_tokenizer(tokenizer: &crate::tokenizer::Tokenizer) -> Self {
+    pub fn from_tokenizer(tokenizer: &crate::tokenizer::GllmTokenizer) -> Self {
         StoppingCriteria::new(tokenizer.stop_token_ids().iter().copied())
     }
 
@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn merge_unions_stop_ids_from_both_sides() {
         // The real Qwen2.5-0.5B case: manifest GGUF metadata gives only
-        // {151645}, a full Tokenizer resolves {151645, 151643} — neither
+        // {151645}, a full GllmTokenizer resolves {151645, 151643} — neither
         // side alone is complete, so the engine must union them.
         let manifest = StoppingCriteria::new([151_645]);
         let caller = StoppingCriteria::new([151_645, 151_643]);

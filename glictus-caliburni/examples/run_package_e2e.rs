@@ -6,7 +6,7 @@
 //! has no tokenizer (`.gllm` does not package one yet, ARTX1 OQ3), so it
 //! only accepts/returns token ids. This example supplies the missing half:
 //! it tokenizes a real prompt and detokenizes the output using
-//! [`glcore::tokenizer::Tokenizer`] loaded from the *original* GGUF the
+//! [`glcore::tokenizer::GllmTokenizer`] loaded from the *original* GGUF the
 //! package was converted from — the same source-of-tokenizer-truth
 //! `glcli`'s `gwen run` uses, just pointed at a sibling `.gllm` package for
 //! the actual math instead of running the GGUF directly.
@@ -19,7 +19,7 @@
 
 use glcore::engine_trait::{GlEngine, InferInput};
 use glcore::format::gguf::GgufFile;
-use glcore::tokenizer::Tokenizer;
+use glcore::tokenizer::GllmTokenizer;
 use glictus_caliburni::runtime::GllmEngine;
 
 struct Args {
@@ -64,7 +64,7 @@ fn main() {
 
     eprintln!("loading tokenizer from {} ...", args.gguf_path);
     let gguf = GgufFile::open(&args.gguf_path).expect("open source GGUF for tokenizer");
-    let tokenizer = Tokenizer::from_gguf(&gguf).expect("build tokenizer from GGUF metadata");
+    let tokenizer = GllmTokenizer::from_gguf_path(&gguf_path).expect("build tokenizer from GGUF metadata");
 
     eprintln!("loading .gllm package from {} ...", args.package_dir);
     let mut engine = GllmEngine::new();

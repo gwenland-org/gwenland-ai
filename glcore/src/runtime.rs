@@ -9,12 +9,12 @@ use std::path::Path;
 use crate::engine_trait::{GlEngine, InferInput};
 use crate::error::GlError;
 use crate::format::gguf::GgufFile;
-use crate::tokenizer::Tokenizer;
+use crate::tokenizer::GllmTokenizer;
 
 /// Owns the active engine and the tokenizer for the loaded model.
 pub struct Runtime {
     engine: Box<dyn GlEngine>,
-    tokenizer: Option<Tokenizer>,
+    tokenizer: Option<GllmTokenizer>,
     /// Force raw completion encoding even for chat models.
     raw_prompt: bool,
 }
@@ -49,7 +49,10 @@ impl Runtime {
         match ext.as_str() {
             "gguf" => {
                 let gguf = GgufFile::open(model_path)?;
-                self.tokenizer = Some(Tokenizer::from_gguf(&gguf)?);
+                // GGUF bytes are read directly by the tokenizer; `gguf` above is
+                // still needed by the engine for tensors.
+                let _ = &gguf;
+                self.tokenizer = Some(GllmTokenizer::from_gguf_path(model_path)?);
             }
             "safetensors" => {
                 let sibling = Path::new(model_path)
@@ -62,7 +65,7 @@ impl Runtime {
                         )
                     })?;
                 let path_str = sibling.to_string_lossy();
-                self.tokenizer = Some(Tokenizer::from_file(&path_str)?);
+                self.tokenizer = Some(GllmTokenizer::from_hf_json_path(&path_str)?);
             }
             other => {
                 return Err(GlError::Parse(format!(
@@ -74,7 +77,7 @@ impl Runtime {
     }
 
     /// Borrow the tokenizer for the currently loaded model.
-    pub fn tokenizer(&self) -> Option<&Tokenizer> {
+    pub fn tokenizer(&self) -> Option<&GllmTokenizer> {
         self.tokenizer.as_ref()
     }
 
@@ -144,10 +147,10 @@ impl Runtime {
             // Chat models answer (and emit their stop token) only when the
             // prompt is wrapped in their chat template; raw text makes them
             // ramble as text completion until max_tokens.
-            if let Some(ids) = tk.encode_chat(prompt) {
+            if let Some(ids) = tk.encode_chat(prompt)? {
                 return Ok(ids);
             }
         }
-        Ok(tk.encode(prompt, tk.add_bos_default()))
+        Ok(tk.encode(prompt, tk.add_bos_default())?)
     }
 }

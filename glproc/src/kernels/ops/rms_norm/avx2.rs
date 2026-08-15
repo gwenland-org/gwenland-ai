@@ -27,15 +27,19 @@ pub unsafe fn run_into(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     
     let mut tmp = [0.0f32; 8];
     _mm256_storeu_ps(tmp.as_mut_ptr(), sum_sq);
-    let mut mean_sq = tmp.iter().sum::<f32>();
+    // ⚠️ Reduce in f64 from here: llama.cpp accumulates the whole sum of
+    // squares in a double. The 8 SIMD lanes each stay f32 (each holds ~n/8
+    // terms, so absorption inside a lane is far weaker), but the horizontal
+    // reduction and the scalar tail are widened to match the reference.
+    let mut mean_sq = tmp.iter().map(|&v| v as f64).sum::<f64>();
     
     while i < n {
         let v = x[i];
-        mean_sq += v * v;
+        mean_sq += (v as f64) * (v as f64);
         i += 1;
     }
     
-    mean_sq /= n.max(1) as f32;
+    let mean_sq = (mean_sq / n.max(1) as f64) as f32;
     let inv = 1.0 / (mean_sq + eps).sqrt();
     let inv_vec = _mm256_set1_ps(inv);
     

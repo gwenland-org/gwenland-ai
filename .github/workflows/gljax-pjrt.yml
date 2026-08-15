@@ -1,0 +1,419 @@
+# gljax — run the PJRT tests against a real plugin.
+#
+# Why this exists separately from ci.yml
+# --------------------------------------
+# `ci.yml` already builds and tests the whole workspace, gljax included — but
+# with no PJRT plugin on the runner, gljax's three plugin tests SKIP. A SKIP is
+# not a pass: those are the tests that decide whether the hand-written PJRT C
+# API bindings in `gljax/src/sys/` are right, and skipping them decides nothing.
+#
+# This workflow downloads the plugin and runs them for real. It is the only
+# place in the repo where `gljax::pjrt` has ever executed: there is no PJRT
+# plugin for Windows, which is the development machine (`gljax/README.md`).
+#
+# The plugin is pinned, not floated
+# ---------------------------------
+# ARTX01 §1.4: "Pin a specific pjrt-artifacts tag. Do not auto-upgrade plugins.
+# Treat them like a compiler dependency." A serialized executable is
+# plugin-version-specific and the C API has had breaking changes, so a floating
+# `latest` would turn an upstream release into a mystery CI failure.
+#
+# The SHA-256 is checked too. Pinning a tag says which artifact you meant;
+# checking the digest says you got it.
+name: gljax PJRT
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "gljax/**"
+      - "glcore/**"
+      - ".github/workflows/gljax-pjrt.yml"
+      - "Cargo.lock"
+  # ⚠️ No `branches:` filter here on purpose. For `pull_request` that key
+  # filters on the *base* branch, and gljax work lands on integration branches
+  # (`docs/gljax-artx-series`) before it reaches main — a `[main]` filter would
+  # silently skip this job on exactly the PRs that introduce the code it
+  # exists to test. Gate every PR that touches gljax, whatever it targets.
+  pull_request:
+    paths:
+      - "gljax/**"
+      - "glcore/**"
+      - ".github/workflows/gljax-pjrt.yml"
+      - "Cargo.lock"
+  workflow_dispatch:
+    inputs:
+      gate_a5_lengths:
+        description: >-
+          Gate A5 output lengths, comma-separated. The full 8,16,32,64,128,256,512
+          sweep measured 76 min; the PR default stops at 128.
+        required: false
+        default: "8,16,32,64,128"
+
+concurrency:
+  group: gljax-pjrt-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+  # ── The pinned plugin ──────────────────────────────────────────────────────
+  # Verified 2026-07-29 by downloading and inspecting the artifact:
+  #   * ELF 64-bit LSB, 274,739,056 bytes extracted
+  #   * exports GetPjrtApi
+  #   * the tarball contains exactly one file: ./libpjrt_cpu.so
+  #
+  # ⚠️ That filename is NOT what ARTX01 §1.4/§5.1 says. The docs call it
+  # `pjrt_c_api_cpu_plugin.so`; zml ships `libpjrt_cpu.so`. ARTX01's "~80MB"
+  # is stale too — it is 64 MB compressed, 274 MB on disk.
+  PJRT_ARTIFACTS_TAG: manual-2026-07-28T12-29-00Z
+  PJRT_ASSET: pjrt-cpu_linux-amd64.tar.gz
+  PJRT_ASSET_SHA256: a00125365f1fb04c164d4dc63941e7b002d29f376be0bdc45557cc62efd19d60
+  PJRT_SO_NAME: libpjrt_cpu.so
+
+  # ── The pinned model ───────────────────────────────────────────────────────
+  # ⚠️ A revision, never `main`. Model weights that move under CI turn a
+  # coherence regression into an unreproducible mystery — and coherence is the
+  # entire signal Gate A5 produces.
+  QWEN2_REPO: Qwen/Qwen2-0.5B
+  QWEN2_REVISION: 91d2aff3f957f99e4c74c962f2f408dcc88a18d8
+  QWEN2_DIR: /home/runner/qwen2-0.5b
+
+  # ⭐ Running the full sweep to close the gate. See the note below before
+  # putting this back to "8,16,32,64,128" for routine PR runs.
+  #
+  # `Session::generate` has no KV cache, so n tokens costs n full forward
+  # passes at the bucket width, and the bucket grows with n — the cost is
+  # superlinear. Qwen2-0.5B is 494 M MACs/position: 128 GFLOP per forward at
+  # bucket 128, 1102 GFLOP at bucket 1024.
+  #
+  # ⚠️ MEASURED, not estimated: run 30433602366 gave **163 GFLOP/s** on this
+  # runner (consistent across buckets 128 and 256). A pre-run estimate of
+  # 15-60 GFLOP/s was pessimistic by ~5x. At the measured rate the full
+  # 7-length sweep is ~76 min, inside the 120-min job timeout — where the
+  # estimate had predicted 6.9 h against GitHub's 6 h limit.
+  GATE_A5_LENGTHS: "8,16,32,64,128,256,512"
+
+jobs:
+  pjrt-cpu:
+    name: gljax on the PJRT CPU plugin
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gljax-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gljax-cargo-
+
+      # 64 MB compressed, and the tag is pinned, so the cache key never goes
+      # stale on its own — it changes only when someone bumps the pin.
+      - name: Cache the PJRT plugin
+        id: pjrt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/pjrt
+          key: pjrt-cpu-${{ env.PJRT_ARTIFACTS_TAG }}-${{ env.PJRT_ASSET_SHA256 }}
+
+      - name: Download and verify the PJRT CPU plugin
+        if: steps.pjrt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/pjrt
+          url="https://github.com/zml/pjrt-artifacts/releases/download/${PJRT_ARTIFACTS_TAG}/${PJRT_ASSET}"
+          echo "Downloading $url"
+          curl -sSfL -o /tmp/pjrt.tar.gz "$url"
+
+          echo "${PJRT_ASSET_SHA256}  /tmp/pjrt.tar.gz" | sha256sum -c -
+
+          tar -xzf /tmp/pjrt.tar.gz -C ~/pjrt
+          test -f "$HOME/pjrt/${PJRT_SO_NAME}"
+
+      # The plugin is useless if it does not export the one symbol gljax
+      # resolves. Checking here turns "GetPjrtApi not found" from a confusing
+      # test failure into an obvious infrastructure failure.
+      # Also publishes the path, so the runner's home directory is never
+      # hardcoded and the cache-hit path gets it too.
+      - name: Verify the plugin exports GetPjrtApi
+        run: |
+          set -euo pipefail
+          so="$HOME/pjrt/${PJRT_SO_NAME}"
+          ls -la "$so"
+          file "$so"
+          if ! nm -D --defined-only "$so" | grep -qw GetPjrtApi; then
+            echo "::error::${PJRT_SO_NAME} does not export GetPjrtApi — not a PJRT plugin"
+            nm -D --defined-only "$so" | head -20
+            exit 1
+          fi
+          echo "GetPjrtApi found"
+          echo "PJRT_PLUGIN_CPU=$so" >> "$GITHUB_ENV"
+
+      - name: Clippy
+        run: cargo clippy -p gljax --all-targets --locked -- -D warnings
+
+      # ⭐ The point of the whole workflow. `--nocapture` so the SKIP lines are
+      # visible in the log, and the guard below turns a silent skip into a
+      # failure — a green run that skipped the plugin tests would be worse than
+      # no run at all, because it would look like coverage.
+      - name: Run gljax tests against the plugin
+        env:
+          # PJRT_PLUGIN_CPU comes from $GITHUB_ENV, set in the verify step.
+          RUST_LOG: gljax=debug
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --locked -- --nocapture 2>&1 | tee /tmp/gljax-test.log
+
+      # ⚠️ Only *plugin* skips are failures here. This job configures a plugin
+      # and deliberately does not download a model, so the checkpoint test
+      # skipping is correct behaviour — the `gate-a5` job below is what covers
+      # it. An earlier version grepped bare `^SKIP ` and failed on exactly that.
+      #
+      # The rule is "no test may skip for something this job supplied", and
+      # what this job supplies is the plugin.
+      - name: Fail if a PJRT plugin test skipped
+        run: |
+          set -euo pipefail
+          if grep -E '^SKIP .*(PJRT|plugin)' /tmp/gljax-test.log; then
+            echo "::error::A PJRT test skipped even though a plugin was configured."
+            echo "A SKIP is not a pass — these are the tests that exercise gljax::sys."
+            exit 1
+          fi
+          echo "No PJRT plugin test skipped."
+          # Everything else that skipped, for the record rather than as a gate.
+          if grep -E '^SKIP ' /tmp/gljax-test.log; then
+            echo "(the skips above need a model, which the gate-a5 job supplies)"
+          fi
+
+      # The offline verifier that found two emitter bugs on the dev machine
+      # (`array<i64: >` and `dense<1e-6>`). It needs no plugin and is fast, so
+      # it runs here too — a parse failure is a much clearer signal than the
+      # compile error PJRT would report for the same module.
+      - name: Set up Python for the MLIR verifier
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify emitted StableHLO parses
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet "jax[cpu]"
+          python gljax/tools/verify_mlir.py
+
+      # ── Gate A5 — coherence on a real model ───────────────────────────────
+      #
+      # Everything above proves the plumbing. This proves the model: real
+      # weights, a real tokenizer, and output a human can read.
+      #
+      # It runs in a separate job so a plumbing failure and a coherence
+      # failure are distinguishable at a glance, and so the ~1 GB model
+      # download only happens when the plumbing already passed.
+      - name: Upload the test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gljax-test-log
+          path: /tmp/gljax-test.log
+          if-no-files-found: warn
+
+  gate-a5:
+    name: Gate A5 — coherence on Qwen2-0.5B
+    runs-on: ubuntu-latest
+    needs: pjrt-cpu
+    # Generous but bounded: the 128-token run is the long pole at ~9-37 min
+    # depending on how the runner's FLOP/s land, plus one XLA compile per
+    # bucket. If this trips, read the tok/s table before raising it — a
+    # timeout here usually means throughput moved, not that the limit is wrong.
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-gljax-a5-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-gljax-a5-
+
+      - name: Cache the PJRT plugin
+        id: pjrt-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/pjrt
+          key: pjrt-cpu-${{ env.PJRT_ARTIFACTS_TAG }}-${{ env.PJRT_ASSET_SHA256 }}
+
+      - name: Download and verify the PJRT CPU plugin
+        if: steps.pjrt-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/pjrt
+          url="https://github.com/zml/pjrt-artifacts/releases/download/${PJRT_ARTIFACTS_TAG}/${PJRT_ASSET}"
+          curl -sSfL -o /tmp/pjrt.tar.gz "$url"
+          echo "${PJRT_ASSET_SHA256}  /tmp/pjrt.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/pjrt.tar.gz -C ~/pjrt
+          test -f "$HOME/pjrt/${PJRT_SO_NAME}"
+
+      - name: Cache Qwen2-0.5B
+        id: qwen2-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.QWEN2_DIR }}
+          key: qwen2-0.5b-${{ env.QWEN2_REVISION }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # `revision` is pinned, so the cache key is exact and this runs once.
+      # Only the four files gljax reads — the repo also carries vocab.json and
+      # merges.txt, which `tokenizer.json` already subsumes.
+      - name: Download Qwen2-0.5B
+        if: steps.qwen2-cache.outputs.cache-hit != 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet huggingface_hub
+          python - <<'PY'
+          import os
+          from huggingface_hub import snapshot_download
+          path = snapshot_download(
+              repo_id=os.environ["QWEN2_REPO"],
+              revision=os.environ["QWEN2_REVISION"],
+              local_dir=os.environ["QWEN2_DIR"],
+              allow_patterns=["config.json", "tokenizer.json",
+                              "tokenizer_config.json", "model.safetensors"],
+              token=os.environ.get("HF_TOKEN") or None,
+          )
+          print("downloaded to", path)
+          PY
+          ls -la "$QWEN2_DIR"
+
+      # Metadata first — seconds, and it is where the cheap-to-get-wrong things
+      # live: rope_theta, the EOS id, whether added_tokens made it into the
+      # vocabulary. Failing here beats failing after a multi-minute XLA compile.
+      - name: Check checkpoint metadata
+        env:
+          QWEN2_META_DIR: ${{ env.QWEN2_DIR }}
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --locked --lib runtime::hf -- --nocapture \
+            2>&1 | tee /tmp/hf-meta.log
+          if grep -q '^SKIP real_qwen2_metadata' /tmp/hf-meta.log; then
+            echo "::error::the metadata test skipped despite QWEN2_META_DIR being set"
+            exit 1
+          fi
+
+      # ⭐⭐ ARTX05's headline risk, checked for real: a KV cache reading one
+      # position off produces fluent, wrong text with no error anywhere, and
+      # Gate A5's coherence check below would very likely still pass on
+      # exactly that bug — it checks the output is real, on-topic language,
+      # not that it matches a known-good run. This is the one check that
+      # catches an off-by-one cache read: token-for-token diff against the
+      # unchanged recomputation oracle. Runs before Gate A5's long sweep so a
+      # plumbing failure here is cheap to see.
+      - name: Run KV cache parity test
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo test -p gljax --release --locked --test wave_a5_kv_cache -- --nocapture \
+            2>&1 | tee /tmp/kv-cache-parity.log
+          if grep -q '^SKIP cached_decode_matches' /tmp/kv-cache-parity.log; then
+            echo "::error::the KV cache parity test skipped despite plugin and model being configured"
+            exit 1
+          fi
+
+      - name: Upload the KV cache parity log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-cache-parity-log
+          path: /tmp/kv-cache-parity.log
+          if-no-files-found: warn
+
+      # ⚠️ Correctness only tells half the story — this measures the other
+      # half: CachedSession's actual tok/s, compared against Session's
+      # already-measured (not re-run — see bench_kv_cache.rs's module docs on
+      # why) numbers from this same workflow. Runs before Gate A5's long sweep
+      # since it should be fast (decode is meant to be O(1) per token).
+      - name: Run KV cache throughput benchmark
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo run -p gljax --release --locked --example bench_kv_cache \
+            2>&1 | tee /tmp/kv-cache-bench.log
+
+      - name: Fail if the KV cache benchmark skipped
+        run: |
+          set -euo pipefail
+          if grep -q '^SKIP bench_kv_cache' /tmp/kv-cache-bench.log; then
+            echo "::error::the KV cache throughput benchmark skipped despite plugin and model being configured"
+            exit 1
+          fi
+
+      - name: Upload the KV cache benchmark log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kv-cache-bench-log
+          path: /tmp/kv-cache-bench.log
+          if-no-files-found: warn
+
+      # ⭐ The gate. `--release` is not optional: a debug build of an XLA
+      # client is fast enough to compile and far too slow to generate.
+      - name: Run Gate A5
+        env:
+          PJRT_PLUGIN_CPU: /home/runner/pjrt/libpjrt_cpu.so
+          QWEN2_HF_DIR: ${{ env.QWEN2_DIR }}
+          # A workflow_dispatch input wins; otherwise the workflow default.
+          GATE_A5_LENGTHS: ${{ inputs.gate_a5_lengths || env.GATE_A5_LENGTHS }}
+          RUST_LOG: info
+        run: |
+          set -euo pipefail
+          cargo run -p gljax --release --locked --example gate_a5 \
+            2>&1 | tee /tmp/gate-a5.log
+
+      # `gate_a5` prints SKIP and exits 0 when its inputs are missing, which is
+      # right for a local run and wrong here — CI configured both.
+      - name: Fail if Gate A5 skipped
+        run: |
+          set -euo pipefail
+          if grep -q '^SKIP gate_a5' /tmp/gate-a5.log; then
+            echo "::error::Gate A5 skipped despite plugin and model being configured."
+            grep '^SKIP gate_a5' /tmp/gate-a5.log
+            exit 1
+          fi
+          grep -q 'Gate A5: PASSED' /tmp/gate-a5.log
+
+      - name: Upload the Gate A5 log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-a5-log
+          path: /tmp/gate-a5.log
+          if-no-files-found: warn

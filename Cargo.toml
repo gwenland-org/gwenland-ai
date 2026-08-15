@@ -7,6 +7,8 @@ members = [
     "glmetal",
     "glbench",
     "glcli",
+    "gljax",
+    "glserve",
     "glictus-caliburni",
     "packages/core",
     "packages/mcp",

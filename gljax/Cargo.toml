@@ -1,0 +1,35 @@
+[package]
+name = "gljax"
+version = "0.2.0"
+edition = "2021"
+description = "GwenLand AI gljax: pure-Rust XLA/PJRT client — StableHLO emission, zero kernels"
+license-file = "../LICENSE"
+
+[dependencies]
+glcore = { path = "../glcore" }
+# The PJRT plugin is loaded at runtime, never linked; libloading is the
+# portable `dlopen`/`LoadLibrary`. ARTX01 §5.4 writes this as `=0.8.5`, but
+# that exact pin is now a superseded patch of a crate whose whole job is
+# loading foreign code — the 0.8 line is tracked instead. The pin ARTX01
+# actually argues for is on the *plugin binary*, not on this.
+libloading = "0.8"
+log = "0.4"
+# ARTX14 Wave A14.1's sampler chain needs a seedable, reproducible PRNG for
+# top-p/min-p/typical sampling (a generation's seed must be replayable, per
+# the chain's own "order is DATA... serialized into telemetry so a generation
+# can be explained and reproduced" design decision). Hand-rolling a PRNG for
+# this is more dangerous than depending on one — `packages/core` already
+# depends on the same "0.8" line, so this does not add a second major version
+# to the workspace's dependency tree.
+rand = { version = "0.8", features = ["small_rng"] }
+# ARTX15 SS1.4's decision, taken as-is: LLGuidance is a cargo dependency (pure
+# Rust, unlike XGrammar's C++ FFI surface) computing grammar masks in ~50us/
+# token for a 128k-token vocabulary, with negligible per-schema startup cost.
+# Default features (lark, rayon, referencing, ahash) are used as-is rather
+# than pared down — `jsonschema_validation` (the one heavy, ~2.5M-binary
+# feature) is NOT a default and is not enabled here.
+llguidance = "1.7"
+serde_json = "1"
+
+[dev-dependencies]
+# none — Wave A1 tests need no fixtures
