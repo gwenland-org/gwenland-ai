@@ -14,7 +14,8 @@ use glcuda::model::{
 use glcuda::sampler::{Sampler, SamplerConfig};
 
 use glproc::model::{
-    GateUp, GlprocModel, LayerWeights, ModelConfig, QkvWeights, RopeStyle as CpuRopeStyle,
+    FfnLayer, GateUp, GlprocModel, LayerWeights, ModelConfig, QkvWeights,
+    RopeStyle as CpuRopeStyle,
     WeightMatrix,
 };
 use glproc::runner::Runner;
@@ -102,11 +103,15 @@ fn cpu_model() -> GlprocModel {
                 q_norm: Some(gain(HEAD_DIM, s[10])),
                 k_norm: Some(gain(HEAD_DIM, s[11])),
                 ffn_norm: gain(DIM, s[12] + 1000),
-                gate_up: GateUp::Split(
-                    WeightMatrix::F32(weights(HIDDEN * DIM, s[4])),
-                    WeightMatrix::F32(weights(HIDDEN * DIM, s[5])),
-                ),
-                w_down: WeightMatrix::F32(weights(DIM * HIDDEN, s[6])),
+                // `gate_up`/`w_down` moved into `FfnLayer::Dense` when the FFN
+                // grew its routed-MoE variant; this exercise model is dense.
+                ffn: FfnLayer::Dense {
+                    gate_up: GateUp::Split(
+                        WeightMatrix::F32(weights(HIDDEN * DIM, s[4])),
+                        WeightMatrix::F32(weights(HIDDEN * DIM, s[5])),
+                    ),
+                    w_down: WeightMatrix::F32(weights(DIM * HIDDEN, s[6])),
+                },
             }
         })
         .collect();
