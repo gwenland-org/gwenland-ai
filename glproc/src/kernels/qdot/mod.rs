@@ -261,6 +261,13 @@ unsafe fn quantize_avx2(
 }
 
 /// Horizontal sum of 8 i32 lanes in a `__m256i`.
+///
+/// # Safety
+/// Requires AVX2. Takes and returns values already in registers — it
+/// dereferences no pointer and touches no caller memory — so having the ISA
+/// is the entire obligation. Every caller is inside this module's
+/// `#[target_feature(enable = "avx2")]` kernels, which are themselves reached
+/// only through the `SimdStrategy` dispatch that proves the feature.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
