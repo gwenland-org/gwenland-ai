@@ -37,7 +37,7 @@ use crate::error::GwenError;
 ///
 /// * `data`   — Flat weight data produced by dequantisation. Consumed by this call.
 /// * `shape`  — Target tensor shape. The product of all dimensions must equal
-///              `data.len()`.
+///   `data.len()`.
 /// * `device` — Target device. On `Device::Cpu` no data copy occurs.
 ///
 /// # Errors

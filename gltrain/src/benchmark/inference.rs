@@ -48,8 +48,9 @@ struct ChatMessage<'a> {
 struct ChatChunk {
     #[serde(default)]
     message: Option<ChunkMessage>,
-    #[serde(default)]
-    done: bool,
+    // The upstream terminator field `done` was deserialized here and never
+    // read — the loop ends on the stream closing, not on the flag. Serde
+    // ignores the key when the server still sends it.
 }
 
 #[derive(serde::Deserialize)]

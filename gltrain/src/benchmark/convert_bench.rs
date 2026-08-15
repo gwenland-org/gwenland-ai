@@ -13,6 +13,7 @@
 ///      bit-unpacking cost.
 ///   2. Q8_0 is the most common dtype in recently published models (Qwen3,
 ///      Llama 3.2) after the default Q4_K_M.
+///
 /// A Q4_0 benchmark can be added later if nibble-unpacking becomes a hotspot.
 ///
 /// Why 1000 iterations?

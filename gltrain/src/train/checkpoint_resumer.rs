@@ -25,7 +25,7 @@ use crate::train::config::ResumeMode;
 ///
 /// - `None`     → `(None, 0)` — fresh start, no discovery.
 /// - `Auto`     → newest `checkpoint_*.safetensors` in `output_path`
-///                (lexicographic max). Missing dir / empty dir → warn, `(None, 0)`.
+///   (lexicographic max). Missing dir / empty dir → warn, `(None, 0)`.
 /// - `Explicit` → the given path if it exists, else `bail!`.
 pub fn resolve_checkpoint(
     mode: &ResumeMode,

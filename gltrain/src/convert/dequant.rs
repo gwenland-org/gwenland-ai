@@ -295,59 +295,59 @@ fn dequant_q4_0_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 
 // ── Euler block kernel ────────────────────────────────────────────────────────
 
-/// Euler cosine projection for a single quantisation block.
-///
-/// # Mathematical derivation
-///
-/// ## Why cosine projection?
-/// Linear dequant (W = X*scale) maps integers uniformly to an arbitrary real
-/// range determined by the scale. GwenTensor inference is designed around
-/// weight values in [-0.618, 0.618] — the inverse Golden Ratio bounds — because
-/// these values align with the fixed-point arithmetic of the GwenTensor kernel.
-/// Feeding linearly-dequanted weights directly into GwenTensor causes overflow
-/// in the accumulator for large models where |scale| >> 0.618.
-///
-/// Cosine projection solves this by projecting integer indices onto the first
-/// quarter of the unit circle, which is naturally bounded by [-1, 1] and
-/// further scaled by δ_b/φ to fit within [-0.618, 0.618].
-///
-/// ## Formula
-///   θ_i = (X_quant[i] × π) / max_bound
-///   W[i] = cos(θ_i) × δ_b / φ
-///
-/// ## Variable meanings
-///   X_quant[i]  — the integer quantised value (e.g. i8 ∈ [-128, 127] for Q8_0)
-///   max_bound   — absolute maximum of all quantised integers in this block.
-///                 Normalises the angle so θ ∈ [-π, +π] regardless of dtype.
-///                 Using the per-block max rather than the theoretical dtype max
-///                 (128 for Q8_0, 8 for Q4_0) preserves relative inter-block
-///                 magnitude differences — the block with the largest activations
-///                 uses the full [-π,+π] range, smaller blocks are compressed.
-///   δ_b         — the GGUF block scale factor (the f16 stored at block head).
-///                 Represents the linear reconstruction scale for this block;
-///                 we reuse it as an amplitude modulator so Euler mode inherits
-///                 the per-block magnitude information encoded in the GGUF file.
-///   φ = 1.618…  — Golden Ratio, 1/φ ≈ 0.618. Scales the cosine output from
-///                 [-1, +1] to [-0.618, +0.618], the GwenTensor sweet spot.
-///                 The "sweet spot" [-0.309, 0.309] = [-0.5/φ, 0.5/φ] is the
-///                 range where cos(θ) contributes maximally to dot-product
-///                 accumulation precision in the GwenTensor fixed-point kernel.
-///
-/// ## Why cosine instead of sigmoid/tanh?
-///   - Cosine is an odd function around 0: cos(0)=1 means zero quantised values
-///     produce the maximum per-block scale, which matches the common case of
-///     sparse quantised activations centred near zero.
-///   - Unlike sigmoid/tanh, cosine projection preserves the sign of the
-///     original block structure through the amplitude term δ_b (which carries
-///     the GGUF sign).
-///   - The period of π ensures the output range [-1,1] is exactly covered for
-///     any max_bound normalisation.
-///
-/// ## Fallback (max_bound == 0)
-/// If all quantised values in a block are zero (a common outcome for pruned
-/// attention heads), max_bound = 0 and the division would be undefined. In that
-/// case we output 0.0 for every element — the block carries no information and
-/// its GwenTensor reconstruction is identically zero regardless of mode.
+// Euler cosine projection for a single quantisation block.
+//
+// # Mathematical derivation
+//
+// ## Why cosine projection?
+// Linear dequant (W = X*scale) maps integers uniformly to an arbitrary real
+// range determined by the scale. GwenTensor inference is designed around
+// weight values in [-0.618, 0.618] — the inverse Golden Ratio bounds — because
+// these values align with the fixed-point arithmetic of the GwenTensor kernel.
+// Feeding linearly-dequanted weights directly into GwenTensor causes overflow
+// in the accumulator for large models where |scale| >> 0.618.
+//
+// Cosine projection solves this by projecting integer indices onto the first
+// quarter of the unit circle, which is naturally bounded by [-1, 1] and
+// further scaled by δ_b/φ to fit within [-0.618, 0.618].
+//
+// ## Formula
+//   θ_i = (X_quant[i] × π) / max_bound
+//   W[i] = cos(θ_i) × δ_b / φ
+//
+// ## Variable meanings
+//   X_quant[i]  — the integer quantised value (e.g. i8 ∈ [-128, 127] for Q8_0)
+//   max_bound   — absolute maximum of all quantised integers in this block.
+//                 Normalises the angle so θ ∈ [-π, +π] regardless of dtype.
+//                 Using the per-block max rather than the theoretical dtype max
+//                 (128 for Q8_0, 8 for Q4_0) preserves relative inter-block
+//                 magnitude differences — the block with the largest activations
+//                 uses the full [-π,+π] range, smaller blocks are compressed.
+//   δ_b         — the GGUF block scale factor (the f16 stored at block head).
+//                 Represents the linear reconstruction scale for this block;
+//                 we reuse it as an amplitude modulator so Euler mode inherits
+//                 the per-block magnitude information encoded in the GGUF file.
+//   φ = 1.618…  — Golden Ratio, 1/φ ≈ 0.618. Scales the cosine output from
+//                 [-1, +1] to [-0.618, +0.618], the GwenTensor sweet spot.
+//                 The "sweet spot" [-0.309, 0.309] = [-0.5/φ, 0.5/φ] is the
+//                 range where cos(θ) contributes maximally to dot-product
+//                 accumulation precision in the GwenTensor fixed-point kernel.
+//
+// ## Why cosine instead of sigmoid/tanh?
+//   - Cosine is an odd function around 0: cos(0)=1 means zero quantised values
+//     produce the maximum per-block scale, which matches the common case of
+//     sparse quantised activations centred near zero.
+//   - Unlike sigmoid/tanh, cosine projection preserves the sign of the
+//     original block structure through the amplitude term δ_b (which carries
+//     the GGUF sign).
+//   - The period of π ensures the output range [-1,1] is exactly covered for
+//     any max_bound normalisation.
+//
+// ## Fallback (max_bound == 0)
+// If all quantised values in a block are zero (a common outcome for pruned
+// attention heads), max_bound = 0 and the division would be undefined. In that
+// case we output 0.0 for every element — the block carries no information and
+// its GwenTensor reconstruction is identically zero regardless of mode.
 // ── Q2_K — Standard ───────────────────────────────────────────────────────────
 
 /// Q2_K standard linear dequantisation.
@@ -476,11 +476,11 @@ fn dequant_q2_k_euler(raw: &[u8], n_elements: usize) -> Result<Vec<f32>, String>
 fn extract_q3k_scales(scales: &[u8]) -> [u8; 16] {
     debug_assert!(scales.len() >= 12);
     let mut out = [0u8; 16];
-    for j in 0..16usize {
+    for (j, slot) in out.iter_mut().enumerate() {
         let bit_pos    = j * 6;
         let byte_index = bit_pos / 8;
         let bit_offset = bit_pos % 8;
-        out[j] = if bit_offset <= 2 {
+        *slot = if bit_offset <= 2 {
             (scales[byte_index] >> bit_offset) & 0x3F
         } else {
             let lo = scales[byte_index] as u16 >> bit_offset;

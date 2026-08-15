@@ -62,13 +62,9 @@ mod tests {
     fn test_memory_guard_check_mock() {
         // Simulate a system where 95 GB of 100 GB is used → 95 % used.
         // With a 90 % threshold the guard must fire.
-        struct MockSys {
-            used: u64,
-            total: u64,
-        }
-
         // We can't construct a real sysinfo::System with synthetic values,
         // so test the arithmetic directly using the same formula as check().
+        // (A `MockSys` struct used to be declared here and never constructed.)
         let used_gb = 95_u64 * 1_073_741_824;
         let total_gb = 100_u64 * 1_073_741_824;
         let pct = (used_gb as f64 / total_gb as f64 * 100.0) as u8;

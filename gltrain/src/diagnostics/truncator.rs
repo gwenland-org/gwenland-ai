@@ -94,7 +94,7 @@ pub fn truncate_to_budget(
     match config.strategy {
         TruncateStrategy::DropLargest => {
             // Sort by token count descending
-            files_with_tokens.sort_by(|a, b| b.tokens.cmp(&a.tokens));
+            files_with_tokens.sort_by_key(|f| std::cmp::Reverse(f.tokens));
             
             let mut kept_files = Vec::new();
             for item in files_with_tokens {

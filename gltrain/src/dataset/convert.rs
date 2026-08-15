@@ -9,8 +9,13 @@ pub enum OutputFormat {
     Alpaca,
 }
 
-impl OutputFormat {
-    pub fn from_str(s: &str) -> Result<Self, String> {
+impl std::str::FromStr for OutputFormat {
+    /// A human-readable reason, surfaced straight to the CLI user — the only
+    /// caller is `--format` parsing, which has nothing to react to
+    /// programmatically.
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.to_lowercase().as_str() {
             "gwenstyle" | "gwen" => Ok(OutputFormat::GwenStyle),
             "chatml" => Ok(OutputFormat::ChatML),

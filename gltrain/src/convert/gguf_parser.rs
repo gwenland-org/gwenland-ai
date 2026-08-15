@@ -36,6 +36,10 @@ const GGML_QK: usize = 32;
 /// Only the dtypes we know how to dequantise are listed. Any unknown dtype
 /// encountered in a real file causes a descriptive error so the user can
 /// open a bug report rather than silently producing corrupt output.
+// GGUF quantization type names mirror the spec and glproc
+// kernels verbatim. Renaming breaks correspondence with the
+// format spec and neighboring crates.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgufDtype {
     /// 32-bit float — no dequantisation needed, direct copy.

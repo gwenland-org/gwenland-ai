@@ -229,10 +229,7 @@ pub async fn stream_chat(
 
         byte_buf.extend_from_slice(&bytes);
 
-        loop {
-            let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') else {
-                break;
-            };
+        while let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') {
             let line_bytes = byte_buf[..nl].to_vec();
             byte_buf.drain(..=nl);
 
@@ -341,10 +338,7 @@ pub async fn stream_chat_json(
                 };
                 byte_buf.extend_from_slice(&bytes);
 
-                loop {
-                    let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') else {
-                        break;
-                    };
+                while let Some(nl) = byte_buf.iter().position(|&b| b == b'\n') {
                     let line_bytes = byte_buf[..nl].to_vec();
                     byte_buf.drain(..=nl);
 

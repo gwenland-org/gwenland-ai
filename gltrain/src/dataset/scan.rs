@@ -205,9 +205,25 @@ impl CheckKind {
         ]
     }
 
-    // @INFO: Parses a user-supplied string (from --check flag) into a CheckKind.
-    // @EDITABLE: Yes, if CheckKind gains new variants.
-    pub fn from_str(s: &str) -> Result<Self, String> {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            CheckKind::Safety    => "safety",
+            CheckKind::Pii       => "pii",
+            CheckKind::Injection => "injection",
+            CheckKind::Bias      => "bias",
+            CheckKind::Balance   => "balance",
+        }
+    }
+}
+
+// @INFO: Parses a user-supplied string (from --check flag) into a CheckKind.
+// @EDITABLE: Yes, if CheckKind gains new variants.
+impl std::str::FromStr for CheckKind {
+    /// A human-readable reason listing the valid checks — this is shown to
+    /// whoever mistyped `--check`, and no caller branches on it.
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
         match s.trim().to_lowercase().as_str() {
             "safety"    => Ok(CheckKind::Safety),
             "pii"       => Ok(CheckKind::Pii),
@@ -218,16 +234,6 @@ impl CheckKind {
                 "unknown check '{}'; valid: safety, pii, injection, bias, balance",
                 other
             )),
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            CheckKind::Safety    => "safety",
-            CheckKind::Pii       => "pii",
-            CheckKind::Injection => "injection",
-            CheckKind::Bias      => "bias",
-            CheckKind::Balance   => "balance",
         }
     }
 }

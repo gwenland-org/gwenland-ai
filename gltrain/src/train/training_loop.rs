@@ -346,10 +346,9 @@ impl TrainingLoop {
 
             // input  = ids[0 .. usable-1]
             // target = ids[1 .. usable]
-            for j in 0..(usable - 1) {
-                input_ids [row_offset + j] = ids[j];
-                target_ids[row_offset + j] = ids[j + 1];
-            }
+            let span = usable - 1;
+            input_ids[row_offset..row_offset + span].copy_from_slice(&ids[..span]);
+            target_ids[row_offset..row_offset + span].copy_from_slice(&ids[1..=span]);
         }
 
         let input = Tensor::from_vec(

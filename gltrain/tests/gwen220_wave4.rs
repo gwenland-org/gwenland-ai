@@ -1,8 +1,9 @@
 //! GWEN-220 Wave 4 — real-attention loss-trend validation on a real GGUF.
 //!
-//! Wave 4 asks that, with the mean-pool surrogate replaced by a real attention
-//! + MLP forward, the training loss is a *faithful proxy* — it must behave like
-//! a real language-model loss on real data, not collapse or diverge.
+//! Wave 4 asks that, with the mean-pool surrogate replaced by a real
+//! attention-plus-MLP forward, the training loss is a *faithful proxy* — it
+//! must behave like a real language-model loss on real data, not collapse or
+//! diverge.
 //!
 //! IMPORTANT — why this test trains on the real dataset, not a synthetic one:
 //! an earlier draft fed a *single repeated token sequence* as a fast overfit

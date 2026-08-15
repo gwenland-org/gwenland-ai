@@ -1305,9 +1305,9 @@ fn column_energy_entropy(w: &[f32], d_out: usize, d_in: usize) -> f32 {
     }
     let mut energy = vec![0.0f64; d_in];
     for row in 0..d_out {
-        for c in 0..d_in {
+        for (c, e) in energy.iter_mut().enumerate() {
             let v = w.get(row * d_in + c).copied().unwrap_or(0.0) as f64;
-            energy[c] += v * v;
+            *e += v * v;
         }
     }
     let total: f64 = energy.iter().sum();

@@ -67,6 +67,7 @@ impl LayerIndex {
     /// Handles both naming conventions used in real GGUF files:
     ///   - `model.layers.{N}.*`  — HuggingFace-style exports
     ///   - `blk.{N}.*`           — llama.cpp-style (Qwen, Llama, Mistral, etc.)
+    ///
     /// All other tensors (embeddings, norms, lm_head, …) are silently skipped.
     pub fn scan(file: &GgufFile) -> Self {
         Self::scan_tensors(&file.tensors, file.data_base)

@@ -104,70 +104,55 @@ impl ModelRegistry {
 
         let mut models = Vec::new();
 
-        if models_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&models_dir) {
-                for entry_result in entries {
-                    if let Ok(entry) = entry_result {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            let metadata_path = path.join("metadata.json");
-                            if metadata_path.exists() {
-                                if let Ok(content) = std::fs::read_to_string(&metadata_path) {
-                                    if let Ok(metadata) =
-                                        serde_json::from_str::<serde_json::Value>(&content)
-                                    {
-                                        let id = path
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .to_string();
-
-                                        if id.starts_with('.') {
-                                            continue;
-                                        }
-
-                                        let source = metadata["source"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let format = metadata["format"]
-                                            .as_str()
-                                            .unwrap_or("gguf")
-                                            .to_string();
-                                        let quant = metadata["quant"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let size_bytes = metadata["size_bytes"]
-                                            .as_u64()
-                                            .or_else(|| metadata["size"].as_u64())
-                                            .unwrap_or(0);
-                                        let downloaded_at = metadata["downloaded_at"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let sha256 = metadata["sha256"]
-                                            .as_str()
-                                            .unwrap_or("")
-                                            .to_string();
-                                        let model_gguf_path = path.join("model.gguf");
-
-                                        models.push(ModelEntry {
-                                            id,
-                                            source,
-                                            format,
-                                            quant,
-                                            size_bytes,
-                                            downloaded_at,
-                                            sha256,
-                                            path: model_gguf_path,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
+        // Guard clauses rather than the eight levels of nesting this used to
+        // be: every `continue` below is "this directory entry is not a model,
+        // skip it", which was previously spelled as an ever-deeper `if`.
+        if let Ok(entries) = std::fs::read_dir(&models_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
                 }
+
+                let metadata_path = path.join("metadata.json");
+                let Ok(content) = std::fs::read_to_string(&metadata_path) else {
+                    continue; // no metadata.json, or unreadable
+                };
+                let Ok(metadata) = serde_json::from_str::<serde_json::Value>(&content) else {
+                    continue; // metadata.json is not valid JSON
+                };
+
+                let id = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+
+                if id.starts_with('.') {
+                    continue;
+                }
+
+                let source = metadata["source"].as_str().unwrap_or("").to_string();
+                let format = metadata["format"].as_str().unwrap_or("gguf").to_string();
+                let quant = metadata["quant"].as_str().unwrap_or("").to_string();
+                let size_bytes = metadata["size_bytes"]
+                    .as_u64()
+                    .or_else(|| metadata["size"].as_u64())
+                    .unwrap_or(0);
+                let downloaded_at = metadata["downloaded_at"].as_str().unwrap_or("").to_string();
+                let sha256 = metadata["sha256"].as_str().unwrap_or("").to_string();
+                let model_gguf_path = path.join("model.gguf");
+
+                models.push(ModelEntry {
+                    id,
+                    source,
+                    format,
+                    quant,
+                    size_bytes,
+                    downloaded_at,
+                    sha256,
+                    path: model_gguf_path,
+                });
             }
         }
 
