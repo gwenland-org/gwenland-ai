@@ -524,6 +524,7 @@ impl Default for LoraMerger {
 ///   - 8-byte LE u64: header JSON length
 ///   - JSON header: `{"{layer}.lora_a": {dtype, shape, data_offsets}, ...}`
 ///   - Contiguous F32 data blobs
+///
 /// @DANGER Tensor offsets in the JSON are relative to the start of the data
 /// blob (i.e., immediately after the header bytes), not to the file start.
 fn load_adapter_safetensors(

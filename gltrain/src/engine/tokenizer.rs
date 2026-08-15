@@ -147,15 +147,16 @@ pub fn detect_budget_from_model(model_name: &str) -> ModelBudget {
         ModelBudget::Small
     } else if lower.contains("13b") || lower.contains("14b") || lower.contains("32b") {
         ModelBudget::Medium
-    } else if lower.contains("70b")
-        || lower.contains("72b")
-        || lower.contains("llama3")
-        || lower.contains("mistral")
-        || lower.contains("qwen")
-    {
-        ModelBudget::Large
     } else {
-        ModelBudget::Large // @EDITABLE
+        // Everything else is Large. That deliberately covers two cases that
+        // used to be written as separate arms returning the same value (which
+        // is what `clippy::if_same_then_else` flagged): the known-large
+        // families -- 70b, 72b, llama3, mistral, qwen -- and any name this
+        // function does not recognise, which defaults to the widest budget
+        // rather than under-provisioning an unknown model.
+        // @EDITABLE: give the unrecognised case its own budget here if the
+        // default should stop being Large.
+        ModelBudget::Large
     }
 }
 

@@ -30,6 +30,12 @@ pub struct ConversationHistory {
     pub path: PathBuf,
 }
 
+impl Default for ConversationHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConversationHistory {
     /// Resolve the default `~/.gwenland/history.jsonl` path.
     pub fn new() -> Self {

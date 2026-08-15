@@ -256,8 +256,6 @@ pub fn generate_collect(
     prompt: &str,
     params: &InferParams,
 ) -> Result<String, GwenError> {
-    use futures_util::StreamExt;
-
     // Drive the async stream to completion on the current Tokio runtime.
     // `stream!` from async-stream produces a regular async generator; we
     // collect it with a blocking handle so `infer` can remain synchronous.

@@ -143,8 +143,9 @@ fn find_function_boundary(
             let ceiling = (target + max_scan).min(lines.len().saturating_sub(1));
             let mut open: i32 = 0;
             let mut close: i32 = 0;
-            for i in target..=ceiling {
-                for ch in lines[i].chars() {
+            for (offset, line) in lines[target..=ceiling].iter().enumerate() {
+                let i = target + offset;
+                for ch in line.chars() {
                     match ch {
                         '{' => open += 1,
                         '}' => close += 1,

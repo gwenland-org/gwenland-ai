@@ -8,7 +8,7 @@
 use crate::convert::gguf_parser::{self, MetadataValue};
 use crate::storage::paths::{GwenPaths, gwen_config_dir};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 // ── check result types ────────────────────────────────────────────────────────
@@ -307,7 +307,7 @@ fn check_gwenland_root() -> Vec<CheckResult> {
         .collect()
 }
 
-fn check_dir_writable(name: &str, dir: &PathBuf) -> CheckResult {
+fn check_dir_writable(name: &str, dir: &Path) -> CheckResult {
     if !dir.is_dir() {
         return CheckResult {
             name: name.into(),

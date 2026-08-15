@@ -475,10 +475,10 @@ pub fn resolve_imports(
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_lowercase());
         
-    let is_known = match extension.as_deref() {
-        Some("rs") | Some("ts") | Some("tsx") | Some("js") | Some("mjs") | Some("jsx") | Some("py") => true,
-        _ => false,
-    };
+    let is_known = matches!(
+        extension.as_deref(),
+        Some("rs" | "ts" | "tsx" | "js" | "mjs" | "jsx" | "py")
+    );
     
     if !is_known {
         // Unknown extension: return just the root file, no resolution

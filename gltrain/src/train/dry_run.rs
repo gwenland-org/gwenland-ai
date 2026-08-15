@@ -133,9 +133,9 @@ impl HfModelConfig {
     ///
     /// Priority:
     /// 1. `num_parameters` if the config supplies it directly.
-    /// 2. Classic transformer formula: `12 × d_model² × num_layers` (attention
-    ///    + FFN, no embedding table, approximate but within ~5% for standard
-    ///    architectures).
+    /// 2. Classic transformer formula: `12 × d_model² × num_layers`
+    ///    (attention plus FFN, no embedding table; approximate but within ~5%
+    ///    for standard architectures).
     fn total_params(&self) -> Option<usize> {
         if let Some(n) = self.num_parameters {
             return Some(n);
@@ -211,7 +211,9 @@ pub fn run(config: &TrainConfig) -> Result<DryRunResult> {
             char_lengths.iter().sum::<usize>() / char_lengths.len()
         };
         // Divide by 4 (BPE approximation), clamp to DEFAULT_MAX_LEN.
-        (avg_chars / 4).max(1).min(DEFAULT_MAX_LEN)
+        // `clamp` panics if max < min; DEFAULT_MAX_LEN is a positive constant
+        // so the 1..=DEFAULT_MAX_LEN range can never invert.
+        (avg_chars / 4).clamp(1, DEFAULT_MAX_LEN)
     };
     let total_tokens = dataset_samples * avg_token_length * config.epochs as usize;
 

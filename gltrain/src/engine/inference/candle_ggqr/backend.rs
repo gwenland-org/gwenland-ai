@@ -205,7 +205,12 @@ impl GgqrCandleBackend {
     /// Borrow the loaded tensors map.
     ///
     /// Returns `GwenError::InferenceBackend` if no model is loaded.
-    pub fn with_state<F, R>(&self, f: F) -> Result<R, GwenError>
+    ///
+    /// Not `pub`: it takes a closure over the private `LoadedState`, so no
+    /// caller outside this module could name the argument type anyway — which
+    /// is exactly what `private_interfaces` was pointing at. Every caller is
+    /// in this file.
+    fn with_state<F, R>(&self, f: F) -> Result<R, GwenError>
     where
         F: FnOnce(&LoadedState) -> Result<R, GwenError>,
     {

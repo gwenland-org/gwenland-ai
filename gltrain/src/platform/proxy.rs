@@ -34,8 +34,9 @@ const HEALTH_ENDPOINT: &str = "/health";
 struct IncomingChatRequest {
     model: String,
     messages: Vec<IncomingMessage>,
-    #[serde(default)]
-    stream: bool,
+    // `stream` used to be deserialized here and never read — this endpoint
+    // always streams (see the SSE response below). Serde ignores the key when
+    // a client still sends it, so the wire contract is unchanged.
     // Sampling overrides from the request body (optional).
     #[serde(default)]
     temperature: Option<f32>,

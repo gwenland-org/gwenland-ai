@@ -79,27 +79,48 @@ pub async fn run_train(
 ) -> Result<()> {
     run_train_with_opts(
         config,
-        dry_run,
-        verbose,
-        false,
-        custom_script,
-        false,
-        None,
-        ResumeMode::None,
+        TrainRunOpts { dry_run, verbose, custom_script, ..Default::default() },
     )
-        .await
+    .await
 }
 
-pub async fn run_train_with_opts(
-    config: &TrainConfig,
-    dry_run: bool,
-    verbose: bool,
-    json_output: bool,
-    custom_script: Option<&Path>,
-    gdtqp: bool,
-    max_steps: Option<usize>,
-    resume: ResumeMode,
-) -> Result<()> {
+/// How one training invocation should run — everything beyond the config
+/// itself.
+///
+/// These seven used to be positional parameters on `run_train_with_opts`,
+/// which is what tripped `clippy::too_many_arguments` (8/7). They are not an
+/// arbitrary bundle assembled to satisfy the lint: four are run-mode flags and
+/// three are per-invocation overrides, and the function's own name already
+/// promised an "opts" type that had never been written.
+#[derive(Debug, Clone, Default)]
+pub struct TrainRunOpts<'a> {
+    /// Print the plan and stop before training.
+    pub dry_run: bool,
+    /// Stream the child process's output.
+    pub verbose: bool,
+    /// Emit machine-readable progress instead of human text.
+    pub json_output: bool,
+    /// Use this script instead of the generated one.
+    pub custom_script: Option<&'a Path>,
+    /// Enable the experimental GDTQP LoRA-rank path (GWEN-219).
+    pub gdtqp: bool,
+    /// Stop after this many steps, overriding the config.
+    pub max_steps: Option<usize>,
+    /// Whether and from where to resume a checkpoint.
+    pub resume: ResumeMode,
+}
+
+pub async fn run_train_with_opts(config: &TrainConfig, opts: TrainRunOpts<'_>) -> Result<()> {
+    let TrainRunOpts {
+        dry_run,
+        verbose,
+        json_output,
+        custom_script,
+        gdtqp,
+        max_steps,
+        resume,
+    } = opts;
+
     // 1. Validate config fields
     config.validate()?;
 

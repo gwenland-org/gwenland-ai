@@ -200,8 +200,7 @@ pub async fn stream_chat(
         }
 
         // Drain all complete SSE lines from the buffer.
-        loop {
-            let Some(nl) = buf.find('\n') else { break };
+        while let Some(nl) = buf.find('\n') {
             let line = buf[..nl].trim_end_matches('\r').to_string();
             buf = buf[nl + 1..].to_string();
 

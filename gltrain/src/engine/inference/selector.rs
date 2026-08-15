@@ -23,7 +23,7 @@
 //
 // Requirements: 4.6, 4.7, 11.4, 11.5, 15.1–15.5, 21.2, 22.1
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::engine::inference::config::InferenceConfig;
 use crate::error::GwenError;
@@ -53,7 +53,7 @@ use crate::error::GwenError;
 pub fn select_backend(config: &InferenceConfig) -> Result<(&'static str, PathBuf), GwenError> {
     // ── 1. Require a non-empty model path ────────────────────────────────────
     let raw = config.model_path.to_string_lossy();
-    if raw.is_empty() || config.model_path == PathBuf::from("") {
+    if raw.is_empty() || config.model_path.as_os_str().is_empty() {
         return Err(GwenError::InferenceBackend(
             "no model_path set in InferenceConfig".to_string(),
         ));
@@ -101,56 +101,52 @@ pub fn select_backend(config: &InferenceConfig) -> Result<(&'static str, PathBuf
 ///
 /// Requirements: 11.4, 11.5, 21.2
 fn resolve_backend(requested: &str) -> Result<&'static str, GwenError> {
+    // `cfg!` rather than `#[cfg]` blocks: these are plain `&'static str`
+    // results that never touch the optional crates, so compiling every arm
+    // under every feature set costs nothing and means the whole function is
+    // type-checked in configurations this machine cannot link. The previous
+    // form needed a `return` inside each `#[cfg]` block to type-check, which
+    // is what `clippy::needless_return` was pointing at.
+    const HAS_MISTRALRS: bool = cfg!(feature = "mistralrs-backend");
+    const HAS_CANDLE: bool = cfg!(feature = "candle-backend");
+
     match requested {
         // ── Explicit mistralrs ────────────────────────────────────────────────
-        "mistralrs" => {
-            #[cfg(feature = "mistralrs-backend")]
-            { return Ok("mistralrs"); }
-            #[cfg(not(feature = "mistralrs-backend"))]
-            { return Err(GwenError::BackendNotAvailable { backend: "mistralrs".to_string() }); }
-        }
+        "mistralrs" if HAS_MISTRALRS => Ok("mistralrs"),
+        "mistralrs" => Err(GwenError::BackendNotAvailable {
+            backend: "mistralrs".to_string(),
+        }),
 
         // ── Explicit candle-ggqr (canonical) or "candle" (legacy alias) ───────
-        "candle-ggqr" | "candle" => {
-            #[cfg(feature = "candle-backend")]
-            { return Ok("candle-ggqr"); }
-            #[cfg(not(feature = "candle-backend"))]
-            { return Err(GwenError::BackendNotAvailable { backend: "candle-ggqr".to_string() }); }
-        }
+        "candle-ggqr" | "candle" if HAS_CANDLE => Ok("candle-ggqr"),
+        "candle-ggqr" | "candle" => Err(GwenError::BackendNotAvailable {
+            backend: "candle-ggqr".to_string(),
+        }),
 
         // ── Auto / unknown — pick the best available backend ──────────────────
         //
         // Priority: mistralrs > candle-ggqr > error.
         // Unknown names fall through to "auto" behaviour so future backend
         // names in config files don't hard-error on older builds.
-        _ => {
-            #[cfg(feature = "mistralrs-backend")]
-            { return Ok("mistralrs"); }
-
-            #[cfg(all(not(feature = "mistralrs-backend"), feature = "candle-backend"))]
-            { return Ok("candle-ggqr"); }
-
-            #[cfg(not(any(feature = "mistralrs-backend", feature = "candle-backend")))]
-            {
-                return Err(GwenError::ArchitectureNotSupported(
-                    "no inference backend is compiled in — rebuild with \
-                     --features candle-backend or --features mistralrs-backend"
-                        .to_string(),
-                ));
-            }
-        }
+        _ if HAS_MISTRALRS => Ok("mistralrs"),
+        _ if HAS_CANDLE => Ok("candle-ggqr"),
+        _ => Err(GwenError::ArchitectureNotSupported(
+            "no inference backend is compiled in — rebuild with \
+             --features candle-backend or --features mistralrs-backend"
+                .to_string(),
+        )),
     }
 }
 
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
-    if s.starts_with("~/") || s == "~" {
-        if let Some(home) = dirs::home_dir() {
-            let rest = s.strip_prefix("~/").unwrap_or("");
-            return home.join(rest);
-        }
+    if (s.starts_with("~/") || s == "~")
+        && let Some(home) = dirs::home_dir()
+    {
+        let rest = s.strip_prefix("~/").unwrap_or("");
+        return home.join(rest);
     }
-    path.clone()
+    path.to_path_buf()
 }
 
 #[cfg(test)]
@@ -160,22 +156,20 @@ mod tests {
     use std::path::PathBuf;
 
     fn cfg_with_path(p: &str) -> InferenceConfig {
-        let mut c = InferenceConfig::default();
-        c.model_path = PathBuf::from(p);
-        c
+        InferenceConfig { model_path: PathBuf::from(p), ..Default::default() }
     }
 
     fn cfg_with_path_and_backend(p: &str, backend: &str) -> InferenceConfig {
-        let mut c = cfg_with_path(p);
-        c.backend = backend.to_string();
-        c
+        InferenceConfig {
+            backend: backend.to_string(),
+            ..cfg_with_path(p)
+        }
     }
 
     // 1. no_path — empty model_path → InferenceBackend error
     #[test]
     fn no_path() {
-        let mut c = InferenceConfig::default();
-        c.model_path = PathBuf::from("");
+        let c = InferenceConfig { model_path: PathBuf::from(""), ..Default::default() };
         let err = select_backend(&c).unwrap_err();
         assert!(
             matches!(err, GwenError::InferenceBackend(_)),
