@@ -155,6 +155,11 @@ impl ThreadPool {
         // against a worker sitting between its last generation check and
         // the condvar wait — without it the wakeup could be lost.
         {
+            // INFALLIBLE: this mutex guards only the pool's own bookkeeping (generation counter,
+            // remaining count) and is never held across the user closure, which runs at
+            // line ~237 outside any guard. A poisoned lock therefore means a worker already
+            // panicked and the pool's invariants are gone — propagating it would relabel an
+            // already-fatal state, not recover from it (error-handling.md Rule 2).
             let _g = self.shared.lock.lock().unwrap();
             self.shared.work_cv.notify_all();
         }
@@ -170,8 +175,16 @@ impl ThreadPool {
                 std::hint::spin_loop();
                 spins += 1;
             } else {
+                // INFALLIBLE: this mutex guards only the pool's own bookkeeping (generation counter,
+                // remaining count) and is never held across the user closure, which runs at
+                // line ~237 outside any guard. A poisoned lock therefore means a worker already
+                // panicked and the pool's invariants are gone — propagating it would relabel an
+                // already-fatal state, not recover from it (error-handling.md Rule 2).
                 let mut g = self.shared.lock.lock().unwrap();
                 while self.shared.remaining.load(Ordering::Acquire) > 0 {
+                    // INFALLIBLE: `Condvar::wait` only returns `Err` when the mutex it re-acquires is
+                    // poisoned, which is the same already-panicked-worker state as the `lock()`
+                    // calls above — see their note.
                     g = self.shared.done_cv.wait(g).unwrap();
                 }
                 break;
@@ -184,6 +197,11 @@ impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
         {
+            // INFALLIBLE: this mutex guards only the pool's own bookkeeping (generation counter,
+            // remaining count) and is never held across the user closure, which runs at
+            // line ~237 outside any guard. A poisoned lock therefore means a worker already
+            // panicked and the pool's invariants are gone — propagating it would relabel an
+            // already-fatal state, not recover from it (error-handling.md Rule 2).
             let _g = self.shared.lock.lock().unwrap();
             self.shared.work_cv.notify_all();
         }
@@ -211,6 +229,11 @@ fn worker_loop(shared: Arc<PoolShared>, tid: usize) {
                 std::hint::spin_loop();
                 spins += 1;
             } else {
+                // INFALLIBLE: this mutex guards only the pool's own bookkeeping (generation counter,
+                // remaining count) and is never held across the user closure, which runs at
+                // line ~237 outside any guard. A poisoned lock therefore means a worker already
+                // panicked and the pool's invariants are gone — propagating it would relabel an
+                // already-fatal state, not recover from it (error-handling.md Rule 2).
                 let mut g = shared.lock.lock().unwrap();
                 loop {
                     if shared.shutdown.load(Ordering::Acquire) {
@@ -221,6 +244,9 @@ fn worker_loop(shared: Arc<PoolShared>, tid: usize) {
                         seen_generation = generation;
                         break;
                     }
+                    // INFALLIBLE: `Condvar::wait` only returns `Err` when the mutex it re-acquires is
+                    // poisoned, which is the same already-panicked-worker state as the `lock()`
+                    // calls above — see their note.
                     g = shared.work_cv.wait(g).unwrap();
                 }
                 break;
@@ -230,6 +256,9 @@ fn worker_loop(shared: Arc<PoolShared>, tid: usize) {
         // SAFETY: the Acquire load of `generation` above synchronizes with
         // `run`'s Release bump, which happens after `job` was written — so
         // the cell holds the current job and nobody writes it while we read.
+        // INFALLIBLE: the SAFETY note above is the proof — the Acquire load of `generation`
+        // synchronizes with `run`'s Release bump, which happens *after* `job` is written,
+        // so the cell is necessarily `Some` on this path.
         let job = unsafe { (*shared.job.get()).expect("job set before generation bump") };
 
         // SAFETY: `ThreadPool::run` keeps the closure alive until we
@@ -239,6 +268,8 @@ fn worker_loop(shared: Arc<PoolShared>, tid: usize) {
         // Release so the caller's Acquire load of `remaining == 0` also
         // publishes this worker's output-row writes.
         if shared.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // INFALLIBLE: same pool-bookkeeping mutex as the sites above — a
+            // poisoned lock here means a sibling worker already panicked.
             let _g = shared.lock.lock().unwrap();
             shared.done_cv.notify_all();
         }

@@ -250,11 +250,17 @@ impl CachedSession {
         let generated = self.generate(&prompt_ids, max_new_tokens, eos, pad)?;
 
         let ids: Vec<u32> = generated.iter().map(|&t| t as u32).collect();
-        Ok(self
-            .tokenizer
-            .as_ref()
-            .expect("checked above")
-            .decode(&ids, true))
+        // Re-check rather than `expect`: `self.generate` above took `&mut self`,
+        // so "we checked at the top of the function" is an assumption about
+        // another method's body, not a local proof. Propagating costs nothing
+        // here and cannot become a panic if that method ever changes.
+        let tokenizer = self.tokenizer.as_ref().ok_or_else(|| {
+            GlError::Engine(
+                "generate_text: no tokenizer attached — build with CachedSession::from_hf_dir"
+                    .to_owned(),
+            )
+        })?;
+        Ok(tokenizer.decode(&ids, true))
     }
 
     /// Prefill once, then decode `max_new_tokens - 1` times with a real KV
@@ -423,6 +429,12 @@ fn build_args<'a>(
     param_order
         .iter()
         .map(|p| match p.kind {
+            // INFALLIBLE: `param_order` and `weights` are both derived from the
+            // same traced signature — the upload loop walks `ParamKind::Weight`
+            // in this same order — so the iterator cannot run dry unless those
+            // two fall out of sync, which is a bug in this file rather than
+            // anything a caller or a model file can cause. Kept as a panic for
+            // the same reason the `unknown kv-cache parameter` arm below is.
             ParamKind::Weight => weight_iter
                 .next()
                 .expect("build_args: fewer uploaded weights than the signature declares"),
@@ -432,6 +444,10 @@ fn build_args<'a>(
                 other => panic!("build_args: unknown kv-cache parameter {other:?}"),
             },
             ParamKind::Input => match p.name.as_str() {
+                // INFALLIBLE: `pos` is `Some` exactly when the executable being
+                // invoked is the decode step, and that is the only signature
+                // whose `param_order` contains a `pos` input — the two are
+                // chosen together at the call site.
                 "pos" => pos
                     .expect("build_args: signature declares pos but no pos buffer was given"),
                 _ => ids,
@@ -453,6 +469,8 @@ fn take_three(
             outputs.len()
         )));
     }
+    // INFALLIBLE: the guard above returns `Err` unless `outputs.len() == 3`,
+    // and these are the only three pops — the local proof is four lines up.
     let v_cache = outputs.pop().expect("checked len == 3");
     let k_cache = outputs.pop().expect("checked len == 3");
     let logits = outputs.pop().expect("checked len == 3");
