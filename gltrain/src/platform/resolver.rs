@@ -7,6 +7,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::platform::scanner::FileEntry;
@@ -99,17 +100,15 @@ fn get_rust_module_path(crate_root: &Path, file_path: &Path) -> Vec<String> {
         .map(|c| c.as_os_str().to_string_lossy().into_owned())
         .collect();
         
-    if let Some(last) = segments.last_mut() {
-        if let Some(pos) = last.rfind('.') {
+    if let Some(last) = segments.last_mut()
+        && let Some(pos) = last.rfind('.') {
             last.truncate(pos);
         }
-    }
     
-    if let Some(last) = segments.last() {
-        if last == "mod" || last == "lib" || last == "main" {
+    if let Some(last) = segments.last()
+        && (last == "mod" || last == "lib" || last == "main") {
             segments.pop();
         }
-    }
     
     segments
 }
@@ -177,14 +176,13 @@ fn resolve_js_ts_path(root: &Path, current_file: &Path, import_path: &str, follo
                 return Some(base);
             }
             // If .js target is requested, check if it maps to .ts or .tsx source files
-            if let Some(ext) = base.extension().and_then(|e| e.to_str()) {
-                if ext == "js" {
+            if let Some(ext) = base.extension().and_then(|e| e.to_str())
+                && ext == "js" {
                     let ts = base.with_extension("ts");
                     if ts.is_file() { return Some(ts); }
                     let tsx = base.with_extension("tsx");
                     if tsx.is_file() { return Some(tsx); }
                 }
-            }
         } else {
             // 2. Try implicit extension fallbacks
             let exts = ["ts", "tsx", "js", "jsx", "mjs"];
@@ -261,17 +259,64 @@ fn resolve_python_module(
     None
 }
 
+// ── Import patterns, compiled once ────────────────────────────────────────────
+//
+// These used to be built inside `extract_imports`, which runs once per scanned
+// file — so a workspace walk recompiled all seven on every file. `scan.rs`
+// carries the rule this violated in its own header: "Do not move these into
+// per-call scope — repeated Regex::new() is expensive at scale."
+//
+// INFALLIBLE (every `unwrap` below): each pattern is a string literal fixed at
+// compile time, so compilation cannot depend on the file being scanned. Under
+// `OnceLock` the first call decides it for the whole process, meaning a
+// malformed pattern fails deterministically on the first scan of any test run
+// rather than on one user's file.
+fn re_rs_mod() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\bmod\s+([a-zA-Z0-9_]+)\s*;").unwrap())
+}
+fn re_rs_use() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"\buse\s+(crate|super|self)\s*::\s*([a-zA-Z0-9_:]+)").unwrap())
+}
+fn re_js_import_export() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(r#"\b(?:import|export)\s+(?:[^'"]+\s+from\s+)?['"]([^'"]+)['"]"#).unwrap()
+    })
+}
+fn re_js_import_simple() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"\bimport\s+['"]([^'"]+)['"]"#).unwrap())
+}
+fn re_js_require() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r#"\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap())
+}
+fn re_py_import() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| Regex::new(r"^\s*import\s+([a-zA-Z0-9_.,\s]+)").unwrap())
+}
+fn re_py_from_import() -> &'static Regex {
+    static R: OnceLock<Regex> = OnceLock::new();
+    R.get_or_init(|| {
+        Regex::new(
+            r"^\s*from\s+(\.+[a-zA-Z0-9_.]*|[a-zA-Z0-9_.]+)\s+import\s+([a-zA-Z0-9_.,\s*()]+)",
+        )
+        .unwrap()
+    })
+}
+
 /// Extract import statements from the content of a file based on its extension.
 fn extract_imports(content: &str, extension: Option<&str>) -> Vec<(String, Option<usize>)> {
     let mut imports = Vec::new();
     
     match extension {
         Some("rs") => {
-            // Match 'mod name;'
-            let mod_regex = Regex::new(r"\bmod\s+([a-zA-Z0-9_]+)\s*;").unwrap();
-            // Match 'use crate/super/self::...'
-            let use_regex = Regex::new(r"\buse\s+(crate|super|self)\s*::\s*([a-zA-Z0-9_:]+)").unwrap();
-            
+            // Match 'mod name;' / 'use crate|super|self::...'
+            let mod_regex = re_rs_mod();
+            let use_regex = re_rs_use();
+
             for line in content.lines() {
                 // Strip inline comments
                 let clean_line = match line.split_once("//") {
@@ -292,13 +337,11 @@ fn extract_imports(content: &str, extension: Option<&str>) -> Vec<(String, Optio
             }
         }
         Some("ts") | Some("tsx") | Some("js") | Some("mjs") | Some("jsx") => {
-            // Match 'import ... from "path"' or 'export ... from "path"'
-            let import_export_regex = Regex::new(r#"\b(?:import|export)\s+(?:[^'"]+\s+from\s+)?['"]([^'"]+)['"]"#).unwrap();
-            // Match 'import "path"'
-            let import_simple_regex = Regex::new(r#"\bimport\s+['"]([^'"]+)['"]"#).unwrap();
-            // Match 'require("path")'
-            let require_regex = Regex::new(r#"\brequire\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
-            
+            // 'import|export .. from "path"' / 'import "path"' / 'require("path")'
+            let import_export_regex = re_js_import_export();
+            let import_simple_regex = re_js_import_simple();
+            let require_regex = re_js_require();
+
             for line in content.lines() {
                 let clean_line = match line.split_once("//") {
                     Some((before, _)) => before,
@@ -315,11 +358,10 @@ fn extract_imports(content: &str, extension: Option<&str>) -> Vec<(String, Optio
             }
         }
         Some("py") => {
-            // Match 'import x, y'
-            let import_regex = Regex::new(r"^\s*import\s+([a-zA-Z0-9_.,\s]+)").unwrap();
-            // Match 'from x import y'
-            let from_import_regex = Regex::new(r"^\s*from\s+(\.+[a-zA-Z0-9_.]*|[a-zA-Z0-9_.]+)\s+import\s+([a-zA-Z0-9_.,\s*()]+)").unwrap();
-            
+            // Match 'import x, y' / 'from x import y'
+            let import_regex = re_py_import();
+            let from_import_regex = re_py_from_import();
+
             for line in content.lines() {
                 let clean_line = match line.split_once('#') {
                     Some((before, _)) => before,
