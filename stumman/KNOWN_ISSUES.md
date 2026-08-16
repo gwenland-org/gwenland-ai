@@ -231,3 +231,154 @@ stop propagating, never as a failure. Erroring on a `None` lookup would break
 LoRA training. Together with KL-002 the invariant is now tight: every input ID
 on a node either belongs to this tape or belongs to no tape at all, never to a
 different one.
+
+---
+
+## KL-004 - Reductions return shape `[1]`, there is no 0-d tensor
+
+| | |
+|---|---|
+| **Status** | **RESOLVED** by decision (M1 Wave 3) |
+| **Raised** | M1 Wave 2 gate, open risk 4 |
+| **Affects** | `Tensor::sum`, `Tensor::mean`, `Tensor::item` |
+| **Regression test** | `sum_returns_rank_one_tensor_holding_the_total`, `mean_returns_rank_one_tensor_holding_the_average` |
+
+### The problem
+
+Wave 2 flagged it: `sum()` and `mean()` returned a bare `f32`, so a loss value
+could not sit on the tape and `loss.backward()` had nothing to attach to. But
+`shape_to_n_elems` rejects an empty shape, so a genuine 0-d tensor could not be
+built either. `item()` already claimed to serve "0-d or 1-elem tensors" when
+only the second was reachable.
+
+### The decision
+
+**A scalar is a rank-1 tensor of shape `[1]`.** Stummañ has no 0-d tensor and
+is not getting one.
+
+- `sum()` and `mean()` now return `Tensor<B>` with shape `[1]` and record a
+  tape node, so they can end a graph and be differentiated.
+- `sum_scalar()` and `mean_scalar()` return the raw `f32` and record nothing,
+  for callers that just want the number.
+- `item()` keeps working, since a `[1]` tensor has exactly one element.
+
+### Why not 0-d
+
+Allowing an empty shape would make `shape.iter().product()` return 1 for a
+shape carrying no information, which is a silent-wrong waiting to happen in any
+code that reasons about rank. Shape `[1]` costs nothing, keeps every existing
+shape check meaningful, and is what the backward seed already assumes: the
+final node's gradient buffer is sized from its shape, and `[1]` makes that seed
+exactly `[1.0]`.
+
+### Cost
+
+`sum()` changed its return type, which is a breaking change to a Wave 1 API.
+One call site existed, in `sum_of_ones_tensor_equals_n_elems`; it moved to
+`sum_scalar()` and kept its name.
+
+---
+
+## KL-005 - `backward()` requires a clean gradient store
+
+| | |
+|---|---|
+| **Status** | **RESOLVED** by guard (M1 Wave 3) |
+| **Introduced** | M1 Wave 3 |
+| **Fixed in** | `Tape::backward` precondition check |
+| **Regression test** | `backward_twice_without_zero_grad_is_rejected` |
+
+### What it did
+
+Calling `backward()` twice in a row did not double the gradient, it **tripled**
+it. Measured on `x @ w` with `x` tracked:
+
+```
+after 1st backward: [1.0, 1.0, 1.0, 1.0]
+after 2nd backward: [3.0, 3.0, 3.0, 3.0]
+```
+
+The seed is accumulated into the store like any other gradient, so the second
+pass starts from a seed of 2.0 and adds its propagation on top of the 1.0
+already there. Nothing warned.
+
+### The guard
+
+`backward()` now returns
+`GlTrainError::InvalidOp("call zero_grad() before backward()")` when the
+gradient store is non-empty. The rejected call mutates nothing, and after
+`zero_grad()` the same pass reproduces the original gradient exactly. Both are
+asserted by the regression test.
+
+### Obligation this places on Wave 4
+
+Accumulating gradients across mini-batches is a real requirement (plan section
+3.5, `grad_accum`). It must get its **own entry point**, something like
+`backward_accumulate()`, that seeds without clearing and is opted into
+deliberately. It must not come back as "just call `backward()` twice", which is
+the behaviour this guard exists to forbid.
+
+---
+
+## KL-006 - Backward closures capture forward values, which an in-place weight update would make stale
+
+| | |
+|---|---|
+| **Status** | KNOWN LIMITATION |
+| **Introduced** | M1 Wave 3 |
+| **Resolution owned by** | **Wave 4+**, and it **must be resolved before any in-place weight update lands** (M2 optimizer) |
+| **Affects** | `stumman/src/tensor/tensor.rs` - the `matmul`, `mul` and `relu` backward closures |
+| **Severity** | None today. High the moment the optimizer writes in place. |
+
+### What
+
+Three ops capture the *values* of their forward inputs at record time, because
+their gradients depend on the operand data rather than only on its shape:
+
+| Op | Captured | Needed for |
+|---|---|---|
+| `matmul` | `a_data`, `b_data` | `dA = dC @ B^T`, `dB = A^T @ dC` |
+| `mul` | `a_data`, `b_data` | `dA = dC * B`, `dB = dC * A` |
+| `relu` | `a_data` | the positive-input mask |
+
+The capture is a `Vec<f32>` snapshot taken when the node is recorded. It is a
+copy, not a view of the tensor's storage.
+
+### Why it is harmless right now
+
+Nothing in the crate mutates tensor storage in place. Every op allocates fresh
+storage, and `Tensor` exposes no `&mut` path to it. Verified, not assumed:
+
+```
+$ grep -rn "make_mut\|storage_mut\|&mut self" src/tensor/tensor.rs
+(no matches)
+```
+
+So a captured snapshot can never disagree with the tensor it came from.
+
+### When it bites
+
+M2's optimizer has to write updated weights back. If it does that in place,
+through `Arc::make_mut` on the storage or a new `&mut` accessor, then any tape
+still holding a capture of that weight keeps the **pre-update** values. The next
+backward pass computes gradients from weights that no longer exist.
+
+There is no error and no crash. The loss curve stays plausible and is quietly
+wrong, which is the most expensive failure shape this crate has.
+
+### Options
+
+- **(a) Require `tape.clear()` before `optimizer.step()`**, enforced with a
+  guard the way KL-005 guards double-backward. Cheapest, and the discipline is
+  correct anyway since the graph is dead once the step is taken.
+  **Recommended.**
+- **(b) Optimizer produces a new tensor** instead of mutating storage. Clean,
+  but every parameter gets a new `TensorId` each step, and optimizer state keyed
+  on that ID would have to be rekeyed. See KL-004's note on ID lifecycle.
+- **(c) Capture `Arc<B::Storage>` rather than a `Vec<f32>` snapshot**, so a
+  copy-on-write mutation leaves the tape's view intact. Costs nothing when
+  nobody mutates, and removes the whole class of problem, but it puts a backend
+  type inside a captured closure and would need care not to leak `B` into the
+  tape's own types.
+
+Whichever is chosen, it lands **with** the in-place update, not after it.

@@ -4,9 +4,9 @@
 //! which tensors went in, which tensor came out, and the backward
 //! function to call during the replay pass (Wave 3).
 //!
-//! Wave 2: nodes are recorded but backward_fn is never called yet.
-//! Wave 3 will add `Tape::backward()` that replays them in reverse.
+//! `Tape::backward()` replays them in reverse recording order.
 
+use crate::error::Result;
 use std::sync::Arc;
 
 /// Unique identifier for a tensor within the tape.
@@ -17,20 +17,37 @@ pub type TensorId = usize;
 /// Unique identifier for a computation node within the tape.
 pub type NodeId = usize;
 
-/// Placeholder type for a node's backward function.
+/// One input's gradient: the data plus the shape it belongs to.
 ///
-/// # This is deliberately inert in Wave 2
+/// `None` means the input is frozen and wants no gradient (KL-003).
+pub type InputGrad = Option<(Vec<f32>, Vec<usize>)>;
+
+/// A node's backward function: given the gradient flowing into the op's
+/// output, produce the gradient for each of its inputs.
 ///
-/// The plan doc's signature, `Box<dyn Fn(&Tensor, &Tape) -> Result<Vec<Tensor>>>`,
-/// cannot be written as-is: `Tensor<B>` is generic over its backend, but
-/// [`crate::autograd::tape::Tape`] must stay backend-agnostic or every tape
-/// becomes generic too — and a single tape could then never hold nodes from
-/// mixed-backend graphs.
+/// Arguments are `grad_output` (dL/d(output), flattened row-major) and
+/// `output_shape`. The return has one entry per [`ComputationNode::inputs`]
+/// entry, in the same order.
 ///
-/// Wave 2 does not solve that. It stores a closure that takes nothing and
-/// returns nothing, purely so the field has a type that compiles and can be
-/// moved into the tape. **Nothing calls it.** Wave 3 owns the real design.
-pub type BackwardFn = Arc<dyn Fn() + Send + Sync>;
+/// # Why `Vec<f32>` instead of tensors
+///
+/// The plan's signature, `Box<dyn Fn(&Tensor, &Tape) -> Result<Vec<Tensor>>>`,
+/// cannot be written: `Tensor<B>` is generic over its backend, so a tape
+/// holding one would become `Tape<B>` and could never span a mixed-backend
+/// graph, which is exactly what M4 needs.
+///
+/// Raw `f32` buffers are the common currency that sidesteps it. Every backward
+/// closure captures the forward values it needs at record time and returns
+/// plain buffers, so nothing in `autograd/` ever names a backend type. The
+/// cost is that backward math runs on the scalar helpers in
+/// [`crate::autograd::ops`] rather than dispatching to AVX2.
+///
+/// # Frozen inputs
+///
+/// Returning `None` at index `i` says input `i` is frozen: no gradient is
+/// computed and none is accumulated. That is normal, not an error. It is the
+/// LoRA shape, a frozen base weight consumed by a trainable activation.
+pub type BackwardFn = Arc<dyn Fn(&[f32], &[usize]) -> Result<Vec<InputGrad>> + Send + Sync>;
 
 /// One recorded operation in the forward pass.
 ///
@@ -41,9 +58,7 @@ pub type BackwardFn = Arc<dyn Fn() + Send + Sync>;
 ///   and any data needed to compute gradients. Stored as a boxed trait
 ///   object for polymorphism — no giant match statement on op type.
 ///
-/// # Wave 2 note
-/// `backward_fn` is stored but never called in Wave 2.
-/// Wave 3 adds `Tape::backward()` which calls these in reverse order.
+/// `Tape::backward()` calls these in reverse recording order.
 pub struct ComputationNode {
     /// Unique node ID (monotonically increasing within this tape).
     pub id: NodeId,
@@ -59,8 +74,7 @@ pub struct ComputationNode {
     /// TensorId of the output tensor produced by this op.
     pub output: TensorId,
 
-    /// Backward function. See [`BackwardFn`] — inert placeholder in Wave 2,
-    /// redesigned in Wave 3 when something finally calls it.
+    /// Backward function for this op. See [`BackwardFn`].
     pub backward_fn: BackwardFn,
 }
 
