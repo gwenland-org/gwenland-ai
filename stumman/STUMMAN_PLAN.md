@@ -326,8 +326,8 @@ gltrain/src/
 ```
 
 **Dependency rules**:
-- `autograd` depends on: `tensor` (for Tensor type)
-- `tensor` depends on: NOTHING (core abstraction)
+- `tensor` depends on: `autograd` — **for IDs and metadata only** (see below)
+- `autograd` depends on: NOTHING (no `Tensor<B>`, no backend types)
 - `nn` depends on: `tensor`, `autograd` (builds on top)
 - `optim` depends on: `tensor`, `nn::Parameter`
 - `backend` depends on: `tensor`, glcore, glproc, glcuda, gljax
@@ -335,7 +335,30 @@ gltrain/src/
 - `checkpoint` depends on: `tensor`, `nn::Module`
 - `train` depends on: ALL (top-level orchestration)
 
-**No circular deps**: `tensor` is the root; everything else builds upward.
+**No circular deps**: `autograd` is the root; everything else builds upward.
+
+> **Corrected in M1 Wave 2 — the arrow runs the other way.** This section
+> originally read "`autograd` depends on `tensor` (for Tensor type)" and
+> "`tensor` depends on: NOTHING". The implementation inverted it, and the
+> inversion is intentional, not an accident to be undone.
+>
+> **Why.** `Tape` must stay backend-agnostic. If it held `Tensor<B>` it would
+> become `Tape<B>`, and a single tape could then never span a mixed-backend
+> graph — which is exactly what M4's CPU/GPU/TPU dispatch needs. So the tape
+> stores only `TensorId` (a `usize`) and `TensorMeta` (a shape plus a flag).
+> Neither mentions `Tensor`, `Backend`, or any backend type. `tensor` then
+> imports those IDs to tag itself and record ops.
+>
+> **This is not circular.** `autograd/{node,tape}.rs` import nothing from
+> `tensor` — verify with `grep -rn "use crate::tensor" src/autograd/`, which
+> must stay empty. The dependency is one-way: `tensor` → `autograd`.
+>
+> **The constraint to preserve.** Autograd may never name a tensor type. If a
+> later wave needs tensor data inside the tape (Wave 3's gradient store is the
+> obvious candidate), it must go through an erased handle or a generic
+> parameter on that *sub-structure* — never by importing `Tensor<B>` into
+> `autograd`, which would make the cycle real and force `Tape` to become
+> generic.
 
 ### 3.4 Key Traits & Interfaces
 
