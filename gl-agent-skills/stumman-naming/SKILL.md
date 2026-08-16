@@ -25,7 +25,7 @@ description: >
 - [ ] I have read [`../gwenland-naming-convention/SKILL.md`](../gwenland-naming-convention/SKILL.md) for the prefix table. This file only covers what is stumman-specific.
 - [ ] I know the prefixed names below **do not exist in the crate yet**. Every type is still on its pre-rename name.
 - [ ] If I'm creating a file, I know its module header must carry the right Breton codename.
-- [ ] If I'm touching the autograd tape, I have read `stumman/KNOWN_ISSUES.md` KL-002 and KL-003 first. Both are naming-adjacent and both are unresolved.
+- [ ] If I'm touching the autograd tape, I have read `stumman/KNOWN_ISSUES.md` first. KL-002 and KL-003 are the naming-adjacent ones and **both were resolved in 47ab498**, each with a regression test. Read them for the settled semantics, not as open questions. KL-004 through KL-006 landed with Wave 3.
 
 ## The rename has not happened
 
@@ -172,13 +172,39 @@ wrapper to route around it. Four resolution options are written up in
 **enum**, not a `BE*` struct. Picking a name now would prejudge a decision
 that belongs to M4.
 
-### KL-003 — the node input list needs a name, in Wave 3
+### KL-002 — one tape per op (RESOLVED in 47ab498)
 
-Untracked operands currently leave dangling IDs on the tape, and
-`KNOWN_ISSUES.md` names two candidate shapes: `inputs: Vec<(TensorId, bool)>`
-or a separate `tracked_inputs` list. That is a naming decision as much as a
-data-structure one, and it is still open. Do not settle it in passing while
-doing unrelated Wave 3 work.
+Operands carrying different tapes are rejected with
+`InvalidOp("operands must share the same tape")`. Every input ID on a node
+therefore belongs either to that node's tape or to no tape at all.
+
+**Naming consequence:** none outstanding. Do not invent a tape-merging or
+multi-tape type to route around the restriction; mixing tapes is disallowed by
+design, not pending a better name.
+
+### KL-003 — the node input list keeps its shape (RESOLVED in 47ab498)
+
+This entry used to say the input list needed a name and warned against settling
+it in passing. It was settled deliberately, in its own commit, with a test.
+
+`ComputationNode::inputs` stays `Vec<TensorId>`. Both candidate shapes that were
+under consideration, `Vec<(TensorId, bool)>` and a separate `tracked_inputs`
+list, were **rejected**. The distinction they encoded is carried by the tape
+instead: an ID that does not resolve via `Tape::get_tensor_meta` is a frozen
+operand.
+
+The rule, stated on `Tensor::record_op` and on `Tape`:
+
+> A `None` input ID means a frozen/untracked operand: no gradient is computed
+> for it, and this is not an error.
+
+Wave 3 honours it. `BackwardFn` returns `InputGrad = Option<(Vec<f32>,
+Vec<usize>)>` per input, and a `None` there is skipped rather than treated as a
+failure.
+
+**Naming consequence:** `InputGrad` takes no prefix. It is a type alias over an
+`Option` of plain data, in the same family as `BackwardFn`, and a prefix would
+buy nothing.
 
 ## Wave 3+ Naming Preview
 
