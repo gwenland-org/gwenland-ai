@@ -1,0 +1,22 @@
+[package]
+name = "stumman"
+version = "0.1.0"
+edition = "2021"
+description = "Stummañ — GwenLand pure-Rust training framework"
+
+# Stummañ is deliberately NOT a member of the root workspace: the training arm
+# is allowed dependencies the "Inference First" rule forbids in the inference
+# tree. Declaring an empty `[workspace]` here makes this directory its own
+# workspace root, so cargo stops walking up and never consults the root
+# manifest — the isolation is achieved without editing the root Cargo.toml.
+[workspace]
+
+[dependencies]
+glcore = { path = "../glcore" }
+glproc = { path = "../glproc" }
+anyhow = "1"
+thiserror = "1"
+
+[dev-dependencies]
+quickcheck = "1"
+quickcheck_macros = "1"
