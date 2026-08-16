@@ -6,14 +6,16 @@
 //! Sub-systems:
 //! - Kevrin  (tensor):   [`tensor`] module
 //! - Karg    (backend):  [`backend`] module
-//! - Kevskrid (autograd): Wave 2+
-//! - Gwellaer (optimizer): Wave 2+
+//! - Kevskrid (autograd): [`autograd`] module — records only, no replay yet
+//! - Gwellaer (optimizer): M2+
 
+pub mod autograd;
 pub mod backend;
 pub mod error;
 pub mod tensor;
 
 // Convenient top-level re-exports
+pub use autograd::{NodeId, Tape, TensorId};
 pub use backend::{GlProc, SisdBackend};
 pub use error::{GlTrainError, Result};
 pub use tensor::{Backend, Tensor};
