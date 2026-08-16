@@ -38,17 +38,11 @@ fn next_tensor_id() -> TensorId {
     NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Lock the shared tape, recovering the guard if the mutex was poisoned.
-///
-/// Poisoning means some other thread panicked while holding the lock. The tape
-/// is a plain `Vec` plus a `HashMap` with no cross-field invariant that a
-/// partial write could corrupt, so reclaiming the guard is sound — and it is
-/// strictly better than the alternatives available here: `with_grad` returns
-/// `Self`, not `Result`, so it cannot propagate a lock error, which would
-/// leave `unwrap()` as the only other option. The project forbids `unwrap()`
-/// outside tests.
+/// Shorthand for [`Tape::lock`], which is the public entry point and carries
+/// the reasoning about poison recovery. Kept as a local name only because this
+/// module reaches for it constantly.
 fn lock_tape(tape: &Arc<Mutex<Tape>>) -> MutexGuard<'_, Tape> {
-    tape.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    Tape::lock(tape)
 }
 
 /// A multi-dimensional tensor backed by compute backend B.
