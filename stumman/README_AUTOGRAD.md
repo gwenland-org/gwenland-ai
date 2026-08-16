@@ -14,6 +14,11 @@ Those are M2 and later. See [STUMMAN_PLAN.md](STUMMAN_PLAN.md) for where this
 is going, and [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the constraints that are
 deliberate rather than missing.
 
+A note on platforms: stumman builds on x86-64 Linux and Windows. It does not
+build on Apple Silicon, because it depends on glproc and glproc's SIMD kernels
+import `std::arch::x86_64` with no architecture gate. CI keeps a macOS leg
+running as experimental so the day that changes, it says so.
+
 A note on names: the crate is mid-convention. New types are born with a
 semantic prefix (`VLGradStore`), older ones still carry their original names
 (`Tensor`, `Tape`, `GlProc`, `SisdBackend`) and get renamed in one dedicated
