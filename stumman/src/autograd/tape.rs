@@ -19,6 +19,7 @@ use crate::autograd::grad_store::VLGradStore;
 use crate::autograd::node::{ComputationNode, NodeId, TensorId};
 use crate::error::{GlTrainError, Result};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Lightweight tensor metadata stored in the tape.
 ///
@@ -82,6 +83,39 @@ pub struct Tape {
 }
 
 impl Tape {
+    /// Lock a shared tape, recovering the guard if the mutex was poisoned.
+    ///
+    /// A tape is almost always held as `Arc<Mutex<Tape>>`, so this is an
+    /// associated function taking that handle rather than a `&self` method:
+    /// you would need the lock already to call a method on the tape itself.
+    ///
+    /// ```
+    /// use std::sync::{Arc, Mutex};
+    /// use stumman::Tape;
+    ///
+    /// let tape = Arc::new(Mutex::new(Tape::new()));
+    /// let guard = Tape::lock(&tape);
+    /// assert!(guard.is_empty());
+    /// ```
+    ///
+    /// # Why it never fails
+    ///
+    /// `Mutex::lock` only errors when another thread panicked while holding
+    /// the lock. A tape is a `Vec` plus a `HashMap` with no cross-field
+    /// invariant a partial write could break, so reclaiming the guard is sound
+    /// and strictly better than the alternatives: this crate forbids `unwrap`
+    /// outside tests, and making every caller write
+    /// `unwrap_or_else(|p| p.into_inner())` by hand just moves the same
+    /// decision somewhere it will eventually be got wrong.
+    ///
+    /// A poisoned tape does mean some earlier forward pass died halfway, so
+    /// the recorded graph may be incomplete. It will not be corrupt.
+    pub fn lock(shared: &Arc<Mutex<Tape>>) -> MutexGuard<'_, Tape> {
+        shared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Create a new empty tape.
     pub fn new() -> Self {
         Self {
