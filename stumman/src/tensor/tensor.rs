@@ -7,7 +7,8 @@
 //! tape, so ops can *record* the forward pass. Still no gradients — no `grad`
 //! field, and nothing replays the tape. That is Wave 3.
 
-use crate::autograd::node::{ComputationNode, TensorId};
+use crate::autograd::node::{BackwardFn, ComputationNode, TensorId};
+use crate::autograd::ops::{matmul_f32, transpose_2d};
 use crate::autograd::tape::{Tape, TensorMeta};
 use crate::error::{GlTrainError, Result};
 use crate::tensor::backend::Backend;
@@ -221,62 +222,68 @@ impl<B: Backend> Tensor<B> {
         }
     }
 
-    /// Record one binary op on the shared tape and attach that tape to `output`.
+    /// Record one op on the shared tape and attach that tape to `output`.
     ///
-    /// Every tracked op funnels through here so the bookkeeping — resolve the
-    /// tape, allocate a node id, register the output's metadata, push the node
-    /// — cannot drift between call sites. A no-op when neither operand is
-    /// tracked.
+    /// Every tracked op funnels through here so the bookkeeping (resolve the
+    /// tape, allocate a node id, register the output, push the node) cannot
+    /// drift between call sites. A no-op when no operand is tracked.
     ///
-    /// # Both operands must share one tape (KL-002)
+    /// `make_backward` is only invoked when the op is actually being recorded.
+    /// Building a backward closure usually means copying the forward operands
+    /// out of backend storage, and a no-grad forward pass should not pay for
+    /// data nothing will read.
     ///
-    /// If `lhs` and `rhs` carry *different* tapes this returns
-    /// [`GlTrainError::InvalidOp`]. Previously the first operand's tape won
-    /// silently: the node landed on one tape referencing an input the other
-    /// tape owned, and the second tape never learned the op happened at all —
-    /// a split graph that no later stage could detect. There is no sensible
-    /// merge, so it is rejected.
+    /// # All operands must share one tape (KL-002)
     ///
-    /// The check runs after the forward compute has already happened. That is
-    /// deliberate: mismatched tapes are a programming error that never occurs
-    /// on a correct path, so the wasted arithmetic costs nothing in practice
-    /// and keeps the tape logic in exactly one place.
+    /// If two operands carry *different* tapes this returns
+    /// [`GlTrainError::InvalidOp`] and neither tape is touched. The first
+    /// operand's tape used to win silently: the node landed on one tape
+    /// referencing an input the other owned, and the second tape never learned
+    /// the op happened, a split graph nothing downstream could detect. There is
+    /// no sensible merge, since node IDs from two tapes collide, so it is
+    /// rejected.
     ///
     /// # Untracked operands are expected, not an error (KL-003)
     ///
-    /// When only one operand is tracked, the node still lists **both** input
-    /// IDs, and the untracked one is deliberately left unregistered — looking
-    /// it up in the tape yields `None`.
+    /// The node lists *every* operand, including untracked ones, and an
+    /// untracked operand is deliberately left unregistered, so looking it up in
+    /// the tape yields `None`.
     ///
     /// **A `None` input ID means a frozen/untracked operand: no gradient is
-    /// computed for it, and this is not an error.** This is the LoRA case —
-    /// a frozen base weight multiplied by a trainable activation. Wave 3's
-    /// `backward()` must skip unresolvable input IDs rather than fail on them.
-    fn record_op(
+    /// computed for it, and this is not an error.** That is the LoRA case, a
+    /// frozen base weight consumed by a trainable activation.
+    /// [`Tape::backward`] skips such inputs rather than failing on them.
+    fn record_op<F>(
         output: &mut Tensor<B>,
-        lhs: &Tensor<B>,
-        rhs: &Tensor<B>,
+        inputs: &[&Tensor<B>],
         op_name: &'static str,
-    ) -> Result<()> {
-        // Resolve which tape this op belongs to, rejecting a mixed pair.
-        let tape = match (&lhs.tape, &rhs.tape) {
-            (Some(t1), Some(t2)) => {
-                if !Arc::ptr_eq(t1, t2) {
-                    return Err(GlTrainError::InvalidOp(
-                        "operands must share the same tape".into(),
-                    ));
+        make_backward: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Result<BackwardFn>,
+    {
+        // Resolve which tape this op belongs to, rejecting a mixed set.
+        let mut tape: Option<Arc<Mutex<Tape>>> = None;
+        for input in inputs {
+            let Some(candidate) = &input.tape else { continue };
+            match &tape {
+                None => tape = Some(candidate.clone()),
+                Some(existing) => {
+                    if !Arc::ptr_eq(existing, candidate) {
+                        return Err(GlTrainError::InvalidOp(
+                            "operands must share the same tape".into(),
+                        ));
+                    }
                 }
-                Some(t1.clone())
             }
-            (Some(t), None) | (None, Some(t)) => Some(t.clone()),
-            (None, None) => None,
-        };
+        }
 
-        if !(lhs.requires_grad || rhs.requires_grad) {
+        if !inputs.iter().any(|i| i.requires_grad) {
             return Ok(());
         }
 
         if let Some(ref t) = tape {
+            let backward_fn = make_backward()?;
             let out_id = output.id;
             let out_shape = output.shape.clone();
             let mut guard = lock_tape(t);
@@ -289,12 +296,10 @@ impl<B: Backend> Tensor<B> {
             guard.push(ComputationNode {
                 id: node_id,
                 op_name,
-                // Both operands are listed even when one is untracked — see
-                // the KL-003 note above.
-                inputs: vec![lhs.id, rhs.id],
+                // Every operand is listed, tracked or not. See KL-003 above.
+                inputs: inputs.iter().map(|i| i.id).collect(),
                 output: out_id,
-                // Wave 2 placeholder — stored, never called. See `BackwardFn`.
-                backward_fn: Arc::new(|| ()),
+                backward_fn,
             });
         }
         output.requires_grad = true;
@@ -315,11 +320,54 @@ impl<B: Backend> Tensor<B> {
         let storage = B::matmul(&self.storage, &other.storage, &self.shape, &other.shape)?;
 
         let mut output = Tensor::from_storage(storage, vec![m, n]);
-        Self::record_op(&mut output, self, other, "Matmul")?;
+        Self::record_op(&mut output, &[self, other], "Matmul", move || {
+            // dA = dC @ B^T, dB = A^T @ dC.
+            let a_tracked = self.requires_grad;
+            let b_tracked = other.requires_grad;
+            // dA reads B and dB reads A, so each operand's data is only worth
+            // copying when the *other* one wants a gradient.
+            let b_data = if a_tracked {
+                B::to_vec(&other.storage)?
+            } else {
+                Vec::new()
+            };
+            let a_data = if b_tracked {
+                B::to_vec(&self.storage)?
+            } else {
+                Vec::new()
+            };
+            let a_shape = self.shape.clone();
+            let b_shape = other.shape.clone();
+            Ok(Arc::new(
+                move |grad_output: &[f32], out_shape: &[usize]| {
+                    let grad_a = if a_tracked {
+                        let bt = transpose_2d(&b_data, &b_shape)?;
+                        let bt_shape = vec![b_shape[1], b_shape[0]];
+                        Some((
+                            matmul_f32(grad_output, out_shape, &bt, &bt_shape)?,
+                            a_shape.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    let grad_b = if b_tracked {
+                        let at = transpose_2d(&a_data, &a_shape)?;
+                        let at_shape = vec![a_shape[1], a_shape[0]];
+                        Some((
+                            matmul_f32(&at, &at_shape, grad_output, out_shape)?,
+                            b_shape.clone(),
+                        ))
+                    } else {
+                        None
+                    };
+                    Ok(vec![grad_a, grad_b])
+                },
+            ) as BackwardFn)
+        })?;
         Ok(output)
     }
 
-    /// Transpose a 2D tensor: [M, N] → [N, M]
+    /// Transpose a 2D tensor: [M, N] to [N, M]
     pub fn transpose(&self) -> Result<Tensor<B>> {
         if self.shape.len() != 2 {
             return Err(GlTrainError::InvalidOp(format!(
@@ -328,10 +376,19 @@ impl<B: Backend> Tensor<B> {
             )));
         }
         let storage = B::transpose(&self.storage, &self.shape)?;
-        Ok(Tensor::from_storage(
-            storage,
-            vec![self.shape[1], self.shape[0]],
-        ))
+        let mut output = Tensor::from_storage(storage, vec![self.shape[1], self.shape[0]]);
+        Self::record_op(&mut output, &[self], "Transpose", move || {
+            // dA = dC^T, transposing [N,M] back to [M,N].
+            let in_shape = self.shape.clone();
+            let out_shape = vec![self.shape[1], self.shape[0]];
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![Some((
+                    transpose_2d(grad_output, &out_shape)?,
+                    in_shape.clone(),
+                ))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
     }
 
     /// Element-wise addition: self + other (shapes must match exactly)
@@ -343,7 +400,19 @@ impl<B: Backend> Tensor<B> {
         let storage = B::add(&self.storage, &other.storage, n)?;
 
         let mut output = Tensor::from_storage(storage, self.shape.clone());
-        Self::record_op(&mut output, self, other, "Add")?;
+        Self::record_op(&mut output, &[self, other], "Add", move || {
+            // dA = dC, dB = dC.
+            let a_tracked = self.requires_grad;
+            let b_tracked = other.requires_grad;
+            let a_shape = self.shape.clone();
+            let b_shape = other.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![
+                    a_tracked.then(|| (grad_output.to_vec(), a_shape.clone())),
+                    b_tracked.then(|| (grad_output.to_vec(), b_shape.clone())),
+                ])
+            }) as BackwardFn)
+        })?;
         Ok(output)
     }
 
@@ -352,7 +421,27 @@ impl<B: Backend> Tensor<B> {
         check_same_shape(&self.shape, &other.shape)?;
         let n = self.n_elems();
         let storage = B::sub(&self.storage, &other.storage, n)?;
-        Ok(Tensor::from_storage(storage, self.shape.clone()))
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self, other], "Sub", move || {
+            // dA = dC, dB = -dC.
+            let a_tracked = self.requires_grad;
+            let b_tracked = other.requires_grad;
+            let a_shape = self.shape.clone();
+            let b_shape = other.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![
+                    a_tracked.then(|| (grad_output.to_vec(), a_shape.clone())),
+                    b_tracked.then(|| {
+                        (
+                            grad_output.iter().map(|g| -g).collect::<Vec<f32>>(),
+                            b_shape.clone(),
+                        )
+                    }),
+                ])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
     }
 
     /// Element-wise multiplication: self * other
@@ -360,30 +449,142 @@ impl<B: Backend> Tensor<B> {
         check_same_shape(&self.shape, &other.shape)?;
         let n = self.n_elems();
         let storage = B::mul(&self.storage, &other.storage, n)?;
-        Ok(Tensor::from_storage(storage, self.shape.clone()))
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self, other], "Mul", move || {
+            // dA = dC * B, dB = dC * A. Same asymmetry as matmul: each
+            // operand's data is only needed if the other wants a gradient.
+            let a_tracked = self.requires_grad;
+            let b_tracked = other.requires_grad;
+            let b_data = if a_tracked {
+                B::to_vec(&other.storage)?
+            } else {
+                Vec::new()
+            };
+            let a_data = if b_tracked {
+                B::to_vec(&self.storage)?
+            } else {
+                Vec::new()
+            };
+            let a_shape = self.shape.clone();
+            let b_shape = other.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![
+                    a_tracked.then(|| {
+                        (
+                            grad_output
+                                .iter()
+                                .zip(&b_data)
+                                .map(|(g, b)| g * b)
+                                .collect::<Vec<f32>>(),
+                            a_shape.clone(),
+                        )
+                    }),
+                    b_tracked.then(|| {
+                        (
+                            grad_output
+                                .iter()
+                                .zip(&a_data)
+                                .map(|(g, a)| g * a)
+                                .collect::<Vec<f32>>(),
+                            b_shape.clone(),
+                        )
+                    }),
+                ])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
     }
 
     /// Scale all elements by scalar: self * scalar
     pub fn mul_scalar(&self, scalar: f32) -> Result<Tensor<B>> {
         let n = self.n_elems();
         let storage = B::mul_scalar(&self.storage, scalar, n)?;
-        Ok(Tensor::from_storage(storage, self.shape.clone()))
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "MulScalar", move || {
+            // dA = dC * scalar.
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let grad_a: Vec<f32> = grad_output.iter().map(|g| g * scalar).collect();
+                Ok(vec![Some((grad_a, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
     }
 
     /// ReLU activation: max(0, x)
     pub fn relu(&self) -> Result<Tensor<B>> {
         let n = self.n_elems();
         let storage = B::relu(&self.storage, n)?;
-        Ok(Tensor::from_storage(storage, self.shape.clone()))
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "Relu", move || {
+            // dA = dC where the forward input was positive, else 0.
+            let a_data = B::to_vec(&self.storage)?;
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let grad_a: Vec<f32> = grad_output
+                    .iter()
+                    .zip(&a_data)
+                    .map(|(g, x)| if *x > 0.0 { *g } else { 0.0 })
+                    .collect();
+                Ok(vec![Some((grad_a, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
     }
 
-    /// Sum all elements to a scalar.
-    pub fn sum(&self) -> Result<f32> {
+    // ── Reductions ────────────────────────────────────────────────────────
+    //
+    // These return a rank-1 tensor of shape [1], not a bare f32, so a loss can
+    // sit on the tape and be differentiated (KL-004). Use `sum_scalar` /
+    // `mean_scalar` when you just want the number and no tape node.
+
+    /// Sum every element into a tensor of shape `[1]`.
+    pub fn sum(&self) -> Result<Tensor<B>> {
+        let total = B::sum(&self.storage)?;
+        let storage = B::from_vec(vec![total])?;
+
+        let mut output = Tensor::from_storage(storage, vec![1]);
+        Self::record_op(&mut output, &[self], "Sum", move || {
+            // Every element contributed once, so each gets the whole upstream
+            // gradient.
+            let in_shape = self.shape.clone();
+            let n = self.n_elems();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let g = grad_output.first().copied().unwrap_or(1.0);
+                Ok(vec![Some((vec![g; n], in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Mean of every element, as a tensor of shape `[1]`.
+    pub fn mean(&self) -> Result<Tensor<B>> {
+        let n = self.n_elems();
+        let avg = B::mean(&self.storage, n)?;
+        let storage = B::from_vec(vec![avg])?;
+
+        let mut output = Tensor::from_storage(storage, vec![1]);
+        Self::record_op(&mut output, &[self], "Mean", move || {
+            // Same as sum, divided by the element count.
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let g = grad_output.first().copied().unwrap_or(1.0) / n as f32;
+                Ok(vec![Some((vec![g; n], in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Sum every element and return the raw number. Records nothing.
+    pub fn sum_scalar(&self) -> Result<f32> {
         B::sum(&self.storage)
     }
 
-    /// Mean of all elements.
-    pub fn mean(&self) -> Result<f32> {
+    /// Mean of every element as a raw number. Records nothing.
+    pub fn mean_scalar(&self) -> Result<f32> {
         B::mean(&self.storage, self.n_elems())
     }
 }
@@ -617,8 +818,26 @@ mod tests {
     #[test]
     fn sum_of_ones_tensor_equals_n_elems() {
         let t = Tensor::<GlProc>::ones(&[3, 4]).unwrap();
-        let s = t.sum().unwrap();
+        // Wave 3 turned sum() into a tape-recording op returning a [1] tensor;
+        // sum_scalar() is the raw-number path this test always wanted.
+        let s = t.sum_scalar().unwrap();
         assert!((s - 12.0).abs() < TOL_ELEM, "sum={s}, expected 12.0");
+    }
+
+    #[test]
+    fn sum_returns_rank_one_tensor_holding_the_total() {
+        let t = Tensor::<GlProc>::ones(&[3, 4]).unwrap();
+        let s = t.sum().unwrap();
+        assert_eq!(s.shape(), &[1], "reductions produce shape [1], see KL-004");
+        assert!((s.item().unwrap() - 12.0).abs() < TOL_ELEM);
+    }
+
+    #[test]
+    fn mean_returns_rank_one_tensor_holding_the_average() {
+        let t = Tensor::<GlProc>::ones(&[3, 4]).unwrap();
+        let m = t.mean().unwrap();
+        assert_eq!(m.shape(), &[1]);
+        assert!((m.item().unwrap() - 1.0).abs() < TOL_ELEM);
     }
 
     // ── Wave 2: Autograd tape integration ────────────────────────────────
@@ -819,5 +1038,381 @@ mod tests {
         // Output tensor must carry the tape forward (for chaining)
         assert!(c.requires_grad(), "output of tracked matmul must require grad");
         assert!(c.tape().is_some(), "output of tracked matmul must carry tape");
+    }
+}
+
+/// Finite-difference gradient checks for every op with a backward function.
+///
+/// Runs on `SisdBackend`, the plain scalar backend, so a failure points at the
+/// backward math rather than at a SIMD kernel.
+#[cfg(test)]
+mod grad_check {
+    use super::*;
+    use crate::backend::SisdBackend;
+
+    /// Finite-difference step. Large enough that the f32 subtraction in
+    /// `(f(x+h) - f(x-h))` keeps significant digits, small enough that the
+    /// central difference stays close to the true derivative.
+    const GRAD_CHECK_EPS: f32 = 1e-2;
+
+    /// Tolerance on the *relative* gradient error. Plan section 1.7 asks for
+    /// rtol=1e-3, which is what this is.
+    ///
+    /// An absolute bound cannot work across these tests. The finite difference
+    /// loses about `|L| * f32_eps / h` to cancellation, and `|L|` grows with
+    /// the gradient magnitude, so a fixed atol that suits a gradient of 1.0
+    /// fails one of 21.0 for reasons that have nothing to do with correctness.
+    /// Normalising by the magnitude tracks the error the method actually has.
+    const GRAD_CHECK_TOL: f32 = 1e-3;
+
+    /// Tolerance for hand-computed exact comparisons, where the only error is
+    /// f32 rounding on small integers.
+    const TOL_EXACT: f32 = 1e-5;
+
+    /// Compare the analytic gradient from `backward()` against a central
+    /// finite difference, and return the largest *relative* disagreement,
+    /// `|a - n| / max(1, |a|, |n|)`.
+    ///
+    /// `f` receives the tape so anything it builds attaches to the same one.
+    /// Building an operand on a different tape would trip the KL-002 guard and
+    /// fail the forward pass instead of checking a gradient.
+    ///
+    /// `backward()` seeds ones, so the quantity being differentiated is
+    /// `sum(f(x))`. The numeric side calls `sum_scalar()` to match.
+    fn finite_diff_check<F>(input: &[f32], shape: &[usize], f: F) -> f32
+    where
+        F: Fn(&Tensor<SisdBackend>, &Arc<Mutex<Tape>>) -> Result<Tensor<SisdBackend>>,
+    {
+        // Analytic side.
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(input.to_vec(), shape)
+            .unwrap()
+            .with_grad(tape.clone());
+        let x_id = x.id();
+        f(&x, &tape).expect("forward pass must succeed");
+
+        let analytic = {
+            let mut guard = lock_tape(&tape);
+            guard.backward().expect("backward must succeed");
+            // Never let a missing gradient pass as "zero error".
+            guard
+                .grad(x_id)
+                .unwrap_or_else(|| panic!("backward produced no gradient for the input"))
+                .0
+                .clone()
+        };
+        assert_eq!(
+            analytic.len(),
+            input.len(),
+            "gradient length must match the input"
+        );
+
+        // Numeric side.
+        let eval = |data: Vec<f32>| -> f32 {
+            let tp = Arc::new(Mutex::new(Tape::new()));
+            let xt = Tensor::<SisdBackend>::from_vec(data, shape)
+                .unwrap()
+                .with_grad(tp.clone());
+            f(&xt, &tp).unwrap().sum_scalar().unwrap()
+        };
+
+        let mut max_err = 0.0f32;
+        for i in 0..input.len() {
+            let mut plus = input.to_vec();
+            let mut minus = input.to_vec();
+            plus[i] += GRAD_CHECK_EPS;
+            minus[i] -= GRAD_CHECK_EPS;
+            let numeric = (eval(plus) - eval(minus)) / (2.0 * GRAD_CHECK_EPS);
+            let scale = 1.0f32.max(analytic[i].abs()).max(numeric.abs());
+            let err = (analytic[i] - numeric).abs() / scale;
+            if err > max_err {
+                max_err = err;
+            }
+        }
+        max_err
+    }
+
+    /// Exact check, no finite differences involved.
+    ///
+    /// With a ones seed, `dA[i,j]` is the sum of row `j` of B and `dB[j,k]` is
+    /// the sum of column `j` of A. Both work out to small integers here, so
+    /// this pins the backward math far more tightly than a finite difference
+    /// can, and it settles whether any FD disagreement is a bug or just noise.
+    #[test]
+    fn matmul_backward_matches_hand_computed_gradient() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        // A = [[1,2,3],[4,5,6]]
+        let a = Tensor::<SisdBackend>::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3])
+            .unwrap()
+            .with_grad(tape.clone());
+        // B = [[0.5,1,1.5,2],[2.5,3,3.5,4],[4.5,5,5.5,6]]
+        let b = Tensor::<SisdBackend>::from_vec(
+            vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
+            &[3, 4],
+        )
+        .unwrap()
+        .with_grad(tape.clone());
+        let (a_id, b_id) = (a.id(), b.id());
+        let _c = a.matmul(&b).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+
+        // Row sums of B: 5, 13, 21. Every row of dA is that vector.
+        let (grad_a, shape_a) = guard.grad(a_id).expect("A must have a gradient");
+        assert_eq!(shape_a, &vec![2, 3]);
+        let want_a = [5.0f32, 13.0, 21.0, 5.0, 13.0, 21.0];
+        for (i, (got, want)) in grad_a.iter().zip(&want_a).enumerate() {
+            assert!(
+                (got - want).abs() < TOL_EXACT,
+                "dA[{i}] = {got}, expected {want}"
+            );
+        }
+
+        // Column sums of A: 5, 7, 9. Every column of dB is that vector.
+        let (grad_b, shape_b) = guard.grad(b_id).expect("B must have a gradient");
+        assert_eq!(shape_b, &vec![3, 4]);
+        let want_b = [5.0f32, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0];
+        for (i, (got, want)) in grad_b.iter().zip(&want_b).enumerate() {
+            assert!(
+                (got - want).abs() < TOL_EXACT,
+                "dB[{i}] = {got}, expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn grad_check_matmul() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[2, 2], |x, tp| {
+            let b = Tensor::<SisdBackend>::from_vec(vec![0.5, 1.0, 1.5, 2.0], &[2, 2])
+                .unwrap()
+                .with_grad(tp.clone());
+            x.matmul(&b)
+        });
+        assert!(err < GRAD_CHECK_TOL, "matmul grad error {err} exceeds tolerance");
+    }
+
+    /// Non-square catches a transposed-index bug that [2,2] hides.
+    #[test]
+    fn grad_check_matmul_non_square() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let err = finite_diff_check(&a, &[2, 3], |x, tp| {
+            let b = Tensor::<SisdBackend>::from_vec(
+                vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 5.5, 6.0],
+                &[3, 4],
+            )
+            .unwrap()
+            .with_grad(tp.clone());
+            x.matmul(&b)
+        });
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "non-square matmul grad error {err} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    fn grad_check_add() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[4], |x, tp| {
+            let b = Tensor::<SisdBackend>::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4])
+                .unwrap()
+                .with_grad(tp.clone());
+            x.add(&b)
+        });
+        assert!(err < GRAD_CHECK_TOL, "add grad error {err} exceeds tolerance");
+    }
+
+    #[test]
+    fn grad_check_sub() {
+        let a = vec![3.0f32, 1.0, 4.0, 1.0];
+        let err = finite_diff_check(&a, &[4], |x, tp| {
+            let b = Tensor::<SisdBackend>::from_vec(vec![1.0, 1.0, 1.0, 1.0], &[4])
+                .unwrap()
+                .with_grad(tp.clone());
+            x.sub(&b)
+        });
+        assert!(err < GRAD_CHECK_TOL, "sub grad error {err} exceeds tolerance");
+    }
+
+    #[test]
+    fn grad_check_mul() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[4], |x, tp| {
+            let b = Tensor::<SisdBackend>::from_vec(vec![2.0, -1.0, 0.5, 3.0], &[4])
+                .unwrap()
+                .with_grad(tp.clone());
+            x.mul(&b)
+        });
+        assert!(err < GRAD_CHECK_TOL, "mul grad error {err} exceeds tolerance");
+    }
+
+    #[test]
+    fn grad_check_mul_scalar() {
+        let a = vec![1.0f32, 2.0, 3.0];
+        let err = finite_diff_check(&a, &[3], |x, _| x.mul_scalar(3.0));
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "mul_scalar grad error {err} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    fn grad_check_relu() {
+        // Mixed signs exercise both branches. None sit within EPS of zero, so
+        // the finite difference never straddles the kink.
+        let a = vec![-1.0f32, 0.5, -0.5, 2.0];
+        let err = finite_diff_check(&a, &[4], |x, _| x.relu());
+        assert!(err < GRAD_CHECK_TOL, "relu grad error {err} exceeds tolerance");
+    }
+
+    #[test]
+    fn grad_check_transpose() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let err = finite_diff_check(&a, &[2, 3], |x, _| x.transpose());
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "transpose grad error {err} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    fn grad_check_sum() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[4], |x, _| x.sum());
+        assert!(err < GRAD_CHECK_TOL, "sum grad error {err} exceeds tolerance");
+    }
+
+    #[test]
+    fn grad_check_mean() {
+        let a = vec![1.0f32, 2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[4], |x, _| x.mean());
+        assert!(err < GRAD_CHECK_TOL, "mean grad error {err} exceeds tolerance");
+    }
+
+    /// Two ops chained, so the gradient has to flow through a node it did not
+    /// start at.
+    #[test]
+    fn grad_check_chained_matmul_then_relu() {
+        let a = vec![1.0f32, -2.0, 3.0, 0.5];
+        let err = finite_diff_check(&a, &[2, 2], |x, tp| {
+            let w = Tensor::<SisdBackend>::from_vec(vec![1.0, -0.5, 0.25, 2.0], &[2, 2])
+                .unwrap()
+                .with_grad(tp.clone());
+            x.matmul(&w)?.relu()
+        });
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "chained matmul->relu grad error {err} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    fn backward_accumulates_grad_for_shared_tensor() {
+        // y = x @ x. x is both operands, so its gradient is the sum of two
+        // contributions.
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![1.0, 0.0, 0.0, 1.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let x_id = x.id();
+        let _y = x.matmul(&x).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+        let (grad, shape) = guard.grad(x_id).expect("x must have a gradient");
+        assert_eq!(shape, &vec![2, 2]);
+        // For x = I with a ones seed, dL/dx = dC @ x^T + x^T @ dC = 2 everywhere.
+        for (i, g) in grad.iter().enumerate() {
+            assert!(
+                (g - 2.0).abs() < GRAD_CHECK_TOL,
+                "element {i}: expected both paths to contribute 1.0 each, got {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn backward_frozen_operand_has_no_gradient() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        // Frozen base weight: never attached to a tape.
+        let w = Tensor::<SisdBackend>::from_vec(vec![1.0, 0.0, 0.0, 1.0], &[2, 2]).unwrap();
+        let x_id = x.id();
+        let w_id = w.id();
+        let _y = x.matmul(&w).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+        assert!(guard.grad(x_id).is_some(), "tracked tensor must have a gradient");
+        assert!(
+            guard.grad(w_id).is_none(),
+            "frozen tensor must not have a gradient (KL-003)"
+        );
+    }
+
+    #[test]
+    fn backward_on_empty_tape_is_a_noop() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let mut guard = lock_tape(&tape);
+        guard.backward().expect("empty tape must not error");
+        assert!(guard.grad_store().is_empty());
+    }
+
+    /// A second `backward()` used to triple the gradient rather than double
+    /// it: the seed accumulates onto itself and then propagates. Measured
+    /// `[1,1,1,1]` then `[3,3,3,3]` before the guard landed.
+    #[test]
+    fn backward_twice_without_zero_grad_is_rejected() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let id = x.id();
+        let w = Tensor::<SisdBackend>::from_vec(vec![1.0, 0.0, 0.0, 1.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let _y = x.matmul(&w).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().expect("first backward must succeed");
+        let first = guard.grad(id).expect("x must have a gradient").0.clone();
+
+        let err = guard
+            .backward()
+            .expect_err("a second backward on a dirty store must be rejected");
+        assert!(
+            matches!(err, GlTrainError::InvalidOp(ref m) if m.contains("zero_grad")),
+            "expected InvalidOp naming zero_grad, got: {err}"
+        );
+
+        // The rejected call must not have altered anything.
+        let after = guard.grad(id).expect("gradient must survive").0.clone();
+        assert_eq!(first, after, "a rejected backward must not touch gradients");
+
+        // After zero_grad the same pass is allowed again and reproduces it.
+        guard.zero_grad();
+        guard.backward().expect("backward must work after zero_grad");
+        let again = guard.grad(id).expect("x must have a gradient").0.clone();
+        assert_eq!(first, again, "backward must be reproducible after zero_grad");
+    }
+
+    #[test]
+    fn zero_grad_clears_gradients_but_keeps_the_graph() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let _y = x.matmul(&x).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+        assert!(!guard.grad_store().is_empty());
+        let nodes_before = guard.len();
+        guard.zero_grad();
+        assert!(guard.grad_store().is_empty(), "zero_grad must drop gradients");
+        assert_eq!(guard.len(), nodes_before, "zero_grad must keep the graph");
     }
 }

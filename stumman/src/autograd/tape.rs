@@ -15,7 +15,9 @@
 //! - `backward()`: reverse traversal + gradient computation
 //! - `grad_store`: a map from TensorId to accumulated gradient
 
+use crate::autograd::grad_store::VLGradStore;
 use crate::autograd::node::{ComputationNode, NodeId, TensorId};
+use crate::error::{GlTrainError, Result};
 use std::collections::HashMap;
 
 /// Lightweight tensor metadata stored in the tape.
@@ -74,6 +76,9 @@ pub struct Tape {
 
     /// Monotonically increasing node ID counter.
     next_node_id: NodeId,
+
+    /// Gradients accumulated by the most recent `backward()`.
+    grad_store: VLGradStore,
 }
 
 impl Tape {
@@ -83,6 +88,7 @@ impl Tape {
             nodes: Vec::new(),
             tensors: HashMap::new(),
             next_node_id: 0,
+            grad_store: VLGradStore::new(),
         }
     }
 
@@ -145,13 +151,125 @@ impl Tape {
         &self.nodes
     }
 
-    /// Clear all recorded nodes and tensor metadata.
-    /// Called between training steps (after `optimizer.step()`).
-    /// Wave 3: also clears the gradient store.
+    /// Clear recorded nodes, tensor metadata and gradients.
+    /// Called between training steps, after `optimizer.step()`.
     pub fn clear(&mut self) {
         self.nodes.clear();
         self.tensors.clear();
         self.next_node_id = 0;
+        self.grad_store.clear();
+    }
+
+    // ── Backward pass ────────────────────────────────────────────────────
+
+    /// Run the backward pass over everything recorded so far.
+    ///
+    /// Nodes are walked in reverse. Forward-order append gives topological
+    /// order for a define-by-run graph, so reversing it is a valid backward
+    /// order with no sort needed.
+    ///
+    /// For each node: read the output gradient out of the store, call the
+    /// node's [`crate::autograd::node::BackwardFn`], and accumulate each
+    /// returned input gradient. A `None` at index `i` means input `i` is
+    /// frozen and is skipped, per KL-003. That is not an error.
+    ///
+    /// # The seed
+    ///
+    /// The last recorded node's output is seeded with all ones, so `backward()`
+    /// computes the gradient of `sum(output)`. When the graph ends in a scalar,
+    /// which is the loss case, shape `[1]` makes that seed exactly `[1.0]` and
+    /// the usual dL/dL = 1 falls out. Seeding a single `1.0` regardless of
+    /// shape would be wrong for every non-scalar tail: the buffer length has to
+    /// match the output it belongs to or the first backward closure reads past
+    /// its end.
+    ///
+    /// # One backward pass per gradient store
+    ///
+    /// Returns [`GlTrainError::InvalidOp`] if gradients are already present.
+    /// Calling this twice in a row does not double the gradient, it triples it:
+    /// the seed accumulates on top of itself and then propagates, measured as
+    /// `[1,1,1,1]` after one call and `[3,3,3,3]` after two. Rather than leave
+    /// that as a footgun, a dirty store is rejected. Call
+    /// [`Tape::zero_grad`] first.
+    ///
+    /// Multi-batch gradient accumulation is a real need and is Wave 4's job.
+    /// It gets an explicit entry point rather than falling out of calling this
+    /// twice by accident.
+    ///
+    /// Read results with [`Tape::grad`]. Reset with [`Tape::zero_grad`].
+    pub fn backward(&mut self) -> Result<()> {
+        if !self.grad_store.is_empty() {
+            return Err(GlTrainError::InvalidOp(
+                "call zero_grad() before backward()".into(),
+            ));
+        }
+        if self.nodes.is_empty() {
+            return Ok(());
+        }
+
+        // Seed the final output with ones.
+        let last_output = self.nodes[self.nodes.len() - 1].output;
+        let seed_shape = self
+            .tensors
+            .get(&last_output)
+            .ok_or_else(|| {
+                GlTrainError::InvalidOp(format!(
+                    "output tensor {last_output} not registered in tape"
+                ))
+            })?
+            .shape
+            .clone();
+        let seed_len: usize = seed_shape.iter().product();
+        self.grad_store
+            .accumulate(last_output, vec![1.0f32; seed_len], seed_shape)?;
+
+        for node in self.nodes.iter().rev() {
+            // No gradient reached this node, so nothing downstream needs it.
+            let Some((grad_output, output_shape)) = self.grad_store.get(node.output).cloned()
+            else {
+                continue;
+            };
+
+            let input_grads = (node.backward_fn)(&grad_output, &output_shape)?;
+
+            if input_grads.len() != node.inputs.len() {
+                return Err(GlTrainError::InvalidOp(format!(
+                    "op '{}' returned {} gradients but the node has {} inputs",
+                    node.op_name,
+                    input_grads.len(),
+                    node.inputs.len()
+                )));
+            }
+
+            for (input_id, maybe_grad) in node.inputs.iter().zip(input_grads) {
+                // KL-003: None means a frozen operand. Skip it.
+                let Some((grad_data, grad_shape)) = maybe_grad else {
+                    continue;
+                };
+                self.grad_store
+                    .accumulate(*input_id, grad_data, grad_shape)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Read a gradient accumulated by [`Tape::backward`].
+    /// `None` means the tensor never received one, which is what a frozen
+    /// operand looks like.
+    pub fn grad(&self, id: TensorId) -> Option<&(Vec<f32>, Vec<usize>)> {
+        self.grad_store.get(id)
+    }
+
+    /// Borrow the whole gradient store.
+    pub fn grad_store(&self) -> &VLGradStore {
+        &self.grad_store
+    }
+
+    /// Drop all gradients but keep the recorded graph.
+    /// Call after the optimizer step.
+    pub fn zero_grad(&mut self) {
+        self.grad_store.clear();
     }
 }
 
@@ -177,18 +295,21 @@ mod tests {
     use crate::autograd::node::ComputationNode;
     use std::sync::Arc;
 
+    /// A node whose backward returns one `None` per input: structurally valid,
+    /// but contributes no gradient. These tests only exercise recording.
     fn dummy_node(
         id: usize,
         op_name: &'static str,
         inputs: Vec<usize>,
         output: usize,
     ) -> ComputationNode {
+        let arity = inputs.len();
         ComputationNode {
             id,
             op_name,
             inputs,
             output,
-            backward_fn: Arc::new(|| ()),
+            backward_fn: Arc::new(move |_: &[f32], _: &[usize]| Ok(vec![None; arity])),
         }
     }
 

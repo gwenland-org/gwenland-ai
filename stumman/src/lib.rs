@@ -15,7 +15,7 @@ pub mod error;
 pub mod tensor;
 
 // Convenient top-level re-exports
-pub use autograd::{NodeId, Tape, TensorId};
+pub use autograd::{NodeId, Tape, TensorId, VLGradStore};
 pub use backend::{GlProc, SisdBackend};
 pub use error::{GlTrainError, Result};
 pub use tensor::{Backend, Tensor};

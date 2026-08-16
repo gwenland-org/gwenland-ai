@@ -82,14 +82,26 @@ states it:
 | Tensor | Kevrin | `tensor/` | `//! Stummañ Kevrin — the tensor sub-system.` |
 | Backend | Karg | `backend/`, `tensor/backend.rs` | `//! Stummañ Karg — SISD backend (pure scalar reference).` |
 | Autograd | Kevskrid | `autograd/` | `//! Stummañ Kevskrid — Autograd tape.` |
+| Op library | Oberour | `autograd/ops.rs` | `//! Stummañ Oberour: pure math helpers for the backward pass.` |
 | Optimizer | Gwellaer | not written yet (M2) | `//! Stummañ Gwellaer — ...` |
 
 A new file under `stumman/src/` opens with its sub-system line. `error.rs` and
-`lib.rs` sit outside the four sub-systems and carry no codename.
+`lib.rs` sit outside the five sub-systems and carry no codename.
 
 Watch the boundary: `tensor/backend.rs` holds the `Backend` **trait** and is
 tagged **Karg**, not Kevrin, even though it sits in the `tensor/` directory.
 The codename tracks the sub-system, not the folder.
+
+Same for `autograd/ops.rs`: it sits under `autograd/` but is **Oberour**, not
+Kevskrid. Kevskrid is the recorder and replayer, the tape and its nodes;
+Oberour is the arithmetic those backward closures call. STUMMAN_PLAN.md Part 7
+assigns Oberour to this path, and by the precedence rule in
+[`../README.md`](../README.md) an architecture doc being implemented outranks
+this skill, so the plan wins and this table follows it.
+
+Do not confuse the two files named `ops.rs`. `tensor/ops.rs` is Kevrin and is
+still an empty placeholder; `autograd/ops.rs` is Oberour and holds
+`matmul_f32` and `transpose_2d`.
 
 ## Module Structure
 
@@ -109,8 +121,15 @@ stumman/src/
     autograd/             -- Kevskrid
         mod.rs
         tape.rs           -- Tape, TensorMeta -> AGTape, VLTensorMeta
-        node.rs           -- ComputationNode, TensorId, NodeId, BackwardFn
+        node.rs           -- ComputationNode, TensorId, NodeId, BackwardFn,
+                          --   InputGrad
+        grad_store.rs     -- VLGradStore       (already prefixed, born Wave 3)
+        ops.rs            -- matmul_f32, transpose_2d   (Oberour, not Kevskrid)
 ```
+
+`VLGradStore` is the first type in the crate to be born with its prefix, which
+is the rule for new types. It is not in the rename table below because there is
+nothing to rename.
 
 ## Rules
 
