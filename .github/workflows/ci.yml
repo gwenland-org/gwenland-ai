@@ -4,20 +4,20 @@
 # pass? It builds no release artifacts and publishes nothing — build.yml owns
 # releases, and the e2e-* workflows own end-to-end product flows.
 #
-# Two crates are excluded because they do not compile at 9fb361d. These are
-# pre-existing breaks, not CI configuration problems, and each exclusion is a
-# debt to pay down rather than a permanent carve-out:
+# No exclusions. This file previously carved out two pre-existing breaks and
+# said "when either is fixed, delete its exclusion below" — both are now fixed,
+# so both carve-outs are gone:
 #
-#   * glcli — `InferInput` gained a `trace` field in the 0.1.129 tracing work
-#     and glcli/src/main.rs:114 was never updated (E0063). This is why the
-#     four Build GwenLand Binaries jobs fail: build.yml builds `-p glcli`.
+#   * glcli's E0063 (`InferInput`'s `trace` field) no longer reproduces; the
+#     crate builds and is covered by `--workspace` like everything else.
 #
-#   * glcuda's `forward` test — asserts `LayerWeights` fields `gate_up` and
-#     `w_down` that the struct does not have (E0560). The glcuda *library*
-#     builds fine and is covered here; only the one test target is skipped.
+#   * glcuda's `forward` test asserted `LayerWeights` fields `gate_up`/`w_down`
+#     (E0560). Those were not deleted, they moved into `FfnLayer::Dense` when
+#     the FFN grew its routed-MoE variant; the test now constructs that and the
+#     whole crate's 59 tests run here.
 #
-# When either is fixed, delete its exclusion below. If this file's exclusion
-# list grows instead of shrinks, that is the signal to stop and fix the tree.
+# Keep it that way: if an exclusion list reappears and grows, that is the
+# signal to stop and fix the tree instead.
 name: CI
 
 on:
@@ -66,12 +66,5 @@ jobs:
       - name: Build workspace
         run: cargo build --workspace --locked
 
-      # Everything except glcuda, whose `forward` test target does not compile.
       - name: Run tests
-        run: cargo test --workspace --locked --exclude glcuda
-
-      # glcuda's remaining targets: lib unit tests + the `parity` integration
-      # test. Named explicitly so the broken `forward` target stays skipped and
-      # nothing else in the crate silently loses coverage.
-      - name: Run glcuda tests (excluding the broken `forward` target)
-        run: cargo test -p glcuda --locked --lib --test parity
+        run: cargo test --workspace --locked

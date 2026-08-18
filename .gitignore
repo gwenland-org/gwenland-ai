@@ -47,7 +47,10 @@ turbo.json
 # Agent / IDE / local tooling
 # -----------------------------------------------------------------------------
 .agents/
-.claude/
+.claude/*
+# ...except the versioned Agent Skills. Canonical text lives in gl-agent-skills/;
+# these are the Claude Code auto-discovery copies. Keep the two in sync.
+!.claude/skills/
 .kiro/
 .gwenland/
 skills-lock.json

@@ -45,6 +45,27 @@ glproc-backend = ["dep:glproc", "dep:glcore"]
 name = "glconv"
 required-features = ["converter"]
 
+# Examples that reach past the default feature set (`default = []`). Cargo
+# builds every auto-discovered example unconditionally — including under
+# `cargo test --workspace`, which is exactly how these three failed CI while
+# looking like inert sample code. Each `required-features` below is not a new
+# rule: it is the feature the example's own module docs already tell you to
+# pass, now enforced by Cargo instead of by the reader.
+#
+# `run_package` and `validate_types` are deliberately absent — they build on
+# default features, and stay auto-discovered.
+[[example]]
+name = "diff_dump"
+required-features = ["glproc-backend"]
+
+[[example]]
+name = "run_package_e2e"
+required-features = ["glproc-backend"]
+
+[[example]]
+name = "verify_bytes"
+required-features = ["converter"]
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"

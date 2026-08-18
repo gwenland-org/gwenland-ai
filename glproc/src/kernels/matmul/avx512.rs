@@ -41,6 +41,10 @@ pub unsafe fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW.
+/// Same bounds-checked slicing as the AVX2 twin: `m`/`k`/`n` disagreeing with
+/// the buffers panics rather than reading out of bounds.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
@@ -66,6 +70,10 @@ pub unsafe fn run(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: us
     }
 }
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW.
+/// As the AVX2 twin: passes an `a`-row of length exactly `k` as `run_matvec`'s
+/// `x` with `in_dim = k`, so it satisfies that unchecked precondition itself.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     for i in 0..m {
@@ -73,8 +81,21 @@ pub unsafe fn run_t(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: 
     }
 }
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW — that is now the *only* obligation on the
+/// caller.
+///
+/// As in the AVX2 twin, `x` is walked by raw pointer to `in_dim`; the length
+/// is enforced here by a real `assert!` (not a `debug_assert`, which release
+/// builds drop) instead of being left as a caller promise. `w` and `y` were
+/// already bounds-checked.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run_matvec(w: &[f32], x: &[f32], y: &mut [f32], out_dim: usize, in_dim: usize) {
+    assert!(
+        x.len() >= in_dim,
+        "run_matvec: x has {} elements, need at least in_dim = {in_dim}",
+        x.len()
+    );
     for o in 0..out_dim {
         let mut acc = _mm512_setzero_ps();
         let row = w[o * in_dim .. (o + 1) * in_dim].as_ptr();

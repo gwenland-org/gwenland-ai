@@ -1,5 +1,12 @@
 use std::arch::x86_64::*;
 
+/// # Safety
+/// Requires AVX-512F and AVX-512BW. The only sanctioned caller is the
+/// `SimdStrategy::Avx512` arm of `kernels::dequant_bf16`, whose match on the
+/// cached CPU probe is what proves the features are present; calling this
+/// directly bypasses that proof and is UB on a CPU without them.
+///
+/// `data` is read as 2-byte bfloat16 lanes. Any length is accepted: the vector loop stops 8 lanes short of the end and a scalar tail finishes the remainder.
 #[target_feature(enable = "avx512f", enable = "avx512bw")]
 pub unsafe fn run(data: &[u8]) -> Vec<f32> {
     let numel = data.len() / 2;

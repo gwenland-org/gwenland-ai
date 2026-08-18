@@ -263,3 +263,66 @@ fn cmd_tui() -> Result<(), GlError> {
     eprintln!("Meanwhile, run the standalone TUI with: cargo run -p gltui");
     Ok(())
 }
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser as _;
+
+    /// `model` is positional and `--prompt` is a flag — the shapes the README
+    /// and the `Info`/`Run` handlers below actually depend on.
+    #[test]
+    fn run_parses_positional_model_and_prompt_flag() {
+        let cli = Cli::try_parse_from(["gwen", "run", "model.gguf", "--prompt", "hello there"])
+            .expect("valid run invocation");
+        match cli.command {
+            Commands::Run { model, prompt, .. } => {
+                assert_eq!(model, "model.gguf");
+                assert_eq!(prompt.as_deref(), Some("hello there"));
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    /// The sampling defaults are part of the CLI's contract: omitting them must
+    /// not silently change generation behaviour.
+    #[test]
+    fn run_sampling_defaults_are_stable() {
+        let cli = Cli::try_parse_from(["gwen", "run", "m.gguf"]).expect("model alone is valid");
+        match cli.command {
+            Commands::Run { max_tokens, temperature, top_k, top_p, repeat_penalty, raw, prompt, .. } => {
+                assert_eq!(max_tokens, 256);
+                assert_eq!(temperature, 0.8);
+                assert_eq!(top_k, 40);
+                assert_eq!(top_p, 0.95);
+                assert_eq!(repeat_penalty, 1.1);
+                assert!(!raw);
+                assert!(prompt.is_none(), "no --prompt means REPL mode");
+            }
+            _ => panic!("expected Run"),
+        }
+    }
+
+    #[test]
+    fn info_takes_a_model_path() {
+        let cli = Cli::try_parse_from(["gwen", "info", "weights.safetensors"]).expect("valid info");
+        match cli.command {
+            Commands::Info { model } => assert_eq!(model, "weights.safetensors"),
+            _ => panic!("expected Info"),
+        }
+    }
+
+    /// Error case: `run` without its positional model must be rejected, not
+    /// defaulted to something.
+    #[test]
+    fn run_without_model_is_rejected() {
+        assert!(Cli::try_parse_from(["gwen", "run"]).is_err());
+    }
+
+    /// Error case: an unknown flag must fail rather than being ignored — a
+    /// silently-dropped `--threads` would look like it took effect.
+    #[test]
+    fn unknown_flag_is_rejected() {
+        assert!(Cli::try_parse_from(["gwen", "run", "m.gguf", "--threads", "4"]).is_err());
+    }
+}

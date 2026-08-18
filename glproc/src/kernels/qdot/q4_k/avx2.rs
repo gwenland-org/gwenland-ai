@@ -66,6 +66,18 @@ pub unsafe fn row_dot_q8k(row: &[u8], act: &Q8KActivation) -> f32 {
     }
 }
 
+/// # Safety
+/// Requires AVX2, FMA and F16C, and `act` quantized for at least
+/// `row.len() / 144 * 256` elements — the contract of its only caller,
+/// [`row_dot_q8k`], which is itself reached only through the `SimdStrategy`
+/// dispatch.
+///
+/// ⚠️ `VNNI` carries an obligation the `#[target_feature]` list above does
+/// **not** state: instantiating `VNNI == true` routes through
+/// [`dot32_lanes_vnni`], which additionally needs AVX-512VL and AVX-512VNNI.
+/// `row_dot_q8k` establishes that by branching on the cached `has_vnni_256()`
+/// probe, so the `true` instantiation is only ever reached on hardware that
+/// has them; selecting it any other way is UB on an AVX2-only CPU.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn row_dot_q8k_inner<const VNNI: bool>(row: &[u8], act: &Q8KActivation) -> f32 {
     let lo_mask = _mm256_set1_epi8(0x0F);
@@ -154,6 +166,11 @@ unsafe fn row_dot_q8k_inner<const VNNI: bool>(row: &[u8], act: &Q8KActivation) -
 
 /// `Σ q_i · a_i` over 32 unsigned-4-bit weights × 32 signed int8 activations,
 /// left in i32 lanes (NOT horizontally summed).
+/// # Safety
+/// Requires AVX2.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2")]
 unsafe fn dot32_lanes(w: __m256i, a: __m256i) -> __m256i {
     // maddubs: unsigned × signed -> i16 pair sums. Weights are 0..15 and
@@ -164,6 +181,16 @@ unsafe fn dot32_lanes(w: __m256i, a: __m256i) -> __m256i {
 }
 
 /// VNNI variant: one `vpdpbusd` replaces the maddubs+madd pair.
+/// # Safety
+/// Requires AVX2, AVX-512VL **and AVX-512VNNI** — a strictly narrower CPU set than the
+/// rest of this module.
+/// Reachable only through the `VNNI == true` instantiation of
+/// `row_dot_inner`/`row_dot_q8k_inner`, which is selected only after those
+/// two AVX-512 sub-features are probed present; instantiating that path on
+/// an AVX2-only CPU is UB even though the surrounding module runs there.
+/// Operates only on values already in vector registers — it dereferences no
+/// pointer and touches no caller memory — so having the ISA is the entire
+/// obligation.
 #[target_feature(enable = "avx2", enable = "avx512vl", enable = "avx512vnni")]
 unsafe fn dot32_lanes_vnni(w: __m256i, a: __m256i) -> __m256i {
     _mm256_dpbusd_epi32(_mm256_setzero_si256(), w, a)
@@ -185,6 +212,15 @@ pub unsafe fn row_dot(row: &[u8], act: &QuantizedActivation) -> f32 {
     }
 }
 
+/// # Safety
+/// Requires AVX2, FMA and F16C, and `act` quantized for at least
+/// `row.len() / 144 * 256` elements — the contract of its only caller,
+/// [`row_dot`].
+///
+/// ⚠️ Same unstated `VNNI` obligation as [`row_dot_q8k_inner`]: the
+/// `VNNI == true` instantiation reaches [`dot32_lanes_vnni`] and so also
+/// needs AVX-512VL and AVX-512VNNI, which `row_dot` proves via
+/// `has_vnni_256()` before selecting it.
 #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
 unsafe fn row_dot_inner<const VNNI: bool>(row: &[u8], act: &QuantizedActivation) -> f32 {
     let lo_mask = _mm256_set1_epi8(0x0F);
