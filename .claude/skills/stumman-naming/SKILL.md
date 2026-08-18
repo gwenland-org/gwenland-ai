@@ -82,7 +82,9 @@ states it:
 | Tensor | Kevrin | `tensor/` | `//! Stummañ Kevrin — the tensor sub-system.` |
 | Backend | Karg | `backend/`, `tensor/backend.rs` | `//! Stummañ Karg — SISD backend (pure scalar reference).` |
 | Autograd | Kevskrid | `autograd/` | `//! Stummañ Kevskrid — Autograd tape.` |
-| Optimizer | Gwellaer | not written yet (M2) | `//! Stummañ Gwellaer — ...` |
+| Optimizer | Gwellaer | `optim/` | `//! Stummañ Gwellaer: AdamW optimizer.` |
+| Model DSL | Gwiskadur | `nn/` | `//! Stummañ Gwiskadur: LoRA adapter.` |
+| Checkpoint | Pik | `checkpoint/` | `//! Stummañ Pik: adapter checkpoint.` |
 
 A new file under `stumman/src/` opens with its sub-system line. `error.rs` and
 `lib.rs` sit outside the four sub-systems and carry no codename.
@@ -174,18 +176,38 @@ the types early.
 | Grad checker | `AGGradCheck` | Numerical gradient verification |
 | Generic grad buffer | `TPGradBuffer<B>` | If it ends up generic over backend |
 
-M2 (optimizer, sub-system Gwellaer) wants a prefix that **does not exist yet**:
+## M2 names (approved 2026-08-17)
 
-| Type | Proposed prefix | Role |
-|------|------|------|
-| `OPAdamW`, `OPSGD`, `OPLion` | `OP` | Stateful update rule applied to model parameters |
+`OP` **is now in the** [GwenLand prefix table](../gwenland-naming-convention/SKILL.md#prefix-table),
+and `CP` was reassigned from Compiler to Checkpoint in the same edit. Both were
+signed off by JinXSuper before any M2 code was written, which is the order the
+parent skill requires.
 
-`OP` is not in the GwenLand prefix table. Before M2 writes a line of optimizer
-code, `OP` gets proposed through the process in
-[`../gwenland-naming-convention/SKILL.md`](../gwenland-naming-convention/SKILL.md#adding-a-new-prefix)
-and added to the table. The obvious objection to answer: why is an optimizer
-not just an `AB` algorithm block? (Answer to give: it carries mutable state
-across steps; an `AB` is pure.)
+| Type | Prefix | Role |
+|---|---|---|
+| `OPAdamW` | `OP` | AdamW. Carries first/second moments across steps. |
+| `OPLion`, `OPAdafactor`, `OPAdamW8bit` | `OP` | Stub optimizers, real interfaces. |
+| `CPLora` | `CP` | Adapter-only checkpoint. |
+| `CPFull`, `CPSharded`, `CPIncremental` | `CP` | Stub checkpoint layouts. |
+| `PLGgufMerge` | `PL` | **Not** a checkpoint: a one-way export pipeline. See below. |
+| `LRLora` | `LR` | Canonical LoRA adapter. |
+| `LRDora`, `LRQLora`, `LRLoHa`, `LRVeRA`, `LRLoCon` | `LR` | Stub adapters. |
+| `ABLinear` | `AB` | Plain linear layer, a reusable building block. |
+| `TPParameter<B>` | `TP` | Named trainable tensor, generic over backend. |
+| `VLLoraConfig`, `VLAdamWConfig`, `VLParamGroup`, `VLAdapterCapability` | `VL` | Config and metadata bags. |
+| `Adapter`, `Optimizer`, `CheckpointStore`, `Exporter`, `Module` | none | Traits take no prefix. |
+| `AdapterRegistry`, `OptimizerRegistry`, `CheckpointRegistry` | none | Match `PluginRegistry` in glictus-caliburni, the pattern they copy. |
+
+Two of these encode a research finding rather than a taste:
+
+- **`PLGgufMerge` is `PL`, not `CP`.** Merging an adapter into a GGUF is
+  lossy and one way: it requantizes, and nothing can resume from its output. A
+  `CP` name would imply a `load()` that cannot exist. `PL` (pipeline) says what
+  it is: read adapter, read base, merge, requantize, write.
+- **There is no `LRLoraPlus`.** LoRA+ changes only the learning-rate ratio
+  between the A and B parameter groups, so it lives on the optimizer as a
+  policy, not in `nn/adapter/`. Naming it as an adapter would create a type
+  structurally identical to `LRLora`.
 
 ## ✅ Correct Pattern
 
@@ -214,7 +236,7 @@ assert!((got - want).abs() < TOL_MATMUL);
 //                                             ❌ em dash in a doc comment
 
 pub struct BEAuto;              // ❌ blocked by KL-001, decide at M4
-pub struct OPAdamW;             // ❌ OP is not an approved prefix yet
+pub struct LRLoraPlus;          // ❌ LoRA+ is an optimizer policy, not an adapter
 pub struct VLGlTrainError;      // ❌ error types take no prefix
 
 assert!((got - want).abs() < 1e-4);   // ❌ bare tolerance literal

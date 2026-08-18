@@ -97,6 +97,41 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// Scale all elements by a scalar: B = A * scalar
     fn mul_scalar(a: &Self::Storage, scalar: f32, n_elems: usize) -> Result<Self::Storage>;
 
+    /// Element-wise division: C = A / B
+    ///
+    /// Added for M2's optimizer. Implementors must reject a zero divisor rather
+    /// than emit an infinity: AdamW's denominator is `sqrt(v) + eps` and can
+    /// only be zero if `eps` was passed as zero, which is a configuration bug
+    /// worth naming instead of propagating as a NaN weight three steps later.
+    fn div(a: &Self::Storage, b: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
+
+    /// Element-wise square root.
+    ///
+    /// Implementors must reject a negative input. AdamW only ever calls this on
+    /// a second moment, which is a sum of squares and cannot be negative, so a
+    /// negative here means the state is already corrupt.
+    fn sqrt(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
+
+    /// Add a scalar to every element: B = A + scalar
+    fn add_scalar(a: &Self::Storage, scalar: f32, n_elems: usize) -> Result<Self::Storage>;
+
+    /// Element-wise negation: B = -A
+    fn neg(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
+
+    /// Element-wise sign: -1.0, 0.0 or +1.0.
+    ///
+    /// Added for [`crate::optim::OPLion`], whose whole update is
+    /// `sign(beta1*m + (1-beta1)*g)`. Lion is a stub on M2, so this method has
+    /// no caller inside the crate yet. It is on the trait rather than in Lion's
+    /// own file because a backend op belongs to the backend: putting it in the
+    /// optimizer would hand the eventual GPU backend a scalar loop it cannot
+    /// replace.
+    ///
+    /// Zero maps to zero, matching `f32::signum` everywhere except at zero:
+    /// `signum` returns +1.0 for `0.0` and -1.0 for `-0.0`, which would give a
+    /// parameter with no momentum a full-size update in an arbitrary direction.
+    fn sign(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
+
     /// ReLU activation: y = max(0, x)
     fn relu(x: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
 
