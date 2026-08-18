@@ -324,61 +324,90 @@ the behaviour this guard exists to forbid.
 
 | | |
 |---|---|
-| **Status** | KNOWN LIMITATION |
+| **Status** | **RESOLVED** by construction (M2 Wave 1) |
 | **Introduced** | M1 Wave 3 |
-| **Resolution owned by** | **Wave 4+**, and it **must be resolved before any in-place weight update lands** (M2 optimizer) |
-| **Affects** | `stumman/src/tensor/tensor.rs` - the `matmul`, `mul` and `relu` backward closures |
-| **Severity** | None today. High the moment the optimizer writes in place. |
+| **Fixed in** | `Tape::finish_step` + the `Optimizer::step` signature |
+| **Affects** | `stumman/src/tensor/tensor.rs` - the `matmul`, `mul`, `div`, `sqrt` and `relu` backward closures |
+| **Regression test** | `finish_step_clears_the_tape_and_returns_the_gradients`, `finish_step_returns_an_empty_store_when_backward_was_never_called`, `finish_step_resets_the_node_id_counter` |
 
 ### What
 
-Three ops capture the *values* of their forward inputs at record time, because
-their gradients depend on the operand data rather than only on its shape:
+Several ops capture the *values* of their forward operands at record time,
+because their gradients depend on the operand data rather than only on its
+shape:
 
 | Op | Captured | Needed for |
 |---|---|---|
 | `matmul` | `a_data`, `b_data` | `dA = dC @ B^T`, `dB = A^T @ dC` |
 | `mul` | `a_data`, `b_data` | `dA = dC * B`, `dB = dC * A` |
+| `div` | `b_data`, `a_data` | `dA = dC / B`, `dB = -dC * A / B^2` |
+| `sqrt` | the forward **output** | `dA = dC / (2*y)` |
 | `relu` | `a_data` | the positive-input mask |
 
 The capture is a `Vec<f32>` snapshot taken when the node is recorded. It is a
 copy, not a view of the tensor's storage.
 
-### Why it is harmless right now
+### When it bit
 
-Nothing in the crate mutates tensor storage in place. Every op allocates fresh
-storage, and `Tensor` exposes no `&mut` path to it. Verified, not assumed:
-
-```
-$ grep -rn "make_mut\|storage_mut\|&mut self" src/tensor/tensor.rs
-(no matches)
-```
-
-So a captured snapshot can never disagree with the tensor it came from.
-
-### When it bites
-
-M2's optimizer has to write updated weights back. If it does that in place,
-through `Arc::make_mut` on the storage or a new `&mut` accessor, then any tape
-still holding a capture of that weight keeps the **pre-update** values. The next
-backward pass computes gradients from weights that no longer exist.
+M2's optimizer writes updated weights back through
+`TPParameter::set_data` -> `Tensor::replace_data`, which mutates storage in
+place so the parameter keeps its `TensorId` across steps (optimizer state is
+keyed on that ID). Any tape still holding a capture of that weight would keep
+the **pre-update** values, and the next backward pass would compute gradients
+from weights that no longer exist.
 
 There is no error and no crash. The loss curve stays plausible and is quietly
 wrong, which is the most expensive failure shape this crate has.
 
-### Options
+### The resolution: option (a), as a type-level guarantee
 
-- **(a) Require `tape.clear()` before `optimizer.step()`**, enforced with a
-  guard the way KL-005 guards double-backward. Cheapest, and the discipline is
-  correct anyway since the graph is dead once the step is taken.
-  **Recommended.**
-- **(b) Optimizer produces a new tensor** instead of mutating storage. Clean,
-  but every parameter gets a new `TensorId` each step, and optimizer state keyed
-  on that ID would have to be rekeyed. See KL-004's note on ID lifecycle.
-- **(c) Capture `Arc<B::Storage>` rather than a `Vec<f32>` snapshot**, so a
-  copy-on-write mutation leaves the tape's view intact. Costs nothing when
-  nobody mutates, and removes the whole class of problem, but it puts a backend
-  type inside a captured closure and would need care not to leak `B` into the
-  tape's own types.
+`KNOWN_ISSUES.md` recommended option (a), "require `tape.clear()` before
+`optimizer.step()`, enforced with a guard". It shipped in that spirit but in a
+stronger form, because the literal reading does not work: the gradients the
+optimizer needs *live in* `grad_store`, so a guard that merely refused a
+non-empty tape would make it impossible to ever read them.
 
-Whichever is chosen, it lands **with** the in-place update, not after it.
+`Tape::finish_step()` does both halves atomically instead:
+
+```rust
+pub fn finish_step(&mut self) -> VLGradStore {
+    let grads = std::mem::take(&mut self.grad_store);
+    self.nodes.clear();
+    self.tensors.clear();
+    self.next_node_id = 0;
+    grads
+}
+```
+
+and `Optimizer::step` takes the returned `VLGradStore`, never a `&mut Tape`:
+
+```rust
+fn step(&mut self, params: &mut [&mut TPParameter<B>], grads: &VLGradStore) -> Result<()>;
+```
+
+**A `VLGradStore` cannot be obtained without the tape already being cleared.**
+There is no ordering for a caller to get wrong and no boolean anyone has to
+remember to check: holding the gradients *is* the proof that no live closure
+can observe the weights the step is about to overwrite. A runtime `if
+tape.is_empty()` check would have been strictly weaker, since it could only
+have run after the grads were already gone.
+
+### What this does not cover
+
+Nothing else in the crate mutates tensor storage. `replace_data` is
+`pub(crate)` and `TPParameter::set_data` is its only caller, so the mutation
+surface is exactly one function and it is on the path this guard protects.
+A future in-place backend kernel would reopen the question and would need
+re-checking against this entry, which is why the entry stays on the record.
+
+### Not chosen
+
+- **(b) Optimizer produces a new tensor.** Every parameter would get a fresh
+  `TensorId` each step, and optimizer state keyed on that ID would need
+  rekeying every step. Rejected: it moves the cost from a guard to a permanent
+  per-step rekey.
+- **(c) Capture `Arc<B::Storage>` instead of a `Vec<f32>` snapshot.** Removes
+  the class of problem entirely and costs nothing when nobody mutates, but it
+  puts a backend type inside a captured closure and leaks `B` into the tape's
+  own types. Still the better answer if the tape ever has to survive a step;
+  it does not today.

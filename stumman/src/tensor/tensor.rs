@@ -112,6 +112,68 @@ impl<B: Backend> Tensor<B> {
         Ok(Self::from_storage(storage, shape.to_vec()))
     }
 
+    /// Create a tensor of `N(0, std^2)` samples from a seeded generator.
+    ///
+    /// Deterministic by construction: the same `(shape, std, seed)` gives the
+    /// same tensor on every run. LoRA's A matrix needs this, and so does VeRA's
+    /// seed-regenerated frozen pair (M3).
+    ///
+    /// `seed` is explicit rather than drawn from the clock because an
+    /// unreproducible weight init makes a divergent training run impossible to
+    /// bisect.
+    pub fn randn(shape: &[usize], std: f32, seed: u64) -> Result<Self> {
+        let n = shape_to_n_elems(shape)?;
+        let mut rng = crate::rng::Xorshift64Star::new(seed);
+        let storage = B::from_vec(rng.normal_vec(n, std))?;
+        Ok(Self::from_storage(storage, shape.to_vec()))
+    }
+
+    /// A zero tensor with the same shape as `self`. Untracked.
+    pub fn zeros_like(&self) -> Result<Self> {
+        Self::zeros(&self.shape)
+    }
+
+    /// Overwrite this tensor's data in place, keeping its [`TensorId`].
+    ///
+    /// This is the optimizer's write path and the only mutation route in the
+    /// crate. It is `pub(crate)` because using it correctly requires the caller
+    /// to have already dealt with KL-006, and the guard for that lives in
+    /// [`crate::optim`].
+    ///
+    /// # The ID is deliberately preserved
+    ///
+    /// A parameter keeps its identity across a step. Optimizer state is keyed by
+    /// name for serialization (tensor IDs are not persistable, see
+    /// [`NEXT_TENSOR_ID`]) but keyed by ID in memory, so a fresh ID every step
+    /// would orphan the moments and silently restart momentum on every update.
+    ///
+    /// # KL-006: the caller must have cleared the tape
+    ///
+    /// `matmul`, `mul` and `relu` snapshot their forward operands into their
+    /// backward closures. If a tape recorded before this call is still live, it
+    /// holds the **pre-update** weights and the next backward pass computes
+    /// gradients against weights that no longer exist. There is no crash and the
+    /// loss curve stays plausible.
+    ///
+    /// This method does not check that, because a `Tensor` has no way to know
+    /// which tapes reference it. [`crate::optim::Optimizer::step`] takes
+    /// `&mut Tape` and rejects a non-empty one, which is where the invariant is
+    /// actually enforced.
+    ///
+    /// Note the swap replaces the `Arc` rather than mutating through it, so any
+    /// *clone* of this tensor keeps the old storage. That is why the parameter
+    /// that owns the weight must be the single source of truth for it.
+    pub(crate) fn replace_data(&mut self, data: Vec<f32>) -> Result<()> {
+        if data.len() != self.n_elems() {
+            return Err(GlTrainError::ShapeMismatch {
+                expected: self.shape.clone(),
+                got: vec![data.len()],
+            });
+        }
+        self.storage = Arc::new(B::from_vec(data)?);
+        Ok(())
+    }
+
     /// Internal constructor from raw storage + shape.
     ///
     /// Every tensor gets a fresh ID here. Grad tracking is opt-in: a tensor is
@@ -523,6 +585,124 @@ impl<B: Backend> Tensor<B> {
                     .zip(&a_data)
                     .map(|(g, x)| if *x > 0.0 { *g } else { 0.0 })
                     .collect();
+                Ok(vec![Some((grad_a, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Element-wise division: self / other
+    ///
+    /// A zero divisor is an error, not an infinity. See [`Backend::div`].
+    pub fn div(&self, other: &Tensor<B>) -> Result<Tensor<B>> {
+        check_same_shape(&self.shape, &other.shape)?;
+        let n = self.n_elems();
+        let storage = B::div(&self.storage, &other.storage, n)?;
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self, other], "Div", move || {
+            // dA = dC / B, dB = -dC * A / B^2. Both need B's values; only dB
+            // additionally needs A's, so A is captured only when B is tracked.
+            let a_tracked = self.requires_grad;
+            let b_tracked = other.requires_grad;
+            let b_data = B::to_vec(&other.storage)?;
+            let a_data = if b_tracked {
+                B::to_vec(&self.storage)?
+            } else {
+                Vec::new()
+            };
+            let a_shape = self.shape.clone();
+            let b_shape = other.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![
+                    a_tracked.then(|| {
+                        (
+                            grad_output
+                                .iter()
+                                .zip(&b_data)
+                                .map(|(g, b)| g / b)
+                                .collect::<Vec<f32>>(),
+                            a_shape.clone(),
+                        )
+                    }),
+                    b_tracked.then(|| {
+                        (
+                            grad_output
+                                .iter()
+                                .zip(&a_data)
+                                .zip(&b_data)
+                                .map(|((g, a), b)| -g * a / (b * b))
+                                .collect::<Vec<f32>>(),
+                            b_shape.clone(),
+                        )
+                    }),
+                ])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Element-wise square root.
+    ///
+    /// Rejects a negative input on the forward pass ([`Backend::sqrt`]), and
+    /// rejects a **zero** input on the backward pass: `d/dx sqrt(x)` is
+    /// `1/(2*sqrt(x))`, which has no finite value at zero. Erroring there keeps
+    /// the same contract `div` has, rather than seeding the tape with an
+    /// infinity that surfaces as a NaN weight several steps later.
+    pub fn sqrt(&self) -> Result<Tensor<B>> {
+        let n = self.n_elems();
+        let storage = B::sqrt(&self.storage, n)?;
+        // Capture the forward OUTPUT before it moves into the tensor: the
+        // gradient is 1/(2*y) where y is what this op already computed, so
+        // recomputing a square root in the backward pass would be wasted work.
+        let y_data = B::to_vec(&storage)?;
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "Sqrt", move || {
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let mut grad_a = Vec::with_capacity(y_data.len());
+                for (i, (g, y)) in grad_output.iter().zip(&y_data).enumerate() {
+                    if *y == 0.0 {
+                        return Err(GlTrainError::InvalidOp(format!(
+                            "sqrt backward: input was zero at index {i}, where the                              derivative 1/(2*sqrt(x)) is unbounded"
+                        )));
+                    }
+                    grad_a.push(g / (2.0 * y));
+                }
+                Ok(vec![Some((grad_a, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Add a scalar to every element: self + scalar
+    pub fn add_scalar(&self, scalar: f32) -> Result<Tensor<B>> {
+        let n = self.n_elems();
+        let storage = B::add_scalar(&self.storage, scalar, n)?;
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "AddScalar", move || {
+            // dA = dC. A constant offset does not scale the gradient.
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                Ok(vec![Some((grad_output.to_vec(), in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Element-wise negation: -self
+    pub fn neg(&self) -> Result<Tensor<B>> {
+        let n = self.n_elems();
+        let storage = B::neg(&self.storage, n)?;
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "Neg", move || {
+            // dA = -dC.
+            let in_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let grad_a: Vec<f32> = grad_output.iter().map(|g| -g).collect();
                 Ok(vec![Some((grad_a, in_shape.clone()))])
             }) as BackwardFn)
         })?;
@@ -1259,6 +1439,121 @@ mod grad_check {
         let a = vec![-1.0f32, 0.5, -0.5, 2.0];
         let err = finite_diff_check(&a, &[4], |x, _| x.relu());
         assert!(err < GRAD_CHECK_TOL, "relu grad error {err} exceeds tolerance");
+    }
+
+    // ── M2 Wave 1: div / sqrt / add_scalar / neg ─────────────────────
+
+    #[test]
+    fn grad_check_sqrt() {
+        // All inputs comfortably positive: `sqrt` errors on a negative forward
+        // input and on a zero backward input, and the +/- EPS probe must not
+        // push any of them across either boundary.
+        let a = vec![0.25f32, 1.0, 4.0, 9.0];
+        let err = finite_diff_check(&a, &[4], |x, _| x.sqrt());
+        assert!(err < GRAD_CHECK_TOL, "sqrt grad error {err} exceeds tolerance");
+    }
+
+    /// `d/dx sqrt(x) = 1/(2*sqrt(x))`, so at x = 4 the gradient is exactly
+    /// 0.25 and at x = 0.25 it is exactly 1.0. A finite difference cannot
+    /// distinguish `1/(2*sqrt(x))` from a subtly wrong constant factor the way
+    /// this can.
+    #[test]
+    fn sqrt_backward_matches_the_hand_computed_derivative() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![4.0, 0.25, 1.0], &[3])
+            .unwrap()
+            .with_grad(tape.clone());
+        let x_id = x.id();
+        let _y = x.sqrt().unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+        let g = &guard.grad(x_id).unwrap().0;
+        let expected = [0.25f32, 1.0, 0.5];
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!(
+                (g[i] - exp).abs() < TOL_EXACT,
+                "sqrt grad[{i}] = {}, expected {exp}",
+                g[i]
+            );
+        }
+    }
+
+    /// The derivative is unbounded at zero. Erroring keeps the same contract
+    /// `div` has, instead of seeding the tape with an infinity that surfaces
+    /// later as a NaN weight with no trace back to here.
+    #[test]
+    fn sqrt_backward_rejects_a_zero_input() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<SisdBackend>::from_vec(vec![1.0, 0.0], &[2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let _y = x.sqrt().expect("sqrt(0) is fine on the forward pass");
+
+        let mut guard = lock_tape(&tape);
+        assert!(
+            guard.backward().is_err(),
+            "backward through sqrt(0) must error, not produce an infinity"
+        );
+    }
+
+    #[test]
+    fn grad_check_div() {
+        // Numerator and denominator both tracked would need two inputs; this
+        // checks the numerator path with a constant denominator, and
+        // `div_backward_matches_the_hand_computed_derivative` pins both.
+        let a = vec![1.0f32, -2.0, 3.0, 4.0];
+        let err = finite_diff_check(&a, &[4], |x, _| {
+            let d = Tensor::<SisdBackend>::from_vec(vec![2.0, 4.0, -2.0, 8.0], &[4]).unwrap();
+            x.div(&d)
+        });
+        assert!(err < GRAD_CHECK_TOL, "div grad error {err} exceeds tolerance");
+    }
+
+    /// With a ones seed, `dA = 1/B` and `dB = -A/B^2`. Chosen so both are
+    /// exact in f32.
+    #[test]
+    fn div_backward_matches_the_hand_computed_derivative() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let a = Tensor::<SisdBackend>::from_vec(vec![6.0, 1.0], &[2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let b = Tensor::<SisdBackend>::from_vec(vec![2.0, 4.0], &[2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let (a_id, b_id) = (a.id(), b.id());
+        let _c = a.div(&b).unwrap();
+
+        let mut guard = lock_tape(&tape);
+        guard.backward().unwrap();
+
+        // dA = 1/B = [0.5, 0.25]
+        let ga = &guard.grad(a_id).unwrap().0;
+        for (i, exp) in [0.5f32, 0.25].iter().enumerate() {
+            assert!((ga[i] - exp).abs() < TOL_EXACT, "dA[{i}] = {}", ga[i]);
+        }
+        // dB = -A/B^2 = [-6/4, -1/16] = [-1.5, -0.0625]
+        let gb = &guard.grad(b_id).unwrap().0;
+        for (i, exp) in [-1.5f32, -0.0625].iter().enumerate() {
+            assert!((gb[i] - exp).abs() < TOL_EXACT, "dB[{i}] = {}", gb[i]);
+        }
+    }
+
+    #[test]
+    fn grad_check_add_scalar() {
+        let a = vec![1.0f32, -2.0, 0.5];
+        let err = finite_diff_check(&a, &[3], |x, _| x.add_scalar(2.5));
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "add_scalar grad error {err} exceeds tolerance"
+        );
+    }
+
+    #[test]
+    fn grad_check_neg() {
+        let a = vec![1.0f32, -2.0, 0.5];
+        let err = finite_diff_check(&a, &[3], |x, _| x.neg());
+        assert!(err < GRAD_CHECK_TOL, "neg grad error {err} exceeds tolerance");
     }
 
     #[test]

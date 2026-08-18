@@ -120,6 +120,70 @@ impl Backend for SisdBackend {
         Ok(out)
     }
 
+    fn div(a: &Self::Storage, b: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "div", "lhs")?;
+        check_len(b, n_elems, "div", "rhs")?;
+        let mut out = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            if b[i] == 0.0 {
+                return Err(GlTrainError::Backend(format!(
+                    "sisd div: divisor is zero at index {i}"
+                )));
+            }
+            out[i] = a[i] / b[i];
+        }
+        Ok(out)
+    }
+
+    fn sqrt(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "sqrt", "input")?;
+        let mut out = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            if a[i] < 0.0 {
+                return Err(GlTrainError::Backend(format!(
+                    "sisd sqrt: negative input {} at index {i}",
+                    a[i]
+                )));
+            }
+            out[i] = a[i].sqrt();
+        }
+        Ok(out)
+    }
+
+    fn add_scalar(a: &Self::Storage, scalar: f32, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "add_scalar", "input")?;
+        let mut out = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            out[i] = a[i] + scalar;
+        }
+        Ok(out)
+    }
+
+    fn neg(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "neg", "input")?;
+        let mut out = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            out[i] = -a[i];
+        }
+        Ok(out)
+    }
+
+    fn sign(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "sign", "input")?;
+        // Deliberately not `f32::signum`, which returns +1.0 for 0.0.
+        let mut out = vec![0.0f32; n_elems];
+        for i in 0..n_elems {
+            out[i] = if a[i] > 0.0 {
+                1.0
+            } else if a[i] < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+        }
+        Ok(out)
+    }
+
     fn add(a: &Self::Storage, b: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
         check_len(a, n_elems, "add", "lhs")?;
         check_len(b, n_elems, "add", "rhs")?;
@@ -267,5 +331,125 @@ mod tests {
                 "glproc/sisd divergence at {idx}: simd={got}, scalar={exp}"
             );
         }
+    }
+
+    // ── M2 Wave 1: the optimizer's arithmetic ops ────────────────────────
+    //
+    // `div`, `sqrt` and `add_scalar` were added to `Backend` for OPAdamW
+    // (M2_RESEARCH.md R5). They shipped without tests; these are them. Each
+    // runs against BOTH backends, because a divergence between the SIMD path
+    // and the scalar oracle is exactly what this file exists to catch.
+
+    #[test]
+    fn div_matches_elementwise_division_on_both_backends() {
+        let a = vec![1.0f32, -6.0, 7.5, 0.0];
+        let b = vec![2.0f32, 3.0, -2.5, 4.0];
+        let expected = [0.5f32, -2.0, -3.0, 0.0];
+
+        let sisd = SisdBackend::div(&a, &b, 4).unwrap();
+        let glp = GlProc::div(&a, &b, 4).unwrap();
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!(
+                (sisd[i] - exp).abs() < TOL_ELEM,
+                "sisd div[{i}] = {}, expected {exp}",
+                sisd[i]
+            );
+            assert!(
+                (glp[i] - exp).abs() < TOL_ELEM,
+                "glproc div[{i}] = {}, expected {exp}",
+                glp[i]
+            );
+        }
+    }
+
+    /// A zero divisor is a configuration bug (AdamW's denominator is
+    /// `sqrt(v) + eps`, zero only if eps was zero). Both backends must name it
+    /// rather than hand back an infinity that becomes a NaN weight later.
+    #[test]
+    fn div_rejects_a_zero_divisor_on_both_backends() {
+        let a = vec![1.0f32, 2.0];
+        let b = vec![1.0f32, 0.0];
+        assert!(SisdBackend::div(&a, &b, 2).is_err(), "sisd accepted 1/0");
+        assert!(GlProc::div(&a, &b, 2).is_err(), "glproc accepted 1/0");
+    }
+
+    #[test]
+    fn sqrt_matches_elementwise_square_root_on_both_backends() {
+        let a = vec![0.0f32, 1.0, 4.0, 2.25];
+        let expected = [0.0f32, 1.0, 2.0, 1.5];
+
+        let sisd = SisdBackend::sqrt(&a, 4).unwrap();
+        let glp = GlProc::sqrt(&a, 4).unwrap();
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!((sisd[i] - exp).abs() < TOL_ELEM, "sisd sqrt[{i}]");
+            assert!((glp[i] - exp).abs() < TOL_ELEM, "glproc sqrt[{i}]");
+        }
+    }
+
+    /// A negative second moment means the optimizer state is already corrupt.
+    /// Returning NaN would let that corruption travel silently.
+    #[test]
+    fn sqrt_rejects_a_negative_input_on_both_backends() {
+        let a = vec![1.0f32, -1e-9];
+        assert!(SisdBackend::sqrt(&a, 2).is_err(), "sisd accepted sqrt(-x)");
+        assert!(GlProc::sqrt(&a, 2).is_err(), "glproc accepted sqrt(-x)");
+        // And the failure must be an error, never a NaN that passes as a value.
+        let got = GlProc::sqrt(&a, 2);
+        assert!(matches!(got, Err(GlTrainError::Backend(_))));
+    }
+
+    #[test]
+    fn add_scalar_offsets_every_element_on_both_backends() {
+        let a = vec![1.0f32, -2.0, 0.0];
+        let expected = [1.5f32, -1.5, 0.5];
+
+        let sisd = SisdBackend::add_scalar(&a, 0.5, 3).unwrap();
+        let glp = GlProc::add_scalar(&a, 0.5, 3).unwrap();
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!((sisd[i] - exp).abs() < TOL_ELEM, "sisd add_scalar[{i}]");
+            assert!((glp[i] - exp).abs() < TOL_ELEM, "glproc add_scalar[{i}]");
+        }
+    }
+
+    #[test]
+    fn neg_flips_the_sign_of_every_element_on_both_backends() {
+        let a = vec![1.0f32, -2.5, 0.0];
+        let expected = [-1.0f32, 2.5, 0.0];
+
+        let sisd = SisdBackend::neg(&a, 3).unwrap();
+        let glp = GlProc::neg(&a, 3).unwrap();
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!((sisd[i] - exp).abs() < TOL_ELEM, "sisd neg[{i}]");
+            assert!((glp[i] - exp).abs() < TOL_ELEM, "glproc neg[{i}]");
+        }
+    }
+
+    /// Zero must map to zero, not to +1.0. `f32::signum` returns +1.0 for 0.0
+    /// and -1.0 for -0.0, which would give a Lion parameter with no momentum a
+    /// full-size step in a direction decided by a sign bit.
+    #[test]
+    fn sign_maps_zero_to_zero_not_to_one() {
+        let a = vec![3.0f32, -3.0, 0.0, -0.0];
+        let expected = [1.0f32, -1.0, 0.0, 0.0];
+
+        let sisd = SisdBackend::sign(&a, 4).unwrap();
+        let glp = GlProc::sign(&a, 4).unwrap();
+        for (i, &exp) in expected.iter().enumerate() {
+            assert!((sisd[i] - exp).abs() < TOL_ELEM, "sisd sign[{i}] = {}", sisd[i]);
+            assert!((glp[i] - exp).abs() < TOL_ELEM, "glproc sign[{i}] = {}", glp[i]);
+        }
+    }
+
+    /// Every op on the trait rejects a storage buffer that disagrees with the
+    /// element count the caller promised, rather than truncating.
+    #[test]
+    fn the_new_ops_reject_a_length_mismatch() {
+        let a = vec![1.0f32, 2.0];
+        let b = vec![1.0f32, 2.0];
+        assert!(SisdBackend::div(&a, &b, 3).is_err());
+        assert!(SisdBackend::sqrt(&a, 3).is_err());
+        assert!(SisdBackend::add_scalar(&a, 1.0, 3).is_err());
+        assert!(SisdBackend::neg(&a, 3).is_err());
+        assert!(SisdBackend::sign(&a, 3).is_err());
     }
 }
