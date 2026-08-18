@@ -305,6 +305,35 @@ impl Tape {
     pub fn zero_grad(&mut self) {
         self.grad_store.clear();
     }
+
+    /// End a training step: take the accumulated gradients and clear the tape,
+    /// in one call.
+    ///
+    /// # This is the KL-006 guard
+    ///
+    /// `matmul`/`mul`/`relu`'s backward closures snapshot their forward
+    /// operands at record time. `KNOWN_ISSUES.md`'s recommended fix (option a)
+    /// is "require `tape.clear()` before `optimizer.step()`", enforced the way
+    /// KL-005 guards double-backward.
+    ///
+    /// A `&mut Tape` check cannot enforce that by itself: the gradients the
+    /// optimizer needs *live in* `grad_store`, so a guard that simply refused a
+    /// non-empty tape would make it impossible to ever read them. This method
+    /// resolves that by doing both atomically: the returned [`VLGradStore`] is
+    /// the only way to get gradients out, and by the time the caller holds it,
+    /// `self` is already fully cleared. There is no ordering for a caller to
+    /// get wrong, and no separate boolean to check.
+    ///
+    /// [`crate::optim::Optimizer::step`] takes the result of this call, never
+    /// the tape itself, which is what makes weight mutation impossible to
+    /// perform against a still-live tape.
+    pub fn finish_step(&mut self) -> VLGradStore {
+        let grads = std::mem::take(&mut self.grad_store);
+        self.nodes.clear();
+        self.tensors.clear();
+        self.next_node_id = 0;
+        grads
+    }
 }
 
 impl Default for Tape {
@@ -410,5 +439,74 @@ mod tests {
         tape.clear();
         assert_eq!(tape.len(), 0);
         assert!(tape.get_tensor_meta(0).is_none());
+    }
+
+    // ── M2 Wave 1: finish_step, the KL-006 resolution ────────────────────
+
+    /// The property KL-006 needs: after `finish_step` the caller holds the
+    /// gradients AND the tape is empty, so there is no window in which an
+    /// in-place weight update could invalidate a live backward closure.
+    #[test]
+    fn finish_step_clears_the_tape_and_returns_the_gradients() {
+        use crate::backend::GlProc;
+        use crate::tensor::Tensor;
+        use std::sync::Mutex;
+
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<GlProc>::from_vec(vec![1.0, 2.0, 3.0, 4.0], &[2, 2])
+            .unwrap()
+            .with_grad(tape.clone());
+        let x_id = x.id();
+        let w = Tensor::<GlProc>::ones(&[2, 2]).unwrap();
+        let _y = x.matmul(&w).unwrap();
+
+        let grads = {
+            let mut guard = Tape::lock(&tape);
+            guard.backward().unwrap();
+            assert!(
+                !guard.is_empty(),
+                "the tape must have nodes before finish_step"
+            );
+            guard.finish_step()
+        };
+
+        // The gradients survived the clear.
+        assert!(
+            grads.contains(x_id),
+            "finish_step dropped the gradient it was supposed to hand over"
+        );
+
+        // The tape did not.
+        let guard = Tape::lock(&tape);
+        assert_eq!(guard.len(), 0, "nodes must be gone");
+        assert_eq!(guard.tensor_count(), 0, "tensor registrations must be gone");
+        assert!(guard.grad_store().is_empty(), "grad store must be gone");
+    }
+
+    /// `finish_step` without a `backward()` yields nothing rather than
+    /// failing. An optimizer stepping on an empty store simply skips every
+    /// parameter, which is the correct no-op.
+    #[test]
+    fn finish_step_returns_an_empty_store_when_backward_was_never_called() {
+        let mut tape = Tape::new();
+        tape.push(dummy_node(0, "Noop", vec![], 0));
+        let grads = tape.finish_step();
+        assert!(grads.is_empty(), "no backward ran, so there are no gradients");
+        assert_eq!(tape.len(), 0, "the tape is still cleared");
+    }
+
+    /// Node IDs restart after `finish_step`, so a second training step records
+    /// against the same ID space rather than growing it forever.
+    #[test]
+    fn finish_step_resets_the_node_id_counter() {
+        let mut tape = Tape::new();
+        let first = tape.next_node_id();
+        tape.push(dummy_node(first, "Noop", vec![], 0));
+        let _ = tape.finish_step();
+        assert_eq!(
+            tape.next_node_id(),
+            first,
+            "IDs must restart, or a long run counts up without bound"
+        );
     }
 }

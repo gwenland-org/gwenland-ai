@@ -120,6 +120,59 @@ impl Backend for GlProc {
         Ok(a.iter().map(|x| x * scalar).collect())
     }
 
+    fn div(a: &Self::Storage, b: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "div", "lhs")?;
+        check_len(b, n_elems, "div", "rhs")?;
+        // A zero divisor is a caller bug, not a number. Returning inf here would
+        // surface three optimizer steps later as a NaN weight with no trace back
+        // to this call.
+        if let Some(idx) = b.iter().position(|y| *y == 0.0) {
+            return Err(GlTrainError::Backend(format!(
+                "div: divisor is zero at index {idx}"
+            )));
+        }
+        Ok(a.iter().zip(b.iter()).map(|(x, y)| x / y).collect())
+    }
+
+    fn sqrt(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "sqrt", "input")?;
+        if let Some(idx) = a.iter().position(|x| *x < 0.0) {
+            return Err(GlTrainError::Backend(format!(
+                "sqrt: negative input {} at index {idx}",
+                a[idx]
+            )));
+        }
+        Ok(a.iter().map(|x| x.sqrt()).collect())
+    }
+
+    fn add_scalar(a: &Self::Storage, scalar: f32, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "add_scalar", "input")?;
+        Ok(a.iter().map(|x| x + scalar).collect())
+    }
+
+    fn neg(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "neg", "input")?;
+        Ok(a.iter().map(|x| -x).collect())
+    }
+
+    fn sign(a: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
+        check_len(a, n_elems, "sign", "input")?;
+        // Not `f32::signum`: it maps 0.0 to +1.0 and -0.0 to -1.0. Lion would
+        // then move a parameter with zero momentum by a full step.
+        Ok(a
+            .iter()
+            .map(|x| {
+                if *x > 0.0 {
+                    1.0
+                } else if *x < 0.0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect())
+    }
+
     fn relu(x: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
         check_len(x, n_elems, "relu", "input")?;
         Ok(x.iter().map(|v| v.max(0.0)).collect())
