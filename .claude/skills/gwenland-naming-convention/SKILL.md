@@ -77,7 +77,8 @@ BCuda         // ❌ single-character prefix
 | `VL` | Value | Value type without independent identity | `VLShape`, `VLTensorMeta`, `VLTensorId` |
 | `EN` | Enum | Finite set of named variants | `ENDataType`, `ENBackend` |
 | `GP` | Graph | Computation or dataflow graph (IR level) | `GPComputeGraph`, `GPInferenceGraph` |
-| `CP` | Compiler | Compiler-level abstractions | `CPCompiler`, `CPModule` |
+| `CP` | Checkpoint | Persisted training artifact with a format version | `CPLora`, `CPFull`, `CPSharded` |
+| `CM` | Compiler | Compiler-level abstractions | `CMCompiler`, `CMModule` |
 | `SV` | Service | Service or orchestrator | `SVInference`, `SVModelRegistry` |
 | `BE` | Backend | Execution platform implementation | `BECuda`, `BEVulkan`, `BEGlProc`, `BESisd` |
 | `KL` | Kernel | Executable compute kernel | `KLMatMul`, `KLAttention` |
@@ -88,6 +89,7 @@ BCuda         // ❌ single-character prefix
 | `AB` | Algorithm Block | Reusable ML algorithmic building block | `ABGELU`, `ABRMSNorm`, `ABAttention` |
 | `TP` | Template/Generic | Generic abstraction over types or values | `TPBuffer<T>`, `TPArray<T>`, `TPTensor<B>` |
 | `AG` | Autograd | Autograd engine components | `AGTape`, `AGNode` |
+| `OP` | Optimizer | Update rule carrying mutable state across steps | `OPAdamW`, `OPLion`, `OPAdafactor` |
 
 ### Picking between the ones that overlap
 
@@ -142,7 +144,7 @@ Read this as "which layer am I writing in", not as a dependency graph.
 | Model / architecture | `MD` | `MDQwen2_5` |
 | Algorithm blocks it decomposes into | `AB` | `ABRMSNorm`, `ABRoPE`, `ABAttention`, `ABSwiGLU` |
 | IR the blocks lower to | `GP` | `GPComputeGraph` |
-| Thing that lowers it | `CP` | `CPCompiler` |
+| Thing that lowers it | `CM` | `CMCompiler` |
 | Launchable compute | `KL` | `KLMatMul` |
 | Platform that runs it | `BE` | `BECuda`, `BEGlProc` |
 | Execution environment | `RT` | `RTInference` |
@@ -201,9 +203,21 @@ any code uses it. Order matters:
 
 Two characters, always. No single-character prefixes, no three-character ones.
 
-`OP` (optimizer) is currently **proposed, not approved** — it is claimed by
-stumman's M2 wave and does not exist in the table yet. Do not use it before
-that wave opens.
+### Decided 2026-08-17 (stumman M2)
+
+Two table changes landed together, both signed off by JinXSuper:
+
+- **`OP` (Optimizer) is approved.** The category survives the "optimizers are a
+  kind of algorithm block" objection in step 1: an `AB` is *pure* — it maps
+  inputs to outputs — while an optimizer carries **mutable state across training
+  steps** (`OPAdamW` holds first and second moments between calls). That is a
+  different lifetime, not a different flavour of the same thing.
+- **`CP` now means Checkpoint, and Compiler moved to `CM`.** `CP` reads as
+  "CheckPoint" to anyone who has not memorised the table, which is the whole
+  point of a mnemonic prefix. The reassignment cost nothing: measured on
+  2026-08-17, **zero types in the repo used `CP`** — no `CPCompiler`, no
+  `CPModule`, and no compiler crate exists to hold them. Rule 3 ("one prefix,
+  one meaning, forever") starts from this entry, not the unused reservation.
 
 ## GwenLand-Specific Notes
 
