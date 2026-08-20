@@ -11,7 +11,7 @@
 //! fixed: `glcore::format::gguf::dequant_q6_k` used the wrong (naive linear)
 //! nibble order for Q6_K, silently corrupting `ffn_down.weight` in every layer
 //! of a real Q4_K_M model — see `notes/issues/gllm-e2e-garbage-output.md`
-//! (resolved) and `architecture/mensura-veritatis-v3/ARTX2-Quant.md` for the
+//! (resolved) and `architecture/gl-stack-audit-2026-07/ARTX2-Quant.md` for the
 //! full audit. Fixed in `converter.rs`'s `dequantize_for_gquant` (PR #16,
 //! merged), verified via `diff_dump.rs` (layer-0 divergence vs the known-good
 //! `glproc::runner::Runner` path dropped 300x) and `run_package_e2e` (garbage
@@ -21,7 +21,7 @@
 //! means the known reason numbers were meaningless is gone. Nobody has re-run
 //! `glbench ppl` against a real GQ4A/GQ2A package since the fix (Pridwen
 //! §12's "Known Unknowns" — GQ4A/GQ2A PPL vs Q4_K_M — are still unmeasured;
-//! see `architecture/mensura-veritatis-v3/ARTX4-Benchmark.md`). Run it, and
+//! see `architecture/gl-stack-audit-2026-07/ARTX4-Benchmark.md`). Run it, and
 //! ideally cross-check with a KL-divergence comparison against
 //! `glproc::runner::Runner`'s logits on the same sequence, before citing any
 //! number anywhere.
@@ -143,12 +143,20 @@ pub fn run_ppl(args: PplArgs) -> Result<(), String> {
         "loading tokenizer from {} (packages don't embed one yet, ARTX1 OQ3)...",
         args.gguf.display()
     );
-    let gguf = GgufFile::open(args.gguf.to_str().ok_or("--gguf path is not valid UTF-8")?)
+    // Opened for validation only — unlike `kl-div`, `ppl` runs no glproc oracle
+    // and needs nothing out of the file but its tokenizer. Kept as an eager
+    // check so a bad --gguf fails here, with a message naming the file, rather
+    // than later inside the tokenizer builder or after the slow package load.
+    let _gguf = GgufFile::open(args.gguf.to_str().ok_or("--gguf path is not valid UTF-8")?)
         .map_err(|e| format!("opening {}: {e}", args.gguf.display()))?;
     let tokenizer = GllmTokenizer::from_gguf_path(&args.gguf.to_string_lossy())
         .map_err(|e| format!("building tokenizer from {}: {e}", args.gguf.display()))?;
 
-    let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false);
+    // See kl_divergence::run_kl_divergence: a tokenisation failure is a hard
+    // error, because it is the measurement's input.
+    let tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false).map_err(|e| {
+        format!("tokenizing the embedded WikiText-2 sample with {}: {e}", args.gguf.display())
+    })?;
     let total_tokens = tokens.len();
     if total_tokens <= args.context {
         return Err(format!(
@@ -232,14 +240,13 @@ fn sliding_window_log_probs(
         let new_start = if window_start == 0 { 0 } else { context - stride };
 
         let mut window_log_probs = Vec::new();
-        for i in new_start..window.len() {
+        for (i, logits) in all_logits.iter().enumerate().take(window.len()).skip(new_start) {
             // logits[i] predicts token at absolute position window_start+i+1.
             let target_abs = window_start + i + 1;
             if target_abs >= tokens.len() {
                 break;
             }
             let target = tokens[target_abs] as usize;
-            let logits = &all_logits[i];
             let lp = log_softmax(logits)
                 .get(target)
                 .copied()
@@ -267,7 +274,7 @@ fn sliding_window_log_probs(
 /// `pub(crate)`: shared with [`crate::kl_divergence`], which needs the exact
 /// same computation on both engines' logits — a second copy here would be
 /// the same "two implementations of one thing" risk this whole workspace
-/// just got audited for (`architecture/mensura-veritatis-v3/ARTX2-Quant.md`).
+/// just got audited for (`architecture/gl-stack-audit-2026-07/ARTX2-Quant.md`).
 pub(crate) fn log_softmax(logits: &[f32]) -> Vec<f32> {
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let sum_exp: f64 = logits.iter().map(|&l| ((l - max) as f64).exp()).sum();

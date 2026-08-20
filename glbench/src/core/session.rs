@@ -9,10 +9,14 @@
 
 use crate::analysis::summary::AnalysisReport;
 use crate::comparison::runs::ComparisonReport;
+use crate::core::availability::{self, ENAvailability, VLAvailabilityMap};
+use crate::core::inference::VLInferenceSession;
 use crate::core::metrics::MeasurementSet;
+use crate::core::mode::{ENInferenceRole, ENSessionMode};
 use crate::core::result::SessionMetadata;
 use crate::core::schema::{field, ToJson};
 use crate::core::workload::WorkloadSpec;
+use crate::storage::digest::VLIntegrity;
 use crate::engine::metadata::EngineMetadata;
 use crate::environment::hardware::EnvironmentSnapshot;
 use crate::export::json::Json;
@@ -45,6 +49,22 @@ pub struct BenchmarkSession {
     pub comparison: Option<ComparisonReport>,
     /// Validation findings (filled after the run).
     pub validation: Option<ValidationReport>,
+
+    // --- v3 (schema v2) ---
+    /// The inference run and the role it plays. For an `InferenceOnly`
+    /// session this is the envelope only — the facts stay in the v1 fields
+    /// above. See [`VLInferenceSession`] for why they were not moved.
+    pub inference: Option<VLInferenceSession>,
+    /// The training run (Wave 4). Gated behind `train-bench`, so a default
+    /// build never compiles stumman.
+    #[cfg(feature = "train-bench")]
+    pub training: Option<crate::training::VLTrainingSession>,
+    /// Why every `null` in this session has no value (D-09). Empty for a v1
+    /// archive; never absent in one this build writes.
+    pub availability: VLAvailabilityMap,
+    /// Content digest, filled by [`crate::storage::archive::write`]. `None`
+    /// before the session is sealed, and in every v1 archive.
+    pub integrity: Option<VLIntegrity>,
 }
 
 impl BenchmarkSession {
@@ -68,6 +88,14 @@ impl BenchmarkSession {
             analysis: None,
             comparison: None,
             validation: None,
+            // An inference session in the mode `SessionMetadata::new` defaults
+            // to, so the §6.2 mode-consistency table holds from construction
+            // rather than only after some later fix-up call.
+            inference: Some(VLInferenceSession::standalone()),
+            #[cfg(feature = "train-bench")]
+            training: None,
+            availability: VLAvailabilityMap::new(),
+            integrity: None,
         }
     }
 
@@ -90,7 +118,25 @@ impl BenchmarkSession {
             ("analysis", opt(&self.analysis)),
             ("comparison", opt(&self.comparison)),
             ("validation", opt(&self.validation)),
+            ("inference", opt(&self.inference)),
+            ("training", self.training_json()),
+            ("availability", availability::to_json(&self.availability)),
+            ("integrity", opt(&self.integrity)),
         ])
+    }
+
+    /// The `training` slot: whatever the training observer produced, or null.
+    #[cfg(feature = "train-bench")]
+    fn training_json(&self) -> Json {
+        self.training.as_ref().map(|t| t.to_json()).unwrap_or(Json::Null)
+    }
+
+    /// Without `train-bench` the slot is still emitted, as null. The schema
+    /// keeps the field either way so a reader never has to distinguish "this
+    /// build cannot train" from "this run did not"; `availability` says which.
+    #[cfg(not(feature = "train-bench"))]
+    fn training_json(&self) -> Json {
+        Json::Null
     }
 
     /// Parse a session back from its JSON archive. Only the fields needed for
@@ -125,8 +171,295 @@ impl BenchmarkSession {
             analysis: None,
             comparison: None,
             validation: None,
+            // v3 fields. Each has a v1 reading (D-20): absent `inference`
+            // means a standalone inference run, absent `availability` is an
+            // empty map, and absent `integrity` is an absence rather than a
+            // verification failure.
+            inference: match v.get("inference") {
+                Some(i) if !matches!(i, Json::Null) => Some(VLInferenceSession::from_json(i)?),
+                _ => Some(VLInferenceSession::standalone()),
+            },
+            // Reconstructed, unlike `telemetry` and `behavior`: a training
+            // session's steps are measured facts that `export` needs to
+            // re-render, and its derived reports are recomputed from them
+            // rather than parsed. See `VLTrainingSession::from_json`.
+            #[cfg(feature = "train-bench")]
+            training: match v.get("training") {
+                Some(t) if !matches!(t, Json::Null) => {
+                    Some(crate::training::VLTrainingSession::from_json(t)?)
+                }
+                _ => None,
+            },
+            availability: availability::from_json(v.get("availability"))?,
+            integrity: match v.get("integrity") {
+                Some(i) if !matches!(i, Json::Null) => Some(VLIntegrity::from_json(i)?),
+                _ => None,
+            },
         })
     }
+
+    /// Declare why every `null` this session emits has no value (D-09/D-10).
+    ///
+    /// Called from [`crate::storage::archive::write`] — the finalisation point,
+    /// deliberately not from export, so a malformed archive is never written in
+    /// the first place.
+    ///
+    /// # Why the annotation is conditional rather than a fixed list
+    ///
+    /// Which fields are null varies per run and per machine: a GPU counter is
+    /// null here and a number on a CUDA box; `spike_ratio` is null only when no
+    /// spike occurred. A fixed list would trip D-10's mirror check — a status
+    /// on a field that turned out to carry a value — on the first machine that
+    /// differs. So each rule is applied only to paths that are *actually* null
+    /// in this session's own JSON, and an explicit declaration always wins.
+    pub fn annotate_availability(&mut self) -> Result<(), String> {
+        let value = self.to_json();
+        let nulls = crate::validation::availability::null_paths(&value);
+
+        for path in nulls {
+            if self.availability.contains_key(&path) {
+                continue; // an explicit declaration wins over the default
+            }
+            let (status, note) = classify_null(&path, self.metadata.session_mode);
+            match note {
+                Some(note) => {
+                    availability::set_with_note(&mut self.availability, &path, status, note)?
+                }
+                None => availability::set(&mut self.availability, &path, status)?,
+            }
+        }
+
+        // The mode table also requires an entry for a subtree that is *absent*
+        // rather than null, which the walk above never reaches.
+        match self.metadata.session_mode {
+            ENSessionMode::InferenceOnly => {
+                if !self.availability.contains_key("training") {
+                    availability::set(
+                        &mut self.availability,
+                        "training",
+                        ENAvailability::NotApplicable,
+                    )?;
+                }
+            }
+            ENSessionMode::TrainingOnly => {
+                if !self.availability.contains_key("inference") {
+                    availability::set(
+                        &mut self.availability,
+                        "inference",
+                        ENAvailability::NotApplicable,
+                    )?;
+                }
+            }
+            ENSessionMode::Unified => {}
+        }
+        Ok(())
+    }
+
+    /// Check the mode-consistency table (design §6.2).
+    ///
+    /// | Mode | `inference` | `training` |
+    /// |---|---|---|
+    /// | `InferenceOnly` | `Some` (`Standalone`) | `None` |
+    /// | `TrainingOnly` | `None` | `Some` |
+    /// | `Unified` | `Some` (`PreTraining`) | `Some` |
+    ///
+    /// Runs at finalisation alongside [`Self::annotate_availability`]. A
+    /// session whose mode and contents disagree is one whose consumers will
+    /// disagree about what they are reading.
+    pub fn check_mode_consistency(&self) -> ValidationReport {
+        use crate::validation::integrity::Severity;
+
+        let mut report = ValidationReport::default();
+        let check = "session_mode";
+        let mode = self.metadata.session_mode;
+        let role = self.inference.as_ref().map(|i| i.role);
+        let has_training = self.has_training();
+
+        match mode {
+            ENSessionMode::InferenceOnly => {
+                match role {
+                    Some(ENInferenceRole::Standalone) => {}
+                    Some(other) => report.push(
+                        Severity::Error,
+                        check,
+                        format!(
+                            "inference_only session has inference role '{}', expected 'standalone'",
+                            other.as_str()
+                        ),
+                    ),
+                    None => report.push(
+                        Severity::Error,
+                        check,
+                        "inference_only session has no inference block",
+                    ),
+                }
+                if has_training {
+                    report.push(
+                        Severity::Error,
+                        check,
+                        "inference_only session carries a training block",
+                    );
+                }
+                self.require_entry(&mut report, "training", ENAvailability::NotApplicable);
+            }
+            ENSessionMode::TrainingOnly => {
+                if let Some(role) = role {
+                    report.push(
+                        Severity::Error,
+                        check,
+                        format!(
+                            "training_only session carries an inference block (role '{}')",
+                            role.as_str()
+                        ),
+                    );
+                }
+                if !has_training {
+                    report.push(
+                        Severity::Error,
+                        check,
+                        "training_only session has no training block",
+                    );
+                }
+                self.require_entry(&mut report, "inference", ENAvailability::NotApplicable);
+            }
+            ENSessionMode::Unified => {
+                match role {
+                    Some(ENInferenceRole::PreTraining) => {}
+                    Some(other) => report.push(
+                        Severity::Error,
+                        check,
+                        format!(
+                            "unified session has outer inference role '{}', expected 'pre_training'",
+                            other.as_str()
+                        ),
+                    ),
+                    None => report.push(
+                        Severity::Error,
+                        check,
+                        "unified session has no inference block",
+                    ),
+                }
+                if !has_training {
+                    report.push(Severity::Error, check, "unified session has no training block");
+                }
+            }
+        }
+        report
+    }
+
+    /// Whether a training block is present.
+    #[cfg(feature = "train-bench")]
+    fn has_training(&self) -> bool {
+        self.training.is_some()
+    }
+
+    /// Without `train-bench` there is no training block to have.
+    #[cfg(not(feature = "train-bench"))]
+    fn has_training(&self) -> bool {
+        false
+    }
+
+    /// Report a missing or wrong mode-table availability entry.
+    fn require_entry(&self, report: &mut ValidationReport, path: &str, want: ENAvailability) {
+        use crate::validation::integrity::Severity;
+        match self.availability.get(path) {
+            Some(entry) if entry.status == want => {}
+            Some(entry) => report.push(
+                Severity::Error,
+                "session_mode",
+                format!(
+                    "availability['{path}'] is '{}', expected '{}' for a {} session",
+                    entry.status.as_str(),
+                    want.as_str(),
+                    self.metadata.session_mode.as_str()
+                ),
+            ),
+            None => report.push(
+                Severity::Error,
+                "session_mode",
+                format!(
+                    "a {} session must record availability['{path}'] = '{}'",
+                    self.metadata.session_mode.as_str(),
+                    want.as_str()
+                ),
+            ),
+        }
+    }
+}
+
+/// Why a given `null` path has no value.
+///
+/// Keyed on the path because the availability map *is* keyed on paths — that is
+/// the axis an archive genuinely varies along, not an incidental name. Rules run
+/// most specific first, and the fallback is `Unavailable`: the weakest honest
+/// claim ("it could exist; this run did not collect it"), never `Unsupported`,
+/// which would assert something about the platform that nobody measured.
+fn classify_null(path: &str, mode: ENSessionMode) -> (ENAvailability, Option<&'static str>) {
+    // Toxicity is deliberately unimplemented, not merely uncollected — see
+    // behavior::toxicity for why glbench refuses to ship a keyword matcher.
+    if path == "behavior.toxicity" {
+        return (
+            ENAvailability::DoesNotExist,
+            Some("deliberately unimplemented; see glbench::behavior::toxicity"),
+        );
+    }
+    // The whole training subtree is meaningless for an inference-only session.
+    if path == "training" || path.starts_with("training.") {
+        if mode == ENSessionMode::InferenceOnly {
+            return (ENAvailability::NotApplicable, None);
+        }
+        return (ENAvailability::Unavailable, None);
+    }
+    if path == "inference" || path.starts_with("inference.") {
+        if mode == ENSessionMode::TrainingOnly {
+            return (ENAvailability::NotApplicable, None);
+        }
+        // A standalone envelope's own fields are empty by design: the facts
+        // live at the top level of the session rather than duplicated inside.
+        return (
+            ENAvailability::NotApplicable,
+            Some("standalone session: the measured facts are the top-level fields"),
+        );
+    }
+    if path.starts_with("environment.hardware.gpu.") {
+        return (
+            ENAvailability::Unsupported,
+            Some("no GPU device reported this counter on the benchmarking machine"),
+        );
+    }
+    if path.starts_with("environment.hardware.thermal.") {
+        return (
+            ENAvailability::Unsupported,
+            Some("no thermal counter available on this platform"),
+        );
+    }
+    // Signals that need a traced run. A measured run deliberately does not
+    // trace: tracing perturbs the timings it would sit beside.
+    if path == "behavior" || path.starts_with("behavior.") {
+        return (
+            ENAvailability::Unavailable,
+            Some("needs a traced run; tracing perturbs timing so it never shares a measured run"),
+        );
+    }
+    if path == "telemetry" || path.starts_with("telemetry.") {
+        return (
+            ENAvailability::Unavailable,
+            Some("the engine reported no telemetry for this phase"),
+        );
+    }
+    if path == "comparison" {
+        return (
+            ENAvailability::NotApplicable,
+            Some("filled only by 'glbench compare' and 'glbench ab'"),
+        );
+    }
+    if path == "integrity" {
+        return (
+            ENAvailability::Unavailable,
+            Some("the digest is written when the archive is sealed"),
+        );
+    }
+    (ENAvailability::Unavailable, None)
 }
 
 /// Encode an optional report as its JSON or null.
@@ -142,7 +475,7 @@ fn opt<T: ToJson>(v: &Option<T>) -> Json {
 /// Absent signals are written as `null`, never as zeros. A CI job asserting
 /// "repetition ratio > 0.6" must fail loudly on a run that never measured
 /// repetition, not silently pass on a fabricated 0.0.
-fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
+pub(crate) fn behavior_json(b: &crate::behavior::BehaviorReport) -> Json {
     let rep = match &b.repetition {
         Some(r) => Json::obj([
             ("unique_1gram_ratio", Json::Num(r.unique_1gram_ratio)),
@@ -530,6 +863,11 @@ mod tests {
             }),
             comparison: None,
             validation: None,
+            inference: Some(VLInferenceSession::standalone()),
+            #[cfg(feature = "train-bench")]
+            training: None,
+            availability: VLAvailabilityMap::new(),
+            integrity: None,
         };
 
         let json = session.to_json();

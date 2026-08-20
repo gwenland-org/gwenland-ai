@@ -1,0 +1,123 @@
+# Stummañ: test the training crate, which ci.yml cannot reach.
+#
+# Why this exists separately from ci.yml
+# --------------------------------------
+# `ci.yml` runs `cargo build/test --workspace` from the repo root. That misses
+# stumman entirely: stumman declares its own empty `[workspace]` table, which
+# makes it a workspace root in its own right, so the root manifest never sees
+# it and `--workspace` never builds it. That isolation is deliberate (the
+# training arm may take dependencies the "Inference First" rule forbids in the
+# inference tree), but it means stumman has no coverage at all unless a
+# workflow enters the directory and runs cargo there.
+#
+# Hence `working-directory: stumman` on every step rather than a root-level
+# `-p stumman`, which would fail: stumman is not a member of any workspace the
+# root knows about.
+#
+# Why the branch filters look like this
+# -------------------------------------
+# `pull_request` has no `branches:` filter, for the same reason gljax-pjrt.yml
+# documents: that key filters on the *base* branch, and stumman work lands on
+# `stumman-m1` before it reaches main, so a `[main]` filter would skip this job
+# on exactly the PRs that introduce the code it exists to test.
+#
+# `push` has no `branches:` filter either, which does differ from ci.yml. M1 is
+# developed entirely on a branch with no PR open yet, so gating pushes on main
+# would mean this workflow never runs during the milestone it was written for.
+# Narrow it to `[main]` once stumman merges and the branch stops being where
+# the work happens.
+name: Stummañ
+
+on:
+  push:
+    paths:
+      - "stumman/**"
+      - ".github/workflows/stumman.yml"
+  pull_request:
+    paths:
+      - "stumman/**"
+      - ".github/workflows/stumman.yml"
+
+concurrency:
+  group: stumman-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build + test (${{ matrix.os }})${{ matrix.experimental && ' [experimental]' || '' }}
+    runs-on: ${{ matrix.os }}
+
+    # macOS is allowed to fail. It is not stumman's fault and not something
+    # stumman can fix: `macos-latest` is Apple Silicon, and glproc has 29 files
+    # opening with a bare `use std::arch::x86_64::*;` and no `#[cfg(target_arch)]`
+    # gate, so the whole dependency fails to compile on aarch64 with E0432.
+    #
+    # This is repo-wide and predates stumman. `ci.yml` has been red on main for
+    # every merge since at least 2026-07-23 for the same reason. Keeping the leg
+    # here means the day glproc grows an aarch64 path, this turns green on its
+    # own and tells us. Dropping it would just hide the gap.
+    #
+    # Promote it back to required by deleting the `experimental` flag on the
+    # macOS entry below, once glproc builds on ARM.
+    continue-on-error: ${{ matrix.experimental }}
+
+    strategy:
+      # One platform failing should not hide the others.
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            experimental: false
+          - os: windows-latest
+            experimental: false
+          - os: macos-latest
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # Keyed on stumman's own lockfile, not `**/Cargo.lock`. The root lockfile
+      # covers a different dependency graph, and hashing it here would evict
+      # this cache every time an inference crate changed.
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            stumman/target
+          key: ${{ runner.os }}-stumman-cargo-${{ hashFiles('stumman/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-stumman-cargo-
+
+      # Clippy first: it compiles everything anyway, so a lint failure and a
+      # test failure stay distinguishable at a glance in the job list.
+      - name: Clippy
+        working-directory: stumman
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        working-directory: stumman
+        run: cargo test --locked
+
+      # ⭐ The example is documentation that can rot. Running it here means a
+      # signature change breaks CI instead of quietly leaving README_AUTOGRAD.md
+      # describing an API that no longer exists.
+      - name: Example
+        working-directory: stumman
+        run: cargo run --example minimal_autograd --locked
+
+      # Doc warnings are not errors by default, so make them one. Unbackticked
+      # generics like Vec<f32> parse as HTML and have slipped through twice.
+      - name: Doc
+        working-directory: stumman
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps --locked

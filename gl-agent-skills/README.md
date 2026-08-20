@@ -39,6 +39,8 @@ speed."**
 | Task | Read these skills first |
 |------|------------------------|
 | **Anything at all** | `before-coding/read-architecture-first.md` |
+| Naming/renaming any type | `gwenland-naming-convention/SKILL.md` |
+| Any work inside `stumman/` | `stumman-naming/SKILL.md` |
 | Multi-step / multi-wave work | `before-coding/wave-confirmation-gates.md` |
 | Any code change | `before-coding/check-existing-tests.md`, `rust-skills/error-handling.md` |
 | Creating a branch / PR | `before-coding/branch-strategy.md` |
@@ -56,6 +58,14 @@ speed."**
 | Run / interpret benchmarks | `bench-skills/glbench-usage.md`, `bench-skills/measurement-discipline.md`, `bench-skills/windows-defender-gotcha.md` |
 
 ## Index
+
+### Naming (directory-per-skill, `SKILL.md` format)
+
+These two use the Agent Skills layout (`<name>/SKILL.md` with YAML frontmatter)
+rather than the flat per-domain files below.
+
+- [gwenland-naming-convention/SKILL.md](gwenland-naming-convention/SKILL.md) — repo-wide two-character type prefixes; **target state, 0/224 types adopted so far**
+- [stumman-naming/SKILL.md](stumman-naming/SKILL.md) — stumman's rename target + the live Breton module codenames
 
 ### before-coding/
 - [read-architecture-first.md](before-coding/read-architecture-first.md) — which docs are ground truth and must be read before anything

@@ -21,6 +21,21 @@ impl Regression {
             Regression::Regressed => "regressed",
         }
     }
+
+    /// Parse the stable identifier back, for reading a verdict out of an
+    /// archive. `None` on an unknown string rather than a guess.
+    /// Inherent `Option`-returning parser rather than a `FromStr` impl,
+    /// matching [`crate::core::workload::WorkloadKind::from_str`]: the call
+    /// sites want `Option`, not a `Result` with an error type.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Regression> {
+        Some(match s {
+            "improved" => Regression::Improved,
+            "neutral" => Regression::Neutral,
+            "regressed" => Regression::Regressed,
+            _ => return None,
+        })
+    }
 }
 
 /// Judge a relative change (positive = better, for a higher-is-better metric)
@@ -45,5 +60,13 @@ mod tests {
         assert_eq!(regression_verdict(0.10, 0.05), Regression::Improved);
         assert_eq!(regression_verdict(-0.10, 0.05), Regression::Regressed);
         assert_eq!(regression_verdict(0.02, 0.05), Regression::Neutral);
+    }
+
+    #[test]
+    fn every_verdict_round_trips_through_its_stable_identifier() {
+        for verdict in [Regression::Improved, Regression::Neutral, Regression::Regressed] {
+            assert_eq!(Regression::from_str(verdict.as_str()), Some(verdict));
+        }
+        assert_eq!(Regression::from_str("catastrophic"), None);
     }
 }

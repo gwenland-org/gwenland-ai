@@ -27,15 +27,54 @@ glcuda = { path = "../glcuda" }
 # entirely (see engine/adapter.rs's module docs); pulling it in unconditionally
 # would make every glbench build depend on glictus-caliburni's glproc-backend
 # feature even when nobody benchmarks GLLM.
-glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend"], optional = true }
+# `converter` is on alongside `glproc-backend` so the bit-profile divergence
+# example can call the real GQ4A/GQ2A *encoders* (they live behind `converter`,
+# not `gquant`, which is struct definitions only). glproc already carries the
+# matching dequant kernels unconditionally; without the encoder the example
+# would have to reimplement quantisation, which is the one thing
+# architecture/gl-stack-audit-2026-07/ARTX2-Quant.md exists to prevent.
+# No new external dependency: `converter` resolves to `dep:glproc` + `gquant`,
+# and glproc is already an unconditional dependency of glbench.
+glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend", "converter"], optional = true }
+
+# Training observation (D-02). Optional so `cargo build --workspace` without the
+# feature never compiles stumman, exactly as gllm-bench works for
+# glictus-caliburni. stumman declares its own `[workspace]` and is not a root
+# member; a path dependency does not require membership.
+#
+# Accepted cost, stated rather than hidden: stumman and `anyhow` enter the root
+# Cargo.lock as optional entries even when unbuilt, and stumman may resolve its
+# own dependency versions differently standalone (own lock file) than from here.
+# Neither affects a default build.
+stumman = { path = "../stumman", optional = true }
 
 [features]
 default = []
 gllm-bench = ["dep:glictus-caliburni"]
+# Training observation (v3 D-02). Wave 1 only reserves the schema slot:
+# `BenchmarkSession::training` holds a raw `Json` projection, so nothing here
+# needs stumman yet. The `stumman = { path = "../stumman", optional = true }`
+# edge this feature is specified to carry arrives with the training observer
+# in Wave 4, together with the `VLTrainingSession` type that replaces the
+# placeholder. Declared now so the cfg-gated code compiles warning-free and
+# the feature name is reserved rather than invented twice.
+train-bench = ["dep:stumman"]
 
 [[bin]]
 name = "glbench"
 path = "src/main.rs"
+
+# Cargo builds every auto-discovered example unconditionally, including under
+# `cargo test --workspace` — declaring the feature it needs makes that a
+# skip rather than a compile error.
+[[example]]
+name = "bitprof_quant_divergence"
+required-features = ["gllm-bench"]
+
+# Runs real training on stumman, so it needs the training edge.
+[[test]]
+name = "training_archive"
+required-features = ["train-bench"]
 
 [dev-dependencies]
 tempfile = "3"

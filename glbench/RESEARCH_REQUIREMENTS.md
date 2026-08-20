@@ -46,7 +46,7 @@ If the answer is unclear, the feature should not be implemented.
 already exists** — cross-reference `README.md`'s feature list and
 `ARCHITECTURE.md`'s module map first. Building a second, independent
 implementation of something glbench already has is exactly the failure mode
-`architecture/mensura-veritatis-v3/ARTX2-Quant.md` documents in the engines
+`architecture/gl-stack-audit-2026-07/ARTX2-Quant.md` documents in the engines
 themselves (two implementations of the same thing, silently disagreeing) —
 the same discipline applies here.
 
@@ -146,7 +146,7 @@ belongs in `README.md`, not here.
 |---|---|
 | Tensor statistics | done — `glbench tensor-stats` (`gllm-bench`): decodes every real tensor, flags NaN/Inf/zero-variance. Real run on Qwen2.5-0.5B GQ4A_CPP: 291/291 scanned, clean. Deliberately does NOT flag by magnitude — no principled threshold without a calibration baseline, see the module's own doc comment |
 | Weight distribution | done (2026-07-24) — `tensor-stats --full` surfaces the mean/std/min/max already computed internally per tensor (previously only fed the 3 flagged conditions, now exported in JSON alongside them). Real run on Qwen2.5-0.5B GQ4A_CPP: 291/291 tensors, full distribution written to JSON, e.g. `output_head.weight` mean 5.06e-5, std 0.0153, min -0.201, max 0.166. |
-| Quantization statistics | partial — see `quant-info`, no error/PPL attribution per format (see `architecture/mensura-veritatis-v3/ARTX4-Benchmark.md`) |
+| Quantization statistics | partial — see `quant-info`, no error/PPL attribution per format (see `architecture/gl-stack-audit-2026-07/ARTX4-Benchmark.md`) |
 | Outlier detection | partial — see `tensor-stats`; NaN/Inf/zero-variance only, magnitude-based outliers explicitly deferred (needs a baseline, see above) |
 | Hidden-state norm analysis | **rejected / deferred** (2026-07-24) — vetted and declined for this pass. Needs new per-layer activation-capture instrumentation inside glproc's forward pass; nothing like this exists today — `glcore::trace::TokenTrace` (the only existing trace hook) captures facts derived from the *final* logits only (token id, logprob, rank, entropy, top-prob), never intermediate layer activations. `diff_dump.rs` (glictus-caliburni) does something similar ad hoc, but as a one-off debug dump, not a reusable engine API. Comparable in scope to the `score_sequence` engine surgery KL-divergence needed, but deeper (every layer, not just the head) — flagged as a real future engine-instrumentation project, not a lightweight glbench-only task (fails question 7). |
 | RMSNorm analysis | reframed and done (2026-07-24) as the **static** variant — `tensor-stats --norm-only` filters to `*norm.weight` (gamma) tensors specifically and reports their own distribution summary, reusing the existing tensor-decode infra (no new engine hook). The **runtime/activation** variant (post-normalization activation statistics during a forward pass) carries the identical instrumentation blocker as hidden-state norm analysis above and is deferred for the same reason. Real run on Qwen2.5-0.5B: 49/49 norm tensors (24 layers × `attn_norm`+`ffn_norm`, plus `output_norm`), clean, gamma magnitude visibly growing with depth (`attn_norm` mean ~0.03 at layer 0 vs ~2.4 at layer 23) — a real, plausible pattern, not a red flag. |
@@ -162,7 +162,11 @@ belongs in `README.md`, not here.
 | KL-divergence vs oracle logits | done — `glbench kl-div`, GLLM-only (`gllm-bench`) so far; real run on Qwen2.5-0.5B GQ4A_CPP: mean 0.999 nats, max 7.52 nats at position 0 — a real, nonzero residual divergence, confirming the qualitative "slightly derailed" E2E text observed after the Q6_K fix |
 | Determinism verification | done — `validation::deterministic` |
 | Regression detection | done — `compare --threshold` |
-| Stability analysis | done — CI95 on throughput means |
+| Stability analysis | done — CI95 on throughput means; training runs also carry a coefficient of variation over a stated trailing window (`training::convergence`) |
+| Archive integrity | done (2026-08-20, v3 Wave 1) — `sha256-128` content digest over the archive's own canonical JSON, sentinel-based, verified by default on `inspect`/`compare`. Detects accidental modification; explicitly **not** a signature, and the archive says so in its own `integrity.note` field. The primitive lives in `glcore::hash` so the workspace has exactly one SHA-256 implementation (verified: the round constant `0x428a2f98` matches one file). |
+| Null semantics | done (2026-08-20, v3 Wave 1) — an eight-value vocabulary (`ENAvailability`) plus a sparse path-keyed map, and the D-10 invariant that makes it real: a `null` with no entry fails the session at write time, and a status on a field that carries a value fails too. Both directions tested. |
+| Bit-level tensor observation (GLBitProf) | done (2026-08-20, v3 Wave 2) — three tiers over `&[f32]`. **Measured cost, two numbers not one:** Tier 1+3 ~27 ns/element (every tensor pays), Tier 2 ×4.59 to ~123 ns/element (only under the 131,072-element cap). ⛔ **Measured limitation:** the divergence is permutation-invariant by construction, so it **cannot** detect a wrong-nibble-order defect — the correct and nibble-swapped GQ4A decodes score exactly zero on every axis while their MAE differs by 14×. That case needs `validation::parity`, not this. |
+| Training observation | done (2026-08-20, v3 Waves 3–4) — `glbench train` / `unified` observe a stumman LoRA run through a non-generic `StepObserver` boundary; glbench never drives the loop. Convergence, phase attribution, memory and adapter reports, plus gradient and optimizer bit scopes. Every field stumman M2 cannot fill (tokens, sync) is present, null, and carries `not_applicable` — verified against real runs in `tests/training_archive.rs`. |
 | Repeated benchmark statistics | done |
 | Accuracy vs performance comparison | done (2026-07-24) — `glbench accuracy-vs-perf <run.json> <accuracy.json>`, a pure report-level combinator: no new measurement, joins an existing `run` session's throughput with an existing `kl-div`/`ppl` session's numerical-accuracy figures into one side-by-side view (auto-detects which shape the second file is). Exists precisely because the two kinds of session were previously only ever viewable separately. Real join on Qwen2.5-0.5B, both recognized accuracy shapes verified live (not just unit-tested): decode 29.6 tok/s / prefill 109.6 tok/s alongside KL-divergence mean 0.998597 / max 7.515453 nats, and separately alongside perplexity 52.924 over 768 evaluated tokens — both runs correctly flagged the same real model-path mismatch when the two archives were deliberately given differently-named model paths, rather than silently joining unrelated runs. |
 
@@ -192,7 +196,8 @@ its derivation before it's accepted, not leave it as a heuristic label.
 |---|---|
 | Markdown report | done |
 | JSON report | done |
-| CSV report | done |
+| CSV report | done — plus `--format training-csv` for per-step training rows, a separate header because they are a different row shape from measured iterations |
+| Loss curve | done (2026-08-20, v3 Wave 5) — ASCII, in the terminal and the Markdown report. Ungated: it plots `(step, loss)` pairs and knows nothing about stumman. States its own resolution (points, columns, step range) so a reader cannot over-read a compressed curve. |
 | Human-readable summary | done |
 | Machine-readable output | done |
 | CI/CD compatible artifacts | done — `validate`'s non-zero exit on divergence |

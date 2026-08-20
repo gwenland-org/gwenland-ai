@@ -10,7 +10,6 @@ members = [
     "gljax",
     "glserve",
     "glictus-caliburni",
-    "packages/core",
     "packages/mcp",
 ]
 
@@ -18,7 +17,18 @@ members = [
 # workspace members and are not built: gltui was a TUI over the legacy
 # `gwenland` stack that never called the GL engines (its CoreBridge was a
 # stub), retired 2026-07-18.
-exclude = [".abandoned"]
+#
+# `gltrain/` (formerly `packages/core`) is excluded for a different reason —
+# it is NOT retired, it is GwenLand's training arm and stays under active
+# development. It is excluded because it mandatorily depends on candle
+# (candle-core/candle-nn/candle-transformers, "always compiled since Cycle
+# 6"), which violates this workspace's "Inference First" rule of zero
+# external ML dependencies (see
+# gl-agent-skills/architecture-skills/inference-first.md, Rule 6). Keeping it
+# excluded means `cargo build/check --workspace` at the root never touches
+# candle; build gltrain on its own with `cargo build` from inside `gltrain/`
+# — it is its own independent workspace with its own Cargo.lock.
+exclude = [".abandoned", "gltrain", "stumman"]
 resolver = "2"
 
 [profile.release]

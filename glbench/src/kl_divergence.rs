@@ -64,7 +64,7 @@
 //! single teacher-forced pass over `--tokens` tokens (default 64, capped
 //! deliberately low: every position costs a full forward pass on *both*
 //! engines, and `.gllm`'s per-token per-layer mmap/unmap overhead — see
-//! `architecture/mensura-veritatis-v3/ARTX4-Benchmark.md` — makes this the
+//! `architecture/gl-stack-audit-2026-07/ARTX4-Benchmark.md` — makes this the
 //! slower of glbench's two `.gllm`-scoring commands) is enough to answer
 //! that question and keeps the implementation to exactly what's needed,
 //! not a second copy of the windowing logic.
@@ -152,7 +152,12 @@ pub fn run_kl_divergence(args: KlDivArgs) -> Result<(), String> {
     let tokenizer =
         GllmTokenizer::from_gguf_path(&args.gguf.to_string_lossy()).map_err(|e| format!("building tokenizer from {}: {e}", args.gguf.display()))?;
 
-    let all_tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false);
+    // A tokenisation failure is a hard error, not a panic: this is the
+    // measurement's input, and a bench that silently proceeds on a partial
+    // token stream reports a number about the wrong text.
+    let all_tokens = tokenizer.encode(WIKITEXT2_SAMPLE, false).map_err(|e| {
+        format!("tokenizing the embedded WikiText-2 sample with {}: {e}", args.gguf.display())
+    })?;
     if all_tokens.len() <= args.tokens {
         return Err(format!(
             "embedded WikiText-2 sample tokenized to only {} tokens, need more than --tokens ({})",

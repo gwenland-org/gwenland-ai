@@ -3,6 +3,7 @@
 //! against the glproc oracle. [`integrity::validate`] runs the condition checks;
 //! [`numerical`] is called by the caller with both token streams.
 
+pub mod availability;
 pub mod deterministic;
 pub mod integrity;
 pub mod memory;

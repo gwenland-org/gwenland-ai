@@ -45,11 +45,17 @@ pub mod export;
 #[cfg(feature = "gllm-bench")]
 pub mod kl_divergence;
 pub mod measurement;
+/// GLBitProf — bit-level observation of tensor values. The math is ungated;
+/// its sources are gated per source (D-11).
+pub mod numerical;
 #[cfg(feature = "gllm-bench")]
 pub mod ppl;
 pub mod quant_info;
 pub mod render;
 pub mod runner;
+/// Training observation (D-05). Gated: a default build never compiles stumman.
+#[cfg(feature = "train-bench")]
+pub mod training;
 pub mod storage;
 #[cfg(feature = "gllm-bench")]
 pub mod tensor_stats;
