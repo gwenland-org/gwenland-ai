@@ -354,6 +354,148 @@ fn strict_mode_refuses_a_status_claiming_a_populated_field_is_absent() {
     make_writable(&path);
 }
 
+// ---------------------------------------------------------------------------
+// Wave 5 — rendering and export
+// ---------------------------------------------------------------------------
+
+/// Facts survive a round trip; derivations are recomputed from them.
+#[test]
+fn a_training_archive_reads_back_its_steps_and_re_derives_its_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("train.json");
+    let session = runner::run(&args()).expect("training runs");
+    let original = session.training.as_ref().unwrap().clone();
+    archive::write(&session, &path).unwrap();
+
+    let back = archive::read(&path).unwrap();
+    let t = back.training.as_ref().expect("training reconstructed");
+
+    // Facts, verbatim.
+    assert_eq!(t.steps.len(), original.steps.len());
+    assert_eq!(t.steps, original.steps);
+    assert_eq!(t.steps_observed, original.steps_observed);
+    assert_eq!(t.step_sample_n, original.step_sample_n);
+    assert_eq!(t.optimizer, original.optimizer);
+    assert_eq!(t.epoch_losses, original.epoch_losses);
+
+    // Derivations, recomputed — and they must agree with the originals,
+    // because re-deriving over the same measurements is deterministic.
+    let a = t.attribution.as_ref().expect("attribution re-derived");
+    let a0 = original.attribution.as_ref().unwrap();
+    assert_eq!(a.steps, a0.steps);
+    assert!((a.total_ms - a0.total_ms).abs() < 1e-9);
+
+    let c = t.convergence.as_ref().expect("convergence re-derived");
+    let c0 = original.convergence.as_ref().unwrap();
+    assert!((c.final_loss - c0.final_loss).abs() < 1e-9);
+    assert!((c.slope_per_step - c0.slope_per_step).abs() < 1e-9);
+
+    make_writable(&path);
+}
+
+/// `glbench export --format training-csv`, through the real archive.
+#[test]
+fn training_steps_export_as_csv_with_real_step_indices() {
+    use glbench::export::csv;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("train.json");
+    let mut a = args();
+    a.samples = 5;
+    a.epochs = 2;
+    a.step_sample_n = 4;
+    let session = runner::run(&a).expect("training runs");
+    archive::write(&session, &path).unwrap();
+
+    let back = archive::read(&path).unwrap();
+    let rows = csv::render_training(&back);
+    assert!(rows.starts_with(csv::TRAINING_HEADER), "{rows}");
+
+    let lines: Vec<&str> = rows.lines().skip(1).collect();
+    assert_eq!(lines.len(), 4, "one row per archived step: {rows}");
+
+    // The `step` column carries the real index, not a row number — a thinned
+    // series must plot against the right x-axis.
+    let indices: Vec<&str> = lines.iter().map(|l| l.split(',').nth(1).unwrap()).collect();
+    assert_eq!(indices, vec!["0", "4", "8", "9"]);
+
+    make_writable(&path);
+}
+
+#[test]
+fn a_session_with_no_training_exports_no_training_csv() {
+    use glbench::export::csv;
+    use glbench::core::metrics::MeasurementSet;
+    use glbench::core::result::SessionMetadata;
+    use glbench::core::session::BenchmarkSession;
+    use glbench::core::workload::WorkloadSpec;
+    use glbench::engine::metadata::EngineMetadata;
+    use glbench::environment::hardware::EnvironmentSnapshot;
+
+    let plain = BenchmarkSession::new(
+        SessionMetadata::new("inference"),
+        EnvironmentSnapshot::probe(""),
+        EngineMetadata {
+            name: "glproc".into(),
+            backend: "cpu".into(),
+            available: true,
+            model_arch: None,
+            quantization: None,
+            thinking_capable: None,
+        },
+        WorkloadSpec::default(),
+        MeasurementSet::default(),
+    );
+    assert!(
+        csv::render_training(&plain).is_empty(),
+        "a header with no rows would suggest a run that trained nothing"
+    );
+}
+
+/// The Markdown report must carry the training numbers *and* the caveats that
+/// make them readable (Gate 5).
+#[test]
+fn the_markdown_report_carries_the_training_sections_and_their_caveats() {
+    use glbench::export::markdown;
+
+    let mut a = args();
+    a.target_loss = Some(0.5);
+    let session = runner::run(&a).expect("training runs");
+    let md = markdown::render(&session);
+
+    for heading in [
+        "## Training",
+        "### Epoch loss",
+        "### Loss curve",
+        "### Convergence",
+        "### Step time",
+        "### Memory",
+    ] {
+        assert!(md.contains(heading), "missing {heading}");
+    }
+    // Sampling is stated even at N=1, so a reader never infers completeness.
+    assert!(md.contains("sample N="), "{md}");
+    // A plateau claim without its window and threshold is an opinion.
+    assert!(md.contains("relative threshold"), "{md}");
+    assert!(md.contains("Stability (CV)"), "{md}");
+    // The availability map is rendered, so nulls are explained in the report
+    // and not only in the JSON.
+    assert!(md.contains("## Availability"), "{md}");
+    assert!(md.contains("not_applicable"), "{md}");
+}
+
+/// A target nobody set must not read as a target of zero.
+#[test]
+fn the_markdown_report_says_no_target_was_given_rather_than_showing_one() {
+    use glbench::export::markdown;
+    let session = runner::run(&args()).expect("training runs");
+    let md = markdown::render(&session);
+    assert!(
+        md.contains("`--target-loss` has no default"),
+        "the report must explain the absence: {md}"
+    );
+}
+
 /// The archive is sealed like any other v2 session — training does not get a
 /// weaker integrity guarantee.
 #[test]

@@ -66,6 +66,56 @@ pub fn render_phase(label: &str, phase: &PhaseProfile) -> String {
     s
 }
 
+/// Render a training step's phase breakdown as the same proportional bars.
+///
+/// Deliberately takes the four durations rather than a `VLTrainingAttribution`,
+/// so this stays ungated and testable in a default build — the same split
+/// `render::loss_curve` makes. The caller has the struct; this only needs
+/// numbers.
+///
+/// `total_ms` is the measured step time, not the sum of the phases. When the
+/// three do not account for the whole step the remainder is drawn as
+/// `unattributed`, exactly as [`render_phase`] does for inference — a
+/// breakdown that silently sums to less than the whole invites the reader to
+/// assume it sums to the whole.
+pub fn render_training_step(
+    forward_ms: f64,
+    backward_ms: f64,
+    optimizer_ms: f64,
+    total_ms: f64,
+) -> String {
+    if total_ms <= 0.0 {
+        return String::new();
+    }
+    let mut rows: Vec<(String, f64)> = vec![
+        ("forward".to_string(), forward_ms),
+        ("backward".to_string(), backward_ms),
+        ("optimizer".to_string(), optimizer_ms),
+    ];
+    // Widest first, matching the inference view's ranking.
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    let unattributed = total_ms - forward_ms - backward_ms - optimizer_ms;
+    if unattributed > 0.0 {
+        rows.push(("unattributed".to_string(), unattributed));
+    }
+
+    let mut s = format!("
+training step flame ({total_ms:.3} ms total)
+");
+    for (name, ms) in rows {
+        let share = (ms / total_ms).clamp(0.0, 1.0);
+        let filled = ((share * BAR_WIDTH as f64).round() as usize).min(BAR_WIDTH);
+        let bar: String = "#".repeat(filled) + &".".repeat(BAR_WIDTH - filled);
+        s.push_str(&format!(
+            "  {name:<NAME_WIDTH$} {bar} {:5.1}% {ms:>8.3} ms
+",
+            share * 100.0
+        ));
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,5 +173,59 @@ mod tests {
             let hashes = line.chars().filter(|&c| c == '#').count();
             assert!(hashes <= BAR_WIDTH, "{line}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Training step breakdown (Wave 5)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_training_step_is_drawn_widest_phase_first() {
+        // backward dominates, then optimizer, then forward.
+        let out = render_training_step(1.0, 5.0, 2.0, 8.0);
+        let names: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("  "))
+            .filter_map(|l| l.split_whitespace().next())
+            .collect();
+        assert_eq!(names, vec!["backward", "optimizer", "forward"]);
+        assert!(out.contains("62.5%"), "backward is 5/8: {out}");
+    }
+
+    #[test]
+    fn a_gap_between_the_phases_and_the_total_is_drawn_as_unattributed() {
+        // Phases sum to 3ms, the step took 5ms.
+        let out = render_training_step(1.0, 1.0, 1.0, 5.0);
+        assert!(out.contains("unattributed"), "{out}");
+        assert!(out.contains("40.0%"), "the 2ms gap is 40% of 5ms: {out}");
+    }
+
+    #[test]
+    fn a_fully_attributed_step_draws_no_unattributed_row() {
+        let out = render_training_step(1.0, 2.0, 1.0, 4.0);
+        assert!(!out.contains("unattributed"), "{out}");
+    }
+
+    #[test]
+    fn a_zero_duration_step_draws_nothing_rather_than_dividing_by_zero() {
+        assert!(render_training_step(0.0, 0.0, 0.0, 0.0).is_empty());
+    }
+
+    /// Clock skew could make the phases exceed the total. Clamp the bar rather
+    /// than overflowing the width or printing a share above 100%.
+    #[test]
+    fn phases_exceeding_the_total_are_clamped_not_overflowed() {
+        let out = render_training_step(3.0, 3.0, 3.0, 1.0);
+        for row in out.lines().filter(|l| l.starts_with("  ")) {
+            // The bar is the one whitespace-delimited token made entirely of
+            // '#' and '.'; counting those characters across the whole row would
+            // also pick up the decimal point in "3.000 ms".
+            let bar = row
+                .split_whitespace()
+                .find(|t| !t.is_empty() && t.chars().all(|c| c == '#' || c == '.'))
+                .unwrap_or_else(|| panic!("no bar in {row:?}"));
+            assert_eq!(bar.len(), BAR_WIDTH, "bar must stay {BAR_WIDTH} wide: {row:?}");
+        }
+        assert!(!out.contains("unattributed"), "a negative gap is not drawn: {out}");
     }
 }

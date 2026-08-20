@@ -120,7 +120,11 @@ usage:
                    mismatch is reported and the session is still rendered,
                    because refusing to show a modified archive is useless
                    exactly when you need to see what changed)
-  glbench export  <session.json> --format <json|md|csv> [--out <file>]
+  glbench export  <session.json> --format <json|md|csv|training-csv> [--out <file>]
+                  (training-csv emits one row per archived training step —
+                   a different row shape from the measured iterations `csv`
+                   exports, so it is a separate format rather than blank
+                   columns under the same header)
   glbench join    <a.json> <b.json> --out <join.json> [--label <name>]
                   [--threshold F] [--no-verify]
                   (compares two archives into a third file that records each
@@ -1065,7 +1069,30 @@ fn cmd_export(args: &[String]) -> Result<(), String> {
         "json" => session.to_json().to_pretty(),
         "md" | "markdown" => markdown::render(&session),
         "csv" => csv::render(&session),
-        other => return Err(format!("unknown --format '{other}' (json|md|csv)")),
+        // Training steps are a different row shape from measured iterations,
+        // so they get their own format rather than blank columns under the
+        // iteration header.
+        #[cfg(feature = "train-bench")]
+        "training-csv" => {
+            let rows = csv::render_training(&session);
+            if rows.is_empty() {
+                return Err(format!(
+                    "{input} has no archived training steps to export"
+                ));
+            }
+            rows
+        }
+        #[cfg(not(feature = "train-bench"))]
+        "training-csv" => {
+            return Err(
+                "--format training-csv requires a build with --features train-bench".into(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "unknown --format '{other}' (json|md|csv|training-csv)"
+            ))
+        }
     };
 
     match out_path {

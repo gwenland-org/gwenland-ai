@@ -14,9 +14,72 @@ first, do not over-engineer.**
 | 3     | Analysis, comparison, validation subsystems                  | ✅ done |
 | 4     | Advanced rendering                                           | 🚧 baseline in place |
 | v2    | Mensura Veritatis v2: CoT-aware quality, per-bucket roofline, intra-session anomaly + hypotheses, cold/warm split, `ab` command, RAPL energy | ✅ done |
+| v3    | Mensura Veritatis v3: schema v2 envelope, null semantics, content digest, join, GLBitProf, training observation | ✅ done (5 waves) |
 
 Phase 1–3 landed together as the first foundation; Phase 4 has a working text +
 table renderer, with the richer output below still open.
+
+## v3 — "Mensura Veritatis v3" (landed, 5 waves)
+
+Design: `architecture/glbench-v3/DESIGN.md` (not this directory's `DESIGN.md`,
+which is v1/v2 and has no D-/F- numbering).
+
+| Wave | Scope | Gate result |
+|---|---|---|
+| 1 | Schema v2 envelope, null semantics (D-09/D-10), `sha256-128` content digest, `glbench join` | 1169 → 1270 tests; **7 external crates removed, 0 added** |
+| 2 | GLBitProf math, weights scope, bit-profile divergence | 1270 → 1306; cost measured; **negative result recorded** (below) |
+| 3 | stumman observer hook (`StepObserver`, phase timing, `VLGradStore::iter`) | stumman 327 tests; overhead measured at 3 layer widths |
+| 4 | `glbench train` / `unified`, convergence, attribution, memory, adapter, gradient+optimizer bit scopes | `--features train-bench` 334 → 417 |
+| 5 | Loss curve, training flame graph, Markdown/CSV training sections, docs | this table |
+
+### What v3 measured, and what it found
+
+Every number below was produced by a command in this repo, not estimated.
+
+- **GLBitProf cost** (`examples/bench_bitprof.rs`, i3-1115G4, release, median
+  of 10): Tier 1+3 — the exponent histogram and 32 per-position bit counts that
+  *every* tensor pays — is **~27 ns/element**, flat from 1M to 16M elements.
+  Tier 2, the sparse mantissa map, is paid only under the cap and multiplies
+  that by **4.59×** to ~123 ns/element. Reported as two numbers because their
+  average (~75) is a figure no tensor actually incurs.
+- **D-12's birthday-bound premise, measured rather than cited**: 131,072
+  near-uniform elements give **128,132** distinct mantissa patterns against the
+  `m·(1 − e^(−n/m))` prediction of 130,053 — **ratio 0.985**.
+- **⛔ Bit-profile divergence cannot detect a permutation.** The design expected
+  a wrong-nibble-order defect (the Q6_K class) to show as a structured
+  per-position anomaly. Measured with the real GQ4A encoder and dequant kernel
+  (`examples/bitprof_quant_divergence.rs`): a correct decode and a
+  nibble-swapped one score **exactly zero** on every axis, while their MAE
+  differs by 14× the scheme's own residual. Every statistic in a `VLBitProfile`
+  is permutation-invariant by construction. A sub-block rotation control, which
+  is *not* a pure permutation, does register (exponent L1 0.049). Pinned by
+  `numerical::compare::tests::permutation_invariance_is_a_known_blind_spot`.
+- **Observer overhead grows with layer width** (`stumman/M2_5_OBSERVABILITY.md`,
+  2 repeats): +4.3% at 64×64, +11.5% at 256×256, **+14.2% at 512×512**. The
+  "fixed cost" hypothesis is refuted by the sweep, which is why D-19's
+  `--step-sample N` is load-bearing rather than a nicety.
+- **Sampling works on the archive too**: a 192-step run with
+  `--bit-scope gradients,optimizer` went from **1.21 MB / 2,688 profiles** to
+  **83.5 KB / 168 profiles** at `--step-sample 16`. Before Wave 4 fixed it,
+  sampling thinned the steps but not the profiles at all.
+
+### Deviations from the v3 design, all declared
+
+- **F-06 was factually wrong.** `glictus-caliburni::checksum` used the `sha2`
+  crate, not a hand-rolled std-only SHA-256, and `glcore` was optional there,
+  not unconditional. The genuinely hand-rolled implementation was in
+  `gljax/src/runtime/digest.rs`. Resolved by writing a std-only SHA-256 in
+  `glcore::hash` and delegating both — workspace implementations 2 → 1.
+- **D-02 does not work as written.** `stumman = { path = ..., optional = true }`
+  fails with "multiple workspace roots found in the same workspace"; the root
+  `Cargo.toml` must also `exclude` it.
+- **§7.1's observer ordering was over-specified** and is corrected in the design
+  document: the observer runs *after* `optimizer.step()`, because
+  `optimizer_ns` cannot be reported by a callback that runs before the
+  optimizer does. KL-006 never depended on the position.
+- **`glbench train` has no `--model` or `--dataset`.** stumman M2 generates its
+  frozen base weight from a seed and builds its dataset in memory; neither flag
+  has a subject, and both are rejected with an error that says so.
 
 ## v2 — "LLM Performance Doctor" (landed)
 
