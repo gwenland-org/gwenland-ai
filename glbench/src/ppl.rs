@@ -240,14 +240,13 @@ fn sliding_window_log_probs(
         let new_start = if window_start == 0 { 0 } else { context - stride };
 
         let mut window_log_probs = Vec::new();
-        for i in new_start..window.len() {
+        for (i, logits) in all_logits.iter().enumerate().take(window.len()).skip(new_start) {
             // logits[i] predicts token at absolute position window_start+i+1.
             let target_abs = window_start + i + 1;
             if target_abs >= tokens.len() {
                 break;
             }
             let target = tokens[target_abs] as usize;
-            let logits = &all_logits[i];
             let lp = log_softmax(logits)
                 .get(target)
                 .copied()

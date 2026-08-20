@@ -26,6 +26,7 @@ use glbench::ppl::{self, PplArgs};
 use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
 use glbench::runner::{planner, scale, thread_scale};
+use glbench::numerical::scope::{self, ENBitScope};
 use glbench::storage::{archive, join};
 use glbench::validation::availability::ENNullSemantics;
 #[cfg(feature = "gllm-bench")]
@@ -124,6 +125,15 @@ usage:
                    containing gllm.json — ZIP-archive .gllm files are not
                    yet readable, see glictus-caliburni ARTX06)
 
+bit profiling (run):
+  --profile bits              profile the model's weight tensors at the bit
+                              level after the benchmark (GLBitProf). Static —
+                              it reads the model file, not the run, so it
+                              cannot perturb the timings.
+  --bit-scope <scope>         weights (default) | gradients | optimizer.
+                              weights needs --features gllm-bench; the two
+                              training scopes are Wave 4 and say so.
+
 archive options (run, ab, scale, ...):
   --null-semantics strict|lenient
                   (strict, the default, refuses to write a session with an
@@ -193,6 +203,8 @@ struct RunArgs {
     out_path: Option<PathBuf>,
     /// How a D-10 violation is treated when the archive is written.
     null_semantics: ENNullSemantics,
+    /// Which tensor family to bit-profile, if `--profile bits` was given.
+    bit_scope: Option<ENBitScope>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -201,6 +213,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut out_path: Option<PathBuf> = None;
     let mut prompt_set = false;
     let mut null_semantics = ENNullSemantics::default();
+    // `--profile bits` and `--bit-scope` are separate flags so the scope can be
+    // named before or after the profile is asked for, in either order.
+    let mut profile_bits = false;
+    let mut bit_scope: Option<ENBitScope> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -243,16 +259,46 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 null_semantics = ENNullSemantics::from_str(&v)
                     .ok_or_else(|| format!("--null-semantics takes strict|lenient, got '{v}'"))?;
             }
+            "--profile" => {
+                let v = value(&mut i)?;
+                match v.as_str() {
+                    "bits" => profile_bits = true,
+                    other => return Err(format!("--profile takes 'bits', got '{other}'")),
+                }
+            }
+            "--bit-scope" => {
+                let v = value(&mut i)?;
+                let scope = ENBitScope::from_str(&v).ok_or_else(|| {
+                    format!("--bit-scope takes weights|gradients|optimizer, got '{v}'")
+                })?;
+                // Refuse a scope this build cannot collect at parse time, not
+                // after a full benchmark run has already been paid for.
+                scope.availability()?;
+                bit_scope = Some(scope);
+            }
             other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
         }
         i += 1;
     }
 
+    // `--profile bits` with no `--bit-scope` means weights (Wave 2's only
+    // collectable scope); `--bit-scope` on its own implies `--profile bits`,
+    // because naming a scope is already asking for the profile.
+    let bit_scope = match (profile_bits, bit_scope) {
+        (_, Some(scope)) => Some(scope),
+        (true, None) => {
+            let scope = ENBitScope::Weights;
+            scope.availability()?;
+            Some(scope)
+        }
+        (false, None) => None,
+    };
+
     if !prompt_set {
         // A representative default prompt (~long enough to exercise prefill).
         spec.prompt = default_prompt();
     }
-    Ok(RunArgs { spec, models, out_path, null_semantics })
+    Ok(RunArgs { spec, models, out_path, null_semantics, bit_scope })
 }
 
 /// Progress heartbeat to stderr so stdout stays the report.
@@ -274,6 +320,13 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     // Report to stdout.
     print!("{}", text::session(&session));
 
+    // GLBitProf, if asked for. Runs after the measured iterations and reads the
+    // model file, not the run — profiling is static, so it cannot perturb the
+    // timings printed above.
+    if let Some(bit_scope) = a.bit_scope {
+        print!("{}", render_bit_profile(&session, bit_scope)?);
+    }
+
     // Archive if requested.
     if let Some(path) = a.out_path {
         let report = archive::write_with_policy(&session, &path, a.null_semantics)?;
@@ -283,6 +336,95 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         eprintln!("archived to {}", path.display());
     }
     Ok(())
+}
+
+/// Render the GLBitProf summary for a finished session.
+///
+/// Human-readable only, deliberately: Wave 2 wires the math and the CLI
+/// surface, and the archive projection of `VLBitProfile` lands with the rest of
+/// the training plumbing in Wave 4. Printing a number the archive cannot yet
+/// carry is better than half a schema.
+fn render_bit_profile(
+    session: &glbench::BenchmarkSession,
+    bit_scope: ENBitScope,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let scopes = scope::scope_weights_for_session(session)?;
+    let mut out = String::new();
+    let _ = writeln!(out, "\nGLBitProf — scope {}", bit_scope.as_str());
+    let _ = writeln!(out, "{}", "\u{2500}".repeat(78));
+
+    if scopes.is_empty() {
+        let _ = writeln!(out, "no tensor in this model could be decoded to f32.");
+        return Ok(out);
+    }
+
+    let _ = writeln!(
+        out,
+        "{:<34} {:>10} {:>6} {:>9} {:>7} {:>7}",
+        "tensor", "count", "sign", "exp range", "dyn", "mantissa"
+    );
+    for entry in &scopes {
+        let p = &entry.profile;
+        let mantissa = match p.mantissa_entropy_bits {
+            // The skipped case prints "skipped", never 0.0 — a tensor whose
+            // mantissa was never profiled has no entropy, which is a different
+            // statement from having none.
+            None => "skipped".to_string(),
+            Some(bits) => format!("{bits:.2}b"),
+        };
+        let _ = writeln!(
+            out,
+            "{:<34} {:>10} {:>5.1}% {:>4}..{:<4} {:>7.4} {:>7}",
+            truncate_name(&entry.tensor_name, 34),
+            p.count,
+            p.sign_set_ratio * 100.0,
+            p.exponent_min,
+            p.exponent_max,
+            p.dynamic_range_used,
+            mantissa
+        );
+    }
+
+    // Per-position entropy is the axis a structured bug shows up on, so the
+    // extremes are named rather than left in a 32-element array nobody reads.
+    let (mut max_h, mut max_at, mut min_h, mut min_at) = (f64::MIN, 0usize, f64::MAX, 0usize);
+    for entry in &scopes {
+        for (i, &h) in entry.profile.bit_entropy.iter().enumerate() {
+            if h > max_h {
+                max_h = h;
+                max_at = i;
+            }
+            if h < min_h {
+                min_h = h;
+                min_at = i;
+            }
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nbit entropy across {} tensors: max {max_h:.4} at bit {max_at}, min {min_h:.4} at bit {min_at}",
+        scopes.len()
+    );
+    let skipped = scopes.iter().filter(|s| s.profile.mantissa_sparse_skipped).count();
+    let _ = writeln!(
+        out,
+        "mantissa map: {} of {} tensors profiled at full 23-bit resolution \
+         ({skipped} over the {}-element cap)",
+        scopes.len() - skipped,
+        scopes.len(),
+        glbench::numerical::bitprof::MANTISSA_SPARSE_CAP
+    );
+    Ok(out)
+}
+
+/// Shorten a tensor name from the left, keeping the distinguishing tail.
+fn truncate_name(name: &str, width: usize) -> String {
+    if name.len() <= width {
+        return name.to_string();
+    }
+    format!("...{}", &name[name.len() - (width - 3)..])
 }
 
 /// `glbench ab` — benchmark N models under one identical workload, in one

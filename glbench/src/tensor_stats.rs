@@ -55,7 +55,7 @@
 //! `glictus-caliburni::package`/`manifest` reader and `glproc`'s dequant
 //! kernels can decode correctly for `GQ4A`/`GQ2A`. Hand-rolling a second
 //! decoder here would be exactly the "two independent implementations of
-//! the same format" risk `architecture/mensura-veritatis-v3/ARTX2-Quant.md`
+//! the same format" risk `architecture/gl-stack-audit-2026-07/ARTX2-Quant.md`
 //! documents — so this is gated behind `gllm-bench` and reuses the real
 //! reader, the same trade `ppl`/`kl-div` already made.
 
@@ -304,7 +304,7 @@ fn compute_stats(values: &[f32]) -> ValueStats {
 /// Decode one tensor to f32, the same dispatch
 /// `GllmEngine::load_shared`/`GlprocBackend::required_tensor` use. `None`
 /// for a dtype this Wave-1-scope decoder cannot read (native GGUF quant
-/// dtypes stored as-is — see `architecture/mensura-veritatis-v3/ARTX3-Format.md`).
+/// dtypes stored as-is — see `architecture/gl-stack-audit-2026-07/ARTX3-Format.md`).
 fn decode(dtype: DType, shape: &[u64], bytes: &[u8]) -> Option<Vec<f32>> {
     match dtype {
         DType::GQ4A => Some(glproc::kernels::gquant::dequant_gq4a_stream(bytes)),
@@ -333,10 +333,46 @@ fn dtype_display(dtype: DType) -> String {
     format!("{dtype:?}")
 }
 
-/// Run `glbench tensor-stats --model <package-dir> [--out <file.json>]`.
-pub fn run_tensor_stats(args: TensorStatsArgs) -> Result<(), String> {
-    eprintln!("opening .gllm package from {} ...", args.model.display());
-    let package = GllmPackage::open(&args.model).map_err(|e| format!("opening {}: {e}", args.model.display()))?;
+/// What a package walk skipped, and why.
+///
+/// Returned rather than printed so each caller decides how to report it —
+/// `tensor-stats` folds it into its JSON session, GLBitProf prints a line.
+#[derive(Debug, Default, Clone)]
+pub struct DecodeSummary {
+    /// Tensors decoded and handed to the callback.
+    pub scanned: usize,
+    /// Tensors whose dtype this decoder cannot read.
+    pub skipped: usize,
+    /// How many were skipped, per dtype.
+    pub skipped_dtypes: BTreeMap<String, usize>,
+}
+
+/// Walk every tensor in a `.gllm` package, decode it to f32, and hand it to
+/// `visit`.
+///
+/// **The one decode path.** `tensor-stats` and GLBitProf both go through here
+/// rather than each reaching for tensor bytes: the dispatch below is the same
+/// one `GllmEngine::load_shared`/`GlprocBackend::required_tensor` use, and a
+/// second copy of it is exactly the risk
+/// `architecture/gl-stack-audit-2026-07/ARTX2-Quant.md` documents.
+///
+/// One tensor is materialised at a time. A real model is gigabytes; a walker
+/// that collected every decoded tensor into a `Vec` before returning would be
+/// unusable on the models this is for.
+///
+/// `keep` filters by tensor name before any decoding happens, so a filtered-out
+/// tensor costs nothing.
+pub fn for_each_decoded_tensor<K, V>(
+    model: &std::path::Path,
+    keep: K,
+    mut visit: V,
+) -> Result<DecodeSummary, String>
+where
+    K: Fn(&str) -> bool,
+    V: FnMut(&TensorEntry, &[f32]),
+{
+    let package =
+        GllmPackage::open(model).map_err(|e| format!("opening {}: {e}", model.display()))?;
     let manifest = package.manifest();
 
     let mut all: Vec<(TensorEntry, PathBuf, Option<u32>)> = Vec::new();
@@ -351,16 +387,9 @@ pub fn run_tensor_stats(args: TensorStatsArgs) -> Result<(), String> {
             all.push((t.clone(), layer_file.path.clone(), Some(idx as u32)));
         }
     }
+    all.retain(|(entry, _, _)| keep(&entry.name));
 
-    if args.norm_only {
-        all.retain(|(entry, _, _)| entry.name.contains("norm.weight"));
-    }
-
-    let mut tensors_scanned = 0usize;
-    let mut tensors_skipped = 0usize;
-    let mut skipped_dtypes: BTreeMap<String, usize> = BTreeMap::new();
-    let mut issues = Vec::new();
-    let mut distributions = Vec::new();
+    let mut summary = DecodeSummary::default();
     let mut mapping_cache: BTreeMap<PathBuf, LayerMapping> = BTreeMap::new();
 
     for (entry, path, layer_idx) in &all {
@@ -371,20 +400,46 @@ pub fn run_tensor_stats(args: TensorStatsArgs) -> Result<(), String> {
         }
         let mapping = mapping_cache.get(path).expect("just inserted");
         let Some(bytes) = mapping.tensor_bytes(&entry.name) else {
-            return Err(format!("{}: tensor {:?} has no data in {}", args.model.display(), entry.name, path.display()));
+            return Err(format!(
+                "{}: tensor {:?} has no data in {}",
+                model.display(),
+                entry.name,
+                path.display()
+            ));
         };
 
         let Some(values) = decode(entry.dtype, &entry.shape, bytes) else {
-            tensors_skipped += 1;
-            *skipped_dtypes.entry(dtype_display(entry.dtype)).or_insert(0) += 1;
+            summary.skipped += 1;
+            *summary
+                .skipped_dtypes
+                .entry(dtype_display(entry.dtype))
+                .or_insert(0) += 1;
             continue;
         };
-        tensors_scanned += 1;
+        summary.scanned += 1;
+        visit(entry, &values);
+    }
 
-        let stats = compute_stats(&values);
+    Ok(summary)
+}
+
+/// Run `glbench tensor-stats --model <package-dir> [--out <file.json>]`.
+pub fn run_tensor_stats(args: TensorStatsArgs) -> Result<(), String> {
+    eprintln!("opening .gllm package from {} ...", args.model.display());
+
+    let mut issues = Vec::new();
+    let mut distributions = Vec::new();
+    let norm_only = args.norm_only;
+    let full = args.full;
+
+    let summary = for_each_decoded_tensor(
+        &args.model,
+        |name| !norm_only || name.contains("norm.weight"),
+        |entry, values| {
+        let stats = compute_stats(values);
         let dtype_str = dtype_display(entry.dtype);
 
-        if args.full {
+        if full {
             distributions.push(TensorDistribution {
                 tensor_name: entry.name.clone(),
                 dtype: dtype_str.clone(),
@@ -420,13 +475,14 @@ pub fn run_tensor_stats(args: TensorStatsArgs) -> Result<(), String> {
                 detail: format!("all {} elements equal {:.6}", stats.count, stats.mean),
             });
         }
-    }
+        },
+    )?;
 
     let session = TensorStatsSession {
         model_path: args.model.display().to_string(),
-        tensors_scanned,
-        tensors_skipped,
-        skipped_dtypes,
+        tensors_scanned: summary.scanned,
+        tensors_skipped: summary.skipped,
+        skipped_dtypes: summary.skipped_dtypes,
         issues,
         distributions,
         timestamp: iso8601_now(),
