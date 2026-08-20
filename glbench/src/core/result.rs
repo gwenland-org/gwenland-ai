@@ -2,6 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::core::mode::ENSessionMode;
 use crate::core::schema::{field_f64, field_str, FromJson, ToJson, GLBENCH_VERSION, SCHEMA_VERSION};
 use crate::export::json::Json;
 
@@ -17,6 +18,19 @@ pub struct SessionMetadata {
     pub glbench_version: String,
     /// Archive schema version.
     pub schema_version: u32,
+    /// What this session measured (v3). A v1 archive has no such field and is
+    /// read as [`ENSessionMode::InferenceOnly`] (D-20).
+    pub session_mode: ENSessionMode,
+    /// Which machine produced it, when the operator chose to record one.
+    ///
+    /// `None` by default and never auto-probed: a hostname is identifying
+    /// information, and `glbench` archives are files users hand to each other.
+    /// `EnvironmentSnapshot` already carries everything analysis needs about
+    /// the machine without naming it.
+    pub host_identifier: Option<String>,
+    /// Which optional collection passes ran, e.g. `"bits+weights"`. `None` when
+    /// only the default measurements were taken.
+    pub collection_profile: Option<String>,
 }
 
 impl SessionMetadata {
@@ -30,6 +44,9 @@ impl SessionMetadata {
                 .unwrap_or(0),
             glbench_version: GLBENCH_VERSION.to_string(),
             schema_version: SCHEMA_VERSION,
+            session_mode: ENSessionMode::InferenceOnly,
+            host_identifier: None,
+            collection_profile: None,
         }
     }
 }
@@ -41,6 +58,15 @@ impl ToJson for SessionMetadata {
             ("created_unix", Json::n(self.created_unix as f64)),
             ("glbench_version", Json::s(self.glbench_version.clone())),
             ("schema_version", Json::n(self.schema_version as f64)),
+            ("session_mode", Json::s(self.session_mode.as_str())),
+            (
+                "host_identifier",
+                self.host_identifier.clone().map(Json::s).unwrap_or(Json::Null),
+            ),
+            (
+                "collection_profile",
+                self.collection_profile.clone().map(Json::s).unwrap_or(Json::Null),
+            ),
         ])
     }
 }
@@ -52,6 +78,19 @@ impl FromJson for SessionMetadata {
             created_unix: field_f64(v, "created_unix")? as u64,
             glbench_version: field_str(v, "glbench_version")?,
             schema_version: field_f64(v, "schema_version")? as u32,
+            // Absent in a v1 archive. Defaulting rather than erroring is the
+            // whole of D-20's reader-compatibility promise; an unrecognised
+            // value is a different matter and is rejected.
+            session_mode: match v.get("session_mode").and_then(|m| m.as_str()) {
+                None => ENSessionMode::InferenceOnly,
+                Some(s) => ENSessionMode::from_str(s)
+                    .ok_or_else(|| format!("unknown session_mode '{s}'"))?,
+            },
+            host_identifier: v.get("host_identifier").and_then(|h| h.as_str()).map(String::from),
+            collection_profile: v
+                .get("collection_profile")
+                .and_then(|c| c.as_str())
+                .map(String::from),
         })
     }
 }

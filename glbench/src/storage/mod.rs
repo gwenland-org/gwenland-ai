@@ -2,4 +2,6 @@
 //! single-session JSON file; [`manifest`] summarizes a directory of them.
 
 pub mod archive;
+pub mod digest;
+pub mod join;
 pub mod manifest;

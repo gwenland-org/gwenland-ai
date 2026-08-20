@@ -12,6 +12,10 @@ pub mod engine_trait;
 pub mod error;
 pub mod format;
 pub mod gate;
+/// SHA-256, the workspace's single hash primitive. Lives here because both
+/// `glictus-caliburni` (`.gllm` checksums) and `glbench` (archive content
+/// digests) need it and neither depends on the other.
+pub mod hash;
 pub mod runtime;
 pub mod stopping;
 pub mod telemetry;

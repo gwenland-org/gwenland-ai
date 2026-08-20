@@ -13,7 +13,14 @@ pub const GLBENCH_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// The archive schema version. Bump this only on a breaking change to the
 /// on-disk [`crate::core::session::BenchmarkSession`] JSON shape.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// v2 (glbench v3, D-20) adds `inference`, `training`, `availability` and
+/// `integrity` at the top level, and `session_mode`, `host_identifier` and
+/// `collection_profile` to `metadata`. Nothing was removed and nothing changed
+/// meaning, so the break is for *writers* only: this build reads a v1 archive
+/// by defaulting the new fields, and a v1 build correctly refuses a v2 one via
+/// the existing check in `storage::archive::read`.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Everything in the data model can render itself to a [`Json`] value.
 pub trait ToJson {

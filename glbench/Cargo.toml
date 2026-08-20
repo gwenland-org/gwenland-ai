@@ -32,6 +32,14 @@ glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend
 [features]
 default = []
 gllm-bench = ["dep:glictus-caliburni"]
+# Training observation (v3 D-02). Wave 1 only reserves the schema slot:
+# `BenchmarkSession::training` holds a raw `Json` projection, so nothing here
+# needs stumman yet. The `stumman = { path = "../stumman", optional = true }`
+# edge this feature is specified to carry arrives with the training observer
+# in Wave 4, together with the `VLTrainingSession` type that replaces the
+# placeholder. Declared now so the cfg-gated code compiles warning-free and
+# the feature name is reserved rather than invented twice.
+train-bench = []
 
 [[bin]]
 name = "glbench"

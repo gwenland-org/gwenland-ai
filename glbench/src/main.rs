@@ -8,6 +8,7 @@
 //!                                                               numerical parity vs an oracle engine
 //!   glbench inspect <session.json>                             re-render an archive
 //!   glbench export  <session.json> --format <json|md|csv>       convert an archive
+//!   glbench join    <a.json> <b.json> --out <join.json>         compare two archives into a third
 //!
 //! Argument parsing is hand-rolled (the crate takes zero external deps, so no
 //! clap here). Parsing is intentionally small and forgiving of flag order.
@@ -25,7 +26,8 @@ use glbench::ppl::{self, PplArgs};
 use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
 use glbench::runner::{planner, scale, thread_scale};
-use glbench::storage::archive;
+use glbench::storage::{archive, join};
+use glbench::validation::availability::ENNullSemantics;
 #[cfg(feature = "gllm-bench")]
 use glbench::tensor_stats::{self, TensorStatsArgs};
 
@@ -41,6 +43,7 @@ fn main() -> ExitCode {
         Some("accuracy-vs-perf") => cmd_accuracy_vs_perf(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
+        Some("join") => cmd_join(&args[1..]),
         Some("quant-info") => cmd_quant_info(&args[1..]),
         #[cfg(feature = "gllm-bench")]
         Some("ppl") => cmd_ppl(&args[1..]),
@@ -85,6 +88,10 @@ usage:
                   (runs <engine> and <oracle> on the identical prompt under
                    greedy decoding and reports the matching token prefix;
                    default oracle is 'glproc')
+  glbench validate --availability <archive.json>
+                  (a different check: the D-10 invariant over an archive that
+                   already exists — every null carries an availability status,
+                   and no status sits on a field that has a value)
   glbench scale   --engine <name> --model <path> --sweep N,N,N,...
                   (runs the identical prompt at each token budget in --sweep,
                    sequentially, and classifies how decode throughput scales)
@@ -93,8 +100,19 @@ usage:
                    --sweep, sequentially, and reports speedup/efficiency
                    relative to the lowest thread count — glproc only, since
                    GLPROC_THREADS is glproc's own env override)
-  glbench inspect <session.json>
+  glbench inspect <session.json> [--no-verify]
+                  (verifies the archive's content digest by default; a
+                   mismatch is reported and the session is still rendered,
+                   because refusing to show a modified archive is useless
+                   exactly when you need to see what changed)
   glbench export  <session.json> --format <json|md|csv> [--out <file>]
+  glbench join    <a.json> <b.json> --out <join.json> [--label <name>]
+                  [--threshold F] [--no-verify]
+                  (compares two archives into a third file that records each
+                   source's content digest; neither source is opened for
+                   writing, and 'glbench inspect <join.json>' re-checks them
+                   so a source edited afterwards shows up as drift.
+                   Exactly two sources in v3)
   glbench accuracy-vs-perf <run.json> <accuracy.json>
                   (joins a `run` archive's throughput with a `kl-div` or
                    `ppl` archive's numerical-accuracy figures, side by side —
@@ -105,6 +123,12 @@ usage:
                    --model names the package directory, e.g. the folder
                    containing gllm.json — ZIP-archive .gllm files are not
                    yet readable, see glictus-caliburni ARTX06)
+
+archive options (run, ab, scale, ...):
+  --null-semantics strict|lenient
+                  (strict, the default, refuses to write a session with an
+                   unexplained null or a mode/content disagreement; lenient
+                   downgrades both to warnings and writes anyway)
 
 glbench measures engine performance; it does not optimize it.";
 
@@ -167,6 +191,8 @@ struct RunArgs {
     spec: WorkloadSpec,
     models: Vec<String>,
     out_path: Option<PathBuf>,
+    /// How a D-10 violation is treated when the archive is written.
+    null_semantics: ENNullSemantics,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -174,6 +200,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut models = Vec::new();
     let mut out_path: Option<PathBuf> = None;
     let mut prompt_set = false;
+    let mut null_semantics = ENNullSemantics::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -211,6 +238,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--out" => out_path = Some(PathBuf::from(value(&mut i)?)),
             "--verify-against" => spec.verify_against = Some(value(&mut i)?),
+            "--null-semantics" => {
+                let v = value(&mut i)?;
+                null_semantics = ENNullSemantics::from_str(&v)
+                    .ok_or_else(|| format!("--null-semantics takes strict|lenient, got '{v}'"))?;
+            }
             other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
         }
         i += 1;
@@ -220,7 +252,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         // A representative default prompt (~long enough to exercise prefill).
         spec.prompt = default_prompt();
     }
-    Ok(RunArgs { spec, models, out_path })
+    Ok(RunArgs { spec, models, out_path, null_semantics })
 }
 
 /// Progress heartbeat to stderr so stdout stays the report.
@@ -244,7 +276,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
 
     // Archive if requested.
     if let Some(path) = a.out_path {
-        archive::write(&session, &path)?;
+        let report = archive::write_with_policy(&session, &path, a.null_semantics)?;
+        for finding in &report.findings {
+            eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+        }
         eprintln!("archived to {}", path.display());
     }
     Ok(())
@@ -324,6 +359,13 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            // A different check entirely: the D-10 invariant over an archive
+            // that already exists, for files written by an older build.
+            "--availability" => {
+                i += 1;
+                let path = args.get(i).ok_or("--availability needs an archive path")?;
+                return cmd_validate_availability(Path::new(path));
+            }
             "--against" => {
                 i += 1;
                 against = args.get(i).ok_or("--against needs a value")?.clone();
@@ -351,6 +393,23 @@ fn cmd_validate(args: &[String]) -> Result<(), String> {
 
     if !report.passed() {
         return Err("numerical parity check failed".into());
+    }
+    Ok(())
+}
+
+/// `glbench validate --availability` — the D-10 invariant over an archive.
+fn cmd_validate_availability(path: &Path) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let report = glbench::validation::availability::check(&text);
+    if report.findings.is_empty() {
+        println!("{}: every null carries an availability status.", path.display());
+        return Ok(());
+    }
+    for finding in &report.findings {
+        println!("[{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+    }
+    if !report.passed() {
+        return Err(format!("{}: null-semantics check failed", path.display()));
     }
     Ok(())
 }
@@ -438,11 +497,129 @@ fn cmd_thread_scale(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `glbench inspect` — re-render an archived session to the terminal.
+/// `glbench inspect` — re-render an archived session, or re-check a join.
+///
+/// Digest verification is on by default. A mismatch prints as an error finding
+/// and the archive is still rendered: refusing to show a modified archive would
+/// make the tool useless exactly when a user most needs to see what changed.
 fn cmd_inspect(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("inspect needs an archive path")?;
-    let session = archive::read(Path::new(path))?;
+    let mut path: Option<&String> = None;
+    let mut verify = true;
+    for arg in args {
+        match arg.as_str() {
+            "--no-verify" => verify = false,
+            other if other.starts_with("--") => return Err(format!("unknown flag '{other}'")),
+            _ => path = Some(arg),
+        }
+    }
+    let path = Path::new(path.ok_or("inspect needs an archive path")?);
+
+    // A join manifest is a different top-level type, distinguished by the one
+    // key a session never has.
+    let text_in = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    let value = glbench::export::json::parse(&text_in)
+        .map_err(|e| format!("parsing {}: {e}", path.display()))?;
+    if join::looks_like_join(&value) {
+        return inspect_join(path);
+    }
+
+    let (session, report) = archive::read_verified(path, verify)?;
+    for finding in &report.findings {
+        eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+    }
     print!("{}", text::session(&session));
+    if !report.passed() {
+        return Err("archive failed integrity verification".into());
+    }
+    Ok(())
+}
+
+/// `glbench inspect <join.json>` — re-verify the sources a join recorded.
+fn inspect_join(path: &Path) -> Result<(), String> {
+    let manifest = join::read(path)?;
+    println!("join: {}", manifest.label);
+    for source in &manifest.sources {
+        println!(
+            "  {} ({}) digest={}",
+            source.path,
+            source.label,
+            source.digest.as_deref().unwrap_or("none (v1 archive)")
+        );
+    }
+    println!();
+    print!("{}", text::comparison(&manifest.comparison));
+
+    let report = join::verify_sources(&manifest);
+    for finding in &report.findings {
+        eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+    }
+    if !report.passed() {
+        return Err("a join source has changed since the join was written".into());
+    }
+    Ok(())
+}
+
+/// `glbench join` — compare two archives into a third file.
+///
+/// Neither source is opened for writing. The join records each source's content
+/// digest so `glbench inspect` can later tell whether one has moved underneath
+/// it; that check is the whole reason the digests are stored.
+fn cmd_join(args: &[String]) -> Result<(), String> {
+    let mut positional: Vec<&String> = Vec::new();
+    let mut out: Option<PathBuf> = None;
+    let mut label: Option<String> = None;
+    let mut threshold = 0.05;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out" => {
+                i += 1;
+                out = Some(PathBuf::from(args.get(i).ok_or("--out needs a value")?));
+            }
+            "--label" => {
+                i += 1;
+                label = Some(args.get(i).ok_or("--label needs a value")?.clone());
+            }
+            "--threshold" => {
+                i += 1;
+                threshold = parse_f64(args.get(i).ok_or("--threshold needs a value")?, "--threshold")?;
+            }
+            // Accepted and ignored: a join always verifies its sources, since
+            // recording an unverified digest would make the drift check a lie.
+            "--no-verify" => {}
+            other if other.starts_with("--") => return Err(format!("unknown flag '{other}'")),
+            _ => positional.push(&args[i]),
+        }
+        i += 1;
+    }
+
+    if positional.len() != join::V3_SOURCE_COUNT {
+        return Err(format!(
+            "join takes exactly {} archive paths, got {}. v3 joins two sessions; \
+             `sources` is a list so an N-way join stays schema-compatible later, \
+             but nothing reads more than two yet",
+            join::V3_SOURCE_COUNT,
+            positional.len()
+        ));
+    }
+    let out = out.ok_or("join needs --out <join.json>")?;
+
+    let (manifest, report) = join::build(
+        Path::new(positional[0]),
+        Path::new(positional[1]),
+        label.as_deref(),
+        threshold,
+    )?;
+    for finding in &report.findings {
+        eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+    }
+    if !report.passed() {
+        return Err("refusing to write a join over sources that failed verification".into());
+    }
+
+    join::write(&manifest, &out)?;
+    print!("{}", text::comparison(&manifest.comparison));
+    eprintln!("wrote {}", out.display());
     Ok(())
 }
 
