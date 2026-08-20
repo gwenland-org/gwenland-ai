@@ -1072,9 +1072,20 @@ and `stumman/KNOWN_ISSUES.md`:
 
 - Breton sub-system codename in the module header. `observe.rs` sits under
   Deskiñ (training).
-- KL-006's ordering is untouched. The observer reads gradients *between*
-  `finish_step()` and `optimizer.step()`; it does not hold them across the
-  update, and it never gets a mutable handle.
+- KL-006's ordering is untouched. Its guarantee is that **the tape is empty
+  before any weight write**, and `finish_step()` establishes that well before
+  the observer runs. The observer never sees a tape, holds gradients only for
+  the duration of one call, and never gets a mutable handle.
+
+  **Corrected 2026-08-20, against the implementation.** This bullet previously
+  required the observer to run *between* `finish_step()` and
+  `optimizer.step()`. That position cannot work: `VLTrainingStep` carries
+  `optimizer_ns`, which a callback running before the optimizer cannot report
+  except as a zero or a lie. The observer therefore runs *after*
+  `optimizer.step()`, which satisfies KL-006 for the reason above — the
+  invariant never depended on the position. Reading `grads` late is safe: it is
+  a local `train_step` owns, and `Optimizer::step` borrows it shared. Signed
+  off by JinXSuper; see `stumman/M2_5_OBSERVABILITY.md` for the full record.
 - No new external dependency. `Instant`, `f32`, and `HashMap` are all std.
 
 ### 7.2 `glcore` — the hash primitive (D-15)

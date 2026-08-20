@@ -28,7 +28,7 @@ members = [
 # excluded means `cargo build/check --workspace` at the root never touches
 # candle; build gltrain on its own with `cargo build` from inside `gltrain/`
 # — it is its own independent workspace with its own Cargo.lock.
-exclude = [".abandoned", "gltrain"]
+exclude = [".abandoned", "gltrain", "stumman"]
 resolver = "2"
 
 [profile.release]
