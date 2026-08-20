@@ -11,7 +11,9 @@
 //! [`Trainer::train_step`].
 
 pub mod dataset;
+pub mod observe;
 pub mod trainer;
 
 pub use dataset::VLMicroDataset;
+pub use observe::{StepObserver, VLTrainingStep};
 pub use trainer::{mse_loss, Trainer, VLTrainerConfig};

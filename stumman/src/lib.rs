@@ -50,4 +50,4 @@ pub use optim::{
 };
 pub use rng::Xorshift64Star;
 pub use tensor::{Backend, Tensor};
-pub use train::{mse_loss, Trainer, VLMicroDataset, VLTrainerConfig};
+pub use train::{mse_loss, StepObserver, Trainer, VLMicroDataset, VLTrainerConfig, VLTrainingStep};
