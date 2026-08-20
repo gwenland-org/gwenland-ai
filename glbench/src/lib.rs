@@ -45,6 +45,9 @@ pub mod export;
 #[cfg(feature = "gllm-bench")]
 pub mod kl_divergence;
 pub mod measurement;
+/// GLBitProf — bit-level observation of tensor values. The math is ungated;
+/// its sources are gated per source (D-11).
+pub mod numerical;
 #[cfg(feature = "gllm-bench")]
 pub mod ppl;
 pub mod quant_info;

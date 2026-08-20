@@ -27,7 +27,15 @@ glcuda = { path = "../glcuda" }
 # entirely (see engine/adapter.rs's module docs); pulling it in unconditionally
 # would make every glbench build depend on glictus-caliburni's glproc-backend
 # feature even when nobody benchmarks GLLM.
-glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend"], optional = true }
+# `converter` is on alongside `glproc-backend` so the bit-profile divergence
+# example can call the real GQ4A/GQ2A *encoders* (they live behind `converter`,
+# not `gquant`, which is struct definitions only). glproc already carries the
+# matching dequant kernels unconditionally; without the encoder the example
+# would have to reimplement quantisation, which is the one thing
+# architecture/gl-stack-audit-2026-07/ARTX2-Quant.md exists to prevent.
+# No new external dependency: `converter` resolves to `dep:glproc` + `gquant`,
+# and glproc is already an unconditional dependency of glbench.
+glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend", "converter"], optional = true }
 
 [features]
 default = []
@@ -44,6 +52,13 @@ train-bench = []
 [[bin]]
 name = "glbench"
 path = "src/main.rs"
+
+# Cargo builds every auto-discovered example unconditionally, including under
+# `cargo test --workspace` — declaring the feature it needs makes that a
+# skip rather than a compile error.
+[[example]]
+name = "bitprof_quant_divergence"
+required-features = ["gllm-bench"]
 
 [dev-dependencies]
 tempfile = "3"
