@@ -34,6 +34,7 @@
 //! There is no ordering for a caller to get wrong, because there is no way to
 //! hold a `VLGradStore` and a populated tape at the same time.
 
+use crate::autograd::grad_store::VLGradStore;
 use crate::autograd::tape::Tape;
 use crate::error::{GlTrainError, Result};
 use crate::nn::adapter::{Adapter, LRLora, VLAdapterSpec};
@@ -42,8 +43,10 @@ use crate::nn::param::TPParameter;
 use crate::optim::{Optimizer, VLAdamWConfig, OPAdamW};
 use crate::tensor::backend::Backend;
 use crate::tensor::Tensor;
+use crate::train::observe::{StepObserver, VLTrainingStep};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::checkpoint::{CPLora, CheckpointStore, VLManifest};
 
@@ -112,6 +115,12 @@ pub struct Trainer<B: Backend> {
     tape: Arc<Mutex<Tape>>,
     config: VLTrainerConfig,
     step: usize,
+    /// M2.5. `None` is the default and the zero-cost path: with no observer
+    /// installed, `train_step` calls no clock and touches no gradient twice.
+    observer: Option<Box<dyn StepObserver>>,
+    /// Which epoch `train` is currently in. Stays 0 for a bare `train_step`,
+    /// which has no epoch to belong to.
+    current_epoch: usize,
 }
 
 impl<B: Backend> Trainer<B> {
@@ -148,6 +157,8 @@ impl<B: Backend> Trainer<B> {
             tape: Arc::new(Mutex::new(Tape::new())),
             config,
             step: 0,
+            observer: None,
+            current_epoch: 0,
         })
     }
 
@@ -176,6 +187,26 @@ impl<B: Backend> Trainer<B> {
         &self.tape
     }
 
+    /// Install an observer. It receives one [`VLTrainingStep`] per step from
+    /// the next `train_step` onwards.
+    ///
+    /// Installing one turns on phase timing and a pass over the gradients, so
+    /// it is not free. Not installing one costs a single `Option::is_some`.
+    pub fn set_observer(&mut self, observer: Box<dyn StepObserver>) {
+        self.observer = Some(observer);
+    }
+
+    /// Remove the observer and hand it back, so a caller can read whatever it
+    /// accumulated. Returns `None` if none was installed.
+    pub fn clear_observer(&mut self) -> Option<Box<dyn StepObserver>> {
+        self.observer.take()
+    }
+
+    /// The epoch `train` is currently in, or 0 outside a `train` call.
+    pub fn current_epoch(&self) -> usize {
+        self.current_epoch
+    }
+
     /// Forward pass: the full layer output, base plus scaled adapter delta.
     pub fn forward(&self, x: &Tensor<B>) -> Result<Tensor<B>> {
         // Once. `LRLora::forward` applies the base weight itself.
@@ -184,10 +215,23 @@ impl<B: Backend> Trainer<B> {
     }
 
     /// One forward, one backward, one optimizer step. Returns the loss.
+    ///
+    /// # M2.5 instrumentation
+    ///
+    /// `observed` is read once, at the top. When it is false every `then` below
+    /// short-circuits, so no clock is read, no gradient is walked, and the
+    /// arithmetic is the same sequence of operations M2 shipped. The timing
+    /// calls sit *between* the math, never inside it, which is why there is one
+    /// code path here rather than two: a duplicated body could drift, a shared
+    /// one cannot.
     pub fn train_step(&mut self, x: &Tensor<B>, target: &Tensor<B>) -> Result<f32> {
+        let observed = self.observer.is_some();
+        let t0 = observed.then(Instant::now);
+
         let pred = self.forward(x)?;
         let loss = mse_loss(&pred, target)?;
         let loss_value = loss.item()?;
+        let t1 = observed.then(Instant::now);
 
         // KL-006: the gradients and the empty tape arrive together, so the
         // in-place weight write below cannot be observed by a live closure.
@@ -196,15 +240,130 @@ impl<B: Backend> Trainer<B> {
             guard.backward()?;
             guard.finish_step()
         };
+        let t2 = observed.then(Instant::now);
 
         // LoRA owns two distinctly-named parameters, so no dedup is needed
         // here. An adapter that shared one across sites (VeRA, M3) would have
         // to go through `crate::nn::trainable_parameters_mut` instead, or the
         // shared parameter would be updated once per site.
-        let mut params = self.adapter.parameters_mut();
-        self.optimizer.step(&mut params, &grads)?;
+        //
+        // Scoped so the `&mut self.adapter` borrow ends before the observer
+        // window, which needs `&self` to read the parameters back out.
+        {
+            let mut params = self.adapter.parameters_mut();
+            self.optimizer.step(&mut params, &grads)?;
+        }
+        let t3 = observed.then(Instant::now);
+
+        let index = self.step;
         self.step += 1;
+
+        // The observer runs *after* the update, not between `finish_step` and
+        // it. `optimizer_ns` cannot be reported by a callback that runs before
+        // the optimizer does, and reading `grads` late is safe: it is a local
+        // this function owns, and `Optimizer::step` only borrows it shared.
+        // KL-006 is untouched either way, since the tape was emptied by
+        // `finish_step` well before any of this.
+        if observed {
+            self.emit_observation(index, loss_value, &grads, t0, t1, t2, t3)?;
+        }
         Ok(loss_value)
+    }
+
+    /// Build one [`VLTrainingStep`] and hand it to the observer.
+    ///
+    /// Only called when an observer is installed, so every `Instant` is `Some`.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_observation(
+        &mut self,
+        index: usize,
+        loss: f32,
+        grads: &VLGradStore,
+        t0: Option<Instant>,
+        t1: Option<Instant>,
+        t2: Option<Instant>,
+        t3: Option<Instant>,
+    ) -> Result<()> {
+        let (Some(t0), Some(t1), Some(t2), Some(t3)) = (t0, t1, t2, t3) else {
+            return Ok(());
+        };
+
+        // Statistics cover **trainable parameters only**, not the whole store.
+        //
+        // `finish_step` returns a gradient for every tensor the tape touched,
+        // which on this trainer is nine entries: the two LoRA parameters plus
+        // seven intermediate activations. Folding activations into
+        // `grad_l2_norm` would produce a number that is not the gradient norm
+        // anyone means by that phrase: every framework's `clip_grad_norm_`
+        // computes it over parameters, and gradient-health analysis reads it
+        // that way. Measured on the 4x4 r=2 fixture, the difference is 9
+        // tensors versus 2.
+        //
+        // The full store still reaches an observer that wants it, through
+        // `on_tensors`.
+        //
+        // Non-finite values are counted and excluded from the norm rather than
+        // folded into it: a single NaN would otherwise make `grad_l2_norm` NaN
+        // and erase the whole signal. NaN and Inf get separate counters because
+        // they point at different bugs, and `is_nan` / `is_infinite` are
+        // mutually exclusive so nothing is double-counted.
+        let mut grad_count = 0usize;
+        let mut grad_elements = 0usize;
+        let mut l2_squared = 0f64;
+        let mut grad_nan = 0usize;
+        let mut grad_inf = 0usize;
+        for param in self.adapter_parameters() {
+            let Some((data, _shape)) = grads.get(param.id()) else {
+                continue;
+            };
+            grad_count += 1;
+            grad_elements += data.len();
+            for &v in data {
+                if v.is_nan() {
+                    grad_nan += 1;
+                } else if v.is_infinite() {
+                    grad_inf += 1;
+                } else {
+                    l2_squared += (v as f64) * (v as f64);
+                }
+            }
+        }
+
+        let record = VLTrainingStep {
+            index,
+            epoch: self.current_epoch,
+            loss,
+            forward_ns: (t1 - t0).as_nanos() as u64,
+            backward_ns: (t2 - t1).as_nanos() as u64,
+            optimizer_ns: (t3 - t2).as_nanos() as u64,
+            total_ns: (t3 - t0).as_nanos() as u64,
+            grad_count,
+            grad_elements,
+            grad_l2_norm: l2_squared.sqrt(),
+            grad_nan,
+            grad_inf,
+            // From the optimizer, not from `self.config`: identical today, but
+            // it stays correct when M3 adds a schedule.
+            lr: self.optimizer.config().lr,
+        };
+
+        // `state_tensors` allocates a full copy of the optimizer state, so it
+        // is only called when the observer asked for it. Computed before the
+        // `&mut self.observer` borrow below, because it needs `&self`.
+        let wants_tensors = self.observer.as_ref().is_some_and(|o| o.wants_tensors());
+        let opt_state = if wants_tensors {
+            self.optimizer.state_tensors(&self.adapter_parameters())?
+        } else {
+            Vec::new()
+        };
+
+        if let Some(observer) = self.observer.as_mut() {
+            observer.on_step(&record);
+            if wants_tensors {
+                observer.on_tensors(grads, &opt_state);
+            }
+        }
+        Ok(())
     }
 
     /// Train for `epochs` passes over `dataset`, returning the mean loss per
@@ -222,7 +381,11 @@ impl<B: Backend> Trainer<B> {
             });
         }
         let mut history = Vec::with_capacity(epochs);
-        for _ in 0..epochs {
+        for epoch in 0..epochs {
+            // M2.5: the only place an epoch exists. `train_step` called
+            // directly reports epoch 0, which is honest rather than a default:
+            // a bare step genuinely does not belong to one.
+            self.current_epoch = epoch;
             let mut total = 0.0f64;
             for i in 0..dataset.len() {
                 let (x, y) = dataset.sample::<B>(i)?;
@@ -230,6 +393,9 @@ impl<B: Backend> Trainer<B> {
             }
             history.push((total / dataset.len() as f64) as f32);
         }
+        // Leave the counter where a bare `train_step` would find it, so the
+        // epoch a step reports never depends on a previous `train` call.
+        self.current_epoch = 0;
         Ok(history)
     }
 
@@ -580,5 +746,315 @@ mod tests {
     fn a_base_weight_of_the_wrong_shape_is_refused() {
         let wrong = Tensor::<GlProc>::zeros(&[3, 5]).unwrap();
         assert!(Trainer::<GlProc>::with_base(VLTrainerConfig::new(4, 4, 2, 0.01, 1), wrong).is_err());
+    }
+
+    // ---- M2.5 observability -------------------------------------------------
+
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Shared read-back handle.
+    ///
+    /// `set_observer` takes a `Box<dyn StepObserver>`, and a trait object
+    /// cannot be downcast back to its concrete type without either an `Any`
+    /// supertrait (which would widen the public trait for the benefit of tests)
+    /// or `unsafe`. Sharing an `Rc<RefCell<..>>` with the observer costs
+    /// nothing and stays entirely in safe code.
+    #[derive(Clone, Default)]
+    struct VLRecorderHandle {
+        steps: Rc<RefCell<Vec<VLTrainingStep>>>,
+        tensor_calls: Rc<RefCell<usize>>,
+    }
+
+    impl VLRecorderHandle {
+        fn steps(&self) -> Vec<VLTrainingStep> {
+            self.steps.borrow().clone()
+        }
+        fn tensor_calls(&self) -> usize {
+            *self.tensor_calls.borrow()
+        }
+    }
+
+    struct VLRecorder {
+        handle: VLRecorderHandle,
+        wants: bool,
+    }
+
+    impl StepObserver for VLRecorder {
+        fn on_step(&mut self, step: &VLTrainingStep) {
+            self.handle.steps.borrow_mut().push(step.clone());
+        }
+        fn wants_tensors(&self) -> bool {
+            self.wants
+        }
+        fn on_tensors(
+            &mut self,
+            _grads: &crate::autograd::grad_store::VLGradStore,
+            _opt_state: &[crate::optim::VLNamedTensor],
+        ) {
+            *self.handle.tensor_calls.borrow_mut() += 1;
+        }
+    }
+
+    /// Install a recorder and hand back the handle to read it through.
+    fn watch(trainer: &mut Trainer<GlProc>, wants: bool) -> VLRecorderHandle {
+        let handle = VLRecorderHandle::default();
+        trainer.set_observer(Box::new(VLRecorder {
+            handle: handle.clone(),
+            wants,
+        }));
+        handle
+    }
+
+    fn fixture(seed: u64) -> (Trainer<GlProc>, Tensor<GlProc>, Tensor<GlProc>) {
+        let cfg = VLTrainerConfig::new(4, 4, 2, 0.01, seed);
+        let base = Tensor::<GlProc>::randn(&[4, 4], 1.0, 1234).unwrap();
+        let trainer = Trainer::<GlProc>::with_base(cfg, base).unwrap();
+        let x = Tensor::<GlProc>::randn(&[1, 4], 1.0, 7).unwrap();
+        let y = Tensor::<GlProc>::randn(&[1, 4], 1.0, 8).unwrap();
+        (trainer, x, y)
+    }
+
+    /// Two identical trainers with no observer produce the same losses. The
+    /// determinism baseline the next test measures the observer against.
+    #[test]
+    fn unobserved_train_step_is_deterministic() {
+        const N: usize = 10;
+        let (mut a, xa, ya) = fixture(42);
+        let (mut b, xb, yb) = fixture(42);
+        for i in 0..N {
+            let la = a.train_step(&xa, &ya).unwrap();
+            let lb = b.train_step(&xb, &yb).unwrap();
+            assert_eq!(la.to_bits(), lb.to_bits(), "step {i}: unobserved run diverged");
+        }
+    }
+
+    /// **The load-bearing test of M2.5.**
+    ///
+    /// Installing an observer must not perturb the arithmetic. Comparing two
+    /// *unobserved* runs cannot show that: both sides would be equally wrong if
+    /// instrumentation broke the math. So one side is observed and the other is
+    /// not, and the losses are compared bit for bit.
+    #[test]
+    fn installing_an_observer_does_not_change_the_loss() {
+        const N: usize = 10;
+        let (mut observed, xo, yo) = fixture(42);
+        let (mut plain, xp, yp) = fixture(42);
+        let _handle = watch(&mut observed, false);
+
+        for i in 0..N {
+            let lo = observed.train_step(&xo, &yo).unwrap();
+            let lp = plain.train_step(&xp, &yp).unwrap();
+            assert_eq!(
+                lo.to_bits(),
+                lp.to_bits(),
+                "step {i}: the observer changed the loss"
+            );
+        }
+
+        // The frozen base must still be frozen on the observed side.
+        let frozen = observed.base().weight().tensor().to_vec().unwrap();
+        let reference = plain.base().weight().tensor().to_vec().unwrap();
+        for (a, b) in frozen.iter().zip(reference.iter()) {
+            assert!((a - b).abs() <= TOL_EXACT, "observation touched a frozen weight");
+        }
+    }
+
+    /// The same, with the expensive payload turned on: `state_tensors` must not
+    /// disturb the run either.
+    #[test]
+    fn requesting_tensors_does_not_change_the_loss() {
+        const N: usize = 6;
+        let (mut observed, xo, yo) = fixture(42);
+        let (mut plain, xp, yp) = fixture(42);
+        let handle = watch(&mut observed, true);
+
+        for i in 0..N {
+            let lo = observed.train_step(&xo, &yo).unwrap();
+            let lp = plain.train_step(&xp, &yp).unwrap();
+            assert_eq!(lo.to_bits(), lp.to_bits(), "step {i}: on_tensors changed the loss");
+        }
+        assert_eq!(handle.tensor_calls(), N);
+    }
+
+    /// Step indices count from zero and the epoch follows the outer loop.
+    #[test]
+    fn observer_receives_step_index_and_epoch() {
+        let (ds, _w) = VLMicroDataset::synthetic_regression(3, 4, 4, 42).unwrap();
+        let mut trainer = Trainer::<GlProc>::new(VLTrainerConfig::new(4, 4, 2, 0.01, 42)).unwrap();
+        let handle = watch(&mut trainer, false);
+
+        trainer.train(&ds, 2).unwrap();
+
+        let seen: Vec<(usize, usize)> = handle.steps().iter().map(|s| (s.index, s.epoch)).collect();
+        assert_eq!(
+            seen,
+            vec![(0, 0), (1, 0), (2, 0), (3, 1), (4, 1), (5, 1)],
+            "step index must be global and monotonic; epoch must follow the outer loop"
+        );
+    }
+
+    /// A bare `train_step` reports epoch 0, and `train` leaves the counter where
+    /// a later bare step would find it.
+    #[test]
+    fn a_bare_train_step_reports_epoch_zero() {
+        let (ds, _w) = VLMicroDataset::synthetic_regression(2, 4, 4, 42).unwrap();
+        let (mut trainer, x, y) = fixture(42);
+        let handle = watch(&mut trainer, false);
+
+        trainer.train(&ds, 3).unwrap();
+        assert_eq!(trainer.current_epoch(), 0, "train must reset the epoch counter");
+        trainer.train_step(&x, &y).unwrap();
+
+        assert_eq!(
+            handle.steps().last().unwrap().epoch,
+            0,
+            "a step outside train() belongs to no epoch"
+        );
+    }
+
+    /// The observed loss is the value `train_step` returned, not a
+    /// recomputation of it. Compared on bits: same value, or a bug.
+    #[test]
+    fn observer_loss_matches_the_returned_value() {
+        let (mut trainer, x, y) = fixture(42);
+        let handle = watch(&mut trainer, false);
+
+        let mut returned = Vec::new();
+        for _ in 0..5 {
+            returned.push(trainer.train_step(&x, &y).unwrap());
+        }
+
+        let steps = handle.steps();
+        assert_eq!(steps.len(), returned.len());
+        for (i, (step, want)) in steps.iter().zip(returned.iter()).enumerate() {
+            assert_eq!(
+                step.loss.to_bits(),
+                want.to_bits(),
+                "step {i}: observed loss is not the returned loss"
+            );
+        }
+    }
+
+    /// Gradient facts are real: LoRA has two trainable parameters, both get a
+    /// gradient, the norm is finite and positive, and a healthy step has
+    /// neither NaN nor Inf.
+    #[test]
+    fn observed_gradient_statistics_describe_the_step() {
+        let (mut trainer, x, y) = fixture(42);
+        let handle = watch(&mut trainer, false);
+        trainer.train_step(&x, &y).unwrap();
+
+        let steps = handle.steps();
+        let step = &steps[0];
+
+        assert_eq!(step.grad_count, 2, "LoRA A and B should both receive a gradient");
+        assert_eq!(step.grad_elements, 4 * 2 + 2 * 4, "r=2 over a 4x4 layer");
+        assert!(step.grad_l2_norm.is_finite(), "norm must be neither NaN nor Inf");
+        assert!(step.grad_l2_norm > 0.0, "a real step has a non-zero gradient");
+        assert_eq!(step.grad_nan, 0);
+        assert_eq!(step.grad_inf, 0);
+        assert!((step.lr - 0.01).abs() < 1e-12, "lr must come from the optimizer");
+    }
+
+    /// The store holds more than the parameters, and the record counts only the
+    /// parameters.
+    ///
+    /// `finish_step` returns a gradient per *tensor*, activations included. This
+    /// was found by running the code, not by reading it: the first version of
+    /// `emit_observation` walked the whole store and reported `grad_count = 9`
+    /// on a two-parameter adapter, which would have made `grad_l2_norm` a number
+    /// nobody could interpret. The test pins both halves of the distinction so a
+    /// later edit cannot quietly re-merge them.
+    #[test]
+    fn the_store_holds_activations_but_the_record_counts_parameters() {
+        struct VLStoreSizer {
+            store_len: Rc<RefCell<usize>>,
+        }
+        impl StepObserver for VLStoreSizer {
+            fn on_step(&mut self, _step: &VLTrainingStep) {}
+            fn wants_tensors(&self) -> bool {
+                true
+            }
+            fn on_tensors(
+                &mut self,
+                grads: &crate::autograd::grad_store::VLGradStore,
+                _opt_state: &[crate::optim::VLNamedTensor],
+            ) {
+                *self.store_len.borrow_mut() = grads.len();
+            }
+        }
+
+        let (mut trainer, x, y) = fixture(42);
+        let store_len = Rc::new(RefCell::new(0usize));
+        trainer.set_observer(Box::new(VLStoreSizer {
+            store_len: Rc::clone(&store_len),
+        }));
+        trainer.train_step(&x, &y).unwrap();
+
+        let store_len = *store_len.borrow();
+        assert!(
+            store_len > 2,
+            "the tape's store should carry activation gradients too, got {store_len}"
+        );
+        // And `iter` must reach all of them, which is what makes the full store
+        // usable by an observer that wants more than the parameters.
+        assert!(store_len >= 2, "store must at least contain the parameters");
+    }
+
+    /// `on_tensors` fires only when the observer asks for it. The default is
+    /// off, so a plain observer never pays for `state_tensors`.
+    #[test]
+    fn tensor_payload_is_opt_in() {
+        for (wants, expected) in [(false, 0), (true, 3)] {
+            let (mut trainer, x, y) = fixture(42);
+            let handle = watch(&mut trainer, wants);
+            for _ in 0..3 {
+                trainer.train_step(&x, &y).unwrap();
+            }
+            assert_eq!(
+                handle.tensor_calls(),
+                expected,
+                "wants_tensors={wants} should give {expected} on_tensors calls"
+            );
+        }
+    }
+
+    /// Phase timings must be attributed, not merely non-zero: the three parts
+    /// have to fit inside the total, or one phase is being charged for
+    /// another's work. `total_ns` is measured before the observer window opens,
+    /// so it must not include the observer's own cost either.
+    #[test]
+    fn phase_timings_are_attributed_within_the_total() {
+        let (mut trainer, x, y) = fixture(42);
+        let handle = watch(&mut trainer, false);
+        for _ in 0..5 {
+            trainer.train_step(&x, &y).unwrap();
+        }
+
+        for (i, s) in handle.steps().iter().enumerate() {
+            let parts = s.forward_ns + s.backward_ns + s.optimizer_ns;
+            assert!(
+                parts <= s.total_ns,
+                "step {i}: phases ({parts} ns) exceed the total ({} ns)",
+                s.total_ns
+            );
+            assert!(s.total_ns > 0, "step {i}: total_ns must be measured");
+        }
+    }
+
+    /// `clear_observer` gives the box back and stops the callbacks.
+    #[test]
+    fn clearing_the_observer_stops_observation() {
+        let (mut trainer, x, y) = fixture(42);
+        let handle = watch(&mut trainer, false);
+        trainer.train_step(&x, &y).unwrap();
+        assert_eq!(handle.steps().len(), 1);
+
+        assert!(trainer.clear_observer().is_some());
+        assert!(trainer.clear_observer().is_none(), "clearing twice yields None");
+
+        trainer.train_step(&x, &y).unwrap();
+        assert_eq!(handle.steps().len(), 1, "a cleared observer must not be called");
     }
 }

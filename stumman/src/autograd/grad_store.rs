@@ -88,6 +88,23 @@ impl VLGradStore {
     pub fn contains(&self, id: TensorId) -> bool {
         self.grads.contains_key(&id)
     }
+
+    /// Every gradient in the store: id, values, shape.
+    ///
+    /// Added for the M2.5 observer, which holds a `&VLGradStore` and otherwise
+    /// has no way to reach anything: every other accessor needs a `TensorId`
+    /// the caller already knows.
+    ///
+    /// Iteration order is **unspecified**. The backing store is a `HashMap`, so
+    /// the order changes between runs. A consumer that needs a stable order
+    /// sorts by `TensorId` itself. This matters more than it looks: a consumer
+    /// that quietly assumes insertion order gets a plausible wrong answer on
+    /// some runs and the right one on others.
+    pub fn iter(&self) -> impl Iterator<Item = (TensorId, &[f32], &[usize])> {
+        self.grads
+            .iter()
+            .map(|(id, (data, shape))| (*id, data.as_slice(), shape.as_slice()))
+    }
 }
 
 #[cfg(test)]
@@ -152,5 +169,39 @@ mod tests {
         store.accumulate(2, vec![1.0], vec![1]).unwrap();
         store.clear();
         assert!(store.is_empty());
+    }
+
+    /// M2.5: `iter` is the observer's only way in, so it has to reach every
+    /// entry. Counting alone would pass on an iterator that yielded the same
+    /// entry three times, so the ids are checked as a set too.
+    #[test]
+    fn iter_yields_every_entry_exactly_once() {
+        let mut store = VLGradStore::new();
+        store.accumulate(3, vec![1.0, 2.0], vec![2]).unwrap();
+        store.accumulate(1, vec![3.0], vec![1]).unwrap();
+        store.accumulate(9, vec![4.0, 5.0, 6.0], vec![3]).unwrap();
+
+        let mut seen: Vec<TensorId> = store.iter().map(|(id, _, _)| id).collect();
+        assert_eq!(seen.len(), store.len(), "iter must yield len() entries");
+        seen.sort_unstable();
+        assert_eq!(seen, vec![1, 3, 9], "iter must reach every accumulated id");
+
+        // Data and shape must arrive intact, not just the keys.
+        let total: usize = store.iter().map(|(_, data, _)| data.len()).sum();
+        assert_eq!(total, 6, "iter must expose every gradient element");
+        for (id, data, shape) in store.iter() {
+            let (want_data, want_shape) = store.get(id).unwrap();
+            assert_eq!(data, want_data.as_slice(), "id {id}: data disagrees with get");
+            assert_eq!(shape, want_shape.as_slice(), "id {id}: shape disagrees with get");
+        }
+    }
+
+    /// An empty store yields nothing rather than panicking. The observer calls
+    /// `iter` unconditionally on any observed step, including one where a
+    /// frozen-only forward produced no gradients at all.
+    #[test]
+    fn iter_on_an_empty_store_yields_nothing() {
+        let store = VLGradStore::new();
+        assert_eq!(store.iter().count(), 0);
     }
 }
