@@ -56,7 +56,7 @@ pub struct BenchmarkSession {
     /// above. See [`VLInferenceSession`] for why they were not moved.
     pub inference: Option<VLInferenceSession>,
     /// The training run (Wave 4). Gated behind `train-bench`, so a default
-    /// build never compiles stumman.
+    /// build never compiles gltrain.
     #[cfg(feature = "train-bench")]
     pub training: Option<crate::training::VLTrainingSession>,
     /// Why every `null` in this session has no value (D-09). Empty for a v1

@@ -53,7 +53,7 @@ pub mod ppl;
 pub mod quant_info;
 pub mod render;
 pub mod runner;
-/// Training observation (D-05). Gated: a default build never compiles stumman.
+/// Training observation (D-05). Gated: a default build never compiles gltrain.
 #[cfg(feature = "train-bench")]
 pub mod training;
 pub mod storage;

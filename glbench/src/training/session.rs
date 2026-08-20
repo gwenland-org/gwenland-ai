@@ -78,7 +78,7 @@ impl VLTrainingSession {
     pub fn null_paths(&self) -> Vec<(String, ENAvailability)> {
         let mut out = Vec::new();
 
-        // F-05: stumman M2 trains one linear layer with no tokenizer, no
+        // F-05: gltrain M2 trains one linear layer with no tokenizer, no
         // batching and no data parallelism. The token-denominated and
         // multi-device per-step fields have no subject at all — one entry
         // covers the whole column (D-09's array collapse).

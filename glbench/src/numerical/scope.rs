@@ -7,7 +7,7 @@
 //! | Scope | Source | Gate |
 //! |---|---|---|
 //! | `weights` | `.gllm` package tensors | `gllm-bench` |
-//! | `gradients` | stumman's `VLGradStore` | `train-bench` (Wave 4) |
+//! | `gradients` | gltrain's `VLGradStore` | `train-bench` (Wave 4) |
 //! | `optimizer` | `Optimizer::state_tensors` | `train-bench` (Wave 4) |
 //!
 //! Gradients and optimizer state are **recognised and refused** here rather

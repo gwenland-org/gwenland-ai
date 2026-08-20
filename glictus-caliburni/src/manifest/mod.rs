@@ -1,4 +1,4 @@
-﻿//! `gllm.json` manifest â€” parsing, data types, and semantic validation
+﻿//! `gllm.json` manifest — parsing, data types, and semantic validation
 //! (ARTX03).
 //!
 //! The manifest is the single source of truth for a GLLM package: after
@@ -91,7 +91,7 @@ impl SharedManifest {
 /// ARTX03 names only `cuda:0` and `cuda:1`, but ARTX06 device maps and ARTX10
 /// rank strings can carry any device. [`Other`](Self::Other) therefore keeps
 /// the raw string instead of discarding it, so a manifest asking for `cuda:2`
-/// stays recoverable â€” see `notes/gllm-deviceplacement-cuda-index.md`.
+/// stays recoverable — see `notes/gllm-deviceplacement-cuda-index.md`.
 ///
 /// This is the manifest's serialized *hint*. The runtime's real device model
 /// is [`Device`](crate::types::execution::Device); convert with
@@ -124,7 +124,7 @@ pub enum KnownDevicePlacement {
 }
 
 impl DevicePlacement {
-    /// CPU placement â€” the default when a manifest says nothing.
+    /// CPU placement — the default when a manifest says nothing.
     pub const CPU: Self = DevicePlacement::Known(KnownDevicePlacement::Cpu);
     /// First CUDA device.
     pub const CUDA0: Self = DevicePlacement::Known(KnownDevicePlacement::Cuda0);
@@ -273,7 +273,7 @@ impl ProjectorManifest {
 }
 
 /// Free-form key-value metadata for tooling/provenance.
-/// Not interpreted by the runtime â€” preserved as-is.
+/// Not interpreted by the runtime — preserved as-is.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct CustomMetadata(pub HashMap<String, serde_json::Value>);
 
@@ -289,7 +289,7 @@ impl CustomMetadata {
     }
 }
 
-/// The complete deserialized `gllm.json` manifest â€” the single source of
+/// The complete deserialized `gllm.json` manifest — the single source of
 /// truth for a GLLM package.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GllmManifest {
@@ -352,7 +352,7 @@ impl GllmManifest {
     }
 
     /// Layer entry by position (positions equal indices in a valid
-    /// manifest â€” rule V07).
+    /// manifest — rule V07).
     pub fn layer_file(&self, index: usize) -> Option<&LayerManifest> {
         self.layers.get(index)
     }

@@ -12,7 +12,7 @@ The repo is a single Cargo workspace rooted at the repository root — run cargo
 - `glcli` — the `gwen` binary: `cargo run -p glcli` runs local inference through the engines.
 - `glictus-caliburni` — the `.gllm` package format and GLLM runtime (Pridwen quantization research: GQ4A/GQ2A superblock formats, CPP assignment policy). Experimental and separate from the GGUF path `glcli` uses today — see `architecture/Pridwen-proposal-v5.md`.
 
-There is also a `packages/` group (`packages/core`, `packages/mcp`) — an in-progress training-arm crate and an MCP server. `gltui` (the former terminal UI) was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL engines, its `CoreBridge` was a stub — and is no longer a workspace member; don't build against it. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+The training crate sits outside this workspace on purpose, declaring its own `[workspace]` table so `cargo build --workspace` at the root never resolves its dependencies: `gltrain/` (Stummañ, GwenLand's from-scratch training framework, built on `glcore`/`glproc` rather than candle — see `gltrain/README_AUTOGRAD.md`). A candle-backed training crate previously occupied that path; it was deleted on 2026-08-20, having no live consumers. `packages/` now holds just `packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL engines, its `CoreBridge` was a stub — and is no longer a workspace member; don't build against it. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
 
 Note the workspace mixes editions: `glcore`/`glproc`/`glcli`/`glbench`/`glcuda`/`glvulkan`/`glmetal` are edition 2021; `glictus-caliburni` and `packages/*` are edition 2024.
 
@@ -54,30 +54,49 @@ GwenLand targets modest hardware — think an 11th-gen i3, 8 GB of RAM, no GPU, 
 
 The same discipline applies to the GPU backends: hand-authored PTX must be pure ASCII with LF line endings (`ptxas` rejects a stray em-dash before it parses a single instruction), and every GPU kernel is validated against `glproc` within an explicit per-operation tolerance — see `architecture/ArchGLML_X2.md`.
 
-## Dependencies: the bar is deliberately high
+## Dependencies: Zero ML Dependency, not zero new dependencies
 
-GwenLand's core promise is a **from-scratch, fully understood engine**: no
-external ML runtimes, no C bindings, no CMake — the GGUF parser, tokenizer,
-kernels, and even the benchmark exporter are hand-written. Every crate you add
-works against that promise: it's supply-chain surface we now have to trust and
-audit, transitive dependencies we didn't choose, build time on every
-contributor's machine, binary size on an 8 GB target, and a license to check.
-So: **don't add trivial dependencies.** If five lines of `std` can do it, five
-lines of `std` win — a helper crate for one call site (`left-pad`-class,
-`lazy_static` where `std::sync::OnceLock` works, `itertools` for a single
-`chunks` loop) will be rejected regardless of how popular it is.
+GwenLand's core promise is a **from-scratch, fully understood engine**: the
+GGUF parser, tokenizer, kernels, and even the benchmark exporter are
+hand-written. That promise has exactly one hard, non-negotiable line: **no ML
+dependency, in any crate inside the inference workspace, ever** — no
+torch/candle/ort bindings, no ggml FFI, no "just for reference" inference
+crate, no C bindings, no CMake. Not "we try to avoid it" — never, full stop.
 
-The current dependency budget, so you know the baseline you're changing:
+Below that line, everything else is judgment, not prohibition. GwenLand adds
+non-ML dependencies all the time — `thiserror`, `memmap2`, `serde`, `clap`,
+`sha2` are already in the tree, and a workspace crate depending on another
+workspace crate isn't an "external dependency" at all. What the project won't
+do is add one *casually*: every crate you add is supply-chain surface we now
+have to trust and audit, transitive dependencies we didn't choose, build time
+on every contributor's machine, binary size on an 8 GB target, and a license
+to check. So: **don't add trivial dependencies.** If five lines of `std` can
+do it, five lines of `std` win — a helper crate for one call site
+(`left-pad`-class, `lazy_static` where `std::sync::OnceLock` works,
+`itertools` for a single `chunks` loop) will be rejected regardless of how
+popular it is.
+
+The scrutiny is graduated by where the dependency lands, not uniform:
 
 - **Engine crates are near-frozen.** `glcore` carries `thiserror`, `memmap2`,
   `byteorder`, `serde`/`serde_json` (metadata only — never on the hot path);
   `glproc` adds `num_cpus`; `glcuda` has *zero* external deps (the driver is
-  `dlopen`ed, not linked); `glbench` is workspace-only **by charter**.
+  `dlopen`ed, not linked); `glbench` is workspace-only **by charter**, and
+  goes further than this project's baseline on purpose (see its README).
 - **Interface crates get more latitude** — `glcli` uses `clap`. More
-  latitude is not a free pass: the same questions below apply.
-- **ML dependencies are never acceptable in any crate** — no torch/candle/ort
-  bindings, no ggml FFI, no "just for reference" inference crates. That's the
-  project.
+  latitude is not a free pass: the same three questions below apply.
+- **The training arm is a deliberate exception, not a loophole.** `gltrain/`
+  and `gltrain/` (see "Getting oriented" above) each sit outside the root
+  Cargo workspace with their own `[workspace]` table, which is what lets
+  `gltrain/` stays isolated without its dependencies ever entering `cargo build
+  --workspace`'s dependency graph at the root. The zero-ML-dependency rule
+  holds *inside the inference workspace*; a crate that opts itself out and
+  says so in its own manifest isn't breaking the rule, it's the mechanism
+  that lets the rule hold everywhere else. `gltrain/` itself still isn't a
+  free-for-all — it's held to the same graduated scrutiny below, just against
+  its own dependency list rather than the inference tree's.
+- **ML dependencies are never acceptable inside the inference workspace** —
+  that's the one line above, restated: it's the whole point of the project.
 
 If you believe a new dependency is justified, make the case **in the PR
 description**, answering all three:

@@ -237,7 +237,7 @@ fn dequant_gguf_tensor(gguf: &GgufFile, name: &str) -> Vec<f32> {
     // Q4_K/Q5_0/Q6_K all route through glproc, never glcore::GgufFile::dequantize
     // — glcore rejects Q4_K/Q5_0 outright, but *silently accepts and
     // mis-decodes* Q6_K (wrong nibble order; see
-    // architecture/mensura-veritatis-v3/ARTX2-Quant.md). This diagnostic tool
+    // architecture/gl-stack-audit-2026-07/ARTX2-Quant.md). This diagnostic tool
     // is exactly what found that bug, and until this fix it was itself still
     // using the wrong Q6_K reference for every sanity check below.
     match info.dtype {

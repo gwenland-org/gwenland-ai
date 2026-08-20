@@ -1,77 +1,64 @@
+//! Stummañ error types.
+//!
+//! GlTrainError wraps glcore::GlError for training-specific context.
+//! All fallible paths return Result<T, GlTrainError>.
+
 use thiserror::Error;
 
-/// Top-level error type for gwenland-core.
+/// Every way a Stummañ operation can fail.
 #[derive(Debug, Error)]
-pub enum GwenError {
-    /// A generic inference backend error.
-    #[error("inference backend error: {0}")]
-    InferenceBackend(String),
-
-    /// The requested backend was not compiled in.
-    #[error("backend '{backend}' not available (compile with --features {backend}-backend)")]
-    BackendNotAvailable { backend: String },
-
-    /// The model architecture is not supported by the given backend.
-    #[error("model architecture not supported by backend '{backend}': {arch}")]
-    UnsupportedArchitecture { backend: String, arch: String },
-
-    /// Model loading failed.
-    #[error("model loading failed: {0}")]
-    ModelLoad(String),
-
-    // ── candle-backend variants (Requirements: 1.4, 2.5, 5.6, 12.4, 14.5) ──
-
-    /// Dequantisation of a specific tensor failed.
-    #[error("dequantization failed for tensor '{tensor_name}': {error}")]
-    Dequantization { tensor_name: String, error: String },
-
-    /// A forward-pass operation failed at a known layer and op.
-    #[error("inference error at {layer}/{operation}: {error}")]
-    InferenceError {
-        layer: String,
-        operation: String,
-        error: String,
-    },
-
-    /// System RAM is insufficient to load the model.
-    #[error("insufficient memory: need {required_gb:.2} GB, have {available_gb:.2} GB")]
-    InsufficientMemory { required_gb: f32, available_gb: f32 },
-
-    /// The model uses an architecture the candle backend does not support.
-    #[error("unsupported model architecture: {0}")]
-    ArchitectureNotSupported(String),
-
-    /// A candle tensor operation returned an error.
-    #[error("candle error: {0}")]
-    CandleError(String),
-
-    // ── GWEN-213: LoRA bridge error variants ──
-
-    /// A LoRA tensor has the wrong shape.
-    #[error("invalid LoRA shape: expected {expected:?}, got {actual:?}")]
-    InvalidLoraShape { expected: Vec<usize>, actual: Vec<usize> },
-
-    /// A lora_b tensor is present but no corresponding lora_a (or vice-versa).
-    #[error("missing LoRA pair for layer index {layer_idx}")]
-    MissingLoraPair { layer_idx: usize },
-
-    /// The adapter delta shape does not match the base weight shape.
-    #[error("shape mismatch for adapter '{adapter_key}': adapter {adapter:?} vs base {base:?}")]
+pub enum GlTrainError {
+    /// Two operands disagreed on shape.
+    #[error("shape mismatch: expected {expected:?}, got {got:?}")]
     ShapeMismatch {
-        adapter_key: String,
-        adapter: Vec<usize>,
-        base: Vec<usize>,
+        /// The shape the operation required.
+        expected: Vec<usize>,
+        /// The shape it actually received.
+        got: Vec<usize>,
     },
 
-    /// The GGUF tensor uses a quantization format the merger does not support.
-    #[error("unsupported quantization format: {format}")]
-    UnsupportedQuantization { format: String },
+    /// A backend rejected the request (bad storage length, unsupported device, ...).
+    #[error("backend error: {0}")]
+    Backend(String),
 
-    /// Peak memory during merge exceeded the configured budget.
-    #[error("memory budget exceeded: required {required} bytes, available {available} bytes")]
-    MemoryBudgetExceeded { required: usize, available: usize },
+    /// The operation itself is not valid for this input (wrong rank, empty shape, ...).
+    #[error("invalid operation: {0}")]
+    InvalidOp(String),
 
-    /// Merged weights contain non-finite values (NaN or Inf).
-    #[error("invalid merged weights in layer '{layer_name}' at index {index}")]
-    InvalidMergedWeights { layer_name: String, index: usize },
+    /// A registered skill exists but is not implemented on this milestone.
+    ///
+    /// This is what an M2 stub returns. It is deliberately distinct from
+    /// [`GlTrainError::InvalidOp`]: the caller asked for something real and
+    /// spelled it correctly, and the answer is "not yet, here is why, here is
+    /// which milestone owns it". A stub must never quietly do something else
+    /// instead, so this error is the only thing a stub's compute path can
+    /// produce.
+    #[error("{skill} is not implemented yet ({milestone}): {reason}")]
+    Unsupported {
+        /// Registry id of the thing that was asked for, e.g. `"dora"`.
+        skill: &'static str,
+        /// Why it is not implemented, in one line. Names the blocking work.
+        reason: &'static str,
+        /// The milestone that owns the implementation, e.g. `"M3"`.
+        milestone: &'static str,
+    },
+
+    /// A checkpoint failed validation, or its bytes could not be parsed.
+    #[error("checkpoint error: {0}")]
+    Checkpoint(String),
+
+    /// An I/O failure while reading or writing a checkpoint.
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+
+    /// A failure surfaced from the shared glcore layer.
+    #[error(transparent)]
+    Gl(#[from] glcore::error::GlError),
+
+    /// Anything else, carried verbatim.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
 }
+
+/// Shorthand for a Stummañ fallible result.
+pub type Result<T> = std::result::Result<T, GlTrainError>;

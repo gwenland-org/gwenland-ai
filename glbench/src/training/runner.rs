@@ -1,10 +1,10 @@
-//! Drives a stumman training run under observation (D-05).
+//! Drives a gltrain training run under observation (D-05).
 //!
 //! # Why there is no `--dataset <path>`
 //!
 //! `architecture/glbench-v3/DESIGN.md` §8 writes the command as
 //! `glbench train --model <path> --dataset <path>`. Neither flag has a subject
-//! at stumman M2, and inventing one would be worse than saying so:
+//! at gltrain M2, and inventing one would be worse than saying so:
 //!
 //! - **No dataset loader exists.** `VLMicroDataset` is built in memory by
 //!   `new`/`push` or by `synthetic_regression`; nothing reads a file. A
@@ -17,14 +17,14 @@
 //! So the workload is described by the parameters that genuinely determine it —
 //! layer shape, rank, sample count, epochs, seeds — and every one of them is
 //! archived, which makes the run reproducible in a way a path never would be.
-//! When stumman grows a real dataset loader, `--dataset` becomes meaningful and
+//! When gltrain grows a real dataset loader, `--dataset` becomes meaningful and
 //! this comment becomes the record of why it was not.
 
 use std::path::PathBuf;
 use std::time::Instant;
 
-use stumman::backend::GlProc;
-use stumman::{Trainer, VLMicroDataset, VLTrainerConfig};
+use gltrain::backend::GlProc;
+use gltrain::{Trainer, VLMicroDataset, VLTrainerConfig};
 
 use crate::core::availability::{self, VLAvailabilityMap};
 use crate::core::inference::VLInferenceSession;
@@ -163,7 +163,7 @@ pub fn run(args: &TrainArgs) -> Result<BenchmarkSession, String> {
         adapter: Some(adapter),
         bit_profiles: out.bit_profiles.clone(),
         post_eval: match args.mode {
-            // A Unified session evaluates after training. stumman M2 has no
+            // A Unified session evaluates after training. gltrain M2 has no
             // generation loop, so the slot is present and carries its role
             // while its own fields stay empty — the same compatibility shape
             // `VLInferenceSession::standalone` uses.
@@ -186,7 +186,7 @@ pub fn run(args: &TrainArgs) -> Result<BenchmarkSession, String> {
     // The workload spec describes the training run in the fields it has. There
     // is no model path, so it stays empty rather than being given a fake one.
     let workload = WorkloadSpec {
-        engine: "stumman".to_string(),
+        engine: "gltrain".to_string(),
         seed: args.seed,
         measure_iters: args.epochs,
         ..WorkloadSpec::default()
@@ -211,7 +211,7 @@ pub fn run(args: &TrainArgs) -> Result<BenchmarkSession, String> {
         metadata,
         EnvironmentSnapshot::probe(""),
         EngineMetadata {
-            name: "stumman".into(),
+            name: "gltrain".into(),
             backend: "glproc".into(),
             available: true,
             model_arch: Some("lora-linear".into()),
@@ -282,7 +282,7 @@ mod tests {
         }
     }
 
-    /// Gate 4's core claim: a real LoRA run on stumman produces a session.
+    /// Gate 4's core claim: a real LoRA run on gltrain produces a session.
     #[test]
     fn a_real_training_run_produces_a_training_session() {
         let session = run(&small()).expect("training runs");

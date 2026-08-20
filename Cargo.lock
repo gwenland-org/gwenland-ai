@@ -400,6 +400,7 @@ dependencies = [
  "glcuda",
  "glictus-caliburni",
  "glproc",
+ "gltrain",
  "tempfile",
 ]
 
@@ -489,6 +490,16 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tower 0.4.13",
+]
+
+[[package]]
+name = "gltrain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glcore",
+ "glproc",
+ "thiserror",
 ]
 
 [[package]]

@@ -287,7 +287,7 @@ fn dequant_q5_0_known_values_and_simd_parity() {
 /// decode_scales}` directly. Two independent implementations of the same bit
 /// layout, currently agreeing only because both happen to be correct — this
 /// is exactly the shape of bug that corrupted `glcore`'s Q6_K path (see
-/// `architecture/mensura-veritatis-v3/ARTX2-Quant.md`). This test cross-checks
+/// `architecture/gl-stack-audit-2026-07/ARTX2-Quant.md`). This test cross-checks
 /// `row_dot`'s integer-domain result against a plain f32 dot product computed
 /// from `dequant_block`'s output, on random (non-degenerate) data, so a future
 /// edit to either implementation that breaks their agreement fails loudly here

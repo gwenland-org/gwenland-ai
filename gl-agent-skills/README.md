@@ -40,7 +40,10 @@ speed."**
 |------|------------------------|
 | **Anything at all** | `before-coding/read-architecture-first.md` |
 | Naming/renaming any type | `gwenland-naming-convention/SKILL.md` |
-| Any work inside `stumman/` | `stumman-naming/SKILL.md` |
+| Any work inside `gltrain/` | `gltrain-naming/SKILL.md` |
+| Implementing/extending `gltrain`'s optimizer (`OPAdamW`, `OPLion`, ...) | `gltrain-m2-skills/adamw.md` |
+| Implementing/extending `gltrain`'s LoRA family (`LRLora`, `LRDora`, `LRQLora`, `LRLoHa`, `LRVeRA`, `LRLoCon`) | `gltrain-m2-skills/lora.md` |
+| Implementing/extending `gltrain`'s checkpoints (`CPLora`, `CPFull`, `CPSharded`, `CPIncremental`, `PLGgufMerge`) | `gltrain-m2-skills/checkpoint.md` |
 | Multi-step / multi-wave work | `before-coding/wave-confirmation-gates.md` |
 | Any code change | `before-coding/check-existing-tests.md`, `rust-skills/error-handling.md` |
 | Creating a branch / PR | `before-coding/branch-strategy.md` |
@@ -65,7 +68,7 @@ These two use the Agent Skills layout (`<name>/SKILL.md` with YAML frontmatter)
 rather than the flat per-domain files below.
 
 - [gwenland-naming-convention/SKILL.md](gwenland-naming-convention/SKILL.md) — repo-wide two-character type prefixes; **target state, 0/224 types adopted so far**
-- [stumman-naming/SKILL.md](stumman-naming/SKILL.md) — stumman's rename target + the live Breton module codenames
+- [gltrain-naming/SKILL.md](gltrain-naming/SKILL.md) — gltrain's rename target + the live Breton module codenames
 
 ### before-coding/
 - [read-architecture-first.md](before-coding/read-architecture-first.md) — which docs are ground truth and must be read before anything

@@ -206,7 +206,7 @@ inputs were actually measured, absent otherwise:
 ```bash
 cargo build --release -p glbench --features train-bench
 
-# Observe a LoRA fine-tune on stumman and archive it.
+# Observe a LoRA fine-tune on gltrain and archive it.
 glbench train --d-in 64 --d-out 64 --rank 4 --samples 32 --epochs 8               --target-loss 0.5 --step-sample 8               --bit-scope gradients,optimizer --out train.json
 
 # Same, with inference roles labelled either side of the run.
@@ -217,11 +217,11 @@ glbench export train.json --format training-csv
 ```
 
 **glbench does not drive training.** It builds a `Trainer`, installs an
-observer, and calls stumman's own `Trainer::train`. It never calls `train_step`
+observer, and calls gltrain's own `Trainer::train`. It never calls `train_step`
 in a loop of its own, never touches optimizer state, and never writes a
 parameter — the same measuring/doing boundary the inference side keeps.
 
-**There is no `--model` or `--dataset`, deliberately.** stumman M2 generates its
+**There is no `--model` or `--dataset`, deliberately.** gltrain M2 generates its
 frozen base weight from `--seed` and builds its dataset in memory from
 `--samples`/`--dataset-seed`; neither flag has a subject, so both are rejected
 with an error that explains why rather than reporting an unknown flag. The shape

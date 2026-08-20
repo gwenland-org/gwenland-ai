@@ -1,4 +1,4 @@
-﻿//! Layer/unit file binary I/O (ARTX04 Waves 2â€“3): tensor index codec,
+﻿//! Layer/unit file binary I/O (ARTX04 Waves 2–3): tensor index codec,
 //! full-file reader, and a writer for converters/fixtures.
 //!
 //! File layout (hybrid header decision, see
@@ -197,7 +197,7 @@ impl LayerFile {
 /// region, with per-tensor alignment. Offsets are computed here; returns
 /// the index entries as written (region-relative offsets).
 ///
-/// This is the fixture/converter path â€” the runtime never writes.
+/// This is the fixture/converter path — the runtime never writes.
 pub fn write_unit_file(
     path: &Path,
     tensors: &[(&str, &[u64], DType, &[u8])],
@@ -243,7 +243,7 @@ pub fn write_unit_file(
 /// Cross-check a parsed layer file's binary index against its manifest
 /// entry (ARTX04 Wave 4). The package checksum already guarantees the
 /// bytes; this guarantees the *metadata* agrees. Returns human-readable
-/// mismatch descriptions â€” empty means fully consistent.
+/// mismatch descriptions — empty means fully consistent.
 pub fn cross_check_manifest(layer: &LayerFile, manifest: &LayerManifest) -> Vec<String> {
     let mut mismatches = Vec::new();
     if layer.tensor_index.len() != manifest.tensors.len() {

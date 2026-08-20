@@ -3,7 +3,7 @@
 //! # Why this is ungated
 //!
 //! It takes `&[(usize, f32)]` — step index and loss — not a
-//! `VLTrainingSession`. Plotting a series has nothing to do with stumman, so
+//! `VLTrainingSession`. Plotting a series has nothing to do with gltrain, so
 //! gating it behind `train-bench` would make the plotting *math* a
 //! training-only feature for no reason. Same split D-11 draws for GLBitProf:
 //! the math is ungated, the source is gated.

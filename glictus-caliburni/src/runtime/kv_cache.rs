@@ -1,23 +1,23 @@
-﻿//! KV cache allocation (ARTX06 Â§"KV Cache").
+﻿//! KV cache allocation (ARTX06 §"KV Cache").
 //!
 //! The cache is sized once, up front, for `max_seq_len` tokens and never
-//! reallocated during inference â€” a realloc mid-pass would move every key and
+//! reallocated during inference — a realloc mid-pass would move every key and
 //! value the backend holds pointers into.
 //!
 //! Storage is raw bytes, not typed elements: the cache holds whatever the
 //! backend writes, and this module never interprets it. It does not know
-//! whether those bytes are FP32, FP16, or BF16 â€” only how many bytes one
+//! whether those bytes are FP32, FP16, or BF16 — only how many bytes one
 //! element takes, read from
 //! [`RuntimeConfig::kv_element_size`](crate::runtime::RuntimeConfig::kv_element_size),
 //! which the runtime fills in from the backend at initialization.
 //!
-//! Dependencies run one way â€” backend â†’ runtime â†’ KV cache â€” so the cache
+//! Dependencies run one way — backend → runtime → KV cache — so the cache
 //! never reaches back for a format it would then have to understand.
 //!
 //! ## Why `max_seq_len` defaults well below `context_length`
 //!
 //! Cache size is linear in sequence length, and the per-token cost is set by
-//! the KV-head count â€” which GQA decouples from model size. Computed from the
+//! the KV-head count — which GQA decouples from model size. Computed from the
 //! three models this crate is verified against, at f32:
 //!
 //! | Model | KV heads | per token | @2048 | @full ctx |
@@ -30,7 +30,7 @@
 //! alone exceeds the 8 GB reference machine's entire RAM, because it has 4x
 //! the KV heads of the 1.5B despite being a similar size. Defaulting
 //! `max_seq_len` to the manifest's `context_length` would therefore turn a
-//! model that loads fine into an instant OOM â€” hence
+//! model that loads fine into an instant OOM — hence
 //! [`RuntimeConfig::max_seq_len`](crate::runtime::RuntimeConfig) defaults to
 //! 2048 and is clamped, never inferred, upward.
 
@@ -44,7 +44,7 @@ pub struct KvCacheConfig {
     /// Number of transformer layers (one slot each).
     pub num_layers: u32,
     /// KV heads per layer. Under GQA this is smaller than the query-head
-    /// count â€” sizing off `num_heads` would over-allocate several times over.
+    /// count — sizing off `num_heads` would over-allocate several times over.
     pub num_kv_heads: u32,
     /// Elements per head.
     pub head_dim: u64,
@@ -61,8 +61,8 @@ pub struct KvCacheConfig {
 impl KvCacheConfig {
     /// Derive a config from manifest metadata and the runtime's config.
     ///
-    /// Takes the element size from `runtime_config` â€” which the runtime filled
-    /// in from the backend â€” so no caller has to know, or can misreport, the
+    /// Takes the element size from `runtime_config` — which the runtime filled
+    /// in from the backend — so no caller has to know, or can misreport, the
     /// KV format.
     ///
     /// `max_seq_len` is clamped to the model's own `context_length`: sizing
@@ -90,7 +90,7 @@ impl KvCacheConfig {
     /// `2 * num_kv_heads * head_dim * max_seq_len * element_size`.
     ///
     /// Saturates instead of overflowing, so an absurd config yields a huge
-    /// number that [`KvCache::allocate`] then refuses â€” never a wrapped small
+    /// number that [`KvCache::allocate`] then refuses — never a wrapped small
     /// one that would under-allocate.
     pub fn slot_size_bytes(&self) -> u64 {
         2u64.saturating_mul(self.num_kv_heads as u64)
@@ -152,7 +152,7 @@ impl KvCacheSlot {
     }
 
     /// Drop cached tokens without freeing memory, readying the slot for a new
-    /// sequence. Capacity is deliberately retained â€” that is the point of
+    /// sequence. Capacity is deliberately retained — that is the point of
     /// pre-allocating.
     pub fn reset(&mut self) {
         self.current_seq_len = 0;
@@ -175,7 +175,7 @@ impl KvCacheSlot {
 
     /// Record that `n` more tokens were cached.
     ///
-    /// Returns [`GllmError::ExecutionFailed`] if that would exceed capacity â€”
+    /// Returns [`GllmError::ExecutionFailed`] if that would exceed capacity —
     /// a silent clamp here would corrupt attention by making the backend and
     /// the cache disagree about how many positions are live.
     pub fn advance(&mut self, n: u32) -> GllmResult<()> {
@@ -210,7 +210,7 @@ impl KvCache {
     /// Allocate every slot up front.
     ///
     /// Refuses configurations whose total exceeds [`Self::MAX_TOTAL_BYTES`]
-    /// rather than letting the allocator abort the process â€” the reference
+    /// rather than letting the allocator abort the process — the reference
     /// 8 GB machine must get a diagnosable error, not an OOM kill.
     pub fn allocate(config: KvCacheConfig) -> GllmResult<Self> {
         let total = config.total_size_bytes();
@@ -229,7 +229,7 @@ impl KvCache {
 
     /// Refuse to allocate more than this in one cache (32 GiB).
     ///
-    /// Not a hardware limit â€” a guard against a manifest whose metadata
+    /// Not a hardware limit — a guard against a manifest whose metadata
     /// implies an absurd cache, which should fail loud rather than swap the
     /// machine to death.
     pub const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024 * 1024;
@@ -239,7 +239,7 @@ impl KvCache {
         self.slots.get(layer_index as usize)
     }
 
-    /// Mutable access to one layer's slot â€” the handle passed to a backend.
+    /// Mutable access to one layer's slot — the handle passed to a backend.
     pub fn slot_mut(&mut self, layer_index: u32) -> Option<&mut KvCacheSlot> {
         self.slots.get_mut(layer_index as usize)
     }
@@ -274,7 +274,7 @@ impl KvCache {
         &self.config
     }
 
-    /// Longest `current_seq_len` across slots â€” how far the sequence has run.
+    /// Longest `current_seq_len` across slots — how far the sequence has run.
     pub fn max_current_seq_len(&self) -> u32 {
         self.slots
             .iter()
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn absurd_config_is_refused_rather_than_oom() {
-        // 128 layers x 64 KV heads x 128 dim x 1M tokens x 4B â€” far past the
+        // 128 layers x 64 KV heads x 128 dim x 1M tokens x 4B — far past the
         // guard. Must return an error, not attempt the allocation.
         let c = KvCacheConfig {
             num_layers: 128,
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn qwen3_full_context_cache_exceeds_the_reference_machine() {
         // Qwen3-1.7B: 28 layers, 8 KV heads, head_dim 128, ctx 40960. A 1.7B
-        // model whose full-context f32 cache is ~8.75 GiB â€” more RAM than the
+        // model whose full-context f32 cache is ~8.75 GiB — more RAM than the
         // reference i3 has in total. This is why max_seq_len is clamped down
         // by config rather than inferred from context_length.
         let full = KvCacheConfig {

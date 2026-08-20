@@ -1,15 +1,15 @@
 //! [`VLTrainingStep`] — one training step, in glbench's archived form.
 //!
-//! # Why this is a separate type from stumman's
+//! # Why this is a separate type from gltrain's
 //!
-//! `stumman::VLTrainingStep` is the *wire* type: what the observer receives
+//! `gltrain::VLTrainingStep` is the *wire* type: what the observer receives
 //! inside `train_step`, shaped by what is cheap to collect there. This one is
 //! the *archive* type: what a v2 session carries, shaped by what a reader needs
 //! years later.
 //!
 //! They are field-for-field identical today, and copying rather than
 //! re-exporting looks redundant because of that. It is not. A re-export would
-//! make stumman's struct part of glbench's archive schema, so any field stumman
+//! make gltrain's struct part of glbench's archive schema, so any field gltrain
 //! added for its own reasons would silently become a schema change — and
 //! `SCHEMA_VERSION` would have to move for a reason no glbench reader cares
 //! about. The conversion in [`From`] is the seam where that decision gets made
@@ -39,9 +39,9 @@ pub struct VLTrainingStep {
     pub total_ns: u64,
 
     /// Trainable parameters that received a gradient. **Not** the size of the
-    /// gradient store — stumman's tape returns activations too, and folding
+    /// gradient store — gltrain's tape returns activations too, and folding
     /// those in would make this number describe the graph rather than the
-    /// update. See `stumman::VLTrainingStep::grad_count`.
+    /// update. See `gltrain::VLTrainingStep::grad_count`.
     pub grad_count: usize,
     /// Total gradient elements across those parameters.
     pub grad_elements: usize,
@@ -56,8 +56,8 @@ pub struct VLTrainingStep {
     pub lr: f64,
 }
 
-impl From<&stumman::VLTrainingStep> for VLTrainingStep {
-    fn from(s: &stumman::VLTrainingStep) -> VLTrainingStep {
+impl From<&gltrain::VLTrainingStep> for VLTrainingStep {
+    fn from(s: &gltrain::VLTrainingStep) -> VLTrainingStep {
         VLTrainingStep {
             index: s.index,
             epoch: s.epoch,
@@ -92,7 +92,7 @@ impl ToJson for VLTrainingStep {
             ("grad_nan", Json::n(self.grad_nan as f64)),
             ("grad_inf", Json::n(self.grad_inf as f64)),
             ("lr", Json::n(self.lr)),
-            // F-05: stumman M2 trains one linear layer with no tokenizer, so
+            // F-05: gltrain M2 trains one linear layer with no tokenizer, so
             // these have no subject. Emitted as null with a `not_applicable`
             // status rather than omitted or zeroed — D-04's whole point.
             ("tokens", Json::Null),

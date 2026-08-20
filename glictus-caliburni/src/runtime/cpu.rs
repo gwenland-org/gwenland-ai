@@ -1,4 +1,4 @@
-﻿//! CPU execution path (ARTX05 Â§"CPU Runtime").
+﻿//! CPU execution path (ARTX05 §"CPU Runtime").
 //!
 //! This is a thin, timed wrapper around an [`ExecutionBackend`]. It owns no
 //! thread pool: ARTX05 keeps layer execution sequential, and the parallelism
@@ -31,7 +31,7 @@ impl CpuRuntime {
     /// Wire a backend to the CPU path.
     ///
     /// Fails with [`GllmError::NoBackendAvailable`] if the backend reports
-    /// itself unusable â€” better to refuse here than at the first layer.
+    /// itself unusable — better to refuse here than at the first layer.
     pub fn new(
         config: &RuntimeConfig,
         backend: Arc<dyn ExecutionBackend>,

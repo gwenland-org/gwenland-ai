@@ -1,4 +1,4 @@
-//! [`VLStepCollector`] — glbench's implementation of stumman's `StepObserver`.
+//! [`VLStepCollector`] — glbench's implementation of gltrain's `StepObserver`.
 //!
 //! # D-05: glbench observes, it does not drive
 //!
@@ -14,7 +14,7 @@
 //! `Any`, so **the returned box is not a way to read the results.** The
 //! collector therefore writes into an `Rc<RefCell<…>>` the caller also holds.
 //!
-//! This is not a guess: `stumman/tests/observer_boundary.rs` demonstrates the
+//! This is not a guess: `gltrain/tests/observer_boundary.rs` demonstrates the
 //! pattern from outside the crate specifically so Wave 4 would not have to
 //! discover it at implementation time.
 //!
@@ -105,8 +105,8 @@ impl VLStepCollector {
     }
 }
 
-impl stumman::StepObserver for VLStepCollector {
-    fn on_step(&mut self, step: &stumman::VLTrainingStep) {
+impl gltrain::StepObserver for VLStepCollector {
+    fn on_step(&mut self, step: &gltrain::VLTrainingStep) {
         let archived = VLTrainingStep::from(step);
         let mut out = self.out.borrow_mut();
         out.steps_observed += 1;
@@ -130,8 +130,8 @@ impl stumman::StepObserver for VLStepCollector {
 
     fn on_tensors(
         &mut self,
-        grads: &stumman::VLGradStore,
-        opt_state: &[stumman::VLNamedTensor],
+        grads: &gltrain::VLGradStore,
+        opt_state: &[gltrain::VLNamedTensor],
     ) {
         let mut out = self.out.borrow_mut();
 
@@ -216,10 +216,10 @@ pub fn finish(handle: &VLCollectedHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use stumman::StepObserver as _;
+    use gltrain::StepObserver as _;
 
-    fn wire_step(index: usize, epoch: usize, loss: f32) -> stumman::VLTrainingStep {
-        stumman::VLTrainingStep {
+    fn wire_step(index: usize, epoch: usize, loss: f32) -> gltrain::VLTrainingStep {
+        gltrain::VLTrainingStep {
             index,
             epoch,
             loss,
@@ -326,7 +326,7 @@ mod tests {
     /// steps.
     #[test]
     fn bit_profiles_follow_the_same_sampling_as_the_steps() {
-        use stumman::{VLGradStore, VLNamedTensor};
+        use gltrain::{VLGradStore, VLNamedTensor};
 
         let (mut collector, handle) =
             VLStepCollector::new(4, vec![ENBitScope::Optimizer]);
@@ -356,7 +356,7 @@ mod tests {
     /// when the payload itself is skipped.
     #[test]
     fn the_optimizer_footprint_is_recorded_even_on_unsampled_steps() {
-        use stumman::{VLGradStore, VLNamedTensor};
+        use gltrain::{VLGradStore, VLNamedTensor};
 
         let (mut collector, handle) = VLStepCollector::new(100, vec![ENBitScope::Optimizer]);
         let state = vec![VLNamedTensor {

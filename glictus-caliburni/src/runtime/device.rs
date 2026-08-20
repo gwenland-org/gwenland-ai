@@ -1,4 +1,4 @@
-﻿//! Device placement resolution (ARTX05 AD-06, ARTX06 Â§"Device Mapping").
+﻿//! Device placement resolution (ARTX05 AD-06, ARTX06 §"Device Mapping").
 //!
 //! Three sources can name a device for a layer, in descending priority:
 //! the layer's own manifest entry, a range assignment in the device map, and
@@ -12,7 +12,7 @@ use crate::error::{GllmError, GllmResult};
 use crate::manifest::{DevicePlacement, LayerManifest};
 use crate::types::execution::Device;
 
-/// Where a resolved placement came from â€” recorded so a fallback can say
+/// Where a resolved placement came from — recorded so a fallback can say
 /// *what* it overrode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeviceSource {
@@ -198,7 +198,7 @@ impl DeviceMapResolver {
     }
 
     /// Resolve one layer's device using the AD-06 priority chain:
-    /// layer manifest â†’ range assignment â†’ map default â†’ runtime default,
+    /// layer manifest → range assignment → map default → runtime default,
     /// then CPU if the winner is unavailable or unparseable.
     pub fn resolve(
         &self,

@@ -1,10 +1,10 @@
 ﻿//! Memory-mapped layer files.
 //!
-//! ARTX05 Â§"Memory Mapping Strategy": the runtime maps a layer, executes it,
+//! ARTX05 §"Memory Mapping Strategy": the runtime maps a layer, executes it,
 //! and unmaps it. The OS page cache does the actual I/O; the runtime only
 //! hints at the access pattern.
 //!
-//! A mapping is validated at open time â€” magic, version, and tensor index are
+//! A mapping is validated at open time — magic, version, and tensor index are
 //! parsed before any caller sees the bytes, so a corrupt file fails loud here
 //! rather than as garbage activations later.
 
@@ -35,7 +35,7 @@ pub struct LayerMapping {
 impl LayerMapping {
     /// Map and validate an execution-unit file.
     ///
-    /// Parses the header and tensor index eagerly (cheap â€” a few hundred
+    /// Parses the header and tensor index eagerly (cheap — a few hundred
     /// bytes) but touches no tensor data, so cost is independent of layer
     /// size. Returns [`GllmError::InvalidMagic`] / [`GllmError::InvalidHeader`]
     /// on a malformed file.
@@ -55,7 +55,7 @@ impl LayerMapping {
         // SAFETY: mapped read-only and never mutated through this handle. The
         // mapping outlives every slice handed out, because `as_bytes` borrows
         // from `self`. A concurrent truncation by another process could fault
-        // on access â€” the same accepted risk glcore takes for GGUF loading.
+        // on access — the same accepted risk glcore takes for GGUF loading.
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|source| {
             GllmError::MapFailed {
                 path: path.display().to_string(),
@@ -90,7 +90,7 @@ impl LayerMapping {
     /// Bytes of one tensor, located via the tensor index.
     ///
     /// Returns `None` if the tensor is absent, or if its recorded range falls
-    /// outside the file â€” a truncated layer yields `None`, never a panic or a
+    /// outside the file — a truncated layer yields `None`, never a panic or a
     /// read past the mapping.
     pub fn tensor_bytes(&self, name: &str) -> Option<&[u8]> {
         let (offset, size) = self.layer.absolute_range(name)?;

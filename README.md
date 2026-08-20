@@ -81,28 +81,73 @@ graph TD
 | `glbench` | Profiler & benchmark harness — engine telemetry, roofline, A/B runs | ✅ |
 | `glcli` | The `gwen` command-line interface | ✅ |
 | `glictus-caliburni` | The `.gllm` package format + GLLM runtime (Pridwen quantization research: GQ4A/GQ2A). Separate from the GGUF path `gwen run` uses — see `architecture/Pridwen-proposal-v5.md` | 🧪 experimental |
+| `gljax` | Pure-Rust StableHLO/PJRT client — emits IR, owns no kernels, hands it to a dynamically loaded PJRT plugin | ✅ 284 tests |
+| `glserve` | HTTP serving CLI on `gljax` (`--fake` mode needs no model or plugin) | ✅ |
 
-There is also a `packages/` group (`packages/core`, `packages/mcp`) — an
-in-progress training-arm crate and an MCP server. `gltui` (the terminal UI)
-was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL
-engines — and is no longer a workspace member.
+The training crate sits outside this workspace on purpose, declaring its own
+`[workspace]` table so `cargo build --workspace` at the root never resolves
+its dependencies: `gltrain/` (Stummañ, GwenLand's from-scratch training
+framework, built on `glcore`/`glproc` — see below). A second, candle-backed
+training crate previously occupied that path and was deleted on 2026-08-20; it
+had no live consumers. `packages/` now holds just
+`packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired to
+`.abandoned/gltui/` on 2026-07-18 — it never called the GL engines — and is no
+longer a workspace member.
 
-## Research: gljax (design only, zero code)
+## Stummañ: the training arm (M1 complete)
 
-[`gljax/`](gljax/architecture/Overall-Architecture.md) is a from-scratch
-StableHLO/PJRT engine design — **17 architecture documents, no `src/`, not a
-workspace member.** Every wave gate in it is a claim to be tested, not a
-result; where a document reports a number, it came from published research or
-a *different* GwenLand engine, never from gljax itself. Start at
-[`Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md).
+[`gltrain/`](gltrain/) is GwenLand's from-scratch training framework — a
+define-by-run autograd engine built on `glcore`/`glproc` instead of candle,
+the same "from-scratch, fully understood" standard the inference engines hold
+themselves to. **M1, the minimal autograd engine, is complete**: a generic
+`Tensor<B>` over a `Backend` trait, a tape that records the forward pass and
+replays it in reverse, backward functions for every op the trait exposes, and
+a gradient check that verifies each one against an independent scalar
+reference backend rather than trusting the math by inspection.
 
-[`gljax/probes/`](gljax/probes/) is the one exception: three small,
-reproducible Python scripts (`python <script>.py`, no gljax code required)
-that settled real questions about what a PJRT CPU plugin actually does with
-quantized weights — e.g. that dequantised weights get fully materialised
-per call unless the dot is tiled over the contracting dimension, at which
-point quantization goes from a 4.6× slowdown to a ~30% tax in decode (and is
-nearly free in prefill). Full write-up:
+No optimizer, no LoRA layer, no GPU backend yet — that's M2 and later. Start
+at [`gltrain/README_AUTOGRAD.md`](gltrain/README_AUTOGRAD.md) for the API and
+a runnable example, or [`gltrain/KNOWN_ISSUES.md`](gltrain/KNOWN_ISSUES.md)
+for the constraints that are deliberate rather than missing.
+
+## gljax: a pure-Rust XLA/PJRT client
+
+[`gljax/`](gljax/) emits StableHLO MLIR text and hands it to a dynamically
+loaded PJRT plugin — it owns no kernels of its own (no CUDA, no PTX, no
+hand-rolled matmul); what the backend does with the IR is the backend's
+decision, and gljax's job is to state the computation portably and then
+measure what actually happened. **284 tests** exercise the StableHLO emitter
+and the surrounding modules (matrix/arch/oracle/tokenizer/sampler/grammar)
+without needing a plugin at all.
+
+Actually executing against a real plugin can't happen on this project's
+Windows dev machine — there is no PJRT plugin for Windows — so that path is
+verified on Linux CI instead:
+[`.github/workflows/gljax-pjrt.yml`](.github/workflows/gljax-pjrt.yml)
+downloads a pinned PJRT CPU plugin and a pinned Qwen2-0.5B checkpoint, then
+runs Gate A5 (real weights, real tokenizer, coherence checked on the
+generated text) plus a KV-cache parity and throughput check against an
+unchanged recompute oracle. Consistently green over the last several runs.
+
+[`glserve/`](glserve/) is an HTTP serving CLI built on top of it —
+`glserve --model <hf-dir> --plugin <pjrt.so> --port N`, or `--fake` to try
+the API with no model or plugin at all.
+
+The 17-document architecture series that designed all of this is still there
+for the "why," starting at
+[`Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md). Not
+every wave gate in it has been executed yet — where a document reports a
+number and it isn't one of the ones above, it came from published research or
+a *different* GwenLand engine, not from a gljax run.
+
+[`gljax/probes/`](gljax/probes/) is a separate, standalone exception: three
+small, reproducible Python scripts (`python <script>.py`, no gljax code
+required) that settled real questions about what a PJRT CPU plugin actually
+does with quantized weights before any Rust code existed — e.g. that
+dequantised weights get fully materialised per call unless the dot is tiled
+over the contracting dimension, at which point quantization goes from a 4.6×
+slowdown to a ~30% tax in decode (and is nearly free in prefill). Full
+write-up:
 [`ARTX10-quantized-runtime-architecture.md`](gljax/architecture/ARTX10-quantized-runtime-architecture.md).
 
 ## Building
