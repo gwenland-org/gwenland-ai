@@ -10,4 +10,7 @@ pub mod quantization;
 pub mod regression;
 pub mod runs;
 pub mod statistics;
+/// Training-configuration comparison (Wave 4). Gated with the training tree.
+#[cfg(feature = "train-bench")]
+pub mod training;
 pub mod trend;

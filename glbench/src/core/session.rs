@@ -55,11 +55,10 @@ pub struct BenchmarkSession {
     /// session this is the envelope only — the facts stay in the v1 fields
     /// above. See [`VLInferenceSession`] for why they were not moved.
     pub inference: Option<VLInferenceSession>,
-    /// The training run. Reserved by the schema and gated behind
-    /// `train-bench`; the concrete `VLTrainingSession` type arrives with the
-    /// training observer, so this holds the raw JSON projection until then.
+    /// The training run (Wave 4). Gated behind `train-bench`, so a default
+    /// build never compiles stumman.
     #[cfg(feature = "train-bench")]
-    pub training: Option<Json>,
+    pub training: Option<crate::training::VLTrainingSession>,
     /// Why every `null` in this session has no value (D-09). Empty for a v1
     /// archive; never absent in one this build writes.
     pub availability: VLAvailabilityMap,
@@ -129,7 +128,7 @@ impl BenchmarkSession {
     /// The `training` slot: whatever the training observer produced, or null.
     #[cfg(feature = "train-bench")]
     fn training_json(&self) -> Json {
-        self.training.clone().unwrap_or(Json::Null)
+        self.training.as_ref().map(|t| t.to_json()).unwrap_or(Json::Null)
     }
 
     /// Without `train-bench` the slot is still emitted, as null. The schema
@@ -180,11 +179,13 @@ impl BenchmarkSession {
                 Some(i) if !matches!(i, Json::Null) => Some(VLInferenceSession::from_json(i)?),
                 _ => Some(VLInferenceSession::standalone()),
             },
+            // Not reconstructed, for the same reason `telemetry` and `behavior`
+            // are not: a training session is a record of a run that already
+            // happened, and a parser for it could only ever agree with the
+            // writer. `inspect` re-renders from the JSON; nothing recomputes a
+            // training run from its archive.
             #[cfg(feature = "train-bench")]
-            training: match v.get("training") {
-                Some(t) if !matches!(t, Json::Null) => Some(t.clone()),
-                _ => None,
-            },
+            training: None,
             availability: availability::from_json(v.get("availability"))?,
             integrity: match v.get("integrity") {
                 Some(i) if !matches!(i, Json::Null) => Some(VLIntegrity::from_json(i)?),

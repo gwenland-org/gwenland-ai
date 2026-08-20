@@ -27,6 +27,8 @@ use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
 use glbench::runner::{planner, scale, thread_scale};
 use glbench::numerical::scope::{self, ENBitScope};
+#[cfg(feature = "train-bench")]
+use glbench::training::runner::{self as train_runner, TrainArgs};
 use glbench::storage::{archive, join};
 use glbench::validation::availability::ENNullSemantics;
 #[cfg(feature = "gllm-bench")]
@@ -45,6 +47,18 @@ fn main() -> ExitCode {
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
         Some("join") => cmd_join(&args[1..]),
+        #[cfg(feature = "train-bench")]
+        Some("train") => cmd_train(&args[1..], glbench::core::mode::ENSessionMode::TrainingOnly),
+        #[cfg(feature = "train-bench")]
+        Some("unified") => cmd_train(&args[1..], glbench::core::mode::ENSessionMode::Unified),
+        // Recognised without the feature, so a user who read about `glbench
+        // train` learns which flag they need rather than that the command does
+        // not exist (design §8).
+        #[cfg(not(feature = "train-bench"))]
+        Some(cmd @ ("train" | "unified")) => Err(format!(
+            "'{cmd}' requires a build with --features train-bench \
+             (it links stumman, which a default build never compiles)"
+        )),
         Some("quant-info") => cmd_quant_info(&args[1..]),
         #[cfg(feature = "gllm-bench")]
         Some("ppl") => cmd_ppl(&args[1..]),
@@ -124,6 +138,30 @@ usage:
                    --model names the package directory, e.g. the folder
                    containing gllm.json — ZIP-archive .gllm files are not
                    yet readable, see glictus-caliburni ARTX06)
+
+training observation (needs --features train-bench):
+  glbench train   [--d-in N] [--d-out N] [--rank N] [--samples N]
+                  [--epochs N] [--lr F] [--seed N] [--dataset-seed N]
+                  [--step-sample N] [--target-loss F] [--bit-scope <list>]
+                  [--label <name>] [--out <file.json>]
+                  (runs a LoRA fine-tune on stumman under observation and
+                   archives it as a training_only v2 session. glbench does not
+                   drive the loop — it installs an observer and calls
+                   stumman's own Trainer::train)
+  glbench unified [same options as train]
+                  (a training run with inference roles labelled either side of
+                   it: the outer envelope is pre_training, training.post_eval
+                   is post_training)
+
+                  There is deliberately no --model or --dataset: stumman M2
+                  generates its frozen base weight from a seed and builds its
+                  dataset in memory, so neither flag has a subject. The shape
+                  and seed flags above fully determine the run, which makes it
+                  reproducible in a way a path would not.
+
+                  --target-loss has NO default. Time-to-target needs someone to
+                  say what good means; without it, steps_to_target is archived
+                  as absent rather than guessed.
 
 bit profiling (run):
   --profile bits              profile the model's weight tensors at the bit
@@ -637,6 +675,221 @@ fn cmd_thread_scale(args: &[String]) -> Result<(), String> {
     let report = thread_scale::run_thread_sweep(&a.spec, &thread_counts, &progress).map_err(|e| e.to_string())?;
     print!("{}", text::thread_sweep(&report));
     Ok(())
+}
+
+/// `glbench train` / `glbench unified` — observe a stumman training run.
+///
+/// D-05: glbench never drives the loop. It builds a `Trainer`, installs a
+/// collector, and calls `Trainer::train`; every number archived is something
+/// stumman reported.
+#[cfg(feature = "train-bench")]
+fn cmd_train(args: &[String], mode: glbench::core::mode::ENSessionMode) -> Result<(), String> {
+    let mut a = TrainArgs { mode, ..TrainArgs::default() };
+    let mut null_semantics = ENNullSemantics::default();
+
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].clone();
+        let value = |i: &mut usize| -> Result<String, String> {
+            *i += 1;
+            args.get(*i).cloned().ok_or_else(|| format!("flag '{flag}' needs a value"))
+        };
+        match flag.as_str() {
+            "--d-in" => a.d_in = parse_num(&value(&mut i)?, &flag)?,
+            "--d-out" => a.d_out = parse_num(&value(&mut i)?, &flag)?,
+            "--rank" => a.rank = parse_num(&value(&mut i)?, &flag)?,
+            "--samples" => a.samples = parse_num(&value(&mut i)?, &flag)?,
+            "--epochs" => a.epochs = parse_num(&value(&mut i)?, &flag)?,
+            "--lr" => a.lr = parse_f64(&value(&mut i)?, &flag)?,
+            "--seed" => a.seed = parse_num(&value(&mut i)?, &flag)?,
+            "--dataset-seed" => a.dataset_seed = parse_num(&value(&mut i)?, &flag)?,
+            "--step-sample" => a.step_sample_n = parse_num(&value(&mut i)?, &flag)?,
+            "--target-loss" => a.target_loss = Some(parse_f32(&value(&mut i)?, &flag)?),
+            "--label" => a.label = Some(value(&mut i)?),
+            "--out" => a.out_path = Some(PathBuf::from(value(&mut i)?)),
+            "--profile" => {
+                let v = value(&mut i)?;
+                if v != "bits" {
+                    return Err(format!("--profile takes 'bits', got '{v}'"));
+                }
+                if a.bit_scopes.is_empty() {
+                    a.bit_scopes.push(ENBitScope::Gradients);
+                }
+            }
+            "--bit-scope" => {
+                a.bit_scopes.clear();
+                for name in value(&mut i)?.split(',') {
+                    let name = name.trim();
+                    let scope = ENBitScope::from_str(name).ok_or_else(|| {
+                        format!("--bit-scope takes weights|gradients|optimizer, got '{name}'")
+                    })?;
+                    if scope == ENBitScope::Weights {
+                        return Err(
+                            "--bit-scope weights profiles a .gllm package, which a training \
+                             run does not have; use gradients and/or optimizer here"
+                                .to_string(),
+                        );
+                    }
+                    a.bit_scopes.push(scope);
+                }
+            }
+            "--null-semantics" => {
+                let v = value(&mut i)?;
+                null_semantics = ENNullSemantics::from_str(&v)
+                    .ok_or_else(|| format!("--null-semantics takes strict|lenient, got '{v}'"))?;
+            }
+            // Named explicitly so the error explains the design decision rather
+            // than reporting an unknown flag.
+            "--model" | "--dataset" => {
+                return Err(format!(
+                    "'{flag}' has no subject at stumman M2: the frozen base weight is \
+                     generated from --seed and the dataset is built in memory from \
+                     --samples/--dataset-seed. See `glbench help`."
+                ))
+            }
+            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+        }
+        i += 1;
+    }
+
+    eprintln!(
+        "training: lora r={} over {}x{}, {} samples x {} epochs",
+        a.rank, a.d_in, a.d_out, a.samples, a.epochs
+    );
+    let session = train_runner::run(&a)?;
+    print!("{}", render_training(&session));
+
+    if let Some(path) = &a.out_path {
+        let report = archive::write_with_policy(&session, path, null_semantics)?;
+        for finding in &report.findings {
+            eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
+        }
+        eprintln!("archived to {}", path.display());
+    }
+    Ok(())
+}
+
+/// Human-readable summary of a finished training session.
+#[cfg(feature = "train-bench")]
+fn render_training(session: &glbench::BenchmarkSession) -> String {
+    use std::fmt::Write as _;
+
+    let Some(t) = session.training.as_ref() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    let rule = "\u{2500}".repeat(60);
+    let _ = writeln!(out, "\nglbench {} :: {}", session.metadata.session_mode.as_str(), session.metadata.label);
+    let _ = writeln!(out, "{rule}");
+
+    if let Some(adapter) = &t.adapter {
+        let _ = writeln!(
+            out,
+            "adapter {} r={} alpha={:.1} over {}x{} | {} trainable / {} base ({:.2}%)",
+            adapter.kind,
+            adapter.rank,
+            adapter.alpha,
+            adapter.d_in,
+            adapter.d_out,
+            adapter.trainable_parameters,
+            adapter.base_parameters,
+            adapter.parameter_ratio * 100.0
+        );
+    }
+    let _ = writeln!(
+        out,
+        "optimizer {} | {} epochs | {} steps observed, {} archived (sample N={})",
+        t.optimizer, t.epochs, t.steps_observed, t.steps_archived, t.step_sample_n
+    );
+
+    if let Some(c) = &t.convergence {
+        let _ = writeln!(out, "\nconvergence");
+        let _ = writeln!(
+            out,
+            "  loss {:.6} -> {:.6} (best {:.6} at step {})",
+            c.first_loss, c.final_loss, c.best_loss, c.best_step
+        );
+        let _ = writeln!(
+            out,
+            "  slope {:+.3e}/step | EMA {:.6} (alpha {:.2})",
+            c.slope_per_step, c.ema_final, c.ema_alpha
+        );
+        // Window and threshold travel with the verdict; a plateau claim without
+        // them is an opinion (research §14).
+        let _ = writeln!(
+            out,
+            "  plateau {} over {} steps at threshold {:.1e} | CV {:.4}",
+            if c.plateau_detected { "detected" } else { "not detected" },
+            c.plateau_window,
+            c.plateau_threshold,
+            c.cv
+        );
+        match (c.target_loss, c.steps_to_target) {
+            (None, _) => {
+                let _ = writeln!(out, "  target: none given (--target-loss has no default)");
+            }
+            (Some(target), Some(step)) => {
+                let _ = writeln!(out, "  target {target:.6} reached at step {step}");
+            }
+            (Some(target), None) => {
+                let _ = writeln!(out, "  target {target:.6} NOT reached in this run");
+            }
+        }
+    }
+
+    if let Some(a) = &t.attribution {
+        let _ = writeln!(out, "\nstep time ({:.3} ms mean over {} steps)", a.mean_step_ms, a.steps);
+        let _ = writeln!(
+            out,
+            "  forward {:.1}% | backward {:.1}% | optimizer {:.1}% | unattributed {:.3} ms",
+            a.forward_share * 100.0,
+            a.backward_share * 100.0,
+            a.optimizer_share * 100.0,
+            a.unattributed_ms
+        );
+    }
+
+    if let Some(m) = &t.memory {
+        let _ = writeln!(out, "\nmemory");
+        let _ = writeln!(out, "  trainable parameters: {} bytes", m.parameter_bytes);
+        match m.optimizer_state_bytes {
+            Some(b) => {
+                let _ = writeln!(out, "  optimizer state: {b} bytes");
+            }
+            None => {
+                let _ = writeln!(out, "  optimizer state: not read (no --bit-scope asked for it)");
+            }
+        }
+        match m.peak_rss_bytes {
+            Some(b) => {
+                let _ = writeln!(out, "  peak RSS: {b} bytes");
+            }
+            None => {
+                let _ = writeln!(out, "  peak RSS: not available on this platform");
+            }
+        }
+    }
+
+    if !t.bit_profiles.is_empty() {
+        let _ = writeln!(out, "\nGLBitProf — {} tensors profiled", t.bit_profiles.len());
+        for entry in t.bit_profiles.iter().take(8) {
+            let p = &entry.scope.profile;
+            let _ = writeln!(
+                out,
+                "  step {:>5}  {:<24} {:>8} elems  sign {:>5.1}%  exp {}..{}",
+                entry.step_index,
+                entry.scope.tensor_name,
+                p.count,
+                p.sign_set_ratio * 100.0,
+                p.exponent_min,
+                p.exponent_max
+            );
+        }
+        if t.bit_profiles.len() > 8 {
+            let _ = writeln!(out, "  ... {} more", t.bit_profiles.len() - 8);
+        }
+    }
+    out
 }
 
 /// `glbench inspect` — re-render an archived session, or re-check a join.

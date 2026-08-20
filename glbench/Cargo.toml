@@ -37,6 +37,17 @@ glcuda = { path = "../glcuda" }
 # and glproc is already an unconditional dependency of glbench.
 glictus-caliburni = { path = "../glictus-caliburni", features = ["glproc-backend", "converter"], optional = true }
 
+# Training observation (D-02). Optional so `cargo build --workspace` without the
+# feature never compiles stumman, exactly as gllm-bench works for
+# glictus-caliburni. stumman declares its own `[workspace]` and is not a root
+# member; a path dependency does not require membership.
+#
+# Accepted cost, stated rather than hidden: stumman and `anyhow` enter the root
+# Cargo.lock as optional entries even when unbuilt, and stumman may resolve its
+# own dependency versions differently standalone (own lock file) than from here.
+# Neither affects a default build.
+stumman = { path = "../stumman", optional = true }
+
 [features]
 default = []
 gllm-bench = ["dep:glictus-caliburni"]
@@ -47,7 +58,7 @@ gllm-bench = ["dep:glictus-caliburni"]
 # in Wave 4, together with the `VLTrainingSession` type that replaces the
 # placeholder. Declared now so the cfg-gated code compiles warning-free and
 # the feature name is reserved rather than invented twice.
-train-bench = []
+train-bench = ["dep:stumman"]
 
 [[bin]]
 name = "glbench"
@@ -59,6 +70,11 @@ path = "src/main.rs"
 [[example]]
 name = "bitprof_quant_divergence"
 required-features = ["gllm-bench"]
+
+# Runs real training on stumman, so it needs the training edge.
+[[test]]
+name = "training_archive"
+required-features = ["train-bench"]
 
 [dev-dependencies]
 tempfile = "3"
