@@ -3,50 +3,39 @@
 //! Fail Fast, Fail Loud: every execution unit carries a SHA-256 checksum
 //! (from `checksums.sha256` or the manifest) that is verified before the
 //! file is trusted for mmap.
+//!
+//! # Where the hash actually lives
+//!
+//! The two primitives below are thin wrappers over [`glcore::hash`]; the
+//! algorithm itself is not implemented here. `glbench` needs the same
+//! primitive for archive content digests, unconditionally and with zero
+//! external dependencies, and a second copy of SHA-256 in the workspace is
+//! precisely the failure mode
+//! `architecture/gl-stack-audit-2026-07/ARTX2-Quant.md` catalogues.
+//!
+//! [`ChecksumVerifier`] stays here: it is `.gllm` package policy (parsing
+//! `checksums.sha256`, deciding what a mismatch means), not a hash.
 
-use std::fmt::Write as _;
-use std::io::Read;
 use std::path::Path;
-
-use sha2::{Digest, Sha256};
 
 use crate::error::GllmError;
 
 /// Length of a SHA-256 digest as lowercase hex.
 const SHA256_HEX_LEN: usize = 64;
 
-/// Read chunk size for file hashing (64 KiB keeps memory flat on GB files).
-const HASH_CHUNK_SIZE: usize = 64 * 1024;
-
-fn to_lower_hex(digest: &[u8]) -> String {
-    digest.iter().fold(
-        String::with_capacity(digest.len() * 2),
-        |mut out, byte| {
-            // write! to a String is infallible.
-            let _ = write!(out, "{byte:02x}");
-            out
-        },
-    )
-}
-
 /// Compute SHA-256 of a file (streamed) and return a lowercase hex string.
+///
+/// Delegates to [`glcore::hash::sha256_file`]; the [`GllmError`] wrapper is
+/// what every caller in this crate already handles.
 pub fn sha256_file(path: &Path) -> Result<String, GllmError> {
-    let mut file = std::fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    let mut buf = vec![0u8; HASH_CHUNK_SIZE];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(to_lower_hex(&hasher.finalize()))
+    Ok(glcore::hash::sha256_file(path)?)
 }
 
 /// Compute SHA-256 of a byte slice and return a lowercase hex string.
+///
+/// Delegates to [`glcore::hash::sha256_bytes`].
 pub fn sha256_bytes(data: &[u8]) -> String {
-    to_lower_hex(&Sha256::digest(data))
+    glcore::hash::sha256_bytes(data)
 }
 
 /// Per-file checksum entry (from `checksums.sha256` or the manifest).
@@ -68,7 +57,7 @@ pub struct ChecksumVerifier {
 impl ChecksumVerifier {
     /// Parse a `checksums.sha256` file in standard `sha256sum` output
     /// format: `<64-hex>  <filename>` per line (a leading `*` on the
-    /// filename â€” binary-mode marker â€” is stripped). Blank lines are
+    /// filename — binary-mode marker — is stripped). Blank lines are
     /// ignored; anything else is an [`GllmError::IntegrityError`].
     pub fn from_file(path: &Path) -> Result<Self, GllmError> {
         let text = std::fs::read_to_string(path)?;
@@ -146,7 +135,7 @@ impl ChecksumVerifier {
 
     /// Verify every entry against the files under `base_dir`.
     ///
-    /// Does NOT short-circuit â€” checks all files and returns every
+    /// Does NOT short-circuit — checks all files and returns every
     /// `(filename, error)` pair that failed, so a corrupted package reports
     /// the full damage in one pass.
     pub fn verify_all(&self, base_dir: &Path) -> Vec<(String, GllmError)> {
@@ -166,7 +155,7 @@ mod tests {
     use super::*;
     use std::fs;
 
-    /// SHA-256 of b"hello" â€” standard published test vector.
+    /// SHA-256 of b"hello" — standard published test vector.
     const SHA256_HELLO: &str =
         "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
 

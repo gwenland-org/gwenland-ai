@@ -1,0 +1,107 @@
+{
+  "analysis": null,
+  "behavior": null,
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cpu",
+    "model_arch": "qwen2",
+    "name": "glproc",
+    "quantization": "Q8_0",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": true,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2995,
+        "model": "11th Gen Intel(R) Core(TM) i3-1115G4 @ 3.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 6.669502139226103
+      },
+      "gpu": {
+        "backend": null,
+        "compute": null,
+        "name": null,
+        "peak_bandwidth_gbs": null,
+        "peak_compute_tops": null,
+        "total_memory_bytes": null
+      },
+      "memory": {
+        "available_bytes": 2076811264,
+        "total_bytes": 8382472192
+      },
+      "storage": {
+        "model_file_bytes": null
+      },
+      "thermal": {
+        "avg_mhz": null,
+        "end_mhz": null,
+        "start_mhz": 2995,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.140",
+      "os": "windows"
+    }
+  },
+  "measurements": {
+    "cold": [],
+    "cpu_utilization_pct": null,
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 6203,
+        "generated_tokens": 128,
+        "prefill_ms": 412.5,
+        "prompt_tokens": 96,
+        "total_ms": 6615.5
+      },
+      {
+        "decode_ms": 6180.4,
+        "generated_tokens": 128,
+        "prefill_ms": 408.1,
+        "prompt_tokens": 96,
+        "total_ms": 6588.5
+      }
+    ],
+    "model_bytes": null,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": null
+  },
+  "metadata": {
+    "created_unix": 1752000000,
+    "glbench_version": "0.1.140",
+    "label": "qwen2.5-0.5b-glproc-q8-v1",
+    "schema_version": 1
+  },
+  "telemetry": null,
+  "validation": null,
+  "workload": {
+    "cold_iters": 5,
+    "cot_mode": null,
+    "engine": "glproc",
+    "kind": "end_to_end",
+    "max_new_tokens": 128,
+    "measure_iters": 3,
+    "model_path": "",
+    "prompt": "",
+    "seed": 42,
+    "temperature": 0,
+    "verify_against": null,
+    "warmup_iters": 1
+  }
+}
