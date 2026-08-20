@@ -2,12 +2,12 @@
 
 > **Domain:** architecture-skills
 > **Applies to:** every design decision in the repository
-> **Last updated:** 2026-07-17
+> **Last updated:** 2026-08-17
 
 ## BEFORE YOU START
 
 - [ ] I can state the priority order: **correct inference anywhere → measured performance on the target tier → everything else.**
-- [ ] My change doesn't trade correctness, portability, or the zero-dependency build for speed.
+- [ ] My change doesn't trade correctness, portability, or the zero-ML-dependency build for speed.
 - [ ] If my change is a speedup, its claim is (or will be) a production measurement, not a projection.
 
 ## Context

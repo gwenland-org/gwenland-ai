@@ -79,7 +79,7 @@ never compiles `tokio`. The cost is paid only by `cargo build --workspace` and
 by building glserve itself.
 
 If that becomes a problem, the fix is to `exclude` glserve from the root
-workspace the way `gltrain` and `stumman` already are — not to delete it.
+workspace the way `gltrain` already is — not to delete it.
 
 ## Direction, kept from ARTX16
 

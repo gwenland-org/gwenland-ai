@@ -1,14 +1,14 @@
 ﻿//! Core runtime types: configuration, execution state, statistics, buffers.
 //!
-//! ARTX05 Â§"Execution Model". These types carry no behaviour beyond
-//! construction and defaults â€” the orchestration lives in
+//! ARTX05 §"Execution Model". These types carry no behaviour beyond
+//! construction and defaults — the orchestration lives in
 //! [`GllmRuntime`](crate::runtime::GllmRuntime).
 
 use crate::manifest::DevicePlacement;
 
 /// Verbosity levels for [`RuntimeLogger`](crate::runtime::logger::RuntimeLogger).
 ///
-/// ARTX05 Â§"Logging and Diagnostics" defines exactly four levels. Ordering is
+/// ARTX05 §"Logging and Diagnostics" defines exactly four levels. Ordering is
 /// by severity so a minimum level can be compared directly: `Error` is the
 /// most severe and sorts lowest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
@@ -40,7 +40,7 @@ impl RuntimeLogLevel {
 ///
 /// [`Default`] targets the reference 8 GB machine: a small prefetch window,
 /// unmap after execution, and checksum verification left *off* (it re-reads
-/// every byte of every layer â€” opt in when a package is suspect).
+/// every byte of every layer — opt in when a package is suspect).
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Layers to map ahead of the executing one. `0` disables prefetch.
@@ -138,7 +138,7 @@ impl RuntimeConfig {
     ///
     /// Crate-internal: called once by the runtime from
     /// [`ExecutionBackend::kv_element_size`](crate::runtime::backend::ExecutionBackend::kv_element_size).
-    /// A zero is ignored â€” it would size the whole cache to nothing.
+    /// A zero is ignored — it would size the whole cache to nothing.
     // The production caller is `GllmRuntime::open` (ARTX05 Phase 7), which does
     // not exist yet; until then only tests exercise this. Kept crate-private
     // rather than `pub` so the backend stays the single source of truth.

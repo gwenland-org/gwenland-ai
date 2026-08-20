@@ -18,17 +18,23 @@ members = [
 # `gwenland` stack that never called the GL engines (its CoreBridge was a
 # stub), retired 2026-07-18.
 #
-# `gltrain/` (formerly `packages/core`) is excluded for a different reason —
-# it is NOT retired, it is GwenLand's training arm and stays under active
-# development. It is excluded because it mandatorily depends on candle
-# (candle-core/candle-nn/candle-transformers, "always compiled since Cycle
-# 6"), which violates this workspace's "Inference First" rule of zero
-# external ML dependencies (see
-# gl-agent-skills/architecture-skills/inference-first.md, Rule 6). Keeping it
-# excluded means `cargo build/check --workspace` at the root never touches
-# candle; build gltrain on its own with `cargo build` from inside `gltrain/`
-# — it is its own independent workspace with its own Cargo.lock.
-exclude = [".abandoned", "gltrain", "stumman"]
+# `gltrain/` (Stummañ) is GwenLand's training arm and stays under active
+# development. It is excluded because the training crate is allowed
+# dependencies the "Inference First" rule forbids in the inference tree, and
+# because keeping it out means `cargo build --workspace` never compiles it —
+# verified, not assumed. It declares its own `[workspace]`, so it is its own
+# workspace root with its own Cargo.lock; build it with `cargo build` from
+# inside `gltrain/`.
+#
+# NOTE: it must appear here even though it declares `[workspace]` itself.
+# Without this entry, `glbench`'s optional `gltrain = { path = "../gltrain" }`
+# fails with "multiple workspace roots found in the same workspace".
+#
+# The candle-based crate that previously occupied this path (package
+# `gwenland-core`, ~31k lines, 381 crates in its tree) was deleted 2026-08-20.
+# It had no live consumers and glbench v3 chose Stummañ over it as the
+# training arm to observe (design finding F-01).
+exclude = [".abandoned", "gltrain"]
 resolver = "2"
 
 [profile.release]

@@ -3,7 +3,7 @@
 //! `GllmInference` is held as `Box<dyn GllmInference>` by the runtime, and
 //! `LayerPlugin` lives in a `Box<dyn LayerPlugin>` registry. If a future
 //! change adds a generic method or `impl Trait` in argument/return position,
-//! this file stops compiling â€” which is the point.
+//! this file stops compiling — which is the point.
 
 use std::path::Path;
 
@@ -13,7 +13,7 @@ use glictus_caliburni::types::package::GllmPackageMeta;
 use glictus_caliburni::types::tensor::{DType, TensorEntry};
 use glictus_caliburni::{ExtensionUri, GllmConverter, GllmInference, LayerPlugin};
 
-/// Minimal runtime that returns fixed logits â€” exercises the default `stream`.
+/// Minimal runtime that returns fixed logits — exercises the default `stream`.
 struct StubRuntime {
     logits: Vec<f32>,
     loaded: bool,

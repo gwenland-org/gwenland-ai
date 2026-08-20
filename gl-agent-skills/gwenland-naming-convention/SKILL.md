@@ -5,16 +5,16 @@ description: >
   backend, KL kernel, AG autograd, TP generic, VL value, plus 12 more). Covers
   the full prefix table, which types take a prefix, and which deliberately do
   not. Use whenever a struct, enum, or type alias is introduced, renamed, or
-  reviewed in glproc, glcore, glcuda, gljax, glserve, stumman, or any future
+  reviewed in glproc, glcore, glcuda, gljax, glserve, gltrain, or any future
   gl* crate. Trigger on any new type name even when the request is about
   something else, because a name is cheapest to fix before it has callers.
-  Read stumman-naming alongside this for the stumman crate specifically.
+  Read gltrain-naming alongside this for the gltrain crate specifically.
 ---
 
 # GwenLand Semantic Naming Convention
 
 > **Domain:** naming (repo-wide)
-> **Applies to:** every `gl*` crate and `stumman`
+> **Applies to:** every `gl*` crate and `gltrain`
 > **Status:** **TARGET STATE.** Adoption today is 0 of 224 public types.
 > **Last updated:** 2026-08-16
 
@@ -22,7 +22,7 @@ description: >
 
 - [ ] I know this convention describes where the repo is **going**, not how it reads now. Grepping for `BE`/`KL`/`AG` returns nothing.
 - [ ] I am introducing or renaming a type. If I'm only editing a function body, this skill does not apply.
-- [ ] If the type lives in `stumman/`, I have also read [`../stumman-naming/SKILL.md`](../stumman-naming/SKILL.md).
+- [ ] If the type lives in `gltrain/`, I have also read [`../gltrain-naming/SKILL.md`](../gltrain-naming/SKILL.md).
 - [ ] I am not mass-renaming existing types as a drive-by. Renames land as their own commit, never bundled into a feature change.
 
 ## Status: read this before you trust the table
@@ -36,7 +36,7 @@ This convention is **prescriptive, not descriptive**. Measured 2026-08-16:
 | glproc | 30 | 0 |
 | glcuda | 26 | 0 |
 | glserve | 20 | 0 |
-| stumman | 7 | 0 |
+| gltrain | 7 | 0 |
 | **Total** | **224** | **0** |
 
 Real names in the tree right now: `Arena`, `BackendKind`, `BlockQ4K`, `DType`,
@@ -100,7 +100,7 @@ Four pairs cause almost every wrong pick:
   launch. The same math appears twice under two prefixes, and that is correct.
 - **`VL` vs a domain prefix** — `VL` is the fallback for plain data with no
   home. If the type only makes sense inside one sub-system, use that
-  sub-system's prefix instead (see `AGNode` in stumman-naming).
+  sub-system's prefix instead (see `AGNode` in gltrain-naming).
 - **`RS` vs `TP`** — `RS` owns something and has a `Drop` story. `TP` is a
   shape over a type parameter. `TPBuffer<T>` is generic; `RSDeviceBuffer` owns
   VRAM.
@@ -152,7 +152,7 @@ Read this as "which layer am I writing in", not as a dependency graph.
 | Silicon underneath | `HW` | `HWTigerLake` |
 
 Training inserts one layer: the model records into `AGTape`, which holds
-`TPTensor<B>`, which dispatches to a `BE*`. See stumman-naming.
+`TPTensor<B>`, which dispatches to a `BE*`. See gltrain-naming.
 
 ## ✅ Correct Pattern
 
@@ -203,7 +203,7 @@ any code uses it. Order matters:
 
 Two characters, always. No single-character prefixes, no three-character ones.
 
-### Decided 2026-08-17 (stumman M2)
+### Decided 2026-08-17 (gltrain M2)
 
 Two table changes landed together, both signed off by JinXSuper:
 
@@ -235,7 +235,7 @@ Two table changes landed together, both signed off by JinXSuper:
 
 ## Related Skills
 
-- [../stumman-naming/SKILL.md](../stumman-naming/SKILL.md) — stumman's type map and rename target
+- [../gltrain-naming/SKILL.md](../gltrain-naming/SKILL.md) — gltrain's type map and rename target
 - [../rust-skills/trait-design.md](../rust-skills/trait-design.md) — why traits stay unprefixed and object-safe
 - [../architecture-skills/backend-independence.md](../architecture-skills/backend-independence.md) — what a `BE*` type may expose
 - [../before-coding/branch-strategy.md](../before-coding/branch-strategy.md) — landing a rename as its own commit

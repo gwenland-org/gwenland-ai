@@ -28,7 +28,7 @@ which is v1/v2 and has no D-/F- numbering).
 |---|---|---|
 | 1 | Schema v2 envelope, null semantics (D-09/D-10), `sha256-128` content digest, `glbench join` | 1169 → 1270 tests; **7 external crates removed, 0 added** |
 | 2 | GLBitProf math, weights scope, bit-profile divergence | 1270 → 1306; cost measured; **negative result recorded** (below) |
-| 3 | stumman observer hook (`StepObserver`, phase timing, `VLGradStore::iter`) | stumman 327 tests; overhead measured at 3 layer widths |
+| 3 | gltrain observer hook (`StepObserver`, phase timing, `VLGradStore::iter`) | gltrain 327 tests; overhead measured at 3 layer widths |
 | 4 | `glbench train` / `unified`, convergence, attribution, memory, adapter, gradient+optimizer bit scopes | `--features train-bench` 334 → 417 |
 | 5 | Loss curve, training flame graph, Markdown/CSV training sections, docs | this table |
 
@@ -54,7 +54,7 @@ Every number below was produced by a command in this repo, not estimated.
   is permutation-invariant by construction. A sub-block rotation control, which
   is *not* a pure permutation, does register (exponent L1 0.049). Pinned by
   `numerical::compare::tests::permutation_invariance_is_a_known_blind_spot`.
-- **Observer overhead grows with layer width** (`stumman/M2_5_OBSERVABILITY.md`,
+- **Observer overhead grows with layer width** (`gltrain/M2_5_OBSERVABILITY.md`,
   2 repeats): +4.3% at 64×64, +11.5% at 256×256, **+14.2% at 512×512**. The
   "fixed cost" hypothesis is refuted by the sweep, which is why D-19's
   `--step-sample N` is load-bearing rather than a nicety.
@@ -70,14 +70,14 @@ Every number below was produced by a command in this repo, not estimated.
   not unconditional. The genuinely hand-rolled implementation was in
   `gljax/src/runtime/digest.rs`. Resolved by writing a std-only SHA-256 in
   `glcore::hash` and delegating both — workspace implementations 2 → 1.
-- **D-02 does not work as written.** `stumman = { path = ..., optional = true }`
+- **D-02 does not work as written.** `gltrain = { path = ..., optional = true }`
   fails with "multiple workspace roots found in the same workspace"; the root
   `Cargo.toml` must also `exclude` it.
 - **§7.1's observer ordering was over-specified** and is corrected in the design
   document: the observer runs *after* `optimizer.step()`, because
   `optimizer_ns` cannot be reported by a callback that runs before the
   optimizer does. KL-006 never depended on the position.
-- **`glbench train` has no `--model` or `--dataset`.** stumman M2 generates its
+- **`glbench train` has no `--model` or `--dataset`.** gltrain M2 generates its
   frozen base weight from a seed and builds its dataset in memory; neither flag
   has a subject, and both are rejected with an error that says so.
 

@@ -16,11 +16,11 @@ pub(crate) fn make_test_gllm_file(path: &Path) -> Vec<u8> {
 /// Write a real unit file containing the named tensors, each filled with a
 /// distinct repeating byte so reads can be told apart.
 ///
-/// Goes through [`write_unit_file`](crate::layer_io::write_unit_file) â€” the
-/// same writer the converter uses â€” so fixtures cannot drift from the real
+/// Goes through [`write_unit_file`](crate::layer_io::write_unit_file) — the
+/// same writer the converter uses — so fixtures cannot drift from the real
 /// format. Each tensor is declared 1-D `[size]` of `Q8_0` (one byte per
 /// element), so `size` is both the element count and the exact byte count.
-/// These fixtures exercise layout only â€” the payload is filler, never decoded.
+/// These fixtures exercise layout only — the payload is filler, never decoded.
 pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
     let payloads: Vec<Vec<u8>> = tensors
         .iter()
@@ -46,10 +46,10 @@ pub(crate) fn write_test_layer(path: &Path, tensors: &[(&str, u64)]) {
     crate::layer_io::write_unit_file(path, &specs).expect("test layer writes");
 }
 
-/// Metadata for Qwen2.5-0.5B-Instruct â€” the reference model these crates are
+/// Metadata for Qwen2.5-0.5B-Instruct — the reference model these crates are
 /// verified against. Values are the real ones read from its GGUF (dim 896,
 /// 14 query heads / 2 KV heads, head_dim 64, ctx 32768, rope base 1e6, rms
-/// eps 1e-6 â€” confirmed via `gwen info` on the actual file, NOT the 1e-5
+/// eps 1e-6 — confirmed via `gwen info` on the actual file, NOT the 1e-5
 /// default; this is the exact value whose mismatch against a hardcoded 1e-5
 /// produced garbage E2E output before rms_eps was threaded through
 /// ModelMetadata), so tests asserting on derived sizes are checking a shape
@@ -138,7 +138,7 @@ pub(crate) mod fixtures {
     }
 
     /// Full-featured manifest: GQA metadata, quantization, projector,
-    /// device hints, custom metadata â€” 2 layers.
+    /// device hints, custom metadata — 2 layers.
     pub(crate) fn full_manifest_json() -> String {
         serde_json::json!({
             "gllm_version": "1.0.0",
@@ -225,7 +225,7 @@ pub(crate) mod fixtures {
 ///
 /// Differs from [`fixtures::write_manifest_package`] in that every unit file
 /// carries a real tensor index, so `LayerFile::parse` succeeds on the mapped
-/// bytes â€” `make_test_gllm_file` writes only a header plus filler, which the
+/// bytes — `make_test_gllm_file` writes only a header plus filler, which the
 /// runtime rejects. Checksums are computed from the bytes actually written.
 pub(crate) fn write_runtime_package(num_layers: u32) -> tempfile::TempDir {
     use crate::checksum::sha256_file;

@@ -142,21 +142,21 @@ impl PackageLayout {
     }
 
     /// Returns the layer entry for the given layer index (not the position
-    /// in the vec â€” indices need not be contiguous). `None` if absent.
+    /// in the vec — indices need not be contiguous). `None` if absent.
     pub fn layer_path(&self, index: u32) -> Option<&LayerPath> {
         self.layer_paths.iter().find(|lp| lp.index == index)
     }
 }
 
-/// Parse `GLLMTensorLayer-NNNN.gllm` â†’ `Some(NNNN)`; other filenames â†’ `None`.
+/// Parse `GLLMTensorLayer-NNNN.gllm` → `Some(NNNN)`; other filenames → `None`.
 ///
 /// Leading zeros are accepted and normalised away, so `-0007` and `-7` both
-/// yield 7 â€” discovery is tolerant of padding width even though
+/// yield 7 — discovery is tolerant of padding width even though
 /// [`format_layer_filename`](crate::manifest::format_layer_filename) always
 /// writes four digits.
 ///
 /// A filename that matches the prefix/extension pattern but whose middle part
-/// is not a number is an error, not a skip â€” Fail Fast, Fail Loud.
+/// is not a number is an error, not a skip — Fail Fast, Fail Loud.
 fn parse_layer_index(name: &str) -> Result<Option<u32>, GllmError> {
     let Some(rest) = name.strip_prefix(LAYER_FILE_PREFIX) else {
         return Ok(None);
@@ -192,7 +192,7 @@ pub struct GllmPackage {
     layer_units: Vec<Option<ExecutionUnit>>,
     /// Loaded from `checksums.sha256` when present.
     pub checksum_verifier: Option<ChecksumVerifier>,
-    /// Validation outcome from [`Self::open`] â€” errors are always empty
+    /// Validation outcome from [`Self::open`] — errors are always empty
     /// (fatal errors abort `open`), warnings are preserved.
     pub validation: ValidationResult,
 }
@@ -200,10 +200,10 @@ pub struct GllmPackage {
 impl GllmPackage {
     /// Open a GLLM package at `root`.
     ///
-    /// Steps: discover layout â†’ parse `gllm.json` â†’ run the semantic
+    /// Steps: discover layout → parse `gllm.json` → run the semantic
     /// validator (fatal findings abort with
-    /// [`GllmError::ManifestValidationError`]) â†’ open `GLLMShared.gllm`
-    /// verifying it against the manifest's checksum â†’ load
+    /// [`GllmError::ManifestValidationError`]) → open `GLLMShared.gllm`
+    /// verifying it against the manifest's checksum → load
     /// `checksums.sha256` when present. Layer files stay unopened (lazy).
     pub fn open(root: &Path) -> Result<Self, GllmError> {
         let layout = PackageLayout::discover(root)?;
@@ -257,7 +257,7 @@ impl GllmPackage {
     }
 
     /// Build a [`ChecksumVerifier`] from the manifest's per-file
-    /// checksums â€” the alternative when `checksums.sha256` is absent.
+    /// checksums — the alternative when `checksums.sha256` is absent.
     pub fn verifier_from_manifest(&self) -> Result<ChecksumVerifier, GllmError> {
         let mut entries = vec![ChecksumEntry {
             filename: self.manifest.shared.file.clone(),
@@ -280,7 +280,7 @@ impl GllmPackage {
 
     /// Open and header-validate the layer with the given index.
     ///
-    /// The result is cached â€” subsequent calls return the cached unit
+    /// The result is cached — subsequent calls return the cached unit
     /// without touching the filesystem.
     pub fn open_layer(&mut self, index: u32) -> Result<&ExecutionUnit, GllmError> {
         let pos = self
@@ -394,7 +394,7 @@ impl GllmPackage {
     /// Verify every entry of the checksum file against the package root.
     ///
     /// Returns all `(filename, error)` failures without short-circuiting;
-    /// empty when everything matches â€” or when no verifier was loaded
+    /// empty when everything matches — or when no verifier was loaded
     /// (check [`has_checksum_file`](Self::has_checksum_file) to tell the
     /// two apart).
     pub fn verify_integrity(&self) -> Vec<(String, GllmError)> {
@@ -687,7 +687,7 @@ mod tests {
     fn test_package_warnings_accessible() {
         let tmp = tempfile::tempdir().unwrap();
         make_valid_package_dir(tmp.path(), 1);
-        // Same major, newer minor â†’ loadable with a V02 warning.
+        // Same major, newer minor → loadable with a V02 warning.
         let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
         fs::write(
             tmp.path().join(MANIFEST_FILENAME),
@@ -735,7 +735,7 @@ mod tests {
         let pkg = GllmPackage::open(tmp.path()).unwrap();
         let layer = pkg.read_layer_file(0).unwrap();
         assert!(layer.tensor_index.is_empty());
-        // Manifest fixture lists no layer tensors either â†’ consistent.
+        // Manifest fixture lists no layer tensors either → consistent.
         assert!(pkg.cross_check_layer(0).unwrap().is_empty());
 
         let err = pkg.read_layer_file(9).unwrap_err();
@@ -747,7 +747,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         make_valid_package_dir(tmp.path(), 1);
         // Swap the manifest's shared checksum for a wrong (but
-        // well-formed) digest â€” the file itself is untouched.
+        // well-formed) digest — the file itself is untouched.
         let manifest = fs::read_to_string(tmp.path().join(MANIFEST_FILENAME)).unwrap();
         let shared_hex = crate::checksum::sha256_file(&tmp.path().join(SHARED_FILENAME)).unwrap();
         let wrong = crate::checksum::sha256_bytes(b"wrong");
