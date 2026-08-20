@@ -38,9 +38,17 @@ cargo build --release -p glbench
 The binary is `glbench`. It has **zero external dependencies** — only the Rust
 standard library and existing GwenLand workspace crates (`glcore`, `glproc`,
 `glcuda`, and optionally `glictus-caliburni` behind `--features gllm-bench`,
-see [Benchmarking GLLM](#benchmarking-gllm)). It works fully offline; the only
-network access anywhere in the stack is model fetching, which is GwenLand
-AI's job, not glbench's.
+see [Benchmarking GLLM](#benchmarking-gllm)).
+
+That's glbench's own charter rule, and it's stricter than GwenLand's
+project-wide baseline. The project-wide rule is **Zero ML Dependency** — no
+torch/candle/ort/ggml, anywhere — which still leaves room for things like an
+OS mmap wrapper or a CLI parser elsewhere in the tree. glbench goes further
+on purpose: it adds no crates.io dependency at all, ML or otherwise, so its
+JSON/CSV/Markdown export stays hand-rolled and decoupled from any
+serialization framework (see [`DESIGN.md`](DESIGN.md) §9). It works fully
+offline; the only network access anywhere in the stack is model fetching,
+which is GwenLand AI's job, not glbench's.
 
 ## Usage
 
@@ -192,6 +200,43 @@ inputs were actually measured, absent otherwise:
 - **scaling** (`scale` only) — `linear` / `sub-linear` / `saturating` /
   `insufficient data`, classified from the sweep's decode-tps-vs-tokens
   slope.
+
+## Training observation (v3, `--features train-bench`)
+
+```bash
+cargo build --release -p glbench --features train-bench
+
+# Observe a LoRA fine-tune on stumman and archive it.
+glbench train --d-in 64 --d-out 64 --rank 4 --samples 32 --epochs 8               --target-loss 0.5 --step-sample 8               --bit-scope gradients,optimizer --out train.json
+
+# Same, with inference roles labelled either side of the run.
+glbench unified --d-in 64 --d-out 64 --rank 4 --samples 32 --epochs 8
+
+# Per-step rows for a spreadsheet.
+glbench export train.json --format training-csv
+```
+
+**glbench does not drive training.** It builds a `Trainer`, installs an
+observer, and calls stumman's own `Trainer::train`. It never calls `train_step`
+in a loop of its own, never touches optimizer state, and never writes a
+parameter — the same measuring/doing boundary the inference side keeps.
+
+**There is no `--model` or `--dataset`, deliberately.** stumman M2 generates its
+frozen base weight from `--seed` and builds its dataset in memory from
+`--samples`/`--dataset-seed`; neither flag has a subject, so both are rejected
+with an error that explains why rather than reporting an unknown flag. The shape
+and seed flags fully determine the run, which makes it reproducible in a way a
+path would not be.
+
+**`--target-loss` has no default.** Time-to-target needs someone to say what
+good means for their model and their data. Without it, `steps_to_target` is
+archived as absent (`not_applicable`) rather than guessed; a target that *was*
+given and never reached is `not_observed`, which is a different claim.
+
+**`--step-sample N` matters more than it looks.** Observer overhead grows with
+layer width — measured at +4.3% (64×64), +11.5% (256×256), +14.2% (512×512) —
+and bit profiles follow the same `N`. On a 192-step run with both training bit
+scopes on, `--step-sample 16` took the archive from 1.21 MB to 83.5 KB.
 
 ## Interpreting Results
 

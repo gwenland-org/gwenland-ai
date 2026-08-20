@@ -116,6 +116,67 @@ impl VLTrainingSession {
         }
         out
     }
+
+    /// Parse an archived training session back.
+    ///
+    /// **Facts are reconstructed; derivations are recomputed.** The steps and
+    /// the counts around them are measurements, so they are read verbatim.
+    /// `attribution` and `convergence` are re-derived from those steps rather
+    /// than parsed, which is exactly the property `glbench/DESIGN.md` §3 claims
+    /// for the whole pipeline: re-running analysis over the same measurements
+    /// is deterministic. Parsing them instead would add a reader that can only
+    /// ever agree with the writer, and would let a hand-edited conclusion
+    /// survive a round trip its own measurements contradict.
+    ///
+    /// `memory`, `adapter`, `bit_profiles` and `post_eval` are not
+    /// reconstructed: nothing downstream of a read re-renders them today, and a
+    /// parser nobody exercises is a parser that rots.
+    pub fn from_json(v: &Json) -> Result<VLTrainingSession, String> {
+        let num = |key: &str| v.get(key).and_then(|n| n.as_f64()).unwrap_or(0.0);
+
+        let mut steps = Vec::new();
+        if let Some(arr) = v.get("steps").and_then(|s| s.as_arr()) {
+            for (i, step) in arr.iter().enumerate() {
+                steps.push(
+                    VLTrainingStep::from_json(step).map_err(|e| format!("steps[{i}]: {e}"))?,
+                );
+            }
+        }
+        let epoch_losses = v
+            .get("epoch_losses")
+            .and_then(|l| l.as_arr())
+            .map(|arr| arr.iter().filter_map(|l| l.as_f64()).map(|l| l as f32).collect())
+            .unwrap_or_default();
+
+        Ok(VLTrainingSession {
+            steps_observed: num("steps_observed") as usize,
+            steps_archived: num("steps_archived") as usize,
+            step_sample_n: (num("step_sample_n") as usize).max(1),
+            epochs: num("epochs") as usize,
+            epoch_losses,
+            optimizer: v
+                .get("optimizer")
+                .and_then(|o| o.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            attribution: crate::training::attribution::analyze(&steps),
+            convergence: crate::training::convergence::analyze(
+                &steps,
+                v.get("convergence")
+                    .and_then(|c| c.get("target_loss"))
+                    .and_then(|t| t.as_f64())
+                    .map(|t| t as f32),
+                crate::training::convergence::DEFAULT_EMA_ALPHA,
+                crate::training::convergence::DEFAULT_PLATEAU_WINDOW,
+                crate::training::convergence::DEFAULT_PLATEAU_THRESHOLD,
+            ),
+            memory: None,
+            adapter: None,
+            bit_profiles: Vec::new(),
+            post_eval: None,
+            steps,
+        })
+    }
 }
 
 impl ToJson for VLTrainingSession {

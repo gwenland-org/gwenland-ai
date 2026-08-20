@@ -62,6 +62,58 @@ fn push_row(
     ));
 }
 
+/// The CSV header for a training session's per-step rows.
+///
+/// A separate header from [`HEADER`] because these are different rows about
+/// different things. Emitting training steps under the iteration header with
+/// blank columns would produce a file whose every row means something the
+/// header does not say.
+#[cfg(feature = "train-bench")]
+pub const TRAINING_HEADER: &str = "label,step,epoch,loss,forward_ns,backward_ns,optimizer_ns,total_ns,grad_count,grad_elements,grad_l2_norm,grad_nan,grad_inf,lr";
+
+/// Render a training session's archived steps as CSV.
+///
+/// One row per **archived** step, which under `--step-sample N` is not every
+/// step (D-19). The row's `step` column carries the real step index rather than
+/// a row number, so a thinned series plots against the right x-axis instead of
+/// looking like a complete run that went N times faster.
+///
+/// Returns an empty string when there is no training block — a header with no
+/// rows would suggest a run that trained nothing.
+#[cfg(feature = "train-bench")]
+pub fn render_training(session: &BenchmarkSession) -> String {
+    let Some(t) = session.training.as_ref() else {
+        return String::new();
+    };
+    if t.steps.is_empty() {
+        return String::new();
+    }
+    let mut s = String::new();
+    s.push_str(TRAINING_HEADER);
+    s.push('\n');
+    let label = quote(&session.metadata.label);
+    for step in &t.steps {
+        s.push_str(&label);
+        s.push_str(&format!(
+            ",{},{},{:.8},{},{},{},{},{},{},{:.8},{},{},{:.8}\n",
+            step.index,
+            step.epoch,
+            step.loss,
+            step.forward_ns,
+            step.backward_ns,
+            step.optimizer_ns,
+            step.total_ns,
+            step.grad_count,
+            step.grad_elements,
+            step.grad_l2_norm,
+            step.grad_nan,
+            step.grad_inf,
+            step.lr,
+        ));
+    }
+    s
+}
+
 /// Quote a field if it contains a comma, quote, or newline (RFC-4180 style).
 fn quote(field: &str) -> String {
     if field.contains([',', '"', '\n']) {

@@ -171,6 +171,31 @@ pub fn render(session: &BenchmarkSession) -> String {
         s.push_str(&behavior_section(b, session.workload.engine == "gllm"));
     }
 
+    // Training (Wave 5). Placed before validation so the reader sees what was
+    // measured before they see whether to trust it, matching the inference
+    // sections above.
+    #[cfg(feature = "train-bench")]
+    if let Some(t) = &session.training {
+        s.push_str(&training_section(t));
+    }
+
+    // Why every null in this archive has no value (D-09). Emitted whenever
+    // there is anything to explain, because a reader who finds a null and no
+    // explanation cannot tell "not measured" from "measured as nothing".
+    if !session.availability.is_empty() {
+        s.push_str("## Availability\n\n");
+        s.push_str("Why a field in this archive carries no value.\n\n");
+        s.push_str("| Path | Status | Note |\n|---|---|---|\n");
+        for (path, entry) in &session.availability {
+            s.push_str(&format!(
+                "| `{path}` | {} | {} |\n",
+                entry.status.as_str(),
+                entry.note.as_deref().unwrap_or("")
+            ));
+        }
+        s.push('\n');
+    }
+
     // Validation.
     if let Some(v) = &session.validation {
         s.push_str("## Validation\n\n");
@@ -181,10 +206,186 @@ pub fn render(session: &BenchmarkSession) -> String {
         s.push('\n');
     }
 
+    // Integrity, when the session has been sealed. Stated with its own
+    // caveat: a digest is not a signature, and a reader who sees a hex string
+    // without that sentence will assume more of it than it can carry.
+    if let Some(i) = &session.integrity {
+        s.push_str(&format!(
+            "## Integrity\n\n- **Algorithm:** `{}`\n- **Digest:** `{}`\n\n\
+             Detects accidental modification. Not a signature — anyone who can \
+             edit this archive can recompute the digest.\n\n",
+            i.algorithm, i.digest
+        ));
+    }
+
     s.push_str(&format!(
-        "---\n_glbench {} · schema v{}_\n",
-        session.metadata.glbench_version, session.metadata.schema_version
+        "---\n_glbench {} · schema v{} · {}_\n",
+        session.metadata.glbench_version,
+        session.metadata.schema_version,
+        session.metadata.session_mode.as_str()
     ));
+    s
+}
+
+/// The training report: what was trained, how it converged, where the time and
+/// memory went.
+#[cfg(feature = "train-bench")]
+fn training_section(t: &crate::training::VLTrainingSession) -> String {
+    let mut s = String::new();
+    s.push_str("## Training\n\n");
+
+    if let Some(a) = &t.adapter {
+        s.push_str(&format!(
+            "- **Adapter:** {} rank {} alpha {:.1} (scaling {:.3}) over {}x{}\n",
+            a.kind, a.rank, a.alpha, a.scaling, a.d_in, a.d_out
+        ));
+        s.push_str(&format!(
+            "- **Trainable:** {} of {} parameters ({:.2}%)\n",
+            a.trainable_parameters,
+            a.base_parameters,
+            a.parameter_ratio * 100.0
+        ));
+    }
+    s.push_str(&format!("- **Optimizer:** {}\n", t.optimizer));
+    s.push_str(&format!("- **Epochs:** {}\n", t.epochs));
+    // Sampling is stated even when N is 1, so a reader never has to infer
+    // whether the step array is complete (D-19).
+    s.push_str(&format!(
+        "- **Steps:** {} observed, {} archived (sample N={})\n\n",
+        t.steps_observed, t.steps_archived, t.step_sample_n
+    ));
+
+    if !t.epoch_losses.is_empty() {
+        s.push_str("### Epoch loss\n\n| Epoch | Mean loss |\n|---|---|\n");
+        for (i, loss) in t.epoch_losses.iter().enumerate() {
+            s.push_str(&format!("| {i} | {loss:.6} |\n"));
+        }
+        s.push('\n');
+    }
+
+    if !t.steps.is_empty() {
+        let points: Vec<(usize, f32)> = t.steps.iter().map(|st| (st.index, st.loss)).collect();
+        s.push_str("### Loss curve\n\n```text\n");
+        s.push_str(crate::render::loss_curve::render(&points).trim_start_matches('\n'));
+        s.push_str("```\n\n");
+        s.push_str(&format!("{}\n\n", crate::render::loss_curve::summary(&points)));
+    }
+
+    if let Some(c) = &t.convergence {
+        s.push_str("### Convergence\n\n");
+        s.push_str(&format!(
+            "- **Loss:** {:.6} -> {:.6} (best {:.6} at step {})\n",
+            c.first_loss, c.final_loss, c.best_loss, c.best_step
+        ));
+        s.push_str(&format!("- **Slope:** {:+.3e} per step\n", c.slope_per_step));
+        s.push_str(&format!(
+            "- **EMA:** {:.6} (alpha {:.2})\n",
+            c.ema_final, c.ema_alpha
+        ));
+        // Window and threshold travel with the verdict. Without them "plateau
+        // detected" is an opinion with a number attached (research §14).
+        s.push_str(&format!(
+            "- **Plateau:** {} over {} steps at relative threshold {:.1e}\n",
+            if c.plateau_detected { "detected" } else { "not detected" },
+            c.plateau_window,
+            c.plateau_threshold
+        ));
+        s.push_str(&format!(
+            "- **Stability (CV):** {:.4} over {} steps\n",
+            c.cv, c.cv_window
+        ));
+        match (c.target_loss, c.steps_to_target) {
+            (None, _) => s.push_str(
+                "- **Target:** none given. `--target-loss` has no default; \
+                 time-to-target is not reported without one.\n",
+            ),
+            (Some(target), Some(step)) => {
+                s.push_str(&format!("- **Target:** {target:.6} reached at step {step}\n"))
+            }
+            (Some(target), None) => s.push_str(&format!(
+                "- **Target:** {target:.6} NOT reached in this run\n"
+            )),
+        }
+        s.push('\n');
+    }
+
+    if let Some(a) = &t.attribution {
+        s.push_str("### Step time\n\n");
+        s.push_str(&format!(
+            "Mean {:.4} ms per step over {} steps.\n\n",
+            a.mean_step_ms, a.steps
+        ));
+        s.push_str("```text\n");
+        s.push_str(
+            crate::render::flamegraph::render_training_step(
+                a.forward_ms,
+                a.backward_ms,
+                a.optimizer_ms,
+                a.total_ms,
+            )
+            .trim_start_matches('\n'),
+        );
+        s.push_str("```\n\n");
+    }
+
+    if let Some(m) = &t.memory {
+        s.push_str("### Memory\n\n");
+        s.push_str(&format!(
+            "- **Trainable parameters:** {} bytes (derived, exact)\n",
+            m.parameter_bytes
+        ));
+        match m.optimizer_state_bytes {
+            Some(b) => s.push_str(&format!("- **Optimizer state:** {b} bytes\n")),
+            None => s.push_str(
+                "- **Optimizer state:** not read (no bit scope requested the payload)\n",
+            ),
+        }
+        match m.peak_rss_bytes {
+            Some(b) => s.push_str(&format!(
+                "- **Peak RSS:** {:.4} GiB\n",
+                bytes_to_gib(b)
+            )),
+            None => s.push_str("- **Peak RSS:** not available on this platform\n"),
+        }
+        s.push('\n');
+    }
+
+    if !t.bit_profiles.is_empty() {
+        s.push_str("### GLBitProf\n\n");
+        s.push_str(&format!(
+            "{} tensors profiled, sampled with the same N as the steps.\n\n",
+            t.bit_profiles.len()
+        ));
+        s.push_str("| Step | Scope | Tensor | Elements | Sign set | Exponent | Mantissa entropy |\n");
+        s.push_str("|---|---|---|---|---|---|---|\n");
+        for entry in t.bit_profiles.iter().take(20) {
+            let p = &entry.scope.profile;
+            let mantissa = match p.mantissa_entropy_bits {
+                // "skipped" never reads as 0.0: a mantissa that was never
+                // profiled has no entropy, which is a different statement from
+                // having none (D-12).
+                None => "skipped".to_string(),
+                Some(b) => format!("{b:.4} b"),
+            };
+            s.push_str(&format!(
+                "| {} | {} | `{}` | {} | {:.1}% | {}..{} | {mantissa} |\n",
+                entry.step_index,
+                entry.scope.scope.as_str(),
+                entry.scope.tensor_name,
+                p.count,
+                p.sign_set_ratio * 100.0,
+                p.exponent_min,
+                p.exponent_max
+            ));
+        }
+        if t.bit_profiles.len() > 20 {
+            s.push_str(&format!(
+                "\n_{} more rows omitted; the full set is in the JSON archive._\n",
+                t.bit_profiles.len() - 20
+            ));
+        }
+        s.push('\n');
+    }
     s
 }
 

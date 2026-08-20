@@ -4,6 +4,18 @@ Codename **Mensura Veritatis** ("measure of truth"). This document records the
 responsibility boundaries, the data flow, and the design decisions that keep
 glbench honest.
 
+> **⚠️ This is the v1/v2 design.** The v3 design — schema v2, null semantics,
+> content digest, GLBitProf, training observation — lives at
+> **`architecture/glbench-v3/DESIGN.md`**, with decisions numbered D-01…D-20 and
+> grounding findings F-01…F-11. If you are looking for a section number like
+> §6.5 or a decision like D-12, that is the file you want; nothing in *this*
+> document uses that numbering.
+>
+> Everything below still holds. v3 extends the envelope and adds modules; it
+> changes none of the boundaries here. §9's zero-dependency rule in particular
+> survived v3 intact — the whole of v3 added **zero** external crates and
+> removed seven.
+
 ---
 
 ## 1. Responsibility boundary
@@ -139,11 +151,35 @@ refuses to read a file whose schema is newer than the running build. Historical
 trend (`comparison::trend`) is computed over whatever ordered set of files the
 user hands in — there is no persistent store.
 
+## 8b. Integrity and null semantics (v3)
+
+Two properties were added to the archive in v3, both in service of §5's rule
+that measurement stores facts:
+
+- **Every `null` says why it is null.** An `availability` map keyed by dotted
+  field path records the reason — measured, estimated, derived, unsupported,
+  unavailable, not applicable, not observed, does not exist. A `null` with no
+  entry fails the session *at write time*, which is what keeps the map from
+  decaying into optional prose.
+- **Every archive carries a content digest.** `sha256-128` over the archive's
+  own canonical JSON, verified by default on read. It detects accidental
+  modification. It is **not** a signature — anyone who can edit the file can
+  recompute it — and the archive states that in its own `integrity.note` field
+  rather than leaving a reader to assume otherwise.
+
+Both are elaborations of the same idea §6 already states: be honest about what
+you do not know, in the file itself and not only in the docs.
+
 ## 9. Dependencies: zero, on purpose
 
 glbench adds **no** crates.io dependencies. The JSON reader/writer
-(`export::json`), CSV writer, Markdown renderer, table layout, and argument
-parser are all hand-rolled against the standard library. This keeps the data
+(`export::json`), CSV writer, Markdown renderer, table layout, argument parser,
+SHA-256 (via `glcore::hash`), and ASCII loss curve are all hand-rolled against
+the standard library.
+
+This survived v3 unchanged, and was measured rather than assumed: the workspace
+went from 132 to **125** unique crates across the five waves — seven removed
+(`sha2` and its transitive tree), none added. This keeps the data
 model decoupled from any serialization framework and guarantees glbench builds
 and runs offline. The workspace crates it depends on (`glcore`, `glproc`,
 `glcuda`) are the engines it measures, not external dependencies.

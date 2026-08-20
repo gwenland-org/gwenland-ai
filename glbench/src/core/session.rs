@@ -179,13 +179,17 @@ impl BenchmarkSession {
                 Some(i) if !matches!(i, Json::Null) => Some(VLInferenceSession::from_json(i)?),
                 _ => Some(VLInferenceSession::standalone()),
             },
-            // Not reconstructed, for the same reason `telemetry` and `behavior`
-            // are not: a training session is a record of a run that already
-            // happened, and a parser for it could only ever agree with the
-            // writer. `inspect` re-renders from the JSON; nothing recomputes a
-            // training run from its archive.
+            // Reconstructed, unlike `telemetry` and `behavior`: a training
+            // session's steps are measured facts that `export` needs to
+            // re-render, and its derived reports are recomputed from them
+            // rather than parsed. See `VLTrainingSession::from_json`.
             #[cfg(feature = "train-bench")]
-            training: None,
+            training: match v.get("training") {
+                Some(t) if !matches!(t, Json::Null) => {
+                    Some(crate::training::VLTrainingSession::from_json(t)?)
+                }
+                _ => None,
+            },
             availability: availability::from_json(v.get("availability"))?,
             integrity: match v.get("integrity") {
                 Some(i) if !matches!(i, Json::Null) => Some(VLIntegrity::from_json(i)?),

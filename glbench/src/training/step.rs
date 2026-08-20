@@ -101,6 +101,35 @@ impl ToJson for VLTrainingStep {
     }
 }
 
+impl VLTrainingStep {
+    /// Parse an archived step back.
+    ///
+    /// Steps are **measured facts**, so unlike the derived reports they are
+    /// reconstructed: `glbench export` needs them to re-render an archive it
+    /// did not produce, and re-deriving attribution and convergence from them
+    /// is deterministic (`glbench/DESIGN.md` §3). Missing numeric fields read
+    /// as 0 rather than failing — an archive from a build with fewer fields is
+    /// still readable.
+    pub fn from_json(v: &Json) -> Result<VLTrainingStep, String> {
+        let num = |key: &str| v.get(key).and_then(|n| n.as_f64()).unwrap_or(0.0);
+        Ok(VLTrainingStep {
+            index: num("index") as usize,
+            epoch: num("epoch") as usize,
+            loss: num("loss") as f32,
+            forward_ns: num("forward_ns") as u64,
+            backward_ns: num("backward_ns") as u64,
+            optimizer_ns: num("optimizer_ns") as u64,
+            total_ns: num("total_ns") as u64,
+            grad_count: num("grad_count") as usize,
+            grad_elements: num("grad_elements") as usize,
+            grad_l2_norm: num("grad_l2_norm"),
+            grad_nan: num("grad_nan") as usize,
+            grad_inf: num("grad_inf") as usize,
+            lr: num("lr"),
+        })
+    }
+}
+
 /// Dotted paths this type emits as `null`, for the session's availability map.
 ///
 /// Returned rather than hard-coded at the call site so the list cannot drift
@@ -166,6 +195,24 @@ mod tests {
                 "{path} must be null, not absent and not 0"
             );
         }
+    }
+
+    #[test]
+    fn an_archived_step_round_trips_through_json() {
+        let back = VLTrainingStep::from_json(&sample().to_json()).unwrap();
+        assert_eq!(back, sample());
+    }
+
+    /// An archive from a build with fewer fields must still read, with the
+    /// missing numbers as 0 rather than a parse failure.
+    #[test]
+    fn a_step_missing_fields_reads_as_zeros_rather_than_failing() {
+        let sparse = Json::obj([("index", Json::n(4.0)), ("loss", Json::n(0.5))]);
+        let step = VLTrainingStep::from_json(&sparse).unwrap();
+        assert_eq!(step.index, 4);
+        assert!((step.loss - 0.5).abs() < 1e-6);
+        assert_eq!(step.grad_count, 0);
+        assert_eq!(step.total_ns, 0);
     }
 
     /// The declared null list must match what the projection actually emits, or

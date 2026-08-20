@@ -56,8 +56,14 @@ glbench/
 │   │                         trend, accuracy-vs-performance
 │   ├── validation/         — integrity, determinism, numerical parity (oracle),
 │   │                         KV-cache memory-risk
+│   ├── numerical/          — GLBitProf: bit-level tensor observation. The
+│   │                         math is UNGATED (`&[f32] -> VLBitProfile`); its
+│   │                         sources are gated per source (v3 D-11)
+│   ├── training/           — training observation, all behind `train-bench`
+│   │                         so a default build never compiles stumman (D-02)
 │   ├── export/             — hand-rolled JSON / Markdown / CSV writers
-│   ├── render/             — terminal text + tables + ASCII flame graph
+│   ├── render/             — terminal text + tables + ASCII flame graph +
+│   │                         ASCII loss curve (ungated, plots (step, loss))
 │   ├── storage/            — user-managed archive files (no database)
 │   ├── quant_info.rs       — `.gllm` manifest tally (see "Two .gllm readers" below)
 │   ├── ppl.rs              — WikiText-2 perplexity via the `.gllm` runtime
@@ -145,7 +151,7 @@ feature or its `glictus-caliburni` dependency at all.
 The caveat, now that it's been named explicitly elsewhere in this repo: this
 is structurally the same shape as the "two independent implementations of
 the same format, agreeing only by construction" pattern documented in
-[`architecture/mensura-veritatis-v3/ARTX2-Quant.md`](../architecture/mensura-veritatis-v3/ARTX2-Quant.md)
+[`architecture/gl-stack-audit-2026-07/ARTX2-Quant.md`](../architecture/gl-stack-audit-2026-07/ARTX2-Quant.md)
 — there, two independent *bit-level* dequant implementations silently
 diverged (the Q6_K bug). The risk here is much smaller (`quant_info.rs`
 parses JSON structure and a dtype string tally, not packed binary weights —
@@ -155,6 +161,50 @@ schema changes and only `glictus-caliburni::manifest` gets updated,
 without erroring. Worth a schema-drift regression test if `quant-info`
 becomes load-bearing for anything beyond its current diagnostic role — not
 done as part of this document, flagged for whoever picks it up.
+
+## Feature gates, and what each one costs
+
+| Feature | Pulls in | Enables |
+|---|---|---|
+| *(default)* | `glcore`, `glproc`, `glcuda` | everything except the two below |
+| `gllm-bench` | `glictus-caliburni` (`glproc-backend`, `converter`) | `ppl`, `kl-div`, `tensor-stats`, `--bit-scope weights` |
+| `train-bench` | `stumman` | `glbench train`, `glbench unified`, `--bit-scope gradients\|optimizer` |
+
+Both are optional for the same reason: a default `cargo build --workspace`
+must not compile them. Verified rather than assumed — building the workspace
+with no features compiles `stumman` **zero times**.
+
+`train-bench` needs one thing the design did not anticipate: `stumman` declares
+its own `[workspace]`, so it must also appear in the **root** `Cargo.toml`
+`exclude` list or cargo refuses the path dependency with "multiple workspace
+roots found in the same workspace". Both isolation properties still hold after
+that change — the default build ignores stumman, and `cd stumman && cargo test`
+still works standalone.
+
+## The v3 envelope (schema v2)
+
+`SCHEMA_VERSION` is 2. A v3 build reads a v1 archive by defaulting
+`session_mode` to `inference_only`, `availability` to an empty map, and
+`integrity` to absent; a v1 build correctly refuses a v2 archive through the
+existing check in `storage::archive::read`. The v1 fixture under
+`tests/fixtures/v1_archive.json` was derived from the pre-v3 writer's own
+source and its key set verified against it, so the compatibility claim is not
+the v3 writer grading its own homework.
+
+Three things the envelope adds:
+
+- **`availability`** — a sparse map from dotted field path to why that field
+  has no value. A `null` with no entry is a defect, and
+  `validation::availability` fails the session on one (D-10). `archive::write`
+  is the finalisation point where that check runs, so a malformed archive is
+  never written; `--null-semantics lenient` downgrades it to a warning.
+- **`integrity`** — a `sha256-128` content digest over the archive's own
+  canonical JSON. It detects accidental modification and is **not a
+  signature**: anyone who can edit the file can recompute it, and
+  `storage::digest`'s own docs say so.
+- **`inference` / `training`** — each carrying an explicit role, so a
+  `unified` session's before-and-after runs are distinguishable from the data
+  rather than from their position in the tree.
 
 ## Data flow
 
