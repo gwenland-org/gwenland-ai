@@ -684,10 +684,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let d7 = 3584usize;
         let h7 = 18944usize;
         let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
-        // (label, out_dim, in_dim) at real 7B shapes.
-        for (label, out_dim, in_dim) in
-            [("gate_up", 2 * h7, d7), ("down   ", d7, h7)]
-        {
+        // Qwen2.5-0.5B, the model actually being benchmarked. These three
+        // rows are a controlled experiment, not a survey.
+        //
+        // A measured prefill profile put down+o at 66% of prefill while
+        // gate+up — the same weight-matrix size, transposed — took 10%. Two
+        // explanations fit: the grid is ceil_div(out_dim, 64), so `down` gets
+        // 14 blocks against `gate`'s 76 on a 40-SM device; or `down`'s K is
+        // 4864 against 896, a 5.4x longer dependent accumulation chain per
+        // block.
+        //
+        // Issuing the prefill sub-slabs across four streams (~56 blocks in
+        // flight instead of 14) moved nothing: -0.6%. That is evidence
+        // against the block-count explanation, so `o_proj` is here as the
+        // control that separates them:
+        //
+        //     gate    76 blocks, K=896    <- blocks differ, K same as o_proj
+        //     o_proj  14 blocks, K=896    <- the control
+        //     down    14 blocks, K=4864   <- K differs, blocks same as o_proj
+        //
+        // If o_proj is fast and down is slow, K is the problem and split-K is
+        // the lever. If both are slow, block count still is, and the stream
+        // A/B failed for some other reason.
+        let d05 = 896usize;
+        let h05 = 4864usize;
+        // (label, out_dim, in_dim)
+        for (label, out_dim, in_dim) in [
+            ("gate_up 7B ", 2 * h7, d7),
+            ("down    7B ", d7, h7),
+            ("gate    .5B", h05, d05),
+            ("o_proj  .5B", d05, d05),
+            ("down    .5B", d05, h05),
+        ] {
             let mark = buf.mark();
             let nb = in_dim / 32;
             let wbytes = (out_dim * in_dim + out_dim * nb * 2) as f64; // qs + f16 scales
@@ -742,6 +770,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             buf.reset_to(mark);
         }
         println!("[gemm-reuse] time/token FLAT across ntok => compute/issue-bound, Phase B reuse buys ~0; time/token FALLING steeply => weight-BW-bound, Phase B pays. Compare eff GB/s to the ~266 achievable.");
+        println!(
+            "[gemm-reuse] .5B rows are a control: gate(76 blk, K=896) vs \
+             o_proj(14 blk, K=896) vs down(14 blk, K=4864). o_proj fast + \
+             down slow => K length is the limit (split-K). Both slow => block \
+             count is, despite the multi-stream A/B saying otherwise."
+        );
     }
 
     // ============================================================
