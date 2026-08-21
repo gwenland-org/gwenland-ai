@@ -436,7 +436,34 @@ fn gemm_mma_q8_matches_dequantized_reference() {
     for (out_dim, in_dim, ntok) in [(16usize, 64usize, 5usize), (16, 64, 20), (16, 64, 64)] {
         gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, false);
     }
+    for (out_dim, in_dim, ntok) in REAL_SHAPES {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, false);
+    }
 }
+
+/// The shapes this engine actually runs, for Qwen2.5-0.5B (dim 896,
+/// intermediate 4864).
+///
+/// ⛔ Every GEMM case here used to be `out_dim=16, in_dim=64`: one block, two
+/// of eight warps in range, a K-loop of two 32-blocks. No shape the model
+/// executes was covered by any GEMM test, so both "pass" and "fail" said
+/// almost nothing about production behaviour — a gap found only when the r256
+/// kernel failed and the failure turned out to be unrepresentative either way.
+///
+/// The block counts are the point. The grid is `ceil_div(out_dim, 64)` with no
+/// split over K or tokens, so `out_dim` alone decides how much of the device
+/// is used — 76 blocks for `gate`/`up`, 14 for `down`/`o`/`q`, 2 for `k`/`v`,
+/// on a 40-SM T4. A measured prefill profile put `down`+`o` at 66% of prefill
+/// while `gate`+`up`, moving twice the weight bytes, took 10%.
+///
+/// `ntok` is capped at 64 because that is `gemm_mma_q8`'s contract; the runner
+/// chunks longer prompts. Keeping it at the cap exercises all eight m-tiles.
+const REAL_SHAPES: [(usize, usize, usize); 4] = [
+    (896, 896, 64),   // q and o_proj: 14 blocks, square
+    (128, 896, 64),   // k and v: 2 blocks — the narrowest output in the model
+    (4864, 896, 64),  // gate and up: 76 blocks, the wide output
+    (896, 4864, 64),  // down: 14 blocks over the longest K in the model
+];
 
 /// Phase B r256 kernel: same math as the 8-tile GEMM but 32 m-tiles (256
 /// rows/read). ntok cases span the guard boundaries — 5 (tile 0 only), 128
@@ -452,6 +479,14 @@ fn gemm_mma_q8_r256_matches_dequantized_reference() {
         [(16usize, 64usize, 5usize), (16, 64, 128), (16, 64, 200), (16, 64, 256)]
     {
         gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, true);
+    }
+    // Real shapes at the token count a 220-token prompt would actually use in
+    // one r256 call — the whole reason the kernel exists. Currently
+    // unreachable: this test fails at (16, 64, 5) first. Kept so that whoever
+    // fixes the indexing defect is held to production shapes, not to the toy
+    // case that reported 41-43% on a wrong answer.
+    for (out_dim, in_dim, _) in REAL_SHAPES {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, 220, true);
     }
 }
 
@@ -482,7 +517,19 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
         qs.extend_from_slice(&block[2..34]);
     }
 
-    let bytes = (qs.len() + scales.len() + (ntok_pad * in_dim) * 5 + ntok * out_dim * 4 + 8192) as u64;
+    // Sized per allocation rather than by a rule of thumb. The old
+    // `(ntok_pad * in_dim) * 5 + 8192` happened to cover the toy shapes: the
+    // *5 is x-as-f32 (4) plus x-as-int8 (1), leaving the per-32 scale buffer
+    // to come out of the 8 KiB slack. At in_dim=4864 that buffer alone is
+    // 38 KiB and the allocation would have failed — a limit invisible while
+    // every case was 16x64.
+    let bytes = (qs.len()                        // weights, int8
+        + scales.len()                           // weight scales, f16
+        + ntok_pad * in_dim * 4                  // x, f32
+        + ntok_pad * in_dim                      // x, quantized int8
+        + (ntok_pad * in_dim / 32) * 4           // x scales, f32
+        + ntok * out_dim * 4                     // y
+        + 64 * 1024) as u64;                     // alignment slack, six allocations
     let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
     let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
     cuda.htod(dwqs, &qs).unwrap();
@@ -507,7 +554,16 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
     buf.free(cuda).unwrap();
 
     let name = if r256 { "gemm_mma_q8_r256" } else { "gemm_mma_q8" };
-    assert_close(&got, &want, EPS_Q8_GEMV, &format!("{name}(ntok={ntok})"));
+    // The shape belongs in the label: with several cases per test, a message
+    // that names only ntok forces you to reproduce the failure before you can
+    // tell which matrix produced it.
+    assert_close(
+        &got,
+        &want,
+        EPS_Q8_GEMV,
+        &format!("{name}(out={out_dim}, in={in_dim}, ntok={ntok}, blocks={})",
+                 out_dim.div_ceil(64)),
+    );
 }
 
 #[test]
