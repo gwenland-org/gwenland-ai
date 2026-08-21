@@ -89,9 +89,60 @@ pub struct Cuda {
     /// graph instead of executing. `AtomicPtr` so `Cuda` stays `Sync`;
     /// only ever flipped between launches by the single owning thread.
     launch_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// Streams for issuing independent prefill sub-slabs concurrently.
+    ///
+    /// `None` unless `GLCUDA_MULTI_STREAM_PREFILL` is set, and never created
+    /// otherwise — the default execution model stays one stream, as
+    /// documented in the crate root. See [`Cuda::prefill_streams`].
+    prefill_streams: std::sync::OnceLock<Option<StreamPool>>,
     /// Facts about the device this handle is bound to.
     pub info: DeviceInfo,
 }
+
+/// How many streams the prefill pool holds when enabled without an explicit
+/// count. A 220-token prompt splits into four 64-row sub-slabs, so four
+/// covers the shape that motivated this.
+const DEFAULT_PREFILL_STREAMS: usize = 4;
+
+/// A set of non-blocking streams for issuing independent work concurrently.
+///
+/// Owns its streams and destroys them on drop. Non-blocking is required: a
+/// stream created without that flag implicitly synchronizes with the default
+/// stream, which would serialize exactly the work this exists to overlap.
+pub struct StreamPool {
+    api: Arc<DriverApi>,
+    streams: Vec<CUstream>,
+}
+
+impl StreamPool {
+    /// Number of streams in the pool. Always >= 1 when the pool exists.
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Never true for a pool that was successfully created; present because
+    /// clippy asks for it alongside `len`.
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+}
+
+impl Drop for StreamPool {
+    fn drop(&mut self) {
+        for s in self.streams.drain(..) {
+            // SAFETY: each stream was created by this pool and is no longer
+            // referenced. Teardown errors are unreportable.
+            unsafe {
+                let _ = (self.api.cu_stream_destroy)(s);
+            }
+        }
+    }
+}
+
+// SAFETY: CUDA streams are context-level objects and the driver API is
+// thread-safe; the pool hands out no interior mutability of its own.
+unsafe impl Send for StreamPool {}
+unsafe impl Sync for StreamPool {}
 
 // SAFETY: the CUDA driver API is thread-safe; the context handle is a
 // process-wide primary context, valid from any thread once retained.
@@ -169,6 +220,7 @@ impl Cuda {
                 device,
                 ctx,
                 launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                prefill_streams: std::sync::OnceLock::new(),
                 info: DeviceInfo { name, sm_major, sm_minor, sm_count, total_mem, driver_version },
             })
         }
@@ -445,6 +497,117 @@ impl Cuda {
             let _ = (self.api.cu_stream_destroy)(stream);
         }
         result
+    }
+
+    /// The prefill stream pool, or `None` when multi-stream prefill is off.
+    ///
+    /// # Why this exists
+    ///
+    /// The MMA GEMM's grid is `ceil_div(out_dim, 64)` — nothing splits K or
+    /// tokens — so `out_dim` alone decides how much of the device is used. On
+    /// a 40-SM T4 running Qwen2.5-0.5B that is 76 blocks for `gate`/`up` and
+    /// **14 for `down`**, which a measured prefill profile put at 66% of
+    /// prefill time while `gate`+`up`, moving twice the weight bytes, took
+    /// 10%.
+    ///
+    /// A prompt longer than 64 tokens is already issued as several
+    /// independent sub-slabs: same weights, different activation rows,
+    /// disjoint output. They are only sequential because they share one
+    /// stream. Issuing them on separate streams puts 4x the blocks in flight
+    /// without touching the kernel — and, as a side effect, the concurrent
+    /// sub-slabs read the same weights, which L2 may serve once instead of
+    /// four times.
+    ///
+    /// # Why it is opt-in
+    ///
+    /// The crate root documents one stream and one sync per token. This is an
+    /// experiment against that invariant, so it is off unless
+    /// `GLCUDA_MULTI_STREAM_PREFILL` is set, and a failure to create the pool
+    /// degrades to the single-stream path rather than failing the run. Set the
+    /// variable to a number to choose the pool size.
+    pub fn prefill_streams(&self) -> Option<&StreamPool> {
+        self.prefill_streams
+            .get_or_init(|| {
+                let raw = std::env::var_os("GLCUDA_MULTI_STREAM_PREFILL")?;
+                let n = raw
+                    .to_str()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|n| *n >= 2)
+                    .unwrap_or(DEFAULT_PREFILL_STREAMS);
+                match self.make_stream_pool(n) {
+                    Ok(pool) => {
+                        eprintln!("[glcuda] multi-stream prefill: {n} streams");
+                        Some(pool)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[glcuda] multi-stream prefill unavailable ({e}); \
+                             staying on the single-stream path"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Create `n` non-blocking streams.
+    fn make_stream_pool(&self, n: usize) -> Result<StreamPool, GlError> {
+        use crate::ffi::CU_STREAM_NON_BLOCKING;
+        let mut streams = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut s: CUstream = std::ptr::null_mut();
+            // SAFETY: out pointer valid; flag is the documented non-blocking
+            // constant.
+            unsafe {
+                check(
+                    &self.api,
+                    (self.api.cu_stream_create)(&mut s, CU_STREAM_NON_BLOCKING),
+                    "cuStreamCreate",
+                )
+            }
+            // Streams already created are freed by the partial pool's Drop.
+            .map_err(|e| {
+                drop(StreamPool { api: self.api.clone(), streams: std::mem::take(&mut streams) });
+                e
+            })?;
+            streams.push(s);
+        }
+        Ok(StreamPool { api: self.api.clone(), streams })
+    }
+
+    /// Point launches at `pool`'s stream `i` for the duration of `body`.
+    ///
+    /// The previous launch target is saved and restored rather than reset to
+    /// NULL: forcing the default stream here would silently break an enclosing
+    /// graph capture. Prefill is not captured today, and this keeps that from
+    /// becoming a trap if it ever is.
+    pub fn on_stream<F>(&self, pool: &StreamPool, i: usize, body: F) -> Result<(), GlError>
+    where
+        F: FnOnce() -> Result<(), GlError>,
+    {
+        use std::sync::atomic::Ordering;
+        let previous = self.launch_stream.load(Ordering::Relaxed);
+        self.launch_stream.store(pool.streams[i % pool.streams.len()], Ordering::Relaxed);
+        let result = body();
+        self.launch_stream.store(previous, Ordering::Relaxed);
+        result
+    }
+
+    /// Wait for every stream in `pool`.
+    ///
+    /// Blunt on purpose: without an event API this is what makes work issued
+    /// across the pool visible to the next kernel on the default stream. It
+    /// costs a host round-trip per call, which is the price of measuring the
+    /// idea before building the machinery to do it properly.
+    pub fn sync_pool(&self, pool: &StreamPool) -> Result<(), GlError> {
+        for s in &pool.streams {
+            // SAFETY: streams are live and owned by the pool.
+            unsafe {
+                check(&self.api, (self.api.cu_stream_synchronize)(*s), "cuStreamSynchronize")?
+            };
+        }
+        Ok(())
     }
 
     /// Replay a captured graph on the default stream and wait for it.

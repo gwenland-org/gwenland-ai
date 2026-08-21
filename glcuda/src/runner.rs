@@ -163,21 +163,52 @@ fn gemm_rows(
                 // the T4 runs only bench + profiler, not cargo test). Re-wire
                 // only after gemm_mma_q8_r256_matches_dequantized_reference is
                 // green on the T4.
+                // The sub-slabs below are independent: same weights, disjoint
+                // activation rows, disjoint output. They are sequential only
+                // because they share a stream. With
+                // GLCUDA_MULTI_STREAM_PREFILL set they are issued across a
+                // stream pool instead, putting one sub-slab's worth of blocks
+                // in flight per stream.
+                //
+                // This matters most where the grid is smallest. The grid is
+                // ceil_div(out_dim, 64) and nothing splits K or tokens, so on
+                // a 40-SM T4 `down` gets 14 blocks — and a measured profile
+                // put down+o at 66% of prefill while gate+up, moving twice the
+                // weight bytes, took 10%.
+                //
+                // Sync is a host round-trip per stream, not an event: blunt,
+                // but it answers whether the idea is worth the machinery
+                // before the machinery gets built.
+                let pool = cuda.prefill_streams();
                 let mut t0 = 0u32;
+                let mut slab = 0usize;
                 while t0 < n {
                     let nn = (n - t0).min(64);
-                    k.gemm_mma_q8(
-                        cuda,
-                        wqs,
-                        wsc,
-                        x_qs + (t0 * inb) as u64,
-                        x_scales + (t0 * (inb / 32)) as u64 * 4,
-                        y + (t0 * rows) as u64 * 4,
-                        rows,
-                        inb,
-                        nn,
-                    )?;
+                    let issue = || {
+                        k.gemm_mma_q8(
+                            cuda,
+                            wqs,
+                            wsc,
+                            x_qs + (t0 * inb) as u64,
+                            x_scales + (t0 * (inb / 32)) as u64 * 4,
+                            y + (t0 * rows) as u64 * 4,
+                            rows,
+                            inb,
+                            nn,
+                        )
+                    };
+                    match pool {
+                        Some(p) => cuda.on_stream(p, slab, issue)?,
+                        None => issue()?,
+                    }
                     t0 += nn;
+                    slab += 1;
+                }
+                // Only when work was actually spread: a single sub-slab on one
+                // pool stream still has to be waited for, so the guard is on
+                // whether a pool was used at all, not on the slab count.
+                if let Some(p) = pool {
+                    cuda.sync_pool(p)?;
                 }
                 Ok(())
             } else {
