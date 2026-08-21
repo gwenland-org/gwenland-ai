@@ -143,11 +143,15 @@ pub fn analyze(session: &BenchmarkSession) -> AnalysisReport {
     let bottleneck = super::bottleneck::classify(session, &ceiling);
     let health = super::health::score(&decode_tps, &prefill_tps, ceiling.efficiency);
 
-    // Per-bucket roofline over the engine's stage telemetry. The ceiling is
-    // the measured CPU read bandwidth when present (the honest number), else
-    // the GPU's published spec; with neither, verdicts stay Unknown.
-    let hw = &session.environment.hardware;
-    let bandwidth_ceiling = hw.cpu.read_bandwidth_gbs.or(hw.gpu.peak_bandwidth_gbs);
+    // Per-bucket roofline over the engine's stage telemetry, against the
+    // bandwidth of the device that actually ran the model; with none known,
+    // verdicts stay Unknown.
+    //
+    // ⛔ This used to select its own ceiling as `cpu.read_bandwidth_gbs.or(gpu…)`
+    // — a second copy of the device-blind rule `ceiling::bandwidth_for_run`
+    // documents. It meant every per-bucket verdict on a CUDA run was computed
+    // against host DDR, 12x low on a T4. Share the one selection.
+    let bandwidth_ceiling = super::ceiling::bandwidth_for_run(session).map(|(bw, _)| bw);
     let roofline = session
         .telemetry
         .as_ref()
