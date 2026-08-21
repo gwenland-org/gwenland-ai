@@ -626,6 +626,21 @@ impl Cuda {
 
 impl Drop for Cuda {
     fn drop(&mut self) {
+        // ⛔ Streams first, context second, and the order is not stylistic.
+        //
+        // Rust drops a struct's fields AFTER its own `Drop::drop` body runs,
+        // so leaving `prefill_streams` to the implicit path would call
+        // cuStreamDestroy against a context this function had already
+        // released — SIGSEGV at exit, which is exactly what the drop-order
+        // note in the crate root warns about for `GlcudaEngine`'s fields.
+        // That note protects resources held *beside* `Cuda`; it cannot
+        // protect one held *inside* it, which is how this got in.
+        //
+        // Observed as rc=-11 on every run that created a pool: the archive
+        // was already written, so the measurements survived and only the
+        // process died. A crash that arrives after the useful work is the
+        // easiest kind to dismiss and still means undefined behaviour ran.
+        drop(self.prefill_streams.take());
         // SAFETY: releasing a context we retained; errors on teardown are
         // unreportable, so they are intentionally ignored.
         unsafe {
