@@ -40,7 +40,51 @@ pub struct GenTiming {
     pub decode: std::time::Duration,
 }
 
+/// Does this weight's GEMV read the int8 activation scratch
+/// (`ws.q8_qs`/`ws.q8_scales`), or the f32 activation directly?
+///
+/// The match is exhaustive on purpose: a new [`GpuWeight`] variant must
+/// answer this question, because getting it wrong means either a wasted
+/// quantize or a GEMV reading a stale scratch buffer — and only the second
+/// one is visible in the output.
+fn consumes_q8_act(w: &GpuWeight) -> bool {
+    match w {
+        // Read `x` (f32) straight: no quantized activation involved.
+        GpuWeight::F32(_) | GpuWeight::Q4_0(_) => false,
+        GpuWeight::Q8_0(_)
+        | GpuWeight::Q8_0Soa { .. }
+        | GpuWeight::Q4_0Soa { .. }
+        | GpuWeight::Q4KSoa { .. }
+        | GpuWeight::Q6KSoa { .. } => true,
+    }
+}
+
+/// Quantize `x` if this weight needs it, then run the GEMV.
+///
+/// For a weight whose input is shared with other GEMVs, hoist the quantize
+/// to the caller and use [`gemv_w_pre`] instead — see the q/k/v trio in
+/// [`GpuModel::record_forward`].
 fn gemv_w(
+    cuda: &Cuda,
+    k: &KernelSet,
+    ws: &crate::model::Workspace,
+    m: &GpuMat,
+    x: CUdeviceptr,
+    y: CUdeviceptr,
+) -> Result<(), GlError> {
+    if consumes_q8_act(&m.w) {
+        k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
+    }
+    gemv_w_pre(cuda, k, ws, m, x, y)
+}
+
+/// [`gemv_w`] without the quantize step.
+///
+/// Precondition when [`consumes_q8_act`] is true for `m`: the caller has
+/// already quantized this GEMV's input into `ws.q8_qs`/`ws.q8_scales` for
+/// exactly `m.in_dim` elements. Weights that read `x` directly ignore the
+/// scratch and are safe to call either way.
+fn gemv_w_pre(
     cuda: &Cuda,
     k: &KernelSet,
     ws: &crate::model::Workspace,
@@ -51,11 +95,9 @@ fn gemv_w(
     match &m.w {
         GpuWeight::F32(s) => k.gemv(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
         GpuWeight::Q8_0(s) => {
-            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q8_0(cuda, s.dptr, ws.q8_qs.dptr, ws.q8_scales.dptr, y, m.out_dim, m.in_dim)
         }
         GpuWeight::Q8_0Soa { qs, scales } => {
-            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q8_0_soa(
                 cuda,
                 qs.dptr,
@@ -69,7 +111,6 @@ fn gemv_w(
         }
         GpuWeight::Q4_0(s) => k.gemv_q4_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
         GpuWeight::Q4_0Soa { qs, scales } => {
-            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q4_0_soa(
                 cuda,
                 qs.dptr,
@@ -82,7 +123,6 @@ fn gemv_w(
             )
         }
         GpuWeight::Q4KSoa { qs, scales, mins } => {
-            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q4_k_soa(
                 cuda,
                 qs.dptr,
@@ -96,7 +136,6 @@ fn gemv_w(
             )
         }
         GpuWeight::Q6KSoa { ql, qh, scales, d } => {
-            k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
             k.gemv_q6_k_soa(
                 cuda,
                 ql.dptr,
@@ -374,9 +413,29 @@ impl GpuModel {
         for (l, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
             k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
-            gemv_w(cuda, k, ws, &layer.wq, xn, q_ptr)?;
-            gemv_w(cuda, k, ws, &layer.wk, xn, k_ptr)?;
-            gemv_w(cuda, k, ws, &layer.wv, xn, v_ptr)?;
+
+            // q/k/v read the SAME normalized activation `xn` over the same
+            // in_dim, so the int8 copy is made once and all three GEMVs share
+            // it. Letting each `gemv_w` quantize for itself wrote the same
+            // bytes into the same scratch three times per layer.
+            //
+            // Prefill has always done it this way (see `prefill_batched`:
+            // one `quantize_q8`, then three `gemm_rows`); decode simply never
+            // followed. Same math either way — the dropped launches were
+            // recomputing a value that was already there.
+            debug_assert!(
+                layer.wq.in_dim == dim && layer.wk.in_dim == dim && layer.wv.in_dim == dim,
+                "q/k/v must share in_dim with the shared quantize below"
+            );
+            if consumes_q8_act(&layer.wq.w)
+                || consumes_q8_act(&layer.wk.w)
+                || consumes_q8_act(&layer.wv.w)
+            {
+                k.quantize_q8(cuda, xn, ws.q8_qs.dptr, ws.q8_scales.dptr, dim)?;
+            }
+            gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
+            gemv_w_pre(cuda, k, ws, &layer.wk, xn, k_ptr)?;
+            gemv_w_pre(cuda, k, ws, &layer.wv, xn, v_ptr)?;
 
             if let Some(b) = &layer.bq {
                 k.add(cuda, q_ptr, b.dptr, q_dim as u32)?;
@@ -389,17 +448,29 @@ impl GpuModel {
             }
 
             // qwen3-style per-head RMSNorm on Q/K, before RoPE.
+            //
+            // Q is [n_heads, head_dim] contiguous and K is [n_kv_heads,
+            // head_dim] contiguous, which is exactly `rms_norm_rows`'s input
+            // shape — one block per head instead of one LAUNCH per head. The
+            // norm weight is shared by every head, and the kernel does not
+            // offset `w` by the row, so it broadcasts as required.
+            //
+            // Bit-exact with the loop it replaces: `gl_rms_norm_rows_f32` is
+            // instruction-for-instruction `gl_rms_norm_f32` plus the row-base
+            // computation, so the reduction order and rounding are unchanged.
+            //
+            // On Qwen3-1.7B this drops 24 single-block launches per layer
+            // (672 per token, over half of all decode launches), each of
+            // which occupied 1 SM of 40.
             if let Some(qn) = &layer.q_norm {
-                for h in 0..c.n_heads {
-                    let seg = at(q_ptr, h * head_dim);
-                    k.rms_norm(cuda, seg, qn.dptr, seg, head_dim as u32, c.rms_eps)?;
-                }
+                k.rms_norm_rows(
+                    cuda, q_ptr, qn.dptr, q_ptr, head_dim as u32, c.rms_eps, c.n_heads as u32,
+                )?;
             }
             if let Some(kn) = &layer.k_norm {
-                for h in 0..c.n_kv_heads {
-                    let seg = at(k_ptr, h * head_dim);
-                    k.rms_norm(cuda, seg, kn.dptr, seg, head_dim as u32, c.rms_eps)?;
-                }
+                k.rms_norm_rows(
+                    cuda, k_ptr, kn.dptr, k_ptr, head_dim as u32, c.rms_eps, c.n_kv_heads as u32,
+                )?;
             }
 
             // RoPE reads `pos` from device memory (token-invariant args).
@@ -905,7 +976,63 @@ impl GpuModel {
 
 #[cfg(test)]
 mod tests {
-    use super::r256_pays;
+    use super::{consumes_q8_act, r256_pays};
+    use crate::buffer::DevSlice;
+    use crate::model::GpuWeight;
+
+    /// A stand-in device region. `consumes_q8_act` matches on the variant and
+    /// never dereferences, so no GPU and no real allocation are involved.
+    fn slice() -> DevSlice {
+        DevSlice { dptr: 0, bytes: 0 }
+    }
+
+    /// Hoisting the q/k/v quantize out of `gemv_w` made this predicate the
+    /// thing that decides whether a GEMV gets a fresh int8 activation. A
+    /// variant wrongly answering `false` reads whatever the previous layer
+    /// left in the scratch -- wrong numbers, no crash, no failing launch.
+    /// So each variant is pinned to the buffer its kernel actually reads.
+    #[test]
+    fn q8_scratch_consumers_are_exactly_the_quantized_gemvs() {
+        // Take the f32 activation `x` directly: quantizing for these would be
+        // pure waste, and skipping it is always safe.
+        assert!(!consumes_q8_act(&GpuWeight::F32(slice())));
+        assert!(!consumes_q8_act(&GpuWeight::Q4_0(slice())));
+
+        // Read ws.q8_qs / ws.q8_scales: these REQUIRE a caller-side quantize.
+        assert!(consumes_q8_act(&GpuWeight::Q8_0(slice())));
+        assert!(consumes_q8_act(&GpuWeight::Q8_0Soa { qs: slice(), scales: slice() }));
+        assert!(consumes_q8_act(&GpuWeight::Q4_0Soa { qs: slice(), scales: slice() }));
+        assert!(consumes_q8_act(&GpuWeight::Q4KSoa {
+            qs: slice(),
+            scales: slice(),
+            mins: slice(),
+        }));
+        assert!(consumes_q8_act(&GpuWeight::Q6KSoa {
+            ql: slice(),
+            qh: slice(),
+            scales: slice(),
+            d: slice(),
+        }));
+    }
+
+    /// The hoist is only valid because ONE quantize serves all three GEMVs,
+    /// which holds only while any of them needing it means the shared copy
+    /// gets made. Mixed-precision q/k/v is not a shape the loader produces
+    /// today, but the guard costs nothing and the failure would be silent.
+    #[test]
+    fn a_single_quantized_projection_still_triggers_the_shared_quantize() {
+        let f32_w = GpuWeight::F32(slice());
+        let q8_w = GpuWeight::Q8_0Soa { qs: slice(), scales: slice() };
+        assert!(
+            consumes_q8_act(&f32_w) || consumes_q8_act(&q8_w),
+            "one quantized projection among three must still make the copy"
+        );
+        assert!(
+            !(consumes_q8_act(&GpuWeight::F32(slice()))
+                || consumes_q8_act(&GpuWeight::Q4_0(slice()))),
+            "an all-f32 trio must skip the quantize entirely"
+        );
+    }
 
     /// The rule is arithmetic, so it is checked as arithmetic -- no GPU, and
     /// no chance of the "threshold of 64" drifting away from the reason for it.
