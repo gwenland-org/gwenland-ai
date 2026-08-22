@@ -113,6 +113,21 @@ fn gemv_w(
     }
 }
 
+/// Does the 256-row GEMM read the weights fewer times than the 64-row one
+/// for `n` token rows?
+///
+/// This is the whole of r256's advantage, so it is the whole of the decision.
+/// Weight fragments are read once per slab, so the counts are `ceil(n/64)` and
+/// `ceil(n/256)`; a tie means r256 offers nothing and loses on shared memory
+/// (9216 bytes against 2304), which costs blocks per SM.
+///
+/// Deliberately no occupancy term. Any coefficient for that would be invented
+/// rather than measured; if a production A/B shows r256 losing somewhere above
+/// 64, that measurement earns the term.
+fn r256_pays(n: u32) -> bool {
+    n.div_ceil(256) < n.div_ceil(64)
+}
+
 /// Device address `elems` f32 past `base`.
 #[inline(always)]
 fn at(base: CUdeviceptr, elems: usize) -> CUdeviceptr {
@@ -150,19 +165,43 @@ fn gemm_rows(
             // test shapes). The prefill scratch is PREFILL_BATCH rows, so
             // the MMA's read-padding to 8 token rows is always in bounds.
             if k.has_mma() && rows.is_multiple_of(8) {
-                // MMA GEMM in 64-row sub-slabs (the base kernel's m-tile span).
+                // ---- Which MMA GEMM, and in what slab size ----
                 //
-                // Phase B (r256, 256-row reuse) is validated at the KERNEL
-                // level — bench [gemm-phaseb] shows 41-43% faster, 96 reg / 0
-                // spill — but wiring it here crashed the ENGINE with
-                // CUDA_ERROR_MISALIGNED_ADDRESS (deferred kernel fault surfacing
-                // at the next HtoD). The r256 kernel's isolated bench feeds it
-                // synthetic buffers; the real prefill scratch exposes an
-                // alignment bug the bench does not. REVERTED to the 64-row path
-                // until r256 passes its parity test ON HARDWARE (never has —
-                // the T4 runs only bench + profiler, not cargo test). Re-wire
-                // only after gemm_mma_q8_r256_matches_dequantized_reference is
-                // green on the T4.
+                // r256 exists to do exactly one thing: read each weight
+                // fragment once per 256 token rows instead of once per 64. So
+                // the choice is made on that quantity, computed from n at the
+                // call site rather than from a tuned constant:
+                //
+                //     reads_64 = ceil(n/64)    reads_256 = ceil(n/256)
+                //
+                // Take r256 only when it strictly reduces that. At n <= 64
+                // they tie -- both read the weights once -- and a tie goes to
+                // the 64-row kernel, which uses 2304 bytes of shared memory
+                // against r256's 9216 and therefore fits more blocks per SM.
+                // The familiar "threshold of 64" falls out of the arithmetic
+                // instead of being typed in.
+                //
+                // What this deliberately does NOT model is occupancy. Any
+                // coefficient for that would be a guess wearing arithmetic's
+                // clothes; if the production A/B shows r256 losing in some
+                // band above 64, that measurement is what earns a cost term.
+                //
+                // r256 is opt-in (GLCUDA_R256). It is measured correct on a T4
+                // -- parity green, max_abs_diff 0.00e0 against gemm_mma_q8 at
+                // real shapes -- and measured 31% faster at 512-row chunks,
+                // after a staging-register bug that made it compute the wrong
+                // answer for months. The last wire-in attempt crashed with
+                // CUDA_ERROR_MISALIGNED_ADDRESS, which that same bug explains
+                // (a clobbered row index becomes a global address) but does
+                // not prove fixed until a production run says so.
+                //
+                // Note the interaction with GLCUDA_MULTI_STREAM_PREFILL: at
+                // n = 220 r256 issues a single slab, so there is nothing left
+                // for the stream pool to overlap. The two switches are
+                // alternatives, not additions.
+                let use_r256 = k.r256_enabled() && r256_pays(n);
+                let slab_rows = if use_r256 { 256 } else { 64 };
+
                 // The sub-slabs below are independent: same weights, disjoint
                 // activation rows, disjoint output. They are sequential only
                 // because they share a stream. With
@@ -172,7 +211,7 @@ fn gemm_rows(
                 //
                 // This matters most where the grid is smallest. The grid is
                 // ceil_div(out_dim, 64) and nothing splits K or tokens, so on
-                // a 40-SM T4 `down` gets 14 blocks — and a measured profile
+                // a 40-SM T4 `down` gets 14 blocks -- and a measured profile
                 // put down+o at 66% of prefill while gate+up, moving twice the
                 // weight bytes, took 10%.
                 //
@@ -183,9 +222,15 @@ fn gemm_rows(
                 let mut t0 = 0u32;
                 let mut slab = 0usize;
                 while t0 < n {
-                    let nn = (n - t0).min(64);
+                    let nn = (n - t0).min(slab_rows);
                     let issue = || {
-                        k.gemm_mma_q8(
+                        let gemm = if use_r256 {
+                            KernelSet::gemm_mma_q8_r256
+                        } else {
+                            KernelSet::gemm_mma_q8
+                        };
+                        gemm(
+                            k,
                             cuda,
                             wqs,
                             wsc,
@@ -855,5 +900,44 @@ impl GpuModel {
                 decode: decode_start.elapsed(),
             },
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::r256_pays;
+
+    /// The rule is arithmetic, so it is checked as arithmetic -- no GPU, and
+    /// no chance of the "threshold of 64" drifting away from the reason for it.
+    #[test]
+    fn r256_only_pays_when_it_saves_a_weight_read() {
+        // Ties: both kernels read the weights exactly once. r256 adds 4x the
+        // shared memory for nothing.
+        for n in [1u32, 8, 63, 64] {
+            assert!(!r256_pays(n), "n={n}: one slab either way, r256 buys nothing");
+        }
+        // 65..=256 is one r256 slab against two, three or four 64-row slabs.
+        for n in [65u32, 128, 192, 220, 256] {
+            assert!(r256_pays(n), "n={n}: r256 reads the weights once, 64-row several times");
+        }
+        // Above 256 the ratio narrows but never inverts.
+        for n in [257u32, 384, 512] {
+            assert!(r256_pays(n), "n={n}");
+        }
+    }
+
+    /// The exact figures the rule turns on, so a change to either divisor
+    /// fails here rather than silently altering dispatch.
+    #[test]
+    fn weight_read_counts_are_what_the_rule_compares() {
+        let reads = |n: u32, slab: u32| n.div_ceil(slab);
+        assert_eq!((reads(220, 64), reads(220, 256)), (4, 1)); // the prefill case
+        assert_eq!((reads(64, 64), reads(64, 256)), (1, 1));   // the tie
+        assert_eq!((reads(512, 64), reads(512, 256)), (8, 2)); // a full chunk
+    }
+
+    #[test]
+    fn zero_rows_is_a_tie_not_a_panic() {
+        assert!(!r256_pays(0));
     }
 }
