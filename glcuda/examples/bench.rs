@@ -771,10 +771,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!("[gemm-reuse] time/token FLAT across ntok => compute/issue-bound, Phase B reuse buys ~0; time/token FALLING steeply => weight-BW-bound, Phase B pays. Compare eff GB/s to the ~266 achievable.");
         println!(
-            "[gemm-reuse] .5B rows are a control: gate(76 blk, K=896) vs \
-             o_proj(14 blk, K=896) vs down(14 blk, K=4864). o_proj fast + \
-             down slow => K length is the limit (split-K). Both slow => block \
-             count is, despite the multi-stream A/B saying otherwise."
+            "[gemm-reuse] .5B rows: RESOLVED. K length measured 1.29x and block \
+             count 0.44x -- neither explains prefill's 13x. The cause is that \
+             `down` never runs this kernel: loader.rs sends in_dim % 256 == 0 to \
+             a native SoA layout, and gemm_rows gives the GEMM to Q8_0Soa alone, \
+             so `down` takes a per-token GEMV loop. See GLCUDA_FORCE_Q8."
         );
     }
 
@@ -915,10 +916,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         println!(
             "[ffn-context] s0 alone | s1 +L2 flush | s2 +24 rotating weight copies | \
-             s3 +the preceding quantize. Prefill costs gate 62.5us and down 822.9us \
-             per sub-slab. The step where `down` climbs toward 822 while `gate` \
-             stays flat is the anomaly; a step that moves BOTH is the harness, \
-             not the finding."
+             s3 +the preceding quantize. RESOLVED: `down` stays flat across every \
+             rung because prefill never runs this kernel for it -- loader.rs sends \
+             in_dim % 256 == 0 to a native SoA layout and gemm_rows gives the GEMM \
+             to Q8_0Soa alone, so `down` takes a per-token GEMV loop. Prefill's \
+             822.9us is a GEMV-loop cost; a GEMM ladder cannot reach it, and that \
+             it does not IS the confirmation. `gate` moves (+14% at s3) because \
+             `gate` does use this kernel."
         );
     }
 
