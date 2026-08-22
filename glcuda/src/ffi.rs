@@ -164,18 +164,27 @@ pub struct DriverApi {
     pub cu_stream_create: unsafe extern "system" fn(*mut CUstream, u32) -> CUresult,
     pub cu_stream_destroy: unsafe extern "system" fn(CUstream) -> CUresult,
     pub cu_stream_synchronize: unsafe extern "system" fn(CUstream) -> CUresult,
+    // The six graph entry points are OPTIONAL (`None` on a driver that
+    // predates CUDA 10). They gate one optimization — replaying the decode
+    // sequence from a captured graph — and the engine runs without them by
+    // issuing the same kernels individually. Requiring them here would make
+    // a missing symbol fail `DriverApi::load`, which turns `cuda_available()`
+    // false and takes the WHOLE engine down over a feature it can live
+    // without. See `Cuda::graphs_available`.
     pub cu_stream_begin_capture:
-        unsafe extern "system" fn(CUstream, u32 /* mode */) -> CUresult,
+        Option<unsafe extern "system" fn(CUstream, u32 /* mode */) -> CUresult>,
     pub cu_stream_end_capture:
-        unsafe extern "system" fn(CUstream, *mut CUgraph) -> CUresult,
-    pub cu_graph_instantiate: unsafe extern "system" fn(
-        *mut CUgraphExec,
-        CUgraph,
-        u64, // flags (0)
-    ) -> CUresult,
-    pub cu_graph_launch: unsafe extern "system" fn(CUgraphExec, CUstream) -> CUresult,
-    pub cu_graph_exec_destroy: unsafe extern "system" fn(CUgraphExec) -> CUresult,
-    pub cu_graph_destroy: unsafe extern "system" fn(CUgraph) -> CUresult,
+        Option<unsafe extern "system" fn(CUstream, *mut CUgraph) -> CUresult>,
+    pub cu_graph_instantiate: Option<
+        unsafe extern "system" fn(
+            *mut CUgraphExec,
+            CUgraph,
+            u64, // flags (0)
+        ) -> CUresult,
+    >,
+    pub cu_graph_launch: Option<unsafe extern "system" fn(CUgraphExec, CUstream) -> CUresult>,
+    pub cu_graph_exec_destroy: Option<unsafe extern "system" fn(CUgraphExec) -> CUresult>,
+    pub cu_graph_destroy: Option<unsafe extern "system" fn(CUgraph) -> CUresult>,
 
     pub cu_get_error_name: unsafe extern "system" fn(CUresult, *mut *const i8) -> CUresult,
 }
@@ -201,7 +210,29 @@ fn sym_v2<T>(lib: *mut c_void, v2: &[u8], v1: &[u8]) -> Result<T, GlError> {
     sym(lib, v2).or_else(|_| sym(lib, v1))
 }
 
+/// Resolve an OPTIONAL symbol: `None` when the driver does not export it,
+/// instead of failing the whole load. Used for the CUDA Graph entry points,
+/// which gate an optimization rather than a capability.
+fn sym_opt<T>(lib: *mut c_void, names: &[&[u8]]) -> Option<T> {
+    names.iter().find_map(|n| sym(lib, n).ok())
+}
+
 impl DriverApi {
+    /// True when every CUDA Graph entry point resolved, i.e. the decode
+    /// sequence can be captured and replayed.
+    ///
+    /// All six are checked together: a driver exporting only some of them
+    /// cannot complete a capture/replay cycle, and finding that out halfway
+    /// through would leave a begun capture unclosed.
+    pub fn graphs_available(&self) -> bool {
+        self.cu_stream_begin_capture.is_some()
+            && self.cu_stream_end_capture.is_some()
+            && self.cu_graph_instantiate.is_some()
+            && self.cu_graph_launch.is_some()
+            && self.cu_graph_exec_destroy.is_some()
+            && self.cu_graph_destroy.is_some()
+    }
+
     /// Load the CUDA driver library and resolve every entry point.
     /// Fails cleanly (no panic, no partial state) when the driver is not
     /// installed — that is the normal case on non-NVIDIA machines.
@@ -243,21 +274,21 @@ impl DriverApi {
             cu_stream_create: sym(lib, b"cuStreamCreate\0")?,
             cu_stream_destroy: sym_v2(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
             cu_stream_synchronize: sym(lib, b"cuStreamSynchronize\0")?,
-            cu_stream_begin_capture: sym_v2(
+            // Optional from here: a driver without these loses graph replay,
+            // not the engine.
+            cu_stream_begin_capture: sym_opt(
                 lib,
-                b"cuStreamBeginCapture_v2\0",
-                b"cuStreamBeginCapture\0",
-            )?,
-            cu_stream_end_capture: sym(lib, b"cuStreamEndCapture\0")?,
+                &[b"cuStreamBeginCapture_v2\0", b"cuStreamBeginCapture\0"],
+            ),
+            cu_stream_end_capture: sym_opt(lib, &[b"cuStreamEndCapture\0"]),
             // The flags-taking instantiate (CUDA 12 renamed _v2 -> WithFlags).
-            cu_graph_instantiate: sym_v2(
+            cu_graph_instantiate: sym_opt(
                 lib,
-                b"cuGraphInstantiateWithFlags\0",
-                b"cuGraphInstantiate_v2\0",
-            )?,
-            cu_graph_launch: sym(lib, b"cuGraphLaunch\0")?,
-            cu_graph_exec_destroy: sym(lib, b"cuGraphExecDestroy\0")?,
-            cu_graph_destroy: sym(lib, b"cuGraphDestroy\0")?,
+                &[b"cuGraphInstantiateWithFlags\0", b"cuGraphInstantiate_v2\0"],
+            ),
+            cu_graph_launch: sym_opt(lib, &[b"cuGraphLaunch\0"]),
+            cu_graph_exec_destroy: sym_opt(lib, &[b"cuGraphExecDestroy\0"]),
+            cu_graph_destroy: sym_opt(lib, &[b"cuGraphDestroy\0"]),
 
             cu_get_error_name: sym(lib, b"cuGetErrorName\0")?,
             _lib: Lib(lib),

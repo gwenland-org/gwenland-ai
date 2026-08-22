@@ -807,6 +807,19 @@ impl GpuModel {
         debug_assert_eq!(pos, self.kv.current_pos());
         self.set_token_inputs(cuda, token, pos)?;
 
+        // Degraded mode: a driver without the CUDA Graph API (pre-CUDA 10)
+        // runs the identical kernel sequence launch-by-launch. Same math,
+        // same order, same buffers — only the per-launch host overhead the
+        // graph exists to remove comes back. This path is also the
+        // correctness reference the graph is validated against, so it must
+        // stay wired even though every supported device today takes the
+        // branch below.
+        if !cuda.graphs_available() {
+            self.record_forward(cuda, k, true)?;
+            self.kv.advance();
+            return Ok(());
+        }
+
         if self.graph.is_none() {
             // Capture the sequence once. record_forward reads pos/cached_len
             // from device memory, so the captured graph is valid for every
