@@ -24,6 +24,8 @@ pub type CUfunction = *mut c_void;
 pub type CUstream = *mut c_void;
 /// Opaque graph handle (a captured/constructed DAG of GPU work).
 pub type CUgraph = *mut c_void;
+/// A CUDA event: a timestamp recorded *on a stream*, in stream order.
+pub type CUevent = *mut c_void;
 /// Opaque executable-graph handle (an instantiated, launch-ready graph).
 pub type CUgraphExec = *mut c_void;
 /// Device memory address. Always 64-bit, even on 32-bit hosts.
@@ -164,6 +166,23 @@ pub struct DriverApi {
     pub cu_stream_create: unsafe extern "system" fn(*mut CUstream, u32) -> CUresult,
     pub cu_stream_destroy: unsafe extern "system" fn(CUstream) -> CUresult,
     pub cu_stream_synchronize: unsafe extern "system" fn(CUstream) -> CUresult,
+
+    // --- Events: on-stream stage timing ---
+    //
+    // OPTIONAL for the same reason the graph entry points are: they gate
+    // measurement, not capability, and an engine that cannot time its stages
+    // must still run. See `Cuda::events_available`.
+    //
+    // Why events and not a host clock: `cuEventRecord` only enqueues a
+    // timestamp, so timing a stage costs no host synchronization and does not
+    // serialize the pipeline the way wrapping it in `cuCtxSynchronize` does.
+    // The elapsed time is read once, after the work is already done.
+    pub cu_event_create: Option<unsafe extern "system" fn(*mut CUevent, u32) -> CUresult>,
+    pub cu_event_record: Option<unsafe extern "system" fn(CUevent, CUstream) -> CUresult>,
+    pub cu_event_synchronize: Option<unsafe extern "system" fn(CUevent) -> CUresult>,
+    pub cu_event_elapsed_time:
+        Option<unsafe extern "system" fn(*mut f32, CUevent, CUevent) -> CUresult>,
+    pub cu_event_destroy: Option<unsafe extern "system" fn(CUevent) -> CUresult>,
     // The six graph entry points are OPTIONAL (`None` on a driver that
     // predates CUDA 10). They gate one optimization — replaying the decode
     // sequence from a captured graph — and the engine runs without them by
@@ -224,6 +243,17 @@ impl DriverApi {
     /// All six are checked together: a driver exporting only some of them
     /// cannot complete a capture/replay cycle, and finding that out halfway
     /// through would leave a begun capture unclosed.
+    /// True when every event entry point resolved, i.e. stages can be timed
+    /// on-stream. Checked as a set for the same reason as the graph API: a
+    /// half-present set cannot complete a record/elapsed cycle.
+    pub fn events_available(&self) -> bool {
+        self.cu_event_create.is_some()
+            && self.cu_event_record.is_some()
+            && self.cu_event_synchronize.is_some()
+            && self.cu_event_elapsed_time.is_some()
+            && self.cu_event_destroy.is_some()
+    }
+
     pub fn graphs_available(&self) -> bool {
         self.cu_stream_begin_capture.is_some()
             && self.cu_stream_end_capture.is_some()
@@ -274,6 +304,12 @@ impl DriverApi {
             cu_stream_create: sym(lib, b"cuStreamCreate\0")?,
             cu_stream_destroy: sym_v2(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
             cu_stream_synchronize: sym(lib, b"cuStreamSynchronize\0")?,
+
+            cu_event_create: sym_opt(lib, &[b"cuEventCreate\0"]),
+            cu_event_record: sym_opt(lib, &[b"cuEventRecord\0"]),
+            cu_event_synchronize: sym_opt(lib, &[b"cuEventSynchronize\0"]),
+            cu_event_elapsed_time: sym_opt(lib, &[b"cuEventElapsedTime\0"]),
+            cu_event_destroy: sym_opt(lib, &[b"cuEventDestroy_v2\0", b"cuEventDestroy\0"]),
             // Optional from here: a driver without these loses graph replay,
             // not the engine.
             cu_stream_begin_capture: sym_opt(

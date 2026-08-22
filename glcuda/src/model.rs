@@ -416,6 +416,40 @@ pub(crate) struct Workspace {
     pub pf_scales: DevSlice,
 }
 
+impl Workspace {
+    /// Total device bytes this workspace holds.
+    ///
+    /// Every field is a bump sub-allocation made once at upload, so this
+    /// is a constant for the model's lifetime -- summed rather than
+    /// tracked, because there is nothing to track.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.x.bytes
+            + self.xn.bytes
+            + self.qkv.bytes
+            + self.attn_out.bytes
+            + self.proj.bytes
+            + self.gate_up.bytes
+            + self.logits.bytes
+            + self.rope_cos.bytes
+            + self.rope_sin.bytes
+            + self.token_params.bytes
+            + self.pos_seq.bytes
+            + self.q8_qs.bytes
+            + self.q8_scales.bytes
+            + self.pf_x.bytes
+            + self.pf_xn.bytes
+            + self.pf_q.bytes
+            + self.pf_k.bytes
+            + self.pf_v.bytes
+            + self.pf_attn.bytes
+            + self.pf_proj.bytes
+            + self.pf_gate.bytes
+            + self.pf_up.bytes
+            + self.pf_qs.bytes
+            + self.pf_scales.bytes
+    }
+}
+
 /// Prompt tokens resident per batched-prefill pass. Bounds the batched
 /// workspace VRAM; longer prompts are processed in consecutive chunks.
 ///
@@ -446,6 +480,12 @@ pub struct GpuModel {
     /// decode step and replayed thereafter. `None` until captured; the
     /// prefill path never uses it.
     pub(crate) graph: Option<crate::driver::GraphExec>,
+    /// Per-stage prefill cost from the most recent `prefill_batched`.
+    ///
+    /// `None` until a prefill has run with profiling available -- and it must
+    /// stay `None` rather than becoming zeros, because glbench treats absent
+    /// telemetry as "not measured" and zeros as "measured, and free".
+    pub(crate) prefill_profile: Option<crate::runner::PrefillProfile>,
     buffer: BackendBuffer,
     /// Total VRAM reserved, for the load-time report.
     pub total_vram_bytes: u64,
@@ -677,12 +717,31 @@ impl GpuModel {
             kv,
             ws,
             graph: None,
+            prefill_profile: None,
             buffer: buf,
             total_vram_bytes: total,
         })
     }
 
     /// Release the model's VRAM (the whole backend buffer).
+    /// Split total VRAM into weights / KV cache / scratch, bytes.
+    ///
+    /// The KV figure is what was RESERVED, not what is in use: the region is
+    /// sized for `max_context` at load and the cursor never shrinks it. That
+    /// distinction matters when reading a memory report -- a cache 2% filled
+    /// still occupies all of this.
+    pub fn vram_breakdown(&self) -> Option<(u64, u64, u64)> {
+        let kv = (KvCacheDev::numel(
+            self.kv.n_layers,
+            self.kv.n_heads,
+            self.kv.head_dim,
+            self.kv.max_context,
+        ) * 4) as u64;
+        let scratch: u64 = self.ws.total_bytes();
+        let weights = self.total_vram_bytes.saturating_sub(kv + scratch);
+        Some((weights, kv, scratch))
+    }
+
     pub fn free(self, cuda: &Cuda) -> Result<(), GlError> {
         self.buffer.free(cuda)
     }
