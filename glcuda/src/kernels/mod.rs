@@ -42,6 +42,10 @@ pub struct KernelSet {
     /// the Phase B weight-reuse kernel (256 rows/weight-read); the bench A/B
     /// picks which m-tile count net-wins on the BW-bound FFN GEMMs.
     mma: Option<(Module, Kernel, Kernel)>,
+    /// Whether prefill should drive the r256 (256-row) GEMM instead of the
+    /// 64-row one. Read once at load from `GLCUDA_R256`; see
+    /// [`KernelSet::r256_enabled`].
+    r256: bool,
     f_add: Kernel,
     f_silu_mul: Kernel,
     f_rope: Kernel,
@@ -94,8 +98,23 @@ impl KernelSet {
             }
             None
         };
+        // Opt-in, and off by default on purpose. r256 is measured correct
+        // (parity green on a T4, max_abs_diff 0.00e0 against gemm_mma_q8 at
+        // real shapes) and measured 31% faster at 512-row chunks -- but the
+        // last attempt to wire it into prefill crashed the engine with
+        // CUDA_ERROR_MISALIGNED_ADDRESS, and a kernel-level win does not have
+        // to survive the trip into production: the multi-stream prefill
+        // experiment was 4x the blocks in flight for -0.6%.
+        //
+        // So this ships as an A/B switch until a production run says to flip
+        // the default.
+        let r256 = mma.is_some() && std::env::var_os("GLCUDA_R256").is_some();
+        if r256 {
+            eprintln!("[glcuda] r256 prefill GEMM enabled (256-row weight reuse)");
+        }
         Ok(KernelSet {
             mma,
+            r256,
             f_add: module.get_function("gl_add_f32")?,
             f_silu_mul: module.get_function("gl_silu_mul_f32")?,
             f_rope: module.get_function("gl_rope_f32")?,
@@ -528,6 +547,12 @@ impl KernelSet {
     /// before [`Self::gemm_mma_q8`].
     pub fn has_mma(&self) -> bool {
         self.mma.is_some()
+    }
+
+    /// Should prefill use the 256-row GEMM? Requires the sm_75 module and
+    /// `GLCUDA_R256` in the environment.
+    pub fn r256_enabled(&self) -> bool {
+        self.r256
     }
 
     /// Batched GEMM `Y[ntok, out] = X[ntok, in] @ W[out, in]^T` on the INT8
