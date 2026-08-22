@@ -56,6 +56,40 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
             info.dimensions
         )));
     }
+    // ⛔ The native SoA layouts below have NO GEMM. `gemm_rows` gives the
+    // tensor-core path to `Q8_0Soa` alone; Q4KSoa, Q6KSoa, Q4_0Soa and F32 all
+    // fall to `for t in 0..n { gemv }` -- one kernel per token.
+    //
+    // That is fine for decode, where the batch IS one token and GEMV is the
+    // right shape. In prefill it costs 6.29x, measured on a T4: the same
+    // projection through the GEMM is 193us and through 64 GEMV calls is 1215us.
+    //
+    // The selector is `in_dim % 256`, and on Qwen2.5-0.5B it lands exactly on
+    // the anomaly:
+    //
+    //     gate, up, q, k, v, o   in_dim 896    896 % 256 = 128  -> Q8_0Soa, GEMM
+    //     down                   in_dim 4864  4864 % 256 =   0  -> Q6KSoa,  GEMV
+    //
+    // `down`+`o` is 66% of prefill and `down` never reaches the GEMM. It
+    // explains why the multi-stream A/B moved nothing (-0.6%), why r256 left
+    // the bucket flat, and why the [ffn-context] ladder found `down` immovable
+    // across an L2 flush, 24 rotating weight copies and the preceding
+    // quantize: every one of those tests the GEMM, and `down` does not use it.
+    //
+    // GLCUDA_FORCE_Q8 requantizes everything to Q8_0Soa so prefill gets the
+    // GEMM. It is a measurement, not a default: the native paths were added to
+    // save DRAM traffic (6.5625 bpw against 8.5), which is real and matters to
+    // decode. The trade has never been measured, and glbench reports both
+    // phases from one run.
+    let force_q8 = std::env::var_os("GLCUDA_FORCE_Q8").is_some();
+    if force_q8 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!(
+                "[glcuda] GLCUDA_FORCE_Q8: k-quant matmuls requantized to Q8_0 \n                 (prefill takes the tensor-core GEMM instead of a per-token GEMV loop)"
+            )
+        });
+    }
     let w = match info.dtype {
         GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
             let data = gguf.tensor_data(info)?;
@@ -75,7 +109,7 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
         // into the SoA triple gl_gemv_q4_k_soa streams at 5.0 bpw. The
         // in_dim % 256 guard is belt-and-braces — ggml cannot emit a Q4_K
         // tensor with a ragged row (QK_K divisibility is a format invariant).
-        GgufDType::Q4_K if in_dim.is_multiple_of(256) => {
+        GgufDType::Q4_K if !force_q8 && in_dim.is_multiple_of(256) => {
             let (qs, scales, mins) = q4_k_to_soa(gguf.tensor_data(info)?)?;
             HostWeight::Q4KSoa { qs, scales, mins }
         }
@@ -91,7 +125,7 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
         // streamed these tensors (half of Q4_K_M's ffn_down/attn_v, plus
         // output.weight) at 8.5 bpw. Zero added quantization error: every
         // stream is verbatim or losslessly relocated.
-        GgufDType::Q6_K if in_dim.is_multiple_of(256) => {
+        GgufDType::Q6_K if !force_q8 && in_dim.is_multiple_of(256) => {
             let (ql, qh, scales, d) = q6_k_to_soa(gguf.tensor_data(info)?)?;
             HostWeight::Q6KSoa { ql, qh, scales, d }
         }

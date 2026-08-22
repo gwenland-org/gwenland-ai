@@ -31,7 +31,11 @@ const MAGIC: &[u8; 8] = b"GLCACHE6";
 fn cache_path(gguf_path: &str) -> PathBuf {
     let mut p = PathBuf::from(gguf_path);
     let name = p.file_name().map(|n| n.to_owned()).unwrap_or_default();
-    p.set_file_name(format!("{}.glcache", name.to_string_lossy()));
+    // The suffix carries the weight-format policy the stage ran under, so a
+    // GLCUDA_FORCE_Q8 run can never be handed the native-SoA weights it exists
+    // to avoid. See load_host_cached.
+    let policy = if std::env::var_os("GLCUDA_FORCE_Q8").is_some() { ".q8" } else { "" };
+    p.set_file_name(format!("{}{policy}.glcache", name.to_string_lossy()));
     p
 }
 
@@ -53,6 +57,16 @@ pub fn load_host_cached(
     gguf_path: &str,
     build: impl FnOnce() -> Result<HostModel, GlError>,
 ) -> Result<HostModel, GlError> {
+    // ⛔ The cache is keyed on the GGUF's size and mtime, which say nothing
+    // about the weight-format policy the stage ran under. GLCUDA_FORCE_Q8
+    // changes which HostWeight variant every k-quant matmul tensor becomes, so
+    // sharing one file between the two would hand a forced run the native
+    // weights it was set to avoid -- an A/B whose arms are secretly identical,
+    // which this project has already produced once.
+    //
+    // Separate files rather than a version byte: the arms then coexist instead
+    // of invalidating each other on every switch, which matters when they
+    // alternate.
     let path = cache_path(gguf_path);
     let ident = src_identity(gguf_path);
 
