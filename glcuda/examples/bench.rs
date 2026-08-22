@@ -779,6 +779,150 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2f. [ffn-context] The anomaly, not the bottleneck.
+    //
+    //     Measured on a T4 with Qwen2.5-0.5B: the SAME kernel, the SAME
+    //     shape, the SAME 64-row sub-slab costs
+    //
+    //         gate    62.5 us in prefill   vs   57.6 us here   (1.09x)
+    //         down   822.9 us in prefill   vs  179.2 us here   (4.59x)
+    //
+    //     gate behaves identically in both contexts. down does not. That
+    //     difference is the anomaly, and it is not explained by anything the
+    //     GEMM itself does -- block count, K length and weight reuse were all
+    //     measured and none of them separate the two.
+    //
+    //     So this walks from THIS harness's context to prefill's, one
+    //     difference at a time, timing only the GEMM:
+    //
+    //       s0  the call alone, same weights every iteration (the hot loop
+    //           this bench has always measured)
+    //       s1  + L2 flushed before each call
+    //       s2  + weights rotated across 24 copies, as 24 layers do
+    //       s3  + the elementwise pass that precedes it in prefill
+    //           (quantize_q8 over this shape's own input)
+    //
+    //     gate is the control. A candidate explanation has to break `down`
+    //     and leave `gate` alone; a step that slows both is a property of the
+    //     harness, not of the anomaly.
+    // ============================================================
+    if k.has_mma() {
+        let d05 = 896usize;
+        let h05 = 4864usize;
+        let ntok = 64usize; // the sub-slab prefill actually issues
+        let layers = 24usize; // rotating weight copies, as in the real model
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let as_u8 =
+            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+
+        println!();
+        for (label, out_dim, in_dim) in [("gate", h05, d05), ("down", d05, h05)] {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            let wq_bytes = (out_dim * in_dim) as u64;
+            let ws_bytes = (out_dim * nb * 2) as u64;
+
+            // `layers` distinct weight copies. Prefill never reads the same
+            // layer twice in a row; this harness always did.
+            let mut wqs_ptrs = Vec::with_capacity(layers);
+            let mut wsc_ptrs = Vec::with_capacity(layers);
+            let wq_host: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
+            let wsc_host: Vec<u8> = vec![0x3C00u16; out_dim * nb]
+                .iter()
+                .flat_map(|b| b.to_le_bytes())
+                .collect();
+            for _ in 0..layers {
+                let a = buf.alloc(wq_bytes)?.dptr;
+                cuda.htod(a, as_u8(&wq_host))?;
+                wqs_ptrs.push(a);
+                let b = buf.alloc(ws_bytes)?.dptr;
+                cuda.htod(b, &wsc_host)?;
+                wsc_ptrs.push(b);
+            }
+
+            let d_x = buf.alloc_f32(ntok * in_dim)?.dptr;
+            cuda.htod_f32(d_x, &vec![0.25f32; ntok * in_dim])?;
+            let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
+            k.quantize_q8(&cuda, d_x, d_xqs, d_xsc, (ntok * in_dim) as u32)?;
+            let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
+
+            // 16 MB of traffic per pass: four times the T4's 4 MB L2, so
+            // nothing of the previous iteration survives.
+            let flush_n = 4 * 1024 * 1024usize;
+            let d_f0 = buf.alloc_f32(flush_n)?.dptr;
+            let d_f1 = buf.alloc_f32(flush_n)?.dptr;
+
+            print!("[ffn-context {label:5}] out={out_dim:<5} in={in_dim:<5} | ");
+            let iters = 50;
+            let mut base_us = 0.0f64;
+            for step in 0..4u32 {
+                // Warm once so the first timed call is not paying for JIT or
+                // first-touch page mapping.
+                k.gemm_mma_q8(
+                    &cuda, wqs_ptrs[0], wsc_ptrs[0], d_xqs, d_xsc, d_y, out_dim as u32,
+                    in_dim as u32, ntok as u32,
+                )?;
+                cuda.synchronize()?;
+
+                let t = Instant::now();
+                for i in 0..iters {
+                    if step >= 1 {
+                        k.add(&cuda, d_f0, d_f1, flush_n as u32)?;
+                    }
+                    if step >= 3 {
+                        k.quantize_q8(&cuda, d_x, d_xqs, d_xsc, (ntok * in_dim) as u32)?;
+                    }
+                    let l = if step >= 2 { i % layers } else { 0 };
+                    k.gemm_mma_q8(
+                        &cuda, wqs_ptrs[l], wsc_ptrs[l], d_xqs, d_xsc, d_y, out_dim as u32,
+                        in_dim as u32, ntok as u32,
+                    )?;
+                }
+                cuda.synchronize()?;
+                let each_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                // The flush and the quantize are inside the timed region, so
+                // subtract what they cost on their own -- otherwise the ladder
+                // measures the scaffolding rather than the GEMM.
+                let mut overhead = 0.0f64;
+                if step >= 1 {
+                    let t2 = Instant::now();
+                    for _ in 0..iters {
+                        k.add(&cuda, d_f0, d_f1, flush_n as u32)?;
+                    }
+                    cuda.synchronize()?;
+                    overhead += t2.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                }
+                if step >= 3 {
+                    let t2 = Instant::now();
+                    for _ in 0..iters {
+                        k.quantize_q8(&cuda, d_x, d_xqs, d_xsc, (ntok * in_dim) as u32)?;
+                    }
+                    cuda.synchronize()?;
+                    overhead += t2.elapsed().as_secs_f64() * 1e6 / iters as f64;
+                }
+                let gemm_us = each_us - overhead;
+                if step == 0 {
+                    base_us = gemm_us;
+                    print!("s0 {gemm_us:.1}us  ");
+                } else {
+                    let d = 100.0 * (gemm_us - base_us) / base_us;
+                    print!("s{step} {gemm_us:.1}us ({d:+.0}%)  ");
+                }
+            }
+            println!();
+            buf.reset_to(mark);
+        }
+        println!(
+            "[ffn-context] s0 alone | s1 +L2 flush | s2 +24 rotating weight copies | \
+             s3 +the preceding quantize. Prefill costs gate 62.5us and down 822.9us \
+             per sub-slab. The step where `down` climbs toward 822 while `gate` \
+             stays flat is the anomaly; a step that moves BOTH is the harness, \
+             not the finding."
+        );
+    }
+
+    // ============================================================
     // 2d2. [r256-parity] r256 correctness at real 7B shapes, on hardware.
     //     The engine wire-in crashed with CUDA_ERROR_MISALIGNED_ADDRESS but
     //     the parity test only runs under `cargo test` (the notebook runs
