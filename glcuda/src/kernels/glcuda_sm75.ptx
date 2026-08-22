@@ -493,6 +493,12 @@ MMA_DONE:
     .reg .b32 %r<48>;
     .reg .f32 %f<80>;
     .reg .b64 %rd<44>;
+    // Prefetch half of the B double-buffer. The CURRENT block stays in
+    // %r26/%r27/%f2/%f3 so the 32 m-tile bodies below are untouched; these
+    // hold the NEXT block until the swap at MMA_KSYNC.
+    .reg .b32 %bfrag0n, %bfrag1n;
+    .reg .f32 %wsc0n, %wsc1n;
+    .reg .pred %pnext;
     .shared .align 16 .b8 sm_a[8192];    // 256 token rows x 32 K bytes
     .shared .align 4 .b8 sm_xs[1024];    // 256 f32 activation scales
 
@@ -666,6 +672,36 @@ MMA_DONE:
 
     mov.u32 %r20, 0;                     // kb (K block index)
 
+    // ---- Software pipelining: prime the B fragment for kb = 0 ----
+    //
+    // sm_75 has no cp.async (Ampere+), so the only way to overlap a global
+    // load with tensor-core work is to issue it a full k-block early. The
+    // weight fragment and its two scales are the only global reads left in
+    // the hot path -- the A slice is in shared memory by the time any
+    // mma.sync runs -- and they are read once per k-block and reused by all
+    // 32 m-tiles, which makes them exactly the right thing to prefetch.
+    //
+    // The pattern is: prime kb=0 here, then each iteration issues kb+1 before
+    // running kb's tiles, and swaps at MMA_KSYNC.
+    //
+    // Zeroed unconditionally first: warps with no output rows branch straight
+    // to MMA_KSYNC and still execute the swap, so the prefetch registers must
+    // not be read while uninitialized even though the values go nowhere.
+    mov.b32 %bfrag0n, 0;
+    mov.b32 %bfrag1n, 0;
+    mov.f32 %wsc0n, 0f00000000;
+    mov.f32 %wsc1n, 0f00000000;
+    // nb == 0 means the k-loop falls straight through to MMA_WRITE; these
+    // addresses would be out of range.
+    setp.gt.u32 %pnext, %r14, 0;
+    @!%pnext bra MMA_KLOOP;
+    @%p11 ld.global.u32 %r26, [%rd11];
+    @%p11 ld.global.u32 %r27, [%rd11+16];
+    @%p11 ld.global.u16 %h1, [%rd13];
+    @%p11 cvt.f32.f16 %f2, %h1;
+    @%p11 ld.global.u16 %h2, [%rd14];
+    @%p11 cvt.f32.f16 %f3, %h2;
+
 MMA_KLOOP:
     setp.ge.u32 %p9, %r20, %r14;
     @%p9 bra MMA_WRITE;
@@ -755,13 +791,27 @@ MMA_STAGE_BAR:
 
     @!%p11 bra MMA_KSYNC;
 
-    // Weight fragment + scales: loaded ONCE, reused by every m-tile below.
-    ld.global.u32 %r26, [%rd11];         // B half 0 (k 0..15)
-    ld.global.u32 %r27, [%rd11+16];      // B half 1 (k 16..31)
-    ld.global.u16 %h1, [%rd13];
-    cvt.f32.f16 %f2, %h1;                // wsc[nc0][kb]
-    ld.global.u16 %h2, [%rd14];
-    cvt.f32.f16 %f3, %h2;                // wsc[nc1][kb]
+    // ---- Prefetch the NEXT k-block's B fragment and scales ----
+    //
+    // Issued BEFORE the 32 m-tiles, so the ~200 cycle global latency is in
+    // flight while the tensor cores consume the CURRENT block already sitting
+    // in %r26/%r27/%f2/%f3.
+    //
+    // %rd11/%rd13/%rd14 still address the CURRENT block here -- MMA_KSYNC
+    // advances them after the tiles -- so kb+1 is at +32 (B half 0), +48
+    // (B half 1, i.e. +32+16) and +2 (the next f16 scale).
+    //
+    // One predicate, not two: PTX allows a single guard per instruction, and
+    // this block already sits behind `@!%p11 bra MMA_KSYNC`, so every warp
+    // reaching it is active.
+    add.s32 %r47, %r20, 1;
+    setp.lt.u32 %pnext, %r47, %r14;      // kb+1 < nb
+    @%pnext ld.global.u32 %bfrag0n, [%rd11+32];
+    @%pnext ld.global.u32 %bfrag1n, [%rd11+48];
+    @%pnext ld.global.u16 %h1, [%rd13+2];
+    @%pnext cvt.f32.f16 %wsc0n, %h1;
+    @%pnext ld.global.u16 %h2, [%rd14+2];
+    @%pnext cvt.f32.f16 %wsc1n, %h2;
 
     mov.u32 %r35, %r33;                  // A frag addr (reset to tile 0)
     mov.u32 %r36, %r34;                  // xsc addr
@@ -1406,6 +1456,15 @@ MMA_STAGE_BAR:
 
 MMA_KSYNC:
     bar.sync 0;
+    // Rotate the double buffer: what was prefetched becomes current.
+    // Unconditional -- inactive warps and warps that left the tile chain
+    // early also land here, and neither ever reads the result. On the last
+    // k-block %pnext was false, so this moves stale values into %r26/%r27,
+    // which the loop exit then discards.
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    mov.f32 %f2, %wsc0n;
+    mov.f32 %f3, %wsc1n;
     add.s64 %rd11, %rd11, 32;            // next K block (weight walker)
     add.s64 %rd13, %rd13, 2;             // wsc nc0
     add.s64 %rd14, %rd14, 2;             // wsc nc1
