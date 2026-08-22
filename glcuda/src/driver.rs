@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use glcore::GlError;
 
 use crate::ffi::{
-    CUcontext, CUdevice, CUdeviceptr, CUfunction, CUgraph, CUgraphExec, CUmodule, CUresult,
+    CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule, CUresult,
     CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
     ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
 };
@@ -22,6 +22,82 @@ fn api() -> Option<&'static Arc<DriverApi>> {
     static API: OnceLock<Option<Arc<DriverApi>>> = OnceLock::new();
     API.get_or_init(|| DriverApi::load().ok().map(Arc::new)).as_ref()
 }
+
+/// A fixed pool of reusable CUDA events used as stage boundaries.
+///
+/// The point is what it does NOT do: `record` only enqueues a timestamp in
+/// stream order, so marking a stage boundary costs no host synchronization.
+/// Marks accumulate through a whole chunk and are read once, at the end, with
+/// a single sync — where the alternative (wrapping each stage in
+/// `cuCtxSynchronize`) drains the pipeline at every boundary and reports
+/// timings for an execution schedule that never runs in production.
+pub struct EventRing {
+    api: Arc<DriverApi>,
+    events: Vec<CUevent>,
+}
+
+impl EventRing {
+    /// How many boundaries this ring can mark.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Never true for a ring built by [`Cuda::event_ring`]; present because
+    /// clippy asks for it alongside `len`.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Enqueue mark `i` on the current launch stream. Out-of-range indices are
+    /// ignored: a ring too small to hold a run's marks degrades to partial
+    /// timing rather than aborting the inference that carries it.
+    pub fn record(&self, cuda: &Cuda, i: usize) {
+        let (Some(rec), Some(&e)) = (self.api.cu_event_record, self.events.get(i)) else {
+            return;
+        };
+        let stream = cuda.launch_stream.load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: e is a live event from this ring; stream is NULL or a live
+        // stream owned for the length of the call.
+        unsafe {
+            let _ = rec(e, stream);
+        }
+    }
+
+    /// Milliseconds between marks `a` and `b`, after waiting for `b`.
+    ///
+    /// Returns `None` when either index is unmarked or the driver refuses —
+    /// an unmeasured stage must read as absent, never as zero.
+    pub fn elapsed_ms(&self, a: usize, b: usize) -> Option<f64> {
+        let (sync, elapsed) = (self.api.cu_event_synchronize?, self.api.cu_event_elapsed_time?);
+        let (&ea, &eb) = (self.events.get(a)?, self.events.get(b)?);
+        let mut ms = 0f32;
+        // SAFETY: both events belong to this ring and were created above.
+        unsafe {
+            if sync(eb) != CUDA_SUCCESS || elapsed(&mut ms, ea, eb) != CUDA_SUCCESS {
+                return None;
+            }
+        }
+        Some(ms as f64)
+    }
+}
+
+impl Drop for EventRing {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.cu_event_destroy {
+            for e in self.events.drain(..) {
+                // SAFETY: each event was created by this ring; teardown
+                // errors are unreportable.
+                unsafe {
+                    let _ = destroy(e);
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: events are context-level objects and the driver API is thread-safe.
+unsafe impl Send for EventRing {}
+unsafe impl Sync for EventRing {}
 
 /// Returned when graph capture or replay is asked of a driver that does not
 /// export the CUDA Graph API. Not a failure state: the caller is expected to
@@ -434,6 +510,35 @@ impl Cuda {
                 "cuLaunchKernel",
             )
         }
+    }
+
+    /// True when this driver exports the CUDA event entry points, i.e.
+    /// [`EventRing`] can time stages on-stream.
+    pub fn events_available(&self) -> bool {
+        self.api.events_available()
+    }
+
+    /// Allocate `n` reusable events for on-stream stage timing.
+    ///
+    /// `None` when the driver does not export the event API — the caller
+    /// falls back to coarse timing rather than failing.
+    pub fn event_ring(&self, n: usize) -> Option<EventRing> {
+        if !self.api.events_available() {
+            return None;
+        }
+        let create = self.api.cu_event_create?;
+        let mut events = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut e: CUevent = std::ptr::null_mut();
+            // SAFETY: out pointer valid; flag 0 = CU_EVENT_DEFAULT, which
+            // enables timing (CU_EVENT_DISABLE_TIMING would not).
+            if unsafe { create(&mut e, 0) } != CUDA_SUCCESS {
+                drop(EventRing { api: self.api.clone(), events });
+                return None;
+            }
+            events.push(e);
+        }
+        Some(EventRing { api: self.api.clone(), events })
     }
 
     /// True when this driver exports the CUDA Graph entry points, i.e.

@@ -330,6 +330,45 @@ mod tests {
     }
 
     #[test]
+    /// Every stage `glcuda` reports must land in a real bucket.
+    ///
+    /// This is the failure mode that kept glcuda invisible: `bucket_of` sends
+    /// anything it does not recognize to `Other`, and `Other` is not part of
+    /// the model breakdown -- so a stage named off-convention does not error,
+    /// it just silently stops being analyzed. Pinning glcuda's real vocabulary
+    /// against the real bucketizer means a rename cannot quietly re-dark the
+    /// roofline.
+    #[test]
+    fn every_glcuda_stage_name_buckets_where_intended() {
+        let want = [
+            ("qkv", Bucket::Attention),
+            ("attn_norm", Bucket::Attention),
+            ("attn_kv_write", Bucket::Attention),
+            ("attention", Bucket::Attention),
+            ("attn_out", Bucket::Attention),
+            ("ffn_elementwise", Bucket::Ffn),
+            ("ffn_down", Bucket::Ffn),
+            ("ffn_gate_up", Bucket::Ffn),
+        ];
+        for name in glcuda::runner::STAGE_NAMES {
+            let (_, expect) = want
+                .iter()
+                .find(|(n, _)| *n == name)
+                .unwrap_or_else(|| panic!("glcuda stage {name:?} has no expected bucket here --                      a stage was added without deciding where it belongs"));
+            assert_eq!(
+                bucket_of(name),
+                *expect,
+                "glcuda stage {name:?} buckets as {:?}, not {expect:?}. A stage in Other is                  dropped from the model breakdown without any error.",
+                bucket_of(name),
+            );
+        }
+        assert_eq!(
+            glcuda::runner::STAGE_NAMES.len(),
+            want.len(),
+            "stage count changed; the expectation table above must change with it"
+        );
+    }
+
     fn no_telemetry_yields_no_report() {
         let t = glcore::telemetry::EngineTelemetry::default();
         assert!(RooflineReport::compute(&t, Some(30.0)).is_none());

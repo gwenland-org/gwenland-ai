@@ -196,6 +196,56 @@ impl GlcudaEngine {
 }
 
 impl GlEngine for GlcudaEngine {
+    /// Per-stage prefill cost, memory breakdown, and the kernel path taken.
+    ///
+    /// Until this existed `glcuda` inherited the trait's `None`, so glbench's
+    /// bucket roofline -- the analysis that on CPU explained *why* a change
+    /// was neutral by splitting it per stage -- was silently dark on CUDA.
+    /// Every GPU optimization so far has been judged on two end-to-end
+    /// numbers, `prefill_tps` and `decode_tps`, which cannot distinguish "no
+    /// effect" from "two effects that cancelled".
+    fn telemetry(&self) -> Option<glcore::telemetry::EngineTelemetry> {
+        use glcore::telemetry::{EngineTelemetry, MemoryTelemetry, PhaseProfile, StageTiming};
+
+        let model = self.model.as_ref()?;
+        let m = model.lock().ok()?;
+
+        let prefill = m.prefill_profile.as_ref().map(|p| {
+            let stages: Vec<StageTiming> = crate::runner::STAGE_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| p.calls[*i] > 0)
+                .map(|(i, name)| StageTiming {
+                    name: (*name).to_string(),
+                    total_ms: p.ms[i].unwrap_or(0.0),
+                    calls: p.calls[i],
+                    // Zero means "this stage moves no weights" (the
+                    // elementwise glue), which is a fact. It is not the same
+                    // as "not attributed", so it is reported as Some(0).
+                    bytes_read: Some(p.bytes[i]),
+                    macs: Some(p.macs[i]),
+                })
+                .collect();
+            // The phase total is the sum of what was attributed. Stage times
+            // from the SYNC fallback are measured in isolation, so their sum
+            // overstates a pipelined wall clock -- which is why `on_stream`
+            // is reported and why this total is not compared against
+            // end-to-end throughput.
+            let total_ms = stages.iter().map(|s| s.total_ms).sum();
+            PhaseProfile { stages, total_ms }
+        });
+
+        let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
+            MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
+        });
+
+        // Absence must read as "not measured", never as a zeroed report.
+        if prefill.is_none() && memory.is_none() {
+            return None;
+        }
+        Some(EngineTelemetry { prefill, decode: None, backend: None, memory, moe: None })
+    }
+
     fn init(&mut self) -> Result<(), GlError> {
         let cuda = Cuda::probe()?;
         let kernels = KernelSet::load(&cuda)?;

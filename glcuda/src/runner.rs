@@ -40,6 +40,94 @@ pub struct GenTiming {
     pub decode: std::time::Duration,
 }
 
+/// Prefill stage names, in the order [`PrefillProfile`] stores them.
+///
+/// The vocabulary is not arbitrary: glbench's roofline groups stages into
+/// Attention / FFN / lm_head by substring (`bucket_of`), so these mirror the
+/// names glproc already reports. A name outside the convention lands in
+/// `Other` and the bucket roofline goes quiet about it -- which is how this
+/// engine has been invisible to the roofline until now.
+pub const STAGE_NAMES: [&str; 8] = [
+    "qkv",             // 0 - norm + activation quantize + Q/K/V GEMMs
+    "attn_norm",       // 1 - bias, qk-norm, RoPE
+    "attn_kv_write",   // 2 - KV cache write
+    "attention",       // 3 - the attention core
+    "ffn_elementwise", // 4 - norm/quantize/silu/residual glue
+    "ffn_down",        // 5 - the down projection
+    "ffn_gate_up",     // 6 - the fused gate+up projection
+    "attn_out",        // 7 - the attention output projection
+];
+pub(crate) const ST_QKV: usize = 0;
+pub(crate) const ST_AN: usize = 1;
+pub(crate) const ST_KV: usize = 2;
+pub(crate) const ST_AC: usize = 3;
+pub(crate) const ST_ELT: usize = 4;
+pub(crate) const ST_DN: usize = 5;
+pub(crate) const ST_GU: usize = 6;
+/// The attention output projection.
+///
+/// It gets its own stage because the `t_dn` bucket wrapped BOTH `wo` and
+/// `w_down`, which is why every profile so far could only report them jointly
+/// ("down+o is 66% of prefill") and never say which of the two it was. They
+/// also belong to different roofline buckets -- `wo` is Attention, `w_down`
+/// is FFN -- so merging them mis-attributes the roofline too.
+pub(crate) const ST_AO: usize = 7;
+
+/// Total device bytes a weight occupies, across all of its streams.
+///
+/// This is what a GEMM/GEMV must actually read to use the weight once, so
+/// multiplying it by the number of times a stage re-reads the weight gives
+/// that stage's traffic -- which is the whole point of reporting it. A stage
+/// far below the bandwidth ceiling is stalled on something other than memory,
+/// and that gap is the finding.
+pub(crate) fn weight_bytes(w: &GpuWeight) -> u64 {
+    match w {
+        GpuWeight::F32(s) | GpuWeight::Q8_0(s) | GpuWeight::Q4_0(s) => s.bytes,
+        GpuWeight::Q8_0Soa { qs, scales } | GpuWeight::Q4_0Soa { qs, scales } => {
+            qs.bytes + scales.bytes
+        }
+        GpuWeight::Q4KSoa { qs, scales, mins } => qs.bytes + scales.bytes + mins.bytes,
+        GpuWeight::Q6KSoa { ql, qh, scales, d } => ql.bytes + qh.bytes + scales.bytes + d.bytes,
+    }
+}
+
+/// How many times a prefill pass over `n` token rows re-reads this weight.
+///
+/// The GEMM streams weights once per output slab, so `ceil(n / slab)`. Every
+/// other format takes the per-token GEMV fallback and reads them `n` times --
+/// which is the `in_dim % 256 == 0` trap, expressed as traffic instead of as
+/// a dispatch rule, and the reason `down` dominates prefill.
+pub(crate) fn weight_reads(w: &GpuWeight, n: u32, slab_rows: u32) -> u64 {
+    match w {
+        GpuWeight::Q8_0Soa { .. } => n.div_ceil(slab_rows.max(1)) as u64,
+        _ => n as u64,
+    }
+}
+
+/// Accumulated per-stage prefill cost: what glbench turns into the bucket
+/// roofline. `ms` is `None` for a stage nothing timed -- absence must never
+/// read as zero.
+#[derive(Debug, Clone, Default)]
+pub struct PrefillProfile {
+    /// Wall-clock per stage, milliseconds.
+    pub ms: [Option<f64>; 8],
+    /// Device bytes read per stage, summed over every re-read.
+    pub bytes: [u64; 8],
+    /// Times each stage ran (layers x chunks).
+    pub calls: [u64; 8],
+    /// Multiply-accumulates per stage. Format-independent, so it compares
+    /// kernels that GB/s cannot -- a kernel reading fewer bytes can look
+    /// efficient while doing the same arithmetic slower.
+    pub macs: [u64; 8],
+    /// Prompt tokens this profile covers.
+    pub tokens: usize,
+    /// True when stage times came from CUDA events (pipelined, production
+    /// schedule); false when they came from the synchronizing fallback, which
+    /// drains the pipeline at every boundary and therefore reports an
+    /// execution order that never runs in production. glbench must say which.
+    pub on_stream: bool,
+}
+
 /// Does this weight's GEMV read the int8 activation scratch
 /// (`ws.q8_qs`/`ws.q8_scales`), or the f32 activation directly?
 ///
@@ -594,14 +682,59 @@ impl GpuModel {
         // rows and the prime suspect for the disproportionate attn cost.
         let (mut t_an, mut t_kv, mut t_ac) =
             (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        // Per-stage accumulators.
+        //
+        // OFF BY DEFAULT, deliberately. The event path costs no host sync, but
+        // it is not free: ~2 records per phase per layer per chunk, plus a
+        // drain that reads every pair. That overhead is small and bounded --
+        // and completely unmeasured, because nothing here has run on a GPU.
+        // Enabling it by default would add unknown cost to the exact path the
+        // A/B arms are timed on, which is the mistake this project keeps
+        // paying for. A profiling run and a measurement run are different
+        // runs; `GLCUDA_TELEMETRY=1` asks for the first.
+        let want_profile = prof || std::env::var_os("GLCUDA_TELEMETRY").is_some();
+        let want_profile = want_profile && cuda.events_available() || prof;
+        let mut stage_ms: [Option<f64>; 8] = [None; 8];
+        let mut stage_bytes = [0u64; 8];
+        let mut stage_calls = [0u64; 8];
+        let mut stage_macs = [0u64; 8];
+
+        // Stage timing has two paths, and they are not equivalent.
+        //
+        // EVENTS (preferred): `record` only enqueues a timestamp in stream
+        // order, so a boundary costs no host sync and the pipeline runs the
+        // way production runs it. Marks are read once per chunk.
+        //
+        // SYNC (fallback, and what GLCUDA_PROFILE_PREFILL always did): drains
+        // the pipeline at every boundary. Each stage's own time is honest --
+        // it is measured in isolation -- but their SUM is not the chunk's
+        // wall clock, because nothing overlaps. `PrefillProfile::on_stream`
+        // carries which one produced the numbers so a reader is never left
+        // guessing.
+        let ring = if want_profile { cuda.event_ring(2 * 12 * c.n_layers) } else { None };
+        let on_stream = ring.is_some();
+        let mut mark = 0usize;
+        let mut pending: Vec<(usize, usize, usize)> = Vec::new();
         macro_rules! phase {
-            ($bucket:expr, $body:block) => {{
-                if prof {
+            ($bucket:expr, $stage:expr, $body:block) => {{
+                if let Some(r) = ring.as_ref() {
+                    let a = mark;
+                    r.record(cuda, a);
+                    $body
+                    let b = a + 1;
+                    r.record(cuda, b);
+                    mark = b + 1;
+                    pending.push(($stage, a, b));
+                    stage_calls[$stage] += 1;
+                } else if prof {
                     cuda.synchronize()?;
                     let _t = Instant::now();
                     $body
                     cuda.synchronize()?;
                     $bucket += _t.elapsed();
+                    stage_ms[$stage] = Some(stage_ms[$stage].unwrap_or(0.0)
+                        + _t.elapsed().as_secs_f64() * 1e3);
+                    stage_calls[$stage] += 1;
                 } else {
                     $body
                 }
@@ -646,7 +779,7 @@ impl GpuModel {
 
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
-                phase!(t_qkv, {
+                phase!(t_qkv, ST_QKV, {
                     k.rms_norm_rows(cuda, pf_x, layer.attn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
                     k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
                     gemm_rows(cuda, k, &layer.wq, 0, q_dim as u32, pf_xn, pf_qs, pf_scales, pf_q, n as u32)?;
@@ -657,7 +790,7 @@ impl GpuModel {
                 // attn, split into norm (bias+qk-norm+rope) / kv-write / core.
                 // t_attn is their sum, reported below — no outer phase! wrapper,
                 // so the inner syncs don't double-count.
-                phase!(t_an, {
+                phase!(t_an, ST_AN, {
                     if let Some(b) = &layer.bq {
                         k.add_bias_rows(cuda, pf_q, b.dptr, q_dim as u32, (n * q_dim) as u32)?;
                     }
@@ -678,11 +811,11 @@ impl GpuModel {
                     k.rope_rows(cuda, pf_q, rope_cos, rope_sin, n_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
                     k.rope_rows(cuda, pf_k, rope_cos, rope_sin, n_kv_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
                 });
-                phase!(t_kv, {
+                phase!(t_kv, ST_KV, {
                     k.kv_write_rows(cuda, self.kv.read_k(l, 0), pf_k, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
                     k.kv_write_rows(cuda, self.kv.read_v(l, 0), pf_v, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
                 });
-                phase!(t_ac, {
+                phase!(t_ac, ST_AC, {
                     // Causal by construction: row t reads cached_len = pos+1
                     // rows, so later rows (already written above) are never seen.
                     k.attn_decode_rows(
@@ -696,29 +829,29 @@ impl GpuModel {
                 // elementwise glue (t_elt). t_ffn is their sum, reported
                 // below — no outer phase! wrapper, so the inner syncs don't
                 // double-count. wo (o-proj) GEMM is grouped into t_dn.
-                phase!(t_elt, {
+                phase!(t_elt, ST_ELT, {
                     k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
                 });
-                phase!(t_dn, {
+                phase!(t_dn, ST_AO, {
                     gemm_rows(cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj, n as u32)?;
                 });
-                phase!(t_elt, {
+                phase!(t_elt, ST_ELT, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
                     k.rms_norm_rows(cuda, pf_x, layer.ffn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
                     k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
                 });
-                phase!(t_gu, {
+                phase!(t_gu, ST_GU, {
                     gemm_rows(cuda, k, &layer.w_gate_up, 0, hidden as u32, pf_xn, pf_qs, pf_scales, pf_gate, n as u32)?;
                     gemm_rows(cuda, k, &layer.w_gate_up, hidden as u32, hidden as u32, pf_xn, pf_qs, pf_scales, pf_up, n as u32)?;
                 });
-                phase!(t_elt, {
+                phase!(t_elt, ST_ELT, {
                     k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
                     k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
                 });
-                phase!(t_dn, {
+                phase!(t_dn, ST_DN, {
                     gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
                 });
-                phase!(t_elt, {
+                phase!(t_elt, ST_ELT, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
                 });
             }
@@ -738,7 +871,50 @@ impl GpuModel {
                 k.rms_norm(cuda, last, self.output_norm.dptr, single_xn, dim as u32, rms_eps)?;
                 gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
             }
+            // Per-chunk weight traffic, per stage. This is the number that
+            // turns "down is 66% of prefill" into "down reads its weights n
+            // times where the GEMM reads them ceil(n/64)" -- the dispatch trap
+            // stated as bytes, which is what a roofline can actually judge.
+            if want_profile {
+                let nn = n as u32;
+                let mut add = |st: usize, m: &GpuMat| {
+                    stage_bytes[st] += weight_bytes(&m.w) * weight_reads(&m.w, nn, 64);
+                    stage_macs[st] += nn as u64 * m.out_dim as u64 * m.in_dim as u64;
+                };
+                for layer in self.layers.iter() {
+                    add(ST_QKV, &layer.wq);
+                    add(ST_QKV, &layer.wk);
+                    add(ST_QKV, &layer.wv);
+                    add(ST_AO, &layer.wo);
+                    add(ST_GU, &layer.w_gate_up);
+                    add(ST_DN, &layer.w_down);
+                }
+            }
+
+            // Drain this chunk's event marks. One sync for the whole chunk,
+            // not one per stage -- the marks were enqueued, the work is done,
+            // and reading them now costs a single wait.
+            if let Some(r) = ring.as_ref() {
+                for &(st, a, b) in &pending {
+                    if let Some(ms) = r.elapsed_ms(a, b) {
+                        stage_ms[st] = Some(stage_ms[st].unwrap_or(0.0) + ms);
+                    }
+                }
+                pending.clear();
+                mark = 0;
+            }
+
             base += n;
+        }
+        if want_profile {
+            self.prefill_profile = Some(PrefillProfile {
+                ms: stage_ms,
+                bytes: stage_bytes,
+                calls: stage_calls,
+                macs: stage_macs,
+                tokens: p,
+                on_stream,
+            });
         }
         if prof {
             let _ = t_attn; // superseded by the t_an/t_kv/t_ac sub-buckets
@@ -997,6 +1173,64 @@ mod tests {
     /// never dereferences, so no GPU and no real allocation are involved.
     fn slice() -> DevSlice {
         DevSlice { dptr: 0, bytes: 0 }
+    }
+
+    /// Weight traffic must count every stream, not just the payload. A
+    /// format whose scales live in a separate allocation reads both, and
+    /// charging it only for `qs` would flatter exactly the SoA formats this
+    /// engine prefers.
+    #[test]
+    fn weight_bytes_counts_every_stream_of_the_format() {
+        use super::weight_bytes;
+        fn sl(b: u64) -> DevSlice {
+            DevSlice { dptr: 0, bytes: b }
+        }
+        assert_eq!(weight_bytes(&GpuWeight::F32(sl(100))), 100);
+        assert_eq!(weight_bytes(&GpuWeight::Q8_0Soa { qs: sl(64), scales: sl(4) }), 68);
+        assert_eq!(
+            weight_bytes(&GpuWeight::Q4KSoa { qs: sl(32), scales: sl(8), mins: sl(8) }),
+            48
+        );
+        assert_eq!(
+            weight_bytes(&GpuWeight::Q6KSoa {
+                ql: sl(32),
+                qh: sl(16),
+                scales: sl(8),
+                d: sl(2)
+            }),
+            58
+        );
+    }
+
+    /// The `in_dim % 256 == 0` dispatch trap, restated as traffic.
+    ///
+    /// Only Q8_0-SoA reaches the tensor-core GEMM, which streams weights once
+    /// per 64-row slab. Every other format falls to a per-token GEMV and reads
+    /// them once PER TOKEN. At a 512-row chunk that is 8 reads against 512 --
+    /// a 64x difference that end-to-end tok/s can only show as "prefill is
+    /// slow", and that a per-stage byte count names outright.
+    #[test]
+    fn weight_reads_expose_the_gemv_fallback_as_traffic() {
+        use super::weight_reads;
+        fn sl() -> DevSlice {
+            DevSlice { dptr: 0, bytes: 1 }
+        }
+        let gemm = GpuWeight::Q8_0Soa { qs: sl(), scales: sl() };
+        let gemv = GpuWeight::Q6KSoa { ql: sl(), qh: sl(), scales: sl(), d: sl() };
+
+        assert_eq!(weight_reads(&gemm, 512, 64), 8);
+        assert_eq!(weight_reads(&gemv, 512, 64), 512);
+        assert_eq!(weight_reads(&gemv, 512, 64) / weight_reads(&gemm, 512, 64), 64);
+
+        // A single token is the decode shape: both read the weights once, and
+        // GEMV is the right kernel there. The trap is prefill-only.
+        assert_eq!(weight_reads(&gemm, 1, 64), 1);
+        assert_eq!(weight_reads(&gemv, 1, 64), 1);
+
+        // Ragged chunks round up rather than truncating -- a partial slab
+        // still costs a full weight read.
+        assert_eq!(weight_reads(&gemm, 65, 64), 2);
+        assert_eq!(weight_reads(&gemm, 220, 64), 4);
     }
 
     /// Hoisting the q/k/v quantize out of `gemv_w` made this predicate the
