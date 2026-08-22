@@ -23,6 +23,13 @@ fn api() -> Option<&'static Arc<DriverApi>> {
     API.get_or_init(|| DriverApi::load().ok().map(Arc::new)).as_ref()
 }
 
+/// Returned when graph capture or replay is asked of a driver that does not
+/// export the CUDA Graph API. Not a failure state: the caller is expected to
+/// fall back to issuing kernels individually.
+const GRAPHS_UNSUPPORTED: &str =
+    "CUDA Graph API not available on this driver (needs CUDA 10+); \
+     the caller should issue kernels individually instead";
+
 /// Map a `CUresult` to a `GlError`, naming the failing call.
 fn check(api: &DriverApi, res: CUresult, what: &str) -> Result<(), GlError> {
     if res == CUDA_SUCCESS {
@@ -429,6 +436,24 @@ impl Cuda {
         }
     }
 
+    /// True when this driver exports the CUDA Graph entry points, i.e.
+    /// [`Cuda::capture`] can succeed.
+    ///
+    /// Callers on the decode path should branch on this rather than treating
+    /// a capture failure as fatal: replaying a captured graph is an
+    /// optimization, and issuing the same kernels individually is the
+    /// supported degraded mode (see `GpuModel::decode_step`).
+    pub fn graphs_available(&self) -> bool {
+        self.api.graphs_available()
+    }
+
+    /// The optional `cuGraphLaunch` entry point, if the driver exports it.
+    fn cu_graph_launch_fn(
+        &self,
+    ) -> Option<unsafe extern "system" fn(CUgraphExec, CUstream) -> CUresult> {
+        self.api.cu_graph_launch
+    }
+
     /// Capture everything launched by `body` into a replayable [`GraphExec`].
     ///
     /// Creates a fresh non-blocking stream, points all launches at it for
@@ -444,6 +469,19 @@ impl Cuda {
     {
         use crate::ffi::{CU_STREAM_CAPTURE_MODE_GLOBAL, CU_STREAM_NON_BLOCKING};
         use std::sync::atomic::Ordering;
+
+        // Resolve the optional graph entry points BEFORE touching a stream.
+        // Bailing here leaves nothing to unwind; discovering a missing symbol
+        // after `cuStreamBeginCapture` would strand the stream in capture mode.
+        let (begin, end, instantiate, destroy) = match (
+            self.api.cu_stream_begin_capture,
+            self.api.cu_stream_end_capture,
+            self.api.cu_graph_instantiate,
+            self.api.cu_graph_destroy,
+        ) {
+            (Some(b), Some(e), Some(i), Some(d)) if self.api.graphs_available() => (b, e, i, d),
+            _ => return Err(GlError::Engine(GRAPHS_UNSUPPORTED.into())),
+        };
 
         // Dedicated capturable stream.
         let mut stream: CUstream = std::ptr::null_mut();
@@ -463,7 +501,7 @@ impl Cuda {
             unsafe {
                 check(
                     &self.api,
-                    (self.api.cu_stream_begin_capture)(stream, CU_STREAM_CAPTURE_MODE_GLOBAL),
+                    begin(stream, CU_STREAM_CAPTURE_MODE_GLOBAL),
                     "cuStreamBeginCapture",
                 )?
             };
@@ -473,17 +511,17 @@ impl Cuda {
             unsafe {
                 check(
                     &self.api,
-                    (self.api.cu_stream_end_capture)(stream, &mut graph),
+                    end(stream, &mut graph),
                     "cuStreamEndCapture",
                 )?
             };
             let mut exec: CUgraphExec = std::ptr::null_mut();
             // SAFETY: graph is a valid captured graph; flags 0.
-            let inst = unsafe { (self.api.cu_graph_instantiate)(&mut exec, graph, 0) };
+            let inst = unsafe { instantiate(&mut exec, graph, 0) };
             // The graph template is no longer needed once instantiated.
             // SAFETY: graph is live and owned here.
             unsafe {
-                let _ = (self.api.cu_graph_destroy)(graph);
+                let _ = destroy(graph);
             }
             check(&self.api, inst, "cuGraphInstantiate")?;
             Ok(GraphExec { api: self.api.clone(), exec })
@@ -612,14 +650,13 @@ impl Cuda {
 
     /// Replay a captured graph on the default stream and wait for it.
     pub fn graph_launch(&self, exec: &GraphExec) -> Result<(), GlError> {
+        // A live GraphExec can only exist if capture succeeded, so this is
+        // always Some in practice; the check keeps the unwrap out of the code.
+        let launch = self
+            .cu_graph_launch_fn()
+            .ok_or_else(|| GlError::Engine(GRAPHS_UNSUPPORTED.into()))?;
         // SAFETY: exec is a live instantiated graph; NULL = default stream.
-        unsafe {
-            check(
-                &self.api,
-                (self.api.cu_graph_launch)(exec.exec, std::ptr::null_mut()),
-                "cuGraphLaunch",
-            )?
-        };
+        unsafe { check(&self.api, launch(exec.exec, std::ptr::null_mut()), "cuGraphLaunch")? };
         self.synchronize()
     }
 }
@@ -715,8 +752,12 @@ unsafe impl Sync for GraphExec {}
 impl Drop for GraphExec {
     fn drop(&mut self) {
         // SAFETY: exec is live and owned by us; teardown errors ignored.
-        unsafe {
-            let _ = (self.api.cu_graph_exec_destroy)(self.exec);
+        // The symbol must exist — this object could not have been built
+        // without it — but a missing one leaks rather than panics in drop.
+        if let Some(destroy) = self.api.cu_graph_exec_destroy {
+            unsafe {
+                let _ = destroy(self.exec);
+            }
         }
     }
 }
