@@ -559,14 +559,30 @@ MMA_DONE:
     // that is rows 0..63 per pass; r256 needs 256 rows, so the k-loop
     // staging runs FOUR passes (row += 64) to cover 0..255. Here we set
     // up the pass-0 pointers; the per-pass loop lives in MMA_KLOOP.
-    shr.u32 %r25, %r4, 2;                // stage row0 = tid / 4
+    shr.u32 %r46, %r4, 2;                // stage row0 = tid / 4
     and.b32 %r45, %r4, 3;
     shl.b32 %r45, %r45, 3;               // stage byte offset = (tid%4)*8
-    // NB: staging byte offset lives in %r45, NOT %r27 ? the weight
-    // fragment load (ld.global.u32 %r27) clobbers %r27 every k-block, and
-    // this offset is read INSIDE the k-loop (4-pass staging), so a shared
-    // register corrupts all staging after the first block.
-    // (per-k-block base pointers rebuilt each pass from %r25 in the loop)
+    // NB: BOTH loop-carried staging values live in registers the m-tile
+    // bodies never touch - the byte offset in %r45 and the row in %r46.
+    //
+    // The hazard: this kernel stages in FOUR passes per k-block, so both
+    // values are read INSIDE the k-loop, while the 32 m-tiles below use
+    // %r24..%r27 and %r38/%r39 as scratch every single tile. Any staging
+    // value parked in one of those is destroyed by the first m-tile and every
+    // k-block after the first stages from garbage.
+    //
+    // The offset was moved to %r45 for exactly this reason. The row was NOT,
+    // and sat in %r25 - which `ld.shared.u32 %r25, [%r35+16]` overwrites 32
+    // times per k-block. With in_dim=64 (nb=2) that made k-block 0 correct and
+    // k-block 1 read rows derived from an A-fragment, which is what the parity
+    // failure `gpu 1.5951226 vs cpu 2.4754333` at ntok=5 was, and the most
+    // likely source of the CUDA_ERROR_MISALIGNED_ADDRESS seen when this kernel
+    // was wired into the engine: a garbage row index becomes a global address.
+    //
+    // The 8-tile kernel does not have this bug because it stages in ONE pass
+    // and consumes %r25 into its pointers in the prologue, never re-reading it
+    // in the loop.
+    // (per-k-block base pointers rebuilt each pass from %r46 in the loop)
     mov.u32 %r29, sm_a;
     // xsc staging base: thread tid handles scale row (tid & 255) but with
     // 256 threads and up to 256 rows that is one row/thread ? a single
@@ -659,7 +675,7 @@ MMA_KLOOP:
     mul.lo.s32 %r40, %r20, 32;          // kb * 32 (qs bytes/block/row-elem)
     shl.b32 %r41, %r20, 2;              // kb * 4 (xsc f32/block)
     // A-slice pass 0: rows 0..63 (row = tid/4 + 0).
-    add.s32 %r42, %r25, 0;      // this pass's row
+    add.s32 %r42, %r46, 0;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A0;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -675,7 +691,7 @@ MMA_KLOOP:
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A0:
     // A-slice pass 1: rows 64..127 (row = tid/4 + 64).
-    add.s32 %r42, %r25, 64;      // this pass's row
+    add.s32 %r42, %r46, 64;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A1;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -691,7 +707,7 @@ MMA_STAGE_A0:
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A1:
     // A-slice pass 2: rows 128..191 (row = tid/4 + 128).
-    add.s32 %r42, %r25, 128;      // this pass's row
+    add.s32 %r42, %r46, 128;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A2;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -707,7 +723,7 @@ MMA_STAGE_A1:
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A2:
     // A-slice pass 3: rows 192..255 (row = tid/4 + 192).
-    add.s32 %r42, %r25, 192;      // this pass's row
+    add.s32 %r42, %r46, 192;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A3;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
