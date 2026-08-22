@@ -779,3 +779,63 @@ compound; the grid one gates.
   on the 8-tile kernel, limited by block count, and r256 is opt-in
   (`GLCUDA_R256`) and off in production.
 
+---
+
+## Addendum 3 — A1 measured on T4, and the gate held, 2026-08-22
+
+First run of the correctness-gated notebook, one T4, interleaved, 3 repeats
+per arm. **The gate passed on hardware**: `parity`, `graph_replay` and
+`forward` all green with zero skips, so Fix 1 (shared q/k/v quantize), Fix 2
+(batched per-head norm) and the graph fallback are now **verified rather than
+assumed** — including bit-exact agreement between CUDA-graph replay and
+individual kernel launches on a real decode step.
+
+### The numbers
+
+| model | prefill | warm decode | cold decode | VRAM |
+|---|---|---|---|---|
+| Qwen2.5-0.5B | **+113.6%** no overlap | −2.2% **overlap** | −2.0% overlap | +3.6% |
+| Qwen2.5-3B | **+693.2%** no overlap | **−19.7%** no overlap | −19.1% no overlap | **+39.0%** |
+
+Within-arm spread was **0.3-0.4%** at 3B (baseline 98.3-98.6, force_q8
+781.5-784.6). On a box that drifts ~8-24% between sessions, that is the
+cleanest A/B this project has produced, and it is what makes the verdict
+safe to act on.
+
+### Verdict: A1 stays opt-in
+
+The prefill win is real, large, and exactly the `in_dim % 256 == 0` GEMV trap
+§7/A1 predicted — `down` never reaches the tensor-core GEMM, and force_q8 is
+what lets it. But decode is bandwidth-bound and force_q8 widens every weight
+from 4.5-6.5625 bpw to 8.5. The mechanism is confirmed by its own arithmetic:
+
+```
+VRAM ratio    3488 / 2509 = 1.390
+decode ratio   67.4 / 54.1 = 1.246
+```
+
+Decode slowed roughly in proportion to the bytes added — physics, not noise.
+The penalty is also **monotone in model size** (−2.2% overlapping at 0.5B →
+−19.7% no-overlap at 3B), so 7B would deepen this verdict, not reverse it.
+7B was never obtained (disk), and is no longer needed to decide direction.
+
+**The notebook's rule was wrong in one respect and is now fixed.** It gated
+the decision on the label `"7B"`, so a run holding a −19.7% no-overlap result
+reported `UNDECIDED`. It now decides on the largest model actually measured,
+ranked by **baseline VRAM** rather than by label — the label is a string
+someone typed, VRAM is a number the run produced — and prints the
+penalty-vs-size trend that justifies extrapolating.
+
+### What this actually argues for
+
+Not a default flip in either direction. `force_q8` fixes a **kernel dispatch**
+problem by changing the **storage format**, and the format change is what
+decode pays for. A GEMM that consumes k-quants directly would take the
+prefill win without the decode cost and make the flag irrelevant. That is now
+the highest-value open item alongside A2 (grid 5× too small), and the two are
+independent.
+
+Recorded in `gl-agent-skills/cuda-skills/rejected-optimizations.md` (new
+file — the existing rejected list is CPU-only and does not constrain glcuda,
+a confusion that already cost this audit a wrong premise once).
+
