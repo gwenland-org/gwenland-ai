@@ -923,6 +923,115 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2g. [gemv-vs-gemm] Does more parallelism beat more traffic?
+    //
+    //     The MMA GEMM's grid is ceil_div(out_dim, 64): 14 blocks for `down`
+    //     on a 40-SM T4. The GEMV's grid is ceil_div(out_dim, 8): 112 blocks
+    //     for the same projection, eight times as many. That is the
+    //     parallelism the GEMM never gets.
+    //
+    //     It is bought with traffic. The GEMM reads the weights once per
+    //     64-row slab; the GEMV reads them once per TOKEN. At ntok=64 that is
+    //     64 reads against 1, and across a 220-token prompt and 24 layers it
+    //     is 23 GB against 419 MB.
+    //
+    //     Arithmetic says traffic wins that trade -- 23 GB at the T4's full
+    //     320 GB/s peak is 72 ms, against the 79 ms down+o costs today, and
+    //     nothing here runs at peak. But arithmetic has been wrong about this
+    //     kernel before, and the trade is one call away from being measured.
+    //     So it is measured.
+    // ============================================================
+    if k.has_mma() {
+        let d05 = 896usize;
+        let h05 = 4864usize;
+        let ntok = 64usize;
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let as_u8 =
+            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+
+        println!();
+        for (label, out_dim, in_dim) in [("gate", h05, d05), ("down", d05, h05)] {
+            let mark = buf.mark();
+            let nb = in_dim / 32;
+            let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
+            cuda.htod(d_wqs, as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()))?;
+            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
+            cuda.htod(
+                d_wsc,
+                &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(),
+            )?;
+            let d_x = buf.alloc_f32(ntok * in_dim)?.dptr;
+            cuda.htod_f32(d_x, &vec![0.25f32; ntok * in_dim])?;
+            let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
+            let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
+            k.quantize_q8(&cuda, d_x, d_xqs, d_xsc, (ntok * in_dim) as u32)?;
+            let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
+
+            let iters = 50;
+
+            // One GEMM call covering all ntok rows.
+            k.gemm_mma_q8(
+                &cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32,
+                ntok as u32,
+            )?;
+            cuda.synchronize()?;
+            let t = Instant::now();
+            for _ in 0..iters {
+                k.gemm_mma_q8(
+                    &cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32,
+                    ntok as u32,
+                )?;
+            }
+            cuda.synchronize()?;
+            let gemm_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+            // ntok GEMV calls covering the same rows.
+            let gemv = |t: usize| -> Result<(), Box<dyn std::error::Error>> {
+                k.gemv_q8_0_soa(
+                    &cuda,
+                    d_wqs,
+                    d_wsc,
+                    d_xqs + (t * in_dim) as u64,
+                    d_xsc + (t * nb) as u64 * 4,
+                    d_y + (t * out_dim) as u64 * 4,
+                    out_dim as u32,
+                    in_dim as u32,
+                )?;
+                Ok(())
+            };
+            for t in 0..ntok {
+                gemv(t)?;
+            }
+            cuda.synchronize()?;
+            let t2 = Instant::now();
+            for _ in 0..iters {
+                for t in 0..ntok {
+                    gemv(t)?;
+                }
+            }
+            cuda.synchronize()?;
+            let gemv_us = t2.elapsed().as_secs_f64() * 1e6 / iters as f64;
+
+            let wmb = (out_dim * in_dim) as f64 / 1e6;
+            println!(
+                "[gemv-vs-gemm {label:5}] out={out_dim:<5} in={in_dim:<5} wt={wmb:.1}MB | \
+                 GEMM {gemm_us:7.1}us ({} blk, 1 weight read) | GEMV {gemv_us:7.1}us ({} blk, \
+                 {ntok} weight reads) | GEMV/GEMM {:.2}x",
+                out_dim.div_ceil(64),
+                out_dim.div_ceil(8),
+                gemv_us / gemm_us
+            );
+            buf.reset_to(mark);
+        }
+        println!(
+            "[gemv-vs-gemm] GEMV trades traffic for blocks: 8x the grid, ntok x the weight \\
+             reads. Below 1.00x it is worth having despite the traffic, which would mean \\
+             occupancy dominates and split-K -- the same blocks WITHOUT the traffic -- is \\
+             the fix. Above 1.00x the traffic wins and the GEMM shape is not the problem."
+        );
+    }
+
+    // ============================================================
     // 2d2. [r256-parity] r256 correctness at real 7B shapes, on hardware.
     //     The engine wire-in crashed with CUDA_ERROR_MISALIGNED_ADDRESS but
     //     the parity test only runs under `cargo test` (the notebook runs
