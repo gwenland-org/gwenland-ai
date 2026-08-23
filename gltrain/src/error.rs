@@ -43,6 +43,14 @@ pub enum GlTrainError {
         milestone: &'static str,
     },
 
+    /// A dataset or tokenizer could not be read, parsed, or encoded.
+    ///
+    /// Distinct from [`GlTrainError::Checkpoint`], which is about this crate's
+    /// *own* artifacts: a corpus is written by someone else, so a failure here
+    /// names an input file's line rather than a format version.
+    #[error("data error: {0}")]
+    Data(String),
+
     /// A checkpoint failed validation, or its bytes could not be parsed.
     #[error("checkpoint error: {0}")]
     Checkpoint(String),

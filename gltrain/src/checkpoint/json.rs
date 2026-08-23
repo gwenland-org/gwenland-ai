@@ -223,10 +223,7 @@ impl Parser<'_> {
             self.i += 1;
             Ok(())
         } else {
-            Err(format!(
-                "expected '{}' at byte {}",
-                c as char, self.i
-            ))
+            Err(format!("expected '{}' at byte {}", c as char, self.i))
         }
     }
 
@@ -303,6 +300,62 @@ impl Parser<'_> {
         }
     }
 
+    /// Decode one `\uXXXX` escape, the `u` already consumed.
+    ///
+    /// # Surrogate pairs
+    ///
+    /// JSON cannot spell a non-BMP character directly: RFC 8259 §7 requires it
+    /// be written as a UTF-16 surrogate pair, `\uD83D\uDE0A`. An earlier
+    /// version of this function rejected both halves outright, reasoning that
+    /// nothing this crate *writes* ever emits one. That held while the parser
+    /// only read back its own output. It stopped holding the moment the parser
+    /// was pointed at an external corpus, where every emoji arrives this way —
+    /// 5 of the 1500 lines in `tests/fixtures/gwen_code_dataset.jsonl` do, and
+    /// each one failed to parse.
+    ///
+    /// A genuinely *unpaired* surrogate is still an error. It cannot be a Rust
+    /// `char`, and substituting U+FFFD would silently corrupt training text.
+    fn unicode_escape(&mut self) -> Result<char, String> {
+        let hi = self.hex4()?;
+        let code = match hi {
+            // High half of a pair: the low half must follow immediately.
+            0xD800..=0xDBFF => {
+                if !self.b[self.i..].starts_with(br"\u") {
+                    return Err(format!("\\u{hi:04x} is an unpaired high surrogate"));
+                }
+                self.i += 2;
+                let lo = self.hex4()?;
+                if !(0xDC00..=0xDFFF).contains(&lo) {
+                    return Err(format!(
+                        "\\u{hi:04x} is followed by \\u{lo:04x}, which is not a low surrogate"
+                    ));
+                }
+                0x1_0000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+            }
+            0xDC00..=0xDFFF => return Err(format!("\\u{hi:04x} is an unpaired low surrogate")),
+            _ => hi,
+        };
+        char::from_u32(code).ok_or_else(|| format!("\\u{code:04x} is not a character"))
+    }
+
+    /// The four hex digits of a `\u` escape, consumed.
+    ///
+    /// The digits are checked explicitly because `u32::from_str_radix` accepts
+    /// a leading `+`, which would let `\u+12f` through as U+012F.
+    fn hex4(&mut self) -> Result<u32, String> {
+        let hex = self
+            .b
+            .get(self.i..self.i + 4)
+            .ok_or_else(|| "truncated \\u escape".to_string())?;
+        let text = std::str::from_utf8(hex).map_err(|_| "bad \\u escape".to_string())?;
+        if !text.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(format!("bad \\u escape '{text}'"));
+        }
+        let code = u32::from_str_radix(text, 16).map_err(|_| "bad \\u escape".to_string())?;
+        self.i += 4;
+        Ok(code)
+    }
+
     fn string(&mut self) -> Result<String, String> {
         self.eat(b'"')?;
         let mut s = String::new();
@@ -327,25 +380,7 @@ impl Parser<'_> {
                         b'n' => s.push('\n'),
                         b'r' => s.push('\r'),
                         b't' => s.push('\t'),
-                        b'u' => {
-                            let hex = self
-                                .b
-                                .get(self.i..self.i + 4)
-                                .ok_or_else(|| "truncated \\u escape".to_string())?;
-                            let code = u32::from_str_radix(
-                                std::str::from_utf8(hex).map_err(|_| "bad \\u escape")?,
-                                16,
-                            )
-                            .map_err(|_| "bad \\u escape".to_string())?;
-                            self.i += 4;
-                            // Lone surrogates cannot appear in a Rust char.
-                            // Nothing this crate writes produces one, so
-                            // rejecting beats silently substituting U+FFFD.
-                            s.push(
-                                char::from_u32(code)
-                                    .ok_or_else(|| format!("\\u{code:04x} is not a character"))?,
-                            );
-                        }
+                        b'u' => s.push(self.unicode_escape()?),
                         other => return Err(format!("unknown escape '\\{}'", other as char)),
                     }
                 }
@@ -471,7 +506,10 @@ mod tests {
         let v = parse(header).unwrap();
         let w = v.get("w").unwrap();
         assert_eq!(w.get("dtype").unwrap().as_str(), Some("F32"));
-        assert_eq!(w.get("shape").unwrap().as_arr().unwrap()[1].as_usize(), Some(2));
+        assert_eq!(
+            w.get("shape").unwrap().as_arr().unwrap()[1].as_usize(),
+            Some(2)
+        );
         assert_eq!(
             w.get("data_offsets").unwrap().as_arr().unwrap()[1].as_usize(),
             Some(16)
@@ -486,5 +524,63 @@ mod tests {
             "keys must be normalized to sorted order: {}",
             v.to_compact()
         );
+    }
+
+    /// The bug this parser had until Wave 2: a surrogate pair is the *only*
+    /// way JSON can spell an emoji, and both halves were being rejected.
+    #[test]
+    fn surrogate_pairs_decode_to_one_non_bmp_character() {
+        // "\ud83d\ude0a" is U+1F60A SMILING FACE WITH SMILING EYES.
+        let v = parse(r#""hi \ud83d\ude0a""#).unwrap();
+        assert_eq!(v.as_str().unwrap(), "hi \u{1f60a}");
+    }
+
+    #[test]
+    fn a_surrogate_pair_survives_a_write_read_round_trip() {
+        let text = "\u{1f600} и 漢字 \u{1f4a1}";
+        let encoded = Json::s(text).to_compact();
+        assert_eq!(parse(&encoded).unwrap().as_str().unwrap(), text);
+    }
+
+    /// An unpaired half is still an error: it is not a Rust `char`, and
+    /// substituting U+FFFD would silently corrupt training text.
+    #[test]
+    fn an_unpaired_surrogate_is_rejected_rather_than_replaced() {
+        assert!(parse(r#""\ud83d""#).is_err(), "lone high surrogate");
+        assert!(parse(r#""\ude0a""#).is_err(), "lone low surrogate");
+        assert!(
+            parse(r#""\ud83d\u0041""#).is_err(),
+            "high surrogate followed by a non-surrogate"
+        );
+    }
+
+    #[test]
+    fn a_bmp_escape_still_decodes_and_a_malformed_one_still_fails() {
+        assert_eq!(parse(r#""\u0041\u00e9""#).unwrap().as_str().unwrap(), "Aé");
+        assert!(parse(r#""\u00g1""#).is_err(), "non-hex digit");
+        assert!(parse(r#""\u12""#).is_err(), "truncated escape");
+        // `from_str_radix` accepts a leading '+', so this must be caught
+        // by the explicit hex-digit check rather than parsed as U+012F.
+        assert!(parse(r#""\u+12f""#).is_err(), "signed hex must not parse");
+    }
+
+    /// The real corpus, not a constructed string: 5 of these 1500 lines carry
+    /// surrogate pairs, and every one of them failed before this fix.
+    #[test]
+    fn every_line_of_the_gwen_code_fixture_parses() {
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/gwen_code_dataset.jsonl"
+        ))
+        .expect("fixture is committed next to the crate");
+        let mut n = 0;
+        for (i, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            parse(line).unwrap_or_else(|e| panic!("line {} failed to parse: {e}", i + 1));
+            n += 1;
+        }
+        assert_eq!(n, 1500, "the fixture is 1500 single-turn samples");
     }
 }
