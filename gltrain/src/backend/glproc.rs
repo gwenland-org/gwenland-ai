@@ -9,6 +9,7 @@
 
 use crate::error::{GlTrainError, Result};
 use crate::tensor::backend::Backend;
+use crate::train::chatml::IGNORE_INDEX;
 
 /// CPU backend using glproc AVX2 kernels.
 #[derive(Clone, Debug, Default)]
@@ -26,6 +27,19 @@ fn check_len(storage: &[f32], n_elems: usize, op: &str, operand: &str) -> Result
         )));
     }
     Ok(())
+}
+
+/// Reject a shape that is not `[rows, cols]`, returning the two dimensions.
+///
+/// Rank 2 is the same restriction `matmul` carries: there is no 3-D storage
+/// layout in this crate, so a `[batch, seq]` caller flattens first.
+fn check_2d(shape: &[usize], op: &str) -> Result<(usize, usize)> {
+    match shape {
+        [rows, cols] => Ok((*rows, *cols)),
+        other => Err(GlTrainError::InvalidOp(format!(
+            "{op} requires a 2D shape [rows, cols], got {other:?}"
+        ))),
+    }
 }
 
 impl Backend for GlProc {
@@ -159,8 +173,7 @@ impl Backend for GlProc {
         check_len(a, n_elems, "sign", "input")?;
         // Not `f32::signum`: it maps 0.0 to +1.0 and -0.0 to -1.0. Lion would
         // then move a parameter with zero momentum by a full step.
-        Ok(a
-            .iter()
+        Ok(a.iter()
             .map(|x| {
                 if *x > 0.0 {
                     1.0
@@ -176,6 +189,70 @@ impl Backend for GlProc {
     fn relu(x: &Self::Storage, n_elems: usize) -> Result<Self::Storage> {
         check_len(x, n_elems, "relu", "input")?;
         Ok(x.iter().map(|v| v.max(0.0)).collect())
+    }
+
+    fn log_softmax(a: &Self::Storage, shape: &[usize]) -> Result<Self::Storage> {
+        let (rows, cols) = check_2d(shape, "log_softmax")?;
+        check_len(a, rows * cols, "log_softmax", "input")?;
+
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            let row = &a[r * cols..(r + 1) * cols];
+            // Without this subtraction `exp` overflows f32 above x ≈ 88.7 and
+            // the whole row becomes inf, then NaN. See the trait docs.
+            let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            if !max.is_finite() {
+                return Err(GlTrainError::Backend(format!(
+                    "log_softmax: row {r} has no finite maximum ({max})"
+                )));
+            }
+            let sum_exp: f32 = row.iter().map(|x| (x - max).exp()).sum();
+            let log_sum_exp = max + sum_exp.ln();
+            for (o, x) in out[r * cols..(r + 1) * cols].iter_mut().zip(row) {
+                *o = x - log_sum_exp;
+            }
+        }
+        Ok(out)
+    }
+
+    fn masked_cross_entropy(
+        log_probs: &Self::Storage,
+        labels: &[i32],
+        shape: &[usize],
+    ) -> Result<(f32, usize)> {
+        let (rows, cols) = check_2d(shape, "masked_cross_entropy")?;
+        check_len(log_probs, rows * cols, "masked_cross_entropy", "log_probs")?;
+        if labels.len() != rows {
+            return Err(GlTrainError::ShapeMismatch {
+                expected: vec![rows],
+                got: vec![labels.len()],
+            });
+        }
+
+        // f64 accumulation: a batch is tens of thousands of terms and the
+        // summands differ by orders of magnitude, so f32 loses the small ones.
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for (r, &label) in labels.iter().enumerate() {
+            if label == IGNORE_INDEX {
+                continue;
+            }
+            // Out of range means the tokenizer and the head disagree on vocab
+            // size. Skipping it would report a plausible loss over a subset.
+            let idx = usize::try_from(label).map_err(|_| {
+                GlTrainError::Backend(format!(
+                    "masked_cross_entropy: row {r} has label {label}, which is negative and is not IGNORE_INDEX ({IGNORE_INDEX})"
+                ))
+            })?;
+            if idx >= cols {
+                return Err(GlTrainError::Backend(format!(
+                    "masked_cross_entropy: row {r} has label {idx}, outside a vocabulary of {cols}"
+                )));
+            }
+            sum -= f64::from(log_probs[r * cols + idx]);
+            count += 1;
+        }
+        Ok((sum as f32, count))
     }
 
     fn sum(a: &Self::Storage) -> Result<f32> {

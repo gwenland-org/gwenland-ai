@@ -26,6 +26,7 @@
 
 use crate::error::{GlTrainError, Result};
 use crate::tensor::backend::Backend;
+use crate::train::chatml::IGNORE_INDEX;
 
 /// Pure-scalar CPU backend. Reference implementation, no SIMD.
 #[derive(Clone, Debug, Default)]
@@ -42,6 +43,16 @@ fn check_len(storage: &[f32], n_elems: usize, op: &str, operand: &str) -> Result
         )));
     }
     Ok(())
+}
+
+/// Reject a shape that is not `[rows, cols]`, returning the two dimensions.
+fn check_2d_sisd(shape: &[usize], op: &str) -> Result<(usize, usize)> {
+    match shape {
+        [rows, cols] => Ok((*rows, *cols)),
+        other => Err(GlTrainError::InvalidOp(format!(
+            "sisd {op} requires a 2D shape [rows, cols], got {other:?}"
+        ))),
+    }
 }
 
 impl Backend for SisdBackend {
@@ -230,6 +241,76 @@ impl Backend for SisdBackend {
             out[i] = if x[i] > 0.0 { x[i] } else { 0.0 };
         }
         Ok(out)
+    }
+
+    fn log_softmax(a: &Self::Storage, shape: &[usize]) -> Result<Self::Storage> {
+        let (rows, cols) = check_2d_sisd(shape, "log_softmax")?;
+        check_len(a, rows * cols, "log_softmax", "input")?;
+
+        let mut out = vec![0.0f32; rows * cols];
+        for r in 0..rows {
+            // Scalar reference: explicit loops, no iterator adaptors, so the
+            // arithmetic order is the one written here. See the module docs.
+            let base = r * cols;
+            let mut max = f32::NEG_INFINITY;
+            for c in 0..cols {
+                let v = a[base + c];
+                if v > max {
+                    max = v;
+                }
+            }
+            if !max.is_finite() {
+                return Err(GlTrainError::Backend(format!(
+                    "sisd log_softmax: row {r} has no finite maximum ({max})"
+                )));
+            }
+            let mut sum_exp = 0.0f32;
+            for c in 0..cols {
+                sum_exp += (a[base + c] - max).exp();
+            }
+            let log_sum_exp = max + sum_exp.ln();
+            for c in 0..cols {
+                out[base + c] = a[base + c] - log_sum_exp;
+            }
+        }
+        Ok(out)
+    }
+
+    fn masked_cross_entropy(
+        log_probs: &Self::Storage,
+        labels: &[i32],
+        shape: &[usize],
+    ) -> Result<(f32, usize)> {
+        let (rows, cols) = check_2d_sisd(shape, "masked_cross_entropy")?;
+        check_len(log_probs, rows * cols, "masked_cross_entropy", "log_probs")?;
+        if labels.len() != rows {
+            return Err(GlTrainError::ShapeMismatch {
+                expected: vec![rows],
+                got: vec![labels.len()],
+            });
+        }
+
+        let mut sum = 0.0f64;
+        let mut count = 0usize;
+        for r in 0..rows {
+            let label = labels[r];
+            if label == IGNORE_INDEX {
+                continue;
+            }
+            let idx = usize::try_from(label).map_err(|_| {
+                GlTrainError::Backend(format!(
+                    "sisd masked_cross_entropy: row {r} has label {label}, which is negative and is not IGNORE_INDEX ({IGNORE_INDEX})"
+                ))
+            })?;
+            if idx >= cols {
+                return Err(GlTrainError::Backend(format!(
+                    "sisd masked_cross_entropy: row {r} has label {idx}, outside a                      vocabulary of {cols}"
+                )));
+            }
+            sum -= f64::from(log_probs[r * cols + idx]);
+            count += 1;
+        }
+        Ok((sum as f32, count))
     }
 
     fn sum(a: &Self::Storage) -> Result<f32> {
@@ -435,8 +516,16 @@ mod tests {
         let sisd = SisdBackend::sign(&a, 4).unwrap();
         let glp = GlProc::sign(&a, 4).unwrap();
         for (i, &exp) in expected.iter().enumerate() {
-            assert!((sisd[i] - exp).abs() < TOL_ELEM, "sisd sign[{i}] = {}", sisd[i]);
-            assert!((glp[i] - exp).abs() < TOL_ELEM, "glproc sign[{i}] = {}", glp[i]);
+            assert!(
+                (sisd[i] - exp).abs() < TOL_ELEM,
+                "sisd sign[{i}] = {}",
+                sisd[i]
+            );
+            assert!(
+                (glp[i] - exp).abs() < TOL_ELEM,
+                "glproc sign[{i}] = {}",
+                glp[i]
+            );
         }
     }
 

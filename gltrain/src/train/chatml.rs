@@ -39,10 +39,19 @@
 //! # Labels are not shifted here
 //!
 //! `labels[i]` describes position `i` of `input_ids`, not `i + 1`. The
-//! next-token shift belongs to the loss function, which is where every
-//! framework puts it and where Wave 3 will implement it. Shifting in the
-//! collator as well would shift twice, and the resulting model would be off by
-//! one token in a way that still trains and still lowers the loss.
+//! next-token shift belongs at the loss, which is where every framework puts
+//! it. Shifting in the collator as well would shift twice, and the resulting
+//! model would be off by one token in a way that still trains and still lowers
+//! the loss.
+//!
+//! Wave 3's [`crate::tensor::Tensor::masked_cross_entropy`] deliberately does
+//! **not** apply it. It is a position-wise cross-entropy: row `i` of the logits
+//! is scored against `labels[i]`. The shift is only meaningful once a *causal*
+//! model exists, because it is the attention mask that lets position `i` see
+//! tokens `0..=i` and nothing later. Wave 3's chain has no attention, so
+//! position `i`'s logits depend on token `i` alone, and shifting would ask it
+//! to predict token `i + 1` from token `i` with nothing else to go on. The
+//! shift lands with the transformer, applied by its caller.
 
 use crate::checkpoint::json::{self, Json};
 use crate::error::{GlTrainError, Result};
