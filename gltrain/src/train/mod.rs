@@ -10,10 +10,17 @@
 //! the order they run in, which is where KL-006 lives. See
 //! [`Trainer::train_step`].
 
+pub mod chatml;
 pub mod dataset;
 pub mod observe;
+pub mod tokenizer;
 pub mod trainer;
 
+pub use chatml::{
+    DTChatMl, ENChatRole, VLBatch, VLChatMlConfig, VLChatSample, VLChatTurn, VLTokenizedSample,
+    IGNORE_INDEX,
+};
 pub use dataset::VLMicroDataset;
 pub use observe::{StepObserver, VLTrainingStep};
+pub use tokenizer::{ABByteTokenizer, ABGllmTokenizer, Tokenizer, IM_END, IM_START};
 pub use trainer::{mse_loss, Trainer, VLTrainerConfig};

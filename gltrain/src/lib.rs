@@ -14,10 +14,11 @@
 //!
 //! `nn::adapter` landed ahead of `optim`/`checkpoint`: LRLora is a full
 //! implementation, and the other five adapters (DoRA/QLoRA/LoHa/VeRA/LoCon) are
-//! researched stubs with real parameter shapes and a capability registry. The
-//! `optim` and `checkpoint` sub-systems are documented in
-//! `gl-agent-skills/gltrain-m2-skills/` (implementation skills for AdamW, LoRA
-//! integration, and checkpoints) rather than implemented yet in this tree.
+//! researched stubs with real parameter shapes and a capability registry.
+//! `optim` and `checkpoint` shipped after that: OPAdamW and CPLora are full,
+//! and OPLion/OPAdafactor/OPAdamW8bit/CPFull/CPIncremental/CPSharded remain
+//! registered stubs. Design notes for all of them live in
+//! `gl-agent-skills/gltrain-m2-skills/`.
 
 pub mod autograd;
 pub mod backend;
@@ -32,16 +33,16 @@ pub mod train;
 // Convenient top-level re-exports
 pub use autograd::{NodeId, Tape, TensorId, VLGradStore};
 pub use backend::{GlProc, SisdBackend};
+pub use checkpoint::{
+    CPFull, CPIncremental, CPLora, CPSharded, CheckpointRegistry, CheckpointStore, ENSegment,
+    ENTensorEntry, ENVersionCompatibility, Exporter, PLGgufMerge, VLCheckpoint, VLCheckpointFormat,
+    VLFormatVersion, VLManifest, VLValidation,
+};
 pub use error::{GlTrainError, Result};
 pub use nn::{
     trainable_parameters, trainable_parameters_mut, ABLinear, Adapter, AdapterRegistry,
     ENSkillStatus, LRDora, LRLoCon, LRLoHa, LRLora, LRQLora, LRVeRA, Module, TPParameter,
     VLAdapterCapability, VLAdapterSpec, VLLoraConfig,
-};
-pub use checkpoint::{
-    CheckpointRegistry, CheckpointStore, ENSegment, ENTensorEntry, ENVersionCompatibility,
-    Exporter, CPFull, CPIncremental, CPLora, CPSharded, PLGgufMerge, VLCheckpoint,
-    VLCheckpointFormat, VLFormatVersion, VLManifest, VLValidation,
 };
 pub use optim::{
     ENAdafactorMoment, ENOptimizerStateShape, OPAdafactor, OPAdamW, OPAdamW8bit, OPAdamWMoments,
@@ -50,4 +51,8 @@ pub use optim::{
 };
 pub use rng::Xorshift64Star;
 pub use tensor::{Backend, Tensor};
-pub use train::{mse_loss, StepObserver, Trainer, VLMicroDataset, VLTrainerConfig, VLTrainingStep};
+pub use train::{
+    mse_loss, ABByteTokenizer, ABGllmTokenizer, DTChatMl, ENChatRole, StepObserver, Tokenizer,
+    Trainer, VLBatch, VLChatMlConfig, VLChatSample, VLChatTurn, VLMicroDataset, VLTokenizedSample,
+    VLTrainerConfig, VLTrainingStep, IGNORE_INDEX,
+};
