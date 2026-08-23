@@ -135,6 +135,62 @@ pub trait Backend: Clone + Send + Sync + 'static {
     /// ReLU activation: y = max(0, x)
     fn relu(x: &Self::Storage, n_elems: usize) -> Result<Self::Storage>;
 
+    // ── Loss ─────────────────────────────────────────────────────────────
+
+    /// Row-wise log-softmax over the last dimension of a 2-D `[rows, cols]`.
+    ///
+    /// Returns `x - max - log(sum(exp(x - max)))` per row, i.e. log-
+    /// probabilities, and the output has the same shape as the input.
+    ///
+    /// # The max subtraction is required, not an optimization
+    ///
+    /// `exp(x)` overflows f32 at x ≈ 88.7. Raw logits from a language-model
+    /// head routinely exceed that, so a naive `log(sum(exp(x)))` returns `inf`
+    /// and the loss becomes `NaN` on the first batch. Subtracting the row max
+    /// is algebraically identity and is what makes the function usable.
+    ///
+    /// # Why log-probabilities rather than probabilities
+    ///
+    /// Cross-entropy needs `log p`. Computing `softmax` and then taking its log
+    /// loses precision exactly where it matters most: a confidently-wrong token
+    /// has `p` near zero, which is where `log` is steepest and where the loss
+    /// carries the largest gradient. Staying in log-space throughout avoids it.
+    ///
+    /// Rank is restricted to 2 for the same reason [`Backend::matmul`] is: this
+    /// crate has no 3-D storage layout, and a caller with a `[batch, seq]`
+    /// batch flattens it to `[batch * seq, vocab]` before calling.
+    fn log_softmax(a: &Self::Storage, shape: &[usize]) -> Result<Self::Storage>;
+
+    /// Cross-entropy of `log_probs` against `labels`, over supervised rows only.
+    ///
+    /// `log_probs` is `[rows, cols]` as produced by [`Backend::log_softmax`],
+    /// and `labels` has one entry per row. A label equal to
+    /// [`crate::train::IGNORE_INDEX`] means the row is masked and contributes
+    /// nothing.
+    ///
+    /// Returns `(sum, count)`: the summed `-log_probs[row, label]` and how many
+    /// rows were supervised.
+    ///
+    /// # Why the sum and the count, and not the mean
+    ///
+    /// Because the backend cannot know what to divide by. Normalizing per row
+    /// is wrong (every row's contribution is already one term), and normalizing
+    /// per sample divides by zero the moment truncation leaves a sample fully
+    /// masked. The denominator anyone means by "the loss" is the batch's total
+    /// supervised count, which only the caller holds. Returning both halves
+    /// lets the caller form it and keeps `0/0` out of the backend.
+    ///
+    /// # A label outside the vocabulary is an error
+    ///
+    /// Not skipped. An out-of-range id means the tokenizer and the model head
+    /// disagree on vocabulary size, and skipping it would train on a silently
+    /// truncated subset while still reporting a plausible loss.
+    fn masked_cross_entropy(
+        log_probs: &Self::Storage,
+        labels: &[i32],
+        shape: &[usize],
+    ) -> Result<(f32, usize)>;
+
     // ── Reduction ────────────────────────────────────────────────────────
 
     /// Sum all elements to a scalar.

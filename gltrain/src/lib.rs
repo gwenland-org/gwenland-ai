@@ -40,9 +40,9 @@ pub use checkpoint::{
 };
 pub use error::{GlTrainError, Result};
 pub use nn::{
-    trainable_parameters, trainable_parameters_mut, ABLinear, Adapter, AdapterRegistry,
-    ENSkillStatus, LRDora, LRLoCon, LRLoHa, LRLora, LRQLora, LRVeRA, Module, TPParameter,
-    VLAdapterCapability, VLAdapterSpec, VLLoraConfig,
+    trainable_parameters, trainable_parameters_mut, ABEmbedding, ABLinear, Adapter,
+    AdapterRegistry, ENSkillStatus, LRDora, LRLoCon, LRLoHa, LRLora, LRQLora, LRVeRA, Module,
+    TPParameter, VLAdapterCapability, VLAdapterSpec, VLLoraConfig,
 };
 pub use optim::{
     ENAdafactorMoment, ENOptimizerStateShape, OPAdafactor, OPAdamW, OPAdamW8bit, OPAdamWMoments,

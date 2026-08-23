@@ -321,7 +321,9 @@ impl<B: Backend> Tensor<B> {
         // Resolve which tape this op belongs to, rejecting a mixed set.
         let mut tape: Option<Arc<Mutex<Tape>>> = None;
         for input in inputs {
-            let Some(candidate) = &input.tape else { continue };
+            let Some(candidate) = &input.tape else {
+                continue;
+            };
             match &tape {
                 None => tape = Some(candidate.clone()),
                 Some(existing) => {
@@ -394,31 +396,29 @@ impl<B: Backend> Tensor<B> {
             };
             let a_shape = self.shape.clone();
             let b_shape = other.shape.clone();
-            Ok(Arc::new(
-                move |grad_output: &[f32], out_shape: &[usize]| {
-                    let grad_a = if a_tracked {
-                        let bt = transpose_2d(&b_data, &b_shape)?;
-                        let bt_shape = vec![b_shape[1], b_shape[0]];
-                        Some((
-                            matmul_f32(grad_output, out_shape, &bt, &bt_shape)?,
-                            a_shape.clone(),
-                        ))
-                    } else {
-                        None
-                    };
-                    let grad_b = if b_tracked {
-                        let at = transpose_2d(&a_data, &a_shape)?;
-                        let at_shape = vec![a_shape[1], a_shape[0]];
-                        Some((
-                            matmul_f32(&at, &at_shape, grad_output, out_shape)?,
-                            b_shape.clone(),
-                        ))
-                    } else {
-                        None
-                    };
-                    Ok(vec![grad_a, grad_b])
-                },
-            ) as BackwardFn)
+            Ok(Arc::new(move |grad_output: &[f32], out_shape: &[usize]| {
+                let grad_a = if a_tracked {
+                    let bt = transpose_2d(&b_data, &b_shape)?;
+                    let bt_shape = vec![b_shape[1], b_shape[0]];
+                    Some((
+                        matmul_f32(grad_output, out_shape, &bt, &bt_shape)?,
+                        a_shape.clone(),
+                    ))
+                } else {
+                    None
+                };
+                let grad_b = if b_tracked {
+                    let at = transpose_2d(&a_data, &a_shape)?;
+                    let at_shape = vec![a_shape[1], a_shape[0]];
+                    Some((
+                        matmul_f32(&at, &at_shape, grad_output, out_shape)?,
+                        b_shape.clone(),
+                    ))
+                } else {
+                    None
+                };
+                Ok(vec![grad_a, grad_b])
+            }) as BackwardFn)
         })?;
         Ok(output)
     }
@@ -761,6 +761,192 @@ impl<B: Backend> Tensor<B> {
     pub fn mean_scalar(&self) -> Result<f32> {
         B::mean(&self.storage, self.n_elems())
     }
+
+    /// Gather one row of this table per token id: `y[i] = self[ids[i]]`.
+    ///
+    /// `self` is `[vocab_size, d_model]` and the result is
+    /// `[ids.len(), d_model]`. Records an "Embedding" node.
+    ///
+    /// This is the one op in the crate whose input is not a tensor. Ids are
+    /// indices, not values, so they are a plain `&[u32]` and the node has a
+    /// single tensor input — the table.
+    ///
+    /// # The backward pass is a scatter-add
+    ///
+    /// A row can be selected by many positions in one batch, and every one of
+    /// them contributes, so the gradient **accumulates** into `grad[id]`.
+    /// Assigning instead would keep only the last occurrence, which still
+    /// trains and still lowers the loss while silently underweighting exactly
+    /// the most frequent tokens.
+    ///
+    /// The gradient is dense `[vocab_size, d_model]` and mostly zero. A sparse
+    /// gradient is the standard optimization and is deliberately not done here:
+    /// [`crate::autograd::grad_store::VLGradStore`] holds flat buffers and
+    /// [`crate::optim::OPAdamW`] reads them positionally, so a sparse form
+    /// needs both to change. That is its own wave.
+    pub fn embedding(&self, ids: &[u32]) -> Result<Tensor<B>> {
+        if self.shape.len() != 2 {
+            return Err(GlTrainError::InvalidOp(format!(
+                "embedding() requires a 2D table [vocab_size, d_model], got {:?}",
+                self.shape
+            )));
+        }
+        if ids.is_empty() {
+            return Err(GlTrainError::InvalidOp(
+                "embedding() needs at least one token id".into(),
+            ));
+        }
+        let vocab = self.shape[0];
+        let d_model = self.shape[1];
+
+        // An out-of-range id means the tokenizer and this table disagree on
+        // vocabulary size. Named here rather than read out of bounds.
+        if let Some((pos, &bad)) = ids.iter().enumerate().find(|(_, &id)| id as usize >= vocab) {
+            return Err(GlTrainError::InvalidOp(format!(
+                "embedding(): token id {bad} at position {pos} is outside a vocabulary of {vocab}"
+            )));
+        }
+
+        let table = B::to_vec(&self.storage)?;
+        let mut out = Vec::with_capacity(ids.len() * d_model);
+        for &id in ids {
+            let row = id as usize * d_model;
+            out.extend_from_slice(&table[row..row + d_model]);
+        }
+        let storage = B::from_vec(out)?;
+
+        let mut output = Tensor::from_storage(storage, vec![ids.len(), d_model]);
+        Self::record_op(&mut output, &[self], "Embedding", move || {
+            let ids = ids.to_vec();
+            let table_shape = self.shape.clone();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                if grad_output.len() != ids.len() * d_model {
+                    return Err(GlTrainError::ShapeMismatch {
+                        expected: vec![ids.len(), d_model],
+                        got: vec![grad_output.len()],
+                    });
+                }
+                let mut grad_table = vec![0.0f32; vocab * d_model];
+                for (i, &id) in ids.iter().enumerate() {
+                    let dst = id as usize * d_model;
+                    let src = i * d_model;
+                    // `+=`, not `=`. See the method docs.
+                    for k in 0..d_model {
+                        grad_table[dst + k] += grad_output[src + k];
+                    }
+                }
+                Ok(vec![Some((grad_table, table_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    // ── Loss ──────────────────────────────────────────────────────────────
+
+    /// Row-wise log-softmax over a 2-D `[rows, cols]` tensor.
+    ///
+    /// Records a "LogSoftmax" node. See [`Backend::log_softmax`] for why the
+    /// result is log-probabilities rather than probabilities.
+    ///
+    /// # The backward pass reads the output, not the input
+    ///
+    /// `dx_j = g_j - softmax_j * sum_i(g_i)`, per row, and `softmax` is just
+    /// `exp` of this op's own output. Saving the output costs one buffer and
+    /// saves recomputing the whole softmax during backward; saving the *input*
+    /// would mean recomputing it. The buffer is only taken when the input is
+    /// tracked, so an inference-only forward pays nothing.
+    pub fn log_softmax(&self) -> Result<Tensor<B>> {
+        let storage = B::log_softmax(&self.storage, &self.shape)?;
+
+        let tracked = self.requires_grad;
+        // Guarded: for a `[tokens, vocab]` head this buffer is the largest
+        // allocation in the step, and an untracked forward has no use for it.
+        let saved = if tracked {
+            B::to_vec(&storage)?
+        } else {
+            Vec::new()
+        };
+
+        let mut output = Tensor::from_storage(storage, self.shape.clone());
+        Self::record_op(&mut output, &[self], "LogSoftmax", move || {
+            let in_shape = self.shape.clone();
+            let cols = in_shape[in_shape.len() - 1];
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                if grad_output.len() != saved.len() {
+                    return Err(GlTrainError::ShapeMismatch {
+                        expected: vec![saved.len()],
+                        got: vec![grad_output.len()],
+                    });
+                }
+                let mut grad_in = vec![0.0f32; saved.len()];
+                for (row_g, (row_y, row_out)) in grad_output
+                    .chunks(cols)
+                    .zip(saved.chunks(cols).zip(grad_in.chunks_mut(cols)))
+                {
+                    let g_sum: f32 = row_g.iter().sum();
+                    for ((o, &g), &y) in row_out.iter_mut().zip(row_g).zip(row_y) {
+                        *o = g - y.exp() * g_sum;
+                    }
+                }
+                Ok(vec![Some((grad_in, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
+
+    /// Masked cross-entropy of these log-probabilities against `labels`.
+    ///
+    /// `self` is `[rows, cols]` as produced by [`Tensor::log_softmax`], and
+    /// `labels` has one entry per row. A label equal to
+    /// [`crate::train::IGNORE_INDEX`] masks that row out. The result is a
+    /// tensor of shape `[1]`, so it can be the tail of a tape and seeded by
+    /// [`crate::autograd::tape::Tape::backward`].
+    ///
+    /// The value is the **mean over supervised rows**: the backend returns the
+    /// sum and the count, and the division happens here where both are known.
+    ///
+    /// # A batch with nothing supervised is an error
+    ///
+    /// Not a zero. `0/0` is `NaN`, and a `NaN` loss propagates into every
+    /// parameter on the first optimizer step with nothing in the log to say
+    /// where it came from. A batch in which truncation masked every row is a
+    /// data bug, and it is named here rather than discovered three steps later.
+    pub fn masked_cross_entropy(&self, labels: &[i32]) -> Result<Tensor<B>> {
+        let (sum, count) = B::masked_cross_entropy(&self.storage, labels, &self.shape)?;
+        if count == 0 {
+            return Err(GlTrainError::InvalidOp(
+                "masked_cross_entropy: no supervised positions in this batch, so the loss would be 0/0. Check the label mask and max_seq_len."
+                    .into(),
+            ));
+        }
+        let loss = sum / count as f32;
+        let storage = B::from_vec(vec![loss])?;
+
+        let mut output = Tensor::from_storage(storage, vec![1]);
+        Self::record_op(&mut output, &[self], "MaskedCrossEntropy", move || {
+            // d(loss)/d(log_probs)[r, c] is -1/count at the labelled column of
+            // a supervised row and zero everywhere else. The `log_softmax` node
+            // downstream turns that into the familiar `(softmax - onehot)/count`.
+            let in_shape = self.shape.clone();
+            let cols = in_shape[in_shape.len() - 1];
+            let n_elems = self.n_elems();
+            let labels = labels.to_vec();
+            Ok(Arc::new(move |grad_output: &[f32], _: &[usize]| {
+                let g = grad_output.first().copied().unwrap_or(1.0) / count as f32;
+                let mut grad_in = vec![0.0f32; n_elems];
+                for (r, &label) in labels.iter().enumerate() {
+                    if label == crate::train::chatml::IGNORE_INDEX {
+                        continue;
+                    }
+                    // Range was validated in the forward pass, which ran first
+                    // and would have returned an error.
+                    grad_in[r * cols + label as usize] = -g;
+                }
+                Ok(vec![Some((grad_in, in_shape.clone()))])
+            }) as BackwardFn)
+        })?;
+        Ok(output)
+    }
 }
 
 // ── Shape validation helpers ─────────────────────────────────────────────────
@@ -810,6 +996,7 @@ impl<B: Backend> std::fmt::Debug for Tensor<B> {
 mod tests {
     use super::*;
     use crate::backend::GlProc;
+    use crate::train::chatml::IGNORE_INDEX;
 
     /// Tolerance for f32 elementwise ops (rounding only, no accumulation).
     const TOL_ELEM: f32 = 1e-6;
@@ -830,10 +1017,7 @@ mod tests {
         assert_eq!(t.shape(), &[2, 3]);
         assert_eq!(t.n_elems(), 6);
         let v = t.to_vec().unwrap();
-        assert!(
-            v.iter().all(|&x| x == 0.0),
-            "expected all zeros, got {v:?}"
-        );
+        assert!(v.iter().all(|&x| x == 0.0), "expected all zeros, got {v:?}");
     }
 
     #[test]
@@ -937,8 +1121,7 @@ mod tests {
     #[test]
     fn transpose_2x3_produces_3x2() {
         // [[1, 2, 3], [4, 5, 6]] → [[1, 4], [2, 5], [3, 6]]
-        let t =
-            Tensor::<GlProc>::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
+        let t = Tensor::<GlProc>::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]).unwrap();
         let tr = t.transpose().unwrap();
         assert_eq!(tr.shape(), &[3, 2]);
         let v = tr.to_vec().unwrap();
@@ -1210,8 +1393,229 @@ mod tests {
         let c = a.matmul(&b).unwrap();
 
         // Output tensor must carry the tape forward (for chaining)
-        assert!(c.requires_grad(), "output of tracked matmul must require grad");
-        assert!(c.tape().is_some(), "output of tracked matmul must carry tape");
+        assert!(
+            c.requires_grad(),
+            "output of tracked matmul must require grad"
+        );
+        assert!(
+            c.tape().is_some(),
+            "output of tracked matmul must carry tape"
+        );
+    }
+    // ── Loss ops (Wave 3) ────────────────────────────────────────────────
+
+    /// Softmax of a uniform row is uniform, so every log-probability is
+    /// -ln(cols). Exact enough to pin the arithmetic.
+    #[test]
+    fn log_softmax_of_a_uniform_row_is_minus_log_of_the_width() {
+        let x = Tensor::<GlProc>::zeros(&[2, 4]).unwrap();
+        let y = x.log_softmax().unwrap();
+        assert_eq!(y.shape(), &[2, 4]);
+        let want = -(4.0f32.ln());
+        for v in y.to_vec().unwrap() {
+            assert!((v - want).abs() < 1e-6, "got {v}, want {want}");
+        }
+    }
+
+    /// Exponentiating the output must give a probability distribution.
+    #[test]
+    fn exponentiated_log_softmax_rows_sum_to_one() {
+        let x = Tensor::<GlProc>::from_vec(vec![1.0, 2.0, 3.0, -1.0, 0.5, 4.0], &[2, 3]).unwrap();
+        let y = x.log_softmax().unwrap().to_vec().unwrap();
+        for row in y.chunks(3) {
+            let total: f32 = row.iter().map(|v| v.exp()).sum();
+            assert!((total - 1.0).abs() < 1e-6, "row sums to {total}");
+        }
+    }
+
+    /// The reason the row max is subtracted. `exp(1000.0)` is `inf` in f32, so
+    /// a naive implementation returns NaN here and the first batch of training
+    /// dies with no explanation.
+    #[test]
+    fn log_softmax_survives_logits_that_would_overflow_exp() {
+        let x = Tensor::<GlProc>::from_vec(vec![1000.0, 0.0, -1000.0], &[1, 3]).unwrap();
+        let y = x.log_softmax().unwrap().to_vec().unwrap();
+        assert!(y.iter().all(|v| v.is_finite()), "got {y:?}");
+        // The max dominates completely: p is ~1 for it, so log p is ~0.
+        assert!(y[0].abs() < 1e-6, "got {}", y[0]);
+        assert!((y[1] - -1000.0).abs() < 1e-3, "got {}", y[1]);
+    }
+
+    #[test]
+    fn log_softmax_rejects_a_non_2d_shape() {
+        assert!(Tensor::<GlProc>::zeros(&[6])
+            .unwrap()
+            .log_softmax()
+            .is_err());
+        assert!(Tensor::<GlProc>::zeros(&[1, 2, 3])
+            .unwrap()
+            .log_softmax()
+            .is_err());
+    }
+
+    /// A uniform distribution over `cols` classes has cross-entropy ln(cols),
+    /// whichever class is the target.
+    #[test]
+    fn cross_entropy_of_a_uniform_distribution_is_log_of_the_width() {
+        let x = Tensor::<GlProc>::zeros(&[3, 4]).unwrap();
+        let loss = x
+            .log_softmax()
+            .unwrap()
+            .masked_cross_entropy(&[0, 2, 3])
+            .unwrap();
+        assert_eq!(loss.shape(), &[1]);
+        let want = 4.0f32.ln();
+        let got = loss.item().unwrap();
+        assert!((got - want).abs() < 1e-6, "got {got}, want {want}");
+    }
+
+    /// A masked row must not move the loss at all: the average is over the
+    /// supervised rows only, not over every row.
+    #[test]
+    fn ignored_rows_are_excluded_from_the_average_not_counted_as_zero() {
+        // Row 0 is uniform (loss ln 4); row 1 is confident and would pull the
+        // mean down sharply if it were counted.
+        let x = Tensor::<GlProc>::from_vec(vec![0.0, 0.0, 0.0, 0.0, 20.0, 0.0, 0.0, 0.0], &[2, 4])
+            .unwrap();
+        let lp = x.log_softmax().unwrap();
+
+        let both = lp.masked_cross_entropy(&[0, 0]).unwrap().item().unwrap();
+        let only_first = lp
+            .masked_cross_entropy(&[0, IGNORE_INDEX])
+            .unwrap()
+            .item()
+            .unwrap();
+
+        let uniform = 4.0f32.ln();
+        assert!((only_first - uniform).abs() < 1e-6, "got {only_first}");
+        assert!(both < only_first, "the confident row should lower the mean");
+    }
+
+    /// `0/0` is NaN, and a NaN loss reaches every parameter on the first step
+    /// with nothing in the log to say where it started.
+    #[test]
+    fn a_fully_masked_batch_is_an_error_rather_than_a_nan() {
+        let x = Tensor::<GlProc>::zeros(&[2, 3]).unwrap();
+        let err = x
+            .log_softmax()
+            .unwrap()
+            .masked_cross_entropy(&[IGNORE_INDEX, IGNORE_INDEX])
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no supervised positions"),
+            "got {err}"
+        );
+    }
+
+    /// An id past the vocabulary means the tokenizer and the head disagree.
+    /// Skipping it would report a plausible loss over a silent subset.
+    #[test]
+    fn a_label_outside_the_vocabulary_is_rejected() {
+        let lp = Tensor::<GlProc>::zeros(&[1, 3])
+            .unwrap()
+            .log_softmax()
+            .unwrap();
+        assert!(lp.masked_cross_entropy(&[7]).is_err(), "label >= cols");
+        assert!(
+            lp.masked_cross_entropy(&[-3]).is_err(),
+            "negative non-sentinel"
+        );
+    }
+
+    #[test]
+    fn cross_entropy_rejects_a_label_count_that_disagrees_with_the_rows() {
+        let lp = Tensor::<GlProc>::zeros(&[2, 3])
+            .unwrap()
+            .log_softmax()
+            .unwrap();
+        assert!(lp.masked_cross_entropy(&[0]).is_err());
+        assert!(lp.masked_cross_entropy(&[0, 1, 2]).is_err());
+    }
+
+    /// The composed gradient is the textbook one: `(softmax - onehot)/count`
+    /// at supervised rows, and exactly zero at masked ones. This is the single
+    /// check that both backward closures and their composition are right.
+    #[test]
+    fn the_composed_backward_is_softmax_minus_onehot_over_the_count() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let data = vec![0.5, -1.0, 2.0, 0.0, 1.0, -0.5];
+        let x = Tensor::<GlProc>::from_vec(data.clone(), &[2, 3])
+            .unwrap()
+            .with_grad(tape.clone());
+        let labels = [2i32, IGNORE_INDEX];
+
+        let loss = x
+            .log_softmax()
+            .unwrap()
+            .masked_cross_entropy(&labels)
+            .unwrap();
+        assert!(loss.item().unwrap().is_finite());
+        Tape::lock(&tape).backward().unwrap();
+
+        let (grad, shape) = Tape::lock(&tape).grad(x.id()).cloned().unwrap();
+        assert_eq!(shape, vec![2, 3]);
+
+        // Row 0: softmax(row) with 1 subtracted at the label, over count = 1.
+        let row0 = &data[..3];
+        let max = row0.iter().copied().fold(f32::MIN, f32::max);
+        let exps: Vec<f32> = row0.iter().map(|v| (v - max).exp()).collect();
+        let total: f32 = exps.iter().sum();
+        for (c, e) in exps.iter().enumerate() {
+            let want = e / total - if c == 2 { 1.0 } else { 0.0 };
+            assert!(
+                (grad[c] - want).abs() < 1e-6,
+                "col {c}: {} vs {want}",
+                grad[c]
+            );
+        }
+        // Row 1 was masked, so it gets nothing.
+        assert!(
+            grad[3..].iter().all(|g| g.abs() < 1e-7),
+            "masked row got a gradient: {:?}",
+            &grad[3..]
+        );
+    }
+
+    /// The gradient of a cross-entropy loss sums to zero across each supervised
+    /// row: probabilities move mass around, they do not create it.
+    #[test]
+    fn each_supervised_rows_gradient_sums_to_zero() {
+        let tape = Arc::new(Mutex::new(Tape::new()));
+        let x = Tensor::<GlProc>::from_vec(vec![0.3, -0.7, 1.1, 2.0, 0.0, -1.0], &[2, 3])
+            .unwrap()
+            .with_grad(tape.clone());
+        x.log_softmax()
+            .unwrap()
+            .masked_cross_entropy(&[0, 1])
+            .unwrap();
+        Tape::lock(&tape).backward().unwrap();
+
+        let (grad, _) = Tape::lock(&tape).grad(x.id()).cloned().unwrap();
+        for (r, row) in grad.chunks(3).enumerate() {
+            let total: f32 = row.iter().sum();
+            assert!(total.abs() < 1e-6, "row {r} sums to {total}");
+        }
+    }
+
+    // ── Embedding (Wave 3) ───────────────────────────────────────────────
+
+    #[test]
+    fn embedding_gathers_rows_and_rejects_a_bad_table_or_id() {
+        let table =
+            Tensor::<GlProc>::from_vec((0..12).map(|v| v as f32).collect(), &[4, 3]).unwrap();
+        let y = table.embedding(&[3, 0]).unwrap();
+        assert_eq!(y.shape(), &[2, 3]);
+        assert_eq!(y.to_vec().unwrap(), vec![9.0, 10.0, 11.0, 0.0, 1.0, 2.0]);
+
+        assert!(table.embedding(&[4]).is_err(), "id past the vocabulary");
+        assert!(table.embedding(&[]).is_err(), "no ids");
+        assert!(
+            Tensor::<GlProc>::zeros(&[12])
+                .unwrap()
+                .embedding(&[0])
+                .is_err(),
+            "1-D table"
+        );
     }
 }
 
@@ -1346,7 +1750,9 @@ mod grad_check {
         // Column sums of A: 5, 7, 9. Every column of dB is that vector.
         let (grad_b, shape_b) = guard.grad(b_id).expect("B must have a gradient");
         assert_eq!(shape_b, &vec![3, 4]);
-        let want_b = [5.0f32, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0];
+        let want_b = [
+            5.0f32, 5.0, 5.0, 5.0, 7.0, 7.0, 7.0, 7.0, 9.0, 9.0, 9.0, 9.0,
+        ];
         for (i, (got, want)) in grad_b.iter().zip(&want_b).enumerate() {
             assert!(
                 (got - want).abs() < TOL_EXACT,
@@ -1364,7 +1770,10 @@ mod grad_check {
                 .with_grad(tp.clone());
             x.matmul(&b)
         });
-        assert!(err < GRAD_CHECK_TOL, "matmul grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "matmul grad error {err} exceeds tolerance"
+        );
     }
 
     /// Non-square catches a transposed-index bug that [2,2] hides.
@@ -1395,7 +1804,10 @@ mod grad_check {
                 .with_grad(tp.clone());
             x.add(&b)
         });
-        assert!(err < GRAD_CHECK_TOL, "add grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "add grad error {err} exceeds tolerance"
+        );
     }
 
     #[test]
@@ -1407,7 +1819,10 @@ mod grad_check {
                 .with_grad(tp.clone());
             x.sub(&b)
         });
-        assert!(err < GRAD_CHECK_TOL, "sub grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "sub grad error {err} exceeds tolerance"
+        );
     }
 
     #[test]
@@ -1419,7 +1834,10 @@ mod grad_check {
                 .with_grad(tp.clone());
             x.mul(&b)
         });
-        assert!(err < GRAD_CHECK_TOL, "mul grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "mul grad error {err} exceeds tolerance"
+        );
     }
 
     #[test]
@@ -1438,7 +1856,10 @@ mod grad_check {
         // the finite difference never straddles the kink.
         let a = vec![-1.0f32, 0.5, -0.5, 2.0];
         let err = finite_diff_check(&a, &[4], |x, _| x.relu());
-        assert!(err < GRAD_CHECK_TOL, "relu grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "relu grad error {err} exceeds tolerance"
+        );
     }
 
     // ── M2 Wave 1: div / sqrt / add_scalar / neg ─────────────────────
@@ -1450,7 +1871,10 @@ mod grad_check {
         // push any of them across either boundary.
         let a = vec![0.25f32, 1.0, 4.0, 9.0];
         let err = finite_diff_check(&a, &[4], |x, _| x.sqrt());
-        assert!(err < GRAD_CHECK_TOL, "sqrt grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "sqrt grad error {err} exceeds tolerance"
+        );
     }
 
     /// `d/dx sqrt(x) = 1/(2*sqrt(x))`, so at x = 4 the gradient is exactly
@@ -1507,7 +1931,10 @@ mod grad_check {
             let d = Tensor::<SisdBackend>::from_vec(vec![2.0, 4.0, -2.0, 8.0], &[4]).unwrap();
             x.div(&d)
         });
-        assert!(err < GRAD_CHECK_TOL, "div grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "div grad error {err} exceeds tolerance"
+        );
     }
 
     /// With a ones seed, `dA = 1/B` and `dB = -A/B^2`. Chosen so both are
@@ -1553,7 +1980,10 @@ mod grad_check {
     fn grad_check_neg() {
         let a = vec![1.0f32, -2.0, 0.5];
         let err = finite_diff_check(&a, &[3], |x, _| x.neg());
-        assert!(err < GRAD_CHECK_TOL, "neg grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "neg grad error {err} exceeds tolerance"
+        );
     }
 
     #[test]
@@ -1570,14 +2000,20 @@ mod grad_check {
     fn grad_check_sum() {
         let a = vec![1.0f32, 2.0, 3.0, 4.0];
         let err = finite_diff_check(&a, &[4], |x, _| x.sum());
-        assert!(err < GRAD_CHECK_TOL, "sum grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "sum grad error {err} exceeds tolerance"
+        );
     }
 
     #[test]
     fn grad_check_mean() {
         let a = vec![1.0f32, 2.0, 3.0, 4.0];
         let err = finite_diff_check(&a, &[4], |x, _| x.mean());
-        assert!(err < GRAD_CHECK_TOL, "mean grad error {err} exceeds tolerance");
+        assert!(
+            err < GRAD_CHECK_TOL,
+            "mean grad error {err} exceeds tolerance"
+        );
     }
 
     /// Two ops chained, so the gradient has to flow through a node it did not
@@ -1635,7 +2071,10 @@ mod grad_check {
 
         let mut guard = lock_tape(&tape);
         guard.backward().unwrap();
-        assert!(guard.grad(x_id).is_some(), "tracked tensor must have a gradient");
+        assert!(
+            guard.grad(x_id).is_some(),
+            "tracked tensor must have a gradient"
+        );
         assert!(
             guard.grad(w_id).is_none(),
             "frozen tensor must not have a gradient (KL-003)"
@@ -1683,9 +2122,14 @@ mod grad_check {
 
         // After zero_grad the same pass is allowed again and reproduces it.
         guard.zero_grad();
-        guard.backward().expect("backward must work after zero_grad");
+        guard
+            .backward()
+            .expect("backward must work after zero_grad");
         let again = guard.grad(id).expect("x must have a gradient").0.clone();
-        assert_eq!(first, again, "backward must be reproducible after zero_grad");
+        assert_eq!(
+            first, again,
+            "backward must be reproducible after zero_grad"
+        );
     }
 
     #[test]
@@ -1701,7 +2145,10 @@ mod grad_check {
         assert!(!guard.grad_store().is_empty());
         let nodes_before = guard.len();
         guard.zero_grad();
-        assert!(guard.grad_store().is_empty(), "zero_grad must drop gradients");
+        assert!(
+            guard.grad_store().is_empty(),
+            "zero_grad must drop gradients"
+        );
         assert_eq!(guard.len(), nodes_before, "zero_grad must keep the graph");
     }
 }
