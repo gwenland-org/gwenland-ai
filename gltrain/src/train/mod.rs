@@ -12,6 +12,7 @@
 
 pub mod chatml;
 pub mod dataset;
+pub mod observability;
 pub mod observe;
 pub mod tokenizer;
 pub mod trainer;
@@ -21,6 +22,10 @@ pub use chatml::{
     IGNORE_INDEX,
 };
 pub use dataset::VLMicroDataset;
+pub use observability::{
+    ENHealthLevel, ENVerdict, VLAnomaly, VLBatchInfo, VLObservedStep, VLObserverConfig,
+    VLParamSnapshot, VLRunConfig, VLStepHealth, VLTrainingObserver,
+};
 pub use observe::{StepObserver, VLTrainingStep};
 pub use tokenizer::{ABByteTokenizer, ABGllmTokenizer, Tokenizer, IM_END, IM_START};
 pub use trainer::{mse_loss, Trainer, VLTrainerConfig};
