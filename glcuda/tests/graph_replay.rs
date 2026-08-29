@@ -172,7 +172,11 @@ fn run(cuda: &Cuda, k: &KernelSet, enc: Enc, graph: bool) -> Vec<Vec<f32>> {
 
 /// Compare the two arms token by token, bit for bit.
 fn assert_arms_agree(individual: &[Vec<f32>], replayed: &[Vec<f32>], what: &str) {
-    assert_eq!(individual.len(), replayed.len(), "{what}: token count differs");
+    assert_eq!(
+        individual.len(),
+        replayed.len(),
+        "{what}: token count differs"
+    );
     for (t, (a, b)) in individual.iter().zip(replayed).enumerate() {
         assert_eq!(a.len(), VOCAB, "{what}: token {t} logit count");
         assert_eq!(b.len(), VOCAB, "{what}: token {t} logit count");
@@ -227,19 +231,24 @@ fn replays_see_updated_position_not_the_captured_one() {
     let Some((cuda, k)) = gpu() else { return };
     let mut m = GpuModel::upload(&cuda, host_model(Enc::F32)).unwrap();
     for (pos, &tok) in PROMPT.iter().enumerate() {
-        m.step(&cuda, &k, tok, pos, pos + 1 == PROMPT.len()).unwrap();
+        m.step(&cuda, &k, tok, pos, pos + 1 == PROMPT.len())
+            .unwrap();
     }
     let repeated = 3u32;
     let mut rows = Vec::new();
     for i in 0..3 {
-        m.decode_step(&cuda, &k, repeated, PROMPT.len() + i).unwrap();
+        m.decode_step(&cuda, &k, repeated, PROMPT.len() + i)
+            .unwrap();
         rows.push(m.logits_host(&cuda).unwrap().to_vec());
     }
     m.free(&cuda).unwrap();
 
     for (a, b) in [(0usize, 1usize), (1, 2)] {
         assert!(
-            rows[a].iter().zip(&rows[b]).any(|(x, y)| x.to_bits() != y.to_bits()),
+            rows[a]
+                .iter()
+                .zip(&rows[b])
+                .any(|(x, y)| x.to_bits() != y.to_bits()),
             "replay {a} and {b} produced identical logits for the same token id. \
              The KV cache grew between them, so the position the graph used did \
              not -- it was frozen at capture time.",
@@ -258,7 +267,11 @@ fn decode_works_in_whichever_mode_the_driver_supports() {
     eprintln!(
         "graph API {} on this driver -- decode takes the {} path",
         if graphs { "available" } else { "MISSING" },
-        if graphs { "captured-replay" } else { "individual-launch fallback" },
+        if graphs {
+            "captured-replay"
+        } else {
+            "individual-launch fallback"
+        },
     );
 
     // Whichever branch decode_step takes internally, it must produce the

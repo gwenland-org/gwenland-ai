@@ -15,8 +15,7 @@ use glcuda::sampler::{Sampler, SamplerConfig};
 
 use glproc::model::{
     FfnLayer, GateUp, GlprocModel, LayerWeights, ModelConfig, QkvWeights,
-    RopeStyle as CpuRopeStyle,
-    WeightMatrix,
+    RopeStyle as CpuRopeStyle, WeightMatrix,
 };
 use glproc::runner::Runner;
 
@@ -50,8 +49,7 @@ fn weights(n: usize, seed: u64) -> Vec<f32> {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
-            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
-                - 0.5)
+            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
                 * 0.2
         })
         .collect()
@@ -148,7 +146,11 @@ fn host_model() -> HostModel {
     let gate_up = |g: u64, u: u64| {
         let mut w = weights(HIDDEN * DIM, g);
         w.extend_from_slice(&weights(HIDDEN * DIM, u));
-        HostMat { w: HostWeight::F32(w), out_dim: 2 * HIDDEN, in_dim: DIM }
+        HostMat {
+            w: HostWeight::F32(w),
+            out_dim: 2 * HIDDEN,
+            in_dim: DIM,
+        }
     };
     let layers = (0..N_LAYERS as u64)
         .map(|i| {
@@ -208,7 +210,9 @@ fn forward_logits_match_glproc() {
     let prompt = [1u32, 2, 3, 7, 4];
     for (pos, &tok) in prompt.iter().enumerate() {
         cpu_run.forward_into(tok, pos).unwrap();
-        gpu_model.step(&cuda, &k, tok, pos, pos + 1 == prompt.len()).unwrap();
+        gpu_model
+            .step(&cuda, &k, tok, pos, pos + 1 == prompt.len())
+            .unwrap();
     }
     let want = cpu_run.logits().to_vec();
     let got = gpu_model.logits_host(&cuda).unwrap().to_vec();
@@ -296,9 +300,15 @@ fn greedy_generation_matches_glproc() {
 
     let mut streamed = Vec::new();
     let (gpu_tokens, timing) = gpu_model
-        .generate(&cuda, &k, &prompt, 8, &mut Sampler::new(greedy_cfg()), |_| false, |t| {
-            streamed.push(t)
-        })
+        .generate(
+            &cuda,
+            &k,
+            &prompt,
+            8,
+            &mut Sampler::new(greedy_cfg()),
+            |_| false,
+            |t| streamed.push(t),
+        )
         .unwrap();
     gpu_model.free(&cuda).unwrap();
 
@@ -323,10 +333,12 @@ fn generate_twice_reuses_cache_deterministically() {
             seed: Some(1),
         })
     };
-    let (a, _) =
-        gpu_model.generate(&cuda, &k, &[1, 2, 3], 5, &mut greedy(), |_| false, |_| {}).unwrap();
-    let (b, _) =
-        gpu_model.generate(&cuda, &k, &[1, 2, 3], 5, &mut greedy(), |_| false, |_| {}).unwrap();
+    let (a, _) = gpu_model
+        .generate(&cuda, &k, &[1, 2, 3], 5, &mut greedy(), |_| false, |_| {})
+        .unwrap();
+    let (b, _) = gpu_model
+        .generate(&cuda, &k, &[1, 2, 3], 5, &mut greedy(), |_| false, |_| {})
+        .unwrap();
     gpu_model.free(&cuda).unwrap();
     assert_eq!(a, b);
 }
@@ -336,7 +348,9 @@ fn invalid_token_and_empty_prompt_error_cleanly() {
     let Some((cuda, k)) = gpu() else { return };
     let mut gpu_model = GpuModel::upload(&cuda, host_model()).unwrap();
     let mut s = Sampler::new(SamplerConfig::default());
-    assert!(gpu_model.generate(&cuda, &k, &[], 5, &mut s, |_| false, |_| {}).is_err());
+    assert!(gpu_model
+        .generate(&cuda, &k, &[], 5, &mut s, |_| false, |_| {})
+        .is_err());
     assert!(gpu_model.step(&cuda, &k, 9999, 0, true).is_err());
     gpu_model.free(&cuda).unwrap();
 }

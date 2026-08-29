@@ -134,8 +134,8 @@ pub struct DriverApi {
     pub cu_module_load_data_ex: unsafe extern "system" fn(
         *mut CUmodule,
         *const c_void,
-        u32,             // numOptions
-        *mut i32,        // options (CUjit_option[])
+        u32,              // numOptions
+        *mut i32,         // options (CUjit_option[])
         *mut *mut c_void, // optionValues
     ) -> CUresult,
     pub cu_module_unload: unsafe extern "system" fn(CUmodule) -> CUresult,
@@ -156,8 +156,8 @@ pub struct DriverApi {
         u32, // blockDimX
         u32,
         u32,
-        u32,      // sharedMemBytes
-        CUstream, // hStream
+        u32,              // sharedMemBytes
+        CUstream,         // hStream
         *mut *mut c_void, // kernelParams
         *mut *mut c_void, // extra
     ) -> CUresult,

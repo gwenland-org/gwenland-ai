@@ -10,8 +10,8 @@ use std::sync::{Arc, OnceLock};
 use glcore::GlError;
 
 use crate::ffi::{
-    CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule, CUresult,
-    CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
+    CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule,
+    CUresult, CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
     ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
 };
 
@@ -20,7 +20,8 @@ use crate::ffi::{
 /// load, not a filesystem search.
 fn api() -> Option<&'static Arc<DriverApi>> {
     static API: OnceLock<Option<Arc<DriverApi>>> = OnceLock::new();
-    API.get_or_init(|| DriverApi::load().ok().map(Arc::new)).as_ref()
+    API.get_or_init(|| DriverApi::load().ok().map(Arc::new))
+        .as_ref()
 }
 
 /// A fixed pool of reusable CUDA events used as stage boundaries.
@@ -55,7 +56,9 @@ impl EventRing {
         let (Some(rec), Some(&e)) = (self.api.cu_event_record, self.events.get(i)) else {
             return;
         };
-        let stream = cuda.launch_stream.load(std::sync::atomic::Ordering::Relaxed);
+        let stream = cuda
+            .launch_stream
+            .load(std::sync::atomic::Ordering::Relaxed);
         // SAFETY: e is a live event from this ring; stream is NULL or a live
         // stream owned for the length of the call.
         unsafe {
@@ -68,7 +71,10 @@ impl EventRing {
     /// Returns `None` when either index is unmarked or the driver refuses —
     /// an unmeasured stage must read as absent, never as zero.
     pub fn elapsed_ms(&self, a: usize, b: usize) -> Option<f64> {
-        let (sync, elapsed) = (self.api.cu_event_synchronize?, self.api.cu_event_elapsed_time?);
+        let (sync, elapsed) = (
+            self.api.cu_event_synchronize?,
+            self.api.cu_event_elapsed_time?,
+        );
         let (&ea, &eb) = (self.events.get(a)?, self.events.get(b)?);
         let mut ms = 0f32;
         // SAFETY: both events belong to this ring and were created above.
@@ -102,8 +108,7 @@ unsafe impl Sync for EventRing {}
 /// Returned when graph capture or replay is asked of a driver that does not
 /// export the CUDA Graph API. Not a failure state: the caller is expected to
 /// fall back to issuing kernels individually.
-const GRAPHS_UNSUPPORTED: &str =
-    "CUDA Graph API not available on this driver (needs CUDA 10+); \
+const GRAPHS_UNSUPPORTED: &str = "CUDA Graph API not available on this driver (needs CUDA 10+); \
      the caller should issue kernels individually instead";
 
 /// Map a `CUresult` to a `GlError`, naming the failing call.
@@ -117,7 +122,9 @@ fn check(api: &DriverApi, res: CUresult, what: &str) -> Result<(), GlError> {
     let known = unsafe { (api.cu_get_error_name)(res, &mut name) } == CUDA_SUCCESS;
     let name = if known && !name.is_null() {
         // SAFETY: the driver returns a NUL-terminated static string.
-        unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
     } else {
         format!("CUDA error {res}")
     };
@@ -250,7 +257,11 @@ impl Cuda {
         unsafe {
             check(&api, (api.cu_init)(0), "cuInit")?;
             let mut count = 0i32;
-            check(&api, (api.cu_device_get_count)(&mut count), "cuDeviceGetCount")?;
+            check(
+                &api,
+                (api.cu_device_get_count)(&mut count),
+                "cuDeviceGetCount",
+            )?;
             if count == 0 {
                 return Err(GlError::Engine("no CUDA device present".into()));
             }
@@ -263,22 +274,43 @@ impl Cuda {
                 (api.cu_device_get_name)(name_buf.as_mut_ptr(), name_buf.len() as i32, device),
                 "cuDeviceGetName",
             )?;
-            let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
+            let name_len = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_buf.len());
             let name = String::from_utf8_lossy(&name_buf[..name_len]).into_owned();
 
             let attr = |sel: i32, what: &str| -> Result<i32, GlError> {
                 let mut v = 0i32;
-                check(&api, (api.cu_device_get_attribute)(&mut v, sel, device), what)?;
+                check(
+                    &api,
+                    (api.cu_device_get_attribute)(&mut v, sel, device),
+                    what,
+                )?;
                 Ok(v)
             };
-            let sm_major = attr(ATTR_COMPUTE_CAPABILITY_MAJOR, "cuDeviceGetAttribute(cc major)")?;
-            let sm_minor = attr(ATTR_COMPUTE_CAPABILITY_MINOR, "cuDeviceGetAttribute(cc minor)")?;
+            let sm_major = attr(
+                ATTR_COMPUTE_CAPABILITY_MAJOR,
+                "cuDeviceGetAttribute(cc major)",
+            )?;
+            let sm_minor = attr(
+                ATTR_COMPUTE_CAPABILITY_MINOR,
+                "cuDeviceGetAttribute(cc minor)",
+            )?;
             let sm_count = attr(ATTR_MULTIPROCESSOR_COUNT, "cuDeviceGetAttribute(sm count)")?;
 
             let mut total_mem = 0usize;
-            check(&api, (api.cu_device_total_mem)(&mut total_mem, device), "cuDeviceTotalMem")?;
+            check(
+                &api,
+                (api.cu_device_total_mem)(&mut total_mem, device),
+                "cuDeviceTotalMem",
+            )?;
             let mut driver_version = 0i32;
-            check(&api, (api.cu_driver_get_version)(&mut driver_version), "cuDriverGetVersion")?;
+            check(
+                &api,
+                (api.cu_driver_get_version)(&mut driver_version),
+                "cuDriverGetVersion",
+            )?;
 
             if sm_major < 7 {
                 return Err(GlError::Engine(format!(
@@ -304,7 +336,14 @@ impl Cuda {
                 ctx,
                 launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
                 prefill_streams: std::sync::OnceLock::new(),
-                info: DeviceInfo { name, sm_major, sm_minor, sm_count, total_mem, driver_version },
+                info: DeviceInfo {
+                    name,
+                    sm_major,
+                    sm_minor,
+                    sm_count,
+                    total_mem,
+                    driver_version,
+                },
             })
         }
     }
@@ -313,7 +352,13 @@ impl Cuda {
     /// `Cuda` created on one thread is used from another.
     pub fn make_current(&self) -> Result<(), GlError> {
         // SAFETY: ctx is a live retained primary context.
-        unsafe { check(&self.api, (self.api.cu_ctx_set_current)(self.ctx), "cuCtxSetCurrent") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_ctx_set_current)(self.ctx),
+                "cuCtxSetCurrent",
+            )
+        }
     }
 
     /// Allocate raw VRAM. Cold path only — the hot path never allocates
@@ -323,7 +368,13 @@ impl Cuda {
         let mut dptr: CUdeviceptr = 0;
         // SAFETY: out pointer valid; nonzero size enforced by caller logic
         // (cuMemAlloc rejects 0 with an error we surface).
-        unsafe { check(&self.api, (self.api.cu_mem_alloc)(&mut dptr, bytes), "cuMemAlloc")? };
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_mem_alloc)(&mut dptr, bytes),
+                "cuMemAlloc",
+            )?
+        };
         Ok(dptr)
     }
 
@@ -339,7 +390,11 @@ impl Cuda {
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: out pointers are valid locals.
         unsafe {
-            check(&self.api, (self.api.cu_mem_get_info)(&mut free, &mut total), "cuMemGetInfo")?
+            check(
+                &self.api,
+                (self.api.cu_mem_get_info)(&mut free, &mut total),
+                "cuMemGetInfo",
+            )?
         };
         Ok((free, total))
     }
@@ -368,7 +423,13 @@ impl Cuda {
     /// Copy device → device (stream-0 ordered) — the KV-cache write path.
     pub fn dtod(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), GlError> {
         // SAFETY: caller guarantees both regions are live and sized.
-        unsafe { check(&self.api, (self.api.cu_memcpy_dtod)(dst, src, bytes), "cuMemcpyDtoD") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_memcpy_dtod)(dst, src, bytes),
+                "cuMemcpyDtoD",
+            )
+        }
     }
 
     /// Copy device → host f32 slice.
@@ -378,11 +439,7 @@ impl Cuda {
         unsafe {
             check(
                 &self.api,
-                (self.api.cu_memcpy_dtoh)(
-                    dst.as_mut_ptr().cast(),
-                    src,
-                    std::mem::size_of_val(dst),
-                ),
+                (self.api.cu_memcpy_dtoh)(dst.as_mut_ptr().cast(), src, std::mem::size_of_val(dst)),
                 "cuMemcpyDtoH",
             )
         }
@@ -391,7 +448,13 @@ impl Cuda {
     /// Block until all queued work on this context has finished.
     pub fn synchronize(&self) -> Result<(), GlError> {
         // SAFETY: no preconditions beyond a current context.
-        unsafe { check(&self.api, (self.api.cu_ctx_synchronize)(), "cuCtxSynchronize") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_ctx_synchronize)(),
+                "cuCtxSynchronize",
+            )
+        }
     }
 
     /// JIT-load a PTX image. The driver compiles it for the actual device
@@ -424,7 +487,10 @@ impl Cuda {
         // (CUDA's documented convention for scalar JIT options).
         let (mut options, mut values): (Vec<i32>, Vec<*mut std::ffi::c_void>) = (
             vec![JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES],
-            vec![err_log.as_mut_ptr().cast(), err_cap as *mut std::ffi::c_void],
+            vec![
+                err_log.as_mut_ptr().cast(),
+                err_cap as *mut std::ffi::c_void,
+            ],
         );
         if want_info {
             options.extend_from_slice(&[
@@ -471,7 +537,10 @@ impl Cuda {
                 eprintln!("[glcuda jit] register/smem usage (ptxas -v):\n{log}");
             }
         }
-        Ok(Module { api: self.api.clone(), raw })
+        Ok(Module {
+            api: self.api.clone(),
+            raw,
+        })
     }
 
     /// Launch `f` with the given geometry onto the current launch stream
@@ -487,7 +556,9 @@ impl Cuda {
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<(), GlError> {
-        let stream = self.launch_stream.load(std::sync::atomic::Ordering::Relaxed);
+        let stream = self
+            .launch_stream
+            .load(std::sync::atomic::Ordering::Relaxed);
         // SAFETY: f belongs to a live module on this context; params
         // pointers are valid for the duration of the call; stream is NULL
         // or a live stream owned for the length of a capture.
@@ -533,12 +604,18 @@ impl Cuda {
             // SAFETY: out pointer valid; flag 0 = CU_EVENT_DEFAULT, which
             // enables timing (CU_EVENT_DISABLE_TIMING would not).
             if unsafe { create(&mut e, 0) } != CUDA_SUCCESS {
-                drop(EventRing { api: self.api.clone(), events });
+                drop(EventRing {
+                    api: self.api.clone(),
+                    events,
+                });
                 return None;
             }
             events.push(e);
         }
-        Some(EventRing { api: self.api.clone(), events })
+        Some(EventRing {
+            api: self.api.clone(),
+            events,
+        })
     }
 
     /// True when this driver exports the CUDA Graph entry points, i.e.
@@ -613,13 +690,7 @@ impl Cuda {
             body()?;
             let mut graph: CUgraph = std::ptr::null_mut();
             // SAFETY: ends the capture opened above; out pointer valid.
-            unsafe {
-                check(
-                    &self.api,
-                    end(stream, &mut graph),
-                    "cuStreamEndCapture",
-                )?
-            };
+            unsafe { check(&self.api, end(stream, &mut graph), "cuStreamEndCapture")? };
             let mut exec: CUgraphExec = std::ptr::null_mut();
             // SAFETY: graph is a valid captured graph; flags 0.
             let inst = unsafe { instantiate(&mut exec, graph, 0) };
@@ -629,12 +700,16 @@ impl Cuda {
                 let _ = destroy(graph);
             }
             check(&self.api, inst, "cuGraphInstantiate")?;
-            Ok(GraphExec { api: self.api.clone(), exec })
+            Ok(GraphExec {
+                api: self.api.clone(),
+                exec,
+            })
         })();
 
         // Restore normal (default-stream) execution and free the capture
         // stream regardless of outcome.
-        self.launch_stream.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.launch_stream
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
         // SAFETY: stream is live and no longer referenced.
         unsafe {
             let _ = (self.api.cu_stream_destroy)(stream);
@@ -711,12 +786,18 @@ impl Cuda {
             }
             // Streams already created are freed by the partial pool's Drop.
             .map_err(|e| {
-                drop(StreamPool { api: self.api.clone(), streams: std::mem::take(&mut streams) });
+                drop(StreamPool {
+                    api: self.api.clone(),
+                    streams: std::mem::take(&mut streams),
+                });
                 e
             })?;
             streams.push(s);
         }
-        Ok(StreamPool { api: self.api.clone(), streams })
+        Ok(StreamPool {
+            api: self.api.clone(),
+            streams,
+        })
     }
 
     /// Point launches at `pool`'s stream `i` for the duration of `body`.
@@ -731,7 +812,8 @@ impl Cuda {
     {
         use std::sync::atomic::Ordering;
         let previous = self.launch_stream.load(Ordering::Relaxed);
-        self.launch_stream.store(pool.streams[i % pool.streams.len()], Ordering::Relaxed);
+        self.launch_stream
+            .store(pool.streams[i % pool.streams.len()], Ordering::Relaxed);
         let result = body();
         self.launch_stream.store(previous, Ordering::Relaxed);
         result
@@ -747,7 +829,11 @@ impl Cuda {
         for s in &pool.streams {
             // SAFETY: streams are live and owned by the pool.
             unsafe {
-                check(&self.api, (self.api.cu_stream_synchronize)(*s), "cuStreamSynchronize")?
+                check(
+                    &self.api,
+                    (self.api.cu_stream_synchronize)(*s),
+                    "cuStreamSynchronize",
+                )?
             };
         }
         Ok(())
@@ -761,7 +847,13 @@ impl Cuda {
             .cu_graph_launch_fn()
             .ok_or_else(|| GlError::Engine(GRAPHS_UNSUPPORTED.into()))?;
         // SAFETY: exec is a live instantiated graph; NULL = default stream.
-        unsafe { check(&self.api, launch(exec.exec, std::ptr::null_mut()), "cuGraphLaunch")? };
+        unsafe {
+            check(
+                &self.api,
+                launch(exec.exec, std::ptr::null_mut()),
+                "cuGraphLaunch",
+            )?
+        };
         self.synchronize()
     }
 }

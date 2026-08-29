@@ -83,9 +83,9 @@ pub(crate) const ST_AO: usize = 7;
 pub(crate) fn weight_bytes(w: &GpuWeight) -> u64 {
     match w {
         GpuWeight::F32(s) | GpuWeight::Q8_0(s) | GpuWeight::Q4_0(s) => s.bytes,
-        GpuWeight::Q8_0Soa { qs, scales } | GpuWeight::Q4_0Soa { qs, scales } => {
-            qs.bytes + scales.bytes
-        }
+        GpuWeight::Q8_0Soa { qs, scales }
+        | GpuWeight::W8PcSoa { qs, scales }
+        | GpuWeight::Q4_0Soa { qs, scales } => qs.bytes + scales.bytes,
         GpuWeight::Q4KSoa { qs, scales, mins } => qs.bytes + scales.bytes + mins.bytes,
         GpuWeight::Q6KSoa { ql, qh, scales, d } => ql.bytes + qh.bytes + scales.bytes + d.bytes,
     }
@@ -99,6 +99,7 @@ pub(crate) fn weight_bytes(w: &GpuWeight) -> u64 {
 /// a dispatch rule, and the reason `down` dominates prefill.
 pub(crate) fn weight_reads(w: &GpuWeight, n: u32, slab_rows: u32) -> u64 {
     match w {
+        GpuWeight::W8PcSoa { .. } => n.div_ceil(64) as u64,
         GpuWeight::Q8_0Soa { .. } => n.div_ceil(slab_rows.max(1)) as u64,
         _ => n as u64,
     }
@@ -141,9 +142,32 @@ fn consumes_q8_act(w: &GpuWeight) -> bool {
         GpuWeight::F32(_) | GpuWeight::Q4_0(_) => false,
         GpuWeight::Q8_0(_)
         | GpuWeight::Q8_0Soa { .. }
+        | GpuWeight::W8PcSoa { .. }
         | GpuWeight::Q4_0Soa { .. }
         | GpuWeight::Q4KSoa { .. }
         | GpuWeight::Q6KSoa { .. } => true,
+    }
+}
+
+/// Quantize one activation matrix according to the consuming weight's scale
+/// contract. W8PC uses one scale per row; every retained quantized format uses
+/// Q8_0's one scale per K32. The decision is outside the element hot loop and
+/// observable through the W8PC load banner.
+#[allow(clippy::too_many_arguments)]
+fn quantize_for(
+    cuda: &Cuda,
+    k: &KernelSet,
+    w: &GpuWeight,
+    x: CUdeviceptr,
+    qs: CUdeviceptr,
+    scales: CUdeviceptr,
+    rows: u32,
+    cols: u32,
+) -> Result<(), GlError> {
+    match w {
+        GpuWeight::W8PcSoa { .. } => k.quantize_q8_rows(cuda, x, qs, scales, rows, cols),
+        _ if consumes_q8_act(w) => k.quantize_q8_matrix(cuda, x, qs, scales, rows, cols),
+        _ => Ok(()),
     }
 }
 
@@ -161,7 +185,16 @@ fn gemv_w(
     y: CUdeviceptr,
 ) -> Result<(), GlError> {
     if consumes_q8_act(&m.w) {
-        k.quantize_q8(cuda, x, ws.q8_qs.dptr, ws.q8_scales.dptr, m.in_dim)?;
+        quantize_for(
+            cuda,
+            k,
+            &m.w,
+            x,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            1,
+            m.in_dim,
+        )?;
     }
     gemv_w_pre(cuda, k, ws, m, x, y)
 }
@@ -182,61 +215,69 @@ fn gemv_w_pre(
 ) -> Result<(), GlError> {
     match &m.w {
         GpuWeight::F32(s) => k.gemv(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
-        GpuWeight::Q8_0(s) => {
-            k.gemv_q8_0(cuda, s.dptr, ws.q8_qs.dptr, ws.q8_scales.dptr, y, m.out_dim, m.in_dim)
-        }
-        GpuWeight::Q8_0Soa { qs, scales } => {
-            k.gemv_q8_0_soa(
-                cuda,
-                qs.dptr,
-                scales.dptr,
-                ws.q8_qs.dptr,
-                ws.q8_scales.dptr,
-                y,
-                m.out_dim,
-                m.in_dim,
-            )
-        }
+        GpuWeight::Q8_0(s) => k.gemv_q8_0(
+            cuda,
+            s.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
+        GpuWeight::Q8_0Soa { qs, scales } => k.gemv_q8_0_soa(
+            cuda,
+            qs.dptr,
+            scales.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
+        GpuWeight::W8PcSoa { qs, scales } => k.gemv_w8pc(
+            cuda,
+            qs.dptr,
+            scales.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
         GpuWeight::Q4_0(s) => k.gemv_q4_0(cuda, s.dptr, x, y, m.out_dim, m.in_dim),
-        GpuWeight::Q4_0Soa { qs, scales } => {
-            k.gemv_q4_0_soa(
-                cuda,
-                qs.dptr,
-                scales.dptr,
-                ws.q8_qs.dptr,
-                ws.q8_scales.dptr,
-                y,
-                m.out_dim,
-                m.in_dim,
-            )
-        }
-        GpuWeight::Q4KSoa { qs, scales, mins } => {
-            k.gemv_q4_k_soa(
-                cuda,
-                qs.dptr,
-                scales.dptr,
-                mins.dptr,
-                ws.q8_qs.dptr,
-                ws.q8_scales.dptr,
-                y,
-                m.out_dim,
-                m.in_dim,
-            )
-        }
-        GpuWeight::Q6KSoa { ql, qh, scales, d } => {
-            k.gemv_q6_k_soa(
-                cuda,
-                ql.dptr,
-                qh.dptr,
-                scales.dptr,
-                d.dptr,
-                ws.q8_qs.dptr,
-                ws.q8_scales.dptr,
-                y,
-                m.out_dim,
-                m.in_dim,
-            )
-        }
+        GpuWeight::Q4_0Soa { qs, scales } => k.gemv_q4_0_soa(
+            cuda,
+            qs.dptr,
+            scales.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
+        GpuWeight::Q4KSoa { qs, scales, mins } => k.gemv_q4_k_soa(
+            cuda,
+            qs.dptr,
+            scales.dptr,
+            mins.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
+        GpuWeight::Q6KSoa { ql, qh, scales, d } => k.gemv_q6_k_soa(
+            cuda,
+            ql.dptr,
+            qh.dptr,
+            scales.dptr,
+            d.dptr,
+            ws.q8_qs.dptr,
+            ws.q8_scales.dptr,
+            y,
+            m.out_dim,
+            m.in_dim,
+        ),
     }
 }
 
@@ -246,13 +287,20 @@ fn gemv_w_pre(
 /// This is the whole of r256's advantage, so it is the whole of the decision.
 /// Weight fragments are read once per slab, so the counts are `ceil(n/64)` and
 /// `ceil(n/256)`; a tie means r256 offers nothing and loses on shared memory
-/// (9216 bytes against 2304), which costs blocks per SM.
+/// (13312 bytes against 3328), which costs blocks per SM.
 ///
 /// Deliberately no occupancy term. Any coefficient for that would be invented
 /// rather than measured; if a production A/B shows r256 losing somewhere above
 /// 64, that measurement earns the term.
 fn r256_pays(n: u32) -> bool {
     n.div_ceil(256) < n.div_ceil(64)
+}
+
+/// Does Wave 6's 128-row tile strictly reduce weight streams versus the
+/// retained 64-row grid? Ties stay on grid64 because it has the measured
+/// occupancy advantage and r128 has no reuse benefit to pay for its registers.
+fn r128_pays(n: u32) -> bool {
+    n.div_ceil(128) < n.div_ceil(64)
 }
 
 /// Device address `elems` f32 past `base`.
@@ -282,9 +330,27 @@ fn gemm_rows(
 ) -> Result<(), GlError> {
     let inb = m.in_dim; // in elements
     match &m.w {
+        GpuWeight::W8PcSoa { qs, scales } => {
+            let wqs = qs.dptr + (row0 * inb) as u64;
+            let wsc = scales.dptr + (row0 * 4) as u64;
+            if k.w8pc_enabled() && rows.is_multiple_of(8) {
+                k.gemm_mma_w8pc(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n)
+            } else {
+                // Correct sm_70 fallback and decode-shaped diagnostic path.
+                // Each activation row has exactly one f32 scale.
+                for t in 0..n {
+                    let xq = x_qs + (t * inb) as u64;
+                    let xs = x_scales + (t * 4) as u64;
+                    let yt = y + (t * rows) as u64 * 4;
+                    k.gemv_w8pc(cuda, wqs, wsc, xq, xs, yt, rows, inb)?;
+                }
+                Ok(())
+            }
+        }
         GpuWeight::Q8_0Soa { qs, scales } => {
             let wqs = qs.dptr + (row0 * inb) as u64; // int8, 1 B/elem
             let wsc = scales.dptr + (row0 * (inb / 32) * 2) as u64; // f16, 2 B/block
+
             // Runtime kernel selection (M2.1 Task B): the tensor-core GEMM
             // on sm_75+, the dp4a GEMM as the sm_70 fallback. Same weight
             // bytes either way; the MMA path needs whole 8-row output tiles
@@ -292,6 +358,28 @@ fn gemm_rows(
             // test shapes). The prefill scratch is PREFILL_BATCH rows, so
             // the MMA's read-padding to 8 token rows is always in bounds.
             if k.has_mma() && rows.is_multiple_of(8) {
+                // Wave 9: the same grid64 kernel and exact arithmetic, with
+                // token slabs adjacent in the launch raster for each weight
+                // tile. Keep it ahead of every alternative GEMM schedule so
+                // the opt-in production A/B changes exactly one variable.
+                if k.l2_raster_enabled() {
+                    return k.gemm_mma_q8_l2(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n);
+                }
+                // Wave 6 candidate: keep grid64 for ties, otherwise let one
+                // 128-row CTA reuse every B fragment across twice as many
+                // tokens. r128 owns its complete grid.y launch, so it must
+                // precede the retained grid64 gate.
+                if k.r128_enabled() && r128_pays(n) {
+                    return k.gemm_mma_q8_r128(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n);
+                }
+                // Wave 3 candidate: one launch exposes every 64-token slab
+                // through grid.y. The kernel rebases x/scales/y per CTA and
+                // preserves the original single-slab MMA body bit-for-bit.
+                // Keep this ahead of r256: the two are alternative ways to
+                // parallelize/reuse the token axis and must be A/B'd alone.
+                if k.grid2d_enabled() {
+                    return k.gemm_mma_q8(cuda, wqs, wsc, x_qs, x_scales, y, rows, inb, n);
+                }
                 // ---- Which MMA GEMM, and in what slab size ----
                 //
                 // r256 exists to do exactly one thing: read each weight
@@ -303,8 +391,8 @@ fn gemm_rows(
                 //
                 // Take r256 only when it strictly reduces that. At n <= 64
                 // they tie -- both read the weights once -- and a tie goes to
-                // the 64-row kernel, which uses 2304 bytes of shared memory
-                // against r256's 9216 and therefore fits more blocks per SM.
+                // the 64-row kernel, which uses 3328 bytes of shared memory
+                // against r256's 13312 and therefore fits more blocks per SM.
                 // The familiar "threshold of 64" falls out of the arithmetic
                 // instead of being typed in.
                 //
@@ -519,7 +607,26 @@ impl GpuModel {
                 || consumes_q8_act(&layer.wk.w)
                 || consumes_q8_act(&layer.wv.w)
             {
-                k.quantize_q8(cuda, xn, ws.q8_qs.dptr, ws.q8_scales.dptr, dim)?;
+                let any_w8pc = matches!(&layer.wq.w, GpuWeight::W8PcSoa { .. })
+                    || matches!(&layer.wk.w, GpuWeight::W8PcSoa { .. })
+                    || matches!(&layer.wv.w, GpuWeight::W8PcSoa { .. });
+                debug_assert!(
+                    !any_w8pc
+                        || (matches!(&layer.wq.w, GpuWeight::W8PcSoa { .. })
+                            && matches!(&layer.wk.w, GpuWeight::W8PcSoa { .. })
+                            && matches!(&layer.wv.w, GpuWeight::W8PcSoa { .. })),
+                    "q/k/v must share one activation-scale contract"
+                );
+                quantize_for(
+                    cuda,
+                    k,
+                    &layer.wq.w,
+                    xn,
+                    ws.q8_qs.dptr,
+                    ws.q8_scales.dptr,
+                    1,
+                    dim,
+                )?;
             }
             gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
             gemv_w_pre(cuda, k, ws, &layer.wk, xn, k_ptr)?;
@@ -552,25 +659,71 @@ impl GpuModel {
             // which occupied 1 SM of 40.
             if let Some(qn) = &layer.q_norm {
                 k.rms_norm_rows(
-                    cuda, q_ptr, qn.dptr, q_ptr, head_dim as u32, c.rms_eps, c.n_heads as u32,
+                    cuda,
+                    q_ptr,
+                    qn.dptr,
+                    q_ptr,
+                    head_dim as u32,
+                    c.rms_eps,
+                    c.n_heads as u32,
                 )?;
             }
             if let Some(kn) = &layer.k_norm {
                 k.rms_norm_rows(
-                    cuda, k_ptr, kn.dptr, k_ptr, head_dim as u32, c.rms_eps, c.n_kv_heads as u32,
+                    cuda,
+                    k_ptr,
+                    kn.dptr,
+                    k_ptr,
+                    head_dim as u32,
+                    c.rms_eps,
+                    c.n_kv_heads as u32,
                 )?;
             }
 
             // RoPE reads `pos` from device memory (token-invariant args).
-            k.rope(cuda, q_ptr, ws.rope_cos.dptr, ws.rope_sin.dptr, c.n_heads as u32, head_dim as u32, neox, pos_ptr)?;
-            k.rope(cuda, k_ptr, ws.rope_cos.dptr, ws.rope_sin.dptr, c.n_kv_heads as u32, head_dim as u32, neox, pos_ptr)?;
+            k.rope(
+                cuda,
+                q_ptr,
+                ws.rope_cos.dptr,
+                ws.rope_sin.dptr,
+                c.n_heads as u32,
+                head_dim as u32,
+                neox,
+                pos_ptr,
+            )?;
+            k.rope(
+                cuda,
+                k_ptr,
+                ws.rope_cos.dptr,
+                ws.rope_sin.dptr,
+                c.n_kv_heads as u32,
+                head_dim as u32,
+                neox,
+                pos_ptr,
+            )?;
 
             // KV write is a single kernel per K/V per layer (computes the
             // destination from device `pos`) — replaces the per-head memcpy
             // and is graph-static. read_k/read_v(l, 0) give this layer's
             // cache base (independent of the cursor).
-            k.kv_write(cuda, self.kv.read_k(l, 0), k_ptr, pos_ptr, head_dim as u32, c.n_kv_heads as u32, head_stride)?;
-            k.kv_write(cuda, self.kv.read_v(l, 0), v_ptr, pos_ptr, head_dim as u32, c.n_kv_heads as u32, head_stride)?;
+            k.kv_write(
+                cuda,
+                self.kv.read_k(l, 0),
+                k_ptr,
+                pos_ptr,
+                head_dim as u32,
+                c.n_kv_heads as u32,
+                head_stride,
+            )?;
+            k.kv_write(
+                cuda,
+                self.kv.read_v(l, 0),
+                v_ptr,
+                pos_ptr,
+                head_dim as u32,
+                c.n_kv_heads as u32,
+                head_stride,
+            )?;
 
             // Fused decode attention over ALL heads (cached_len from device).
             let scale = 1.0 / (head_dim as f32).sqrt();
@@ -620,7 +773,12 @@ impl GpuModel {
     /// issues the tensor-core GEMM in 64-row sub-slabs, so weight traffic is
     /// unchanged in Phase A by design. Leaves the last prompt token's logits
     /// in `ws.logits` and advances the KV cursor to `prompt.len()`.
-    pub fn prefill_batched(&mut self, cuda: &Cuda, k: &KernelSet, prompt: &[u32]) -> Result<(), GlError> {
+    pub fn prefill_batched(
+        &mut self,
+        cuda: &Cuda,
+        k: &KernelSet,
+        prompt: &[u32],
+    ) -> Result<(), GlError> {
         let c = &self.config;
         let dim = c.dim;
         let head_dim = c.head_dim;
@@ -666,13 +824,19 @@ impl GpuModel {
         let prof = std::env::var_os("GLCUDA_PROFILE_PREFILL").is_some();
         // t_attn/t_ffn are recomputed from their sub-buckets below; only t_qkv
         // is still accumulated directly in the loop.
-        let (mut t_qkv, t_attn, t_ffn) =
-            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut t_qkv, t_attn, t_ffn) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
         // Fine-grained FFN sub-buckets (only meaningful with the profiler on):
         // gate+up GEMMs, down GEMM, and the elementwise glue (quant/silu/
         // norm/add) — to localize the 51-67% FFN cost the coarse split shows.
-        let (mut t_gu, mut t_dn, mut t_elt) =
-            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut t_gu, mut t_dn, mut t_elt) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
         // Fine-grained attn sub-buckets: profiling showed attn is ~40% of
         // prefill and, unlike FFN, contains no big GEMM — so localize it into
         // norm (bias+qk-norm+rope), kv-write, and the attention core. t_attn is
@@ -680,8 +844,11 @@ impl GpuModel {
         // double-counting). "norm" groups the pre-core elementwise/rope glue;
         // "core" is attn_decode_rows, the decode-shaped kernel run over prefill
         // rows and the prime suspect for the disproportionate attn cost.
-        let (mut t_an, mut t_kv, mut t_ac) =
-            (std::time::Duration::ZERO, std::time::Duration::ZERO, std::time::Duration::ZERO);
+        let (mut t_an, mut t_kv, mut t_ac) = (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        );
         // Per-stage accumulators.
         //
         // OFF BY DEFAULT, deliberately. The event path costs no host sync, but
@@ -711,7 +878,11 @@ impl GpuModel {
         // wall clock, because nothing overlaps. `PrefillProfile::on_stream`
         // carries which one produced the numbers so a reader is never left
         // guessing.
-        let ring = if want_profile { cuda.event_ring(2 * 12 * c.n_layers) } else { None };
+        let ring = if want_profile {
+            cuda.event_ring(2 * 12 * c.n_layers)
+        } else {
+            None
+        };
         let on_stream = ring.is_some();
         let mut mark = 0usize;
         let mut pending: Vec<(usize, usize, usize)> = Vec::new();
@@ -780,11 +951,61 @@ impl GpuModel {
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
                 phase!(t_qkv, ST_QKV, {
-                    k.rms_norm_rows(cuda, pf_x, layer.attn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
-                    k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
-                    gemm_rows(cuda, k, &layer.wq, 0, q_dim as u32, pf_xn, pf_qs, pf_scales, pf_q, n as u32)?;
-                    gemm_rows(cuda, k, &layer.wk, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_k, n as u32)?;
-                    gemm_rows(cuda, k, &layer.wv, 0, kv_dim as u32, pf_xn, pf_qs, pf_scales, pf_v, n as u32)?;
+                    k.rms_norm_rows(
+                        cuda,
+                        pf_x,
+                        layer.attn_norm.dptr,
+                        pf_xn,
+                        dim as u32,
+                        rms_eps,
+                        n as u32,
+                    )?;
+                    quantize_for(
+                        cuda,
+                        k,
+                        &layer.wq.w,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        n as u32,
+                        dim as u32,
+                    )?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.wq,
+                        0,
+                        q_dim as u32,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        pf_q,
+                        n as u32,
+                    )?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.wk,
+                        0,
+                        kv_dim as u32,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        pf_k,
+                        n as u32,
+                    )?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.wv,
+                        0,
+                        kv_dim as u32,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        pf_v,
+                        n as u32,
+                    )?;
                 });
 
                 // attn, split into norm (bias+qk-norm+rope) / kv-write / core.
@@ -803,25 +1024,92 @@ impl GpuModel {
                     // Per-head q/k norms: a [n, heads*head_dim] block is exactly
                     // n*heads contiguous rows of head_dim.
                     if let Some(qn) = &layer.q_norm {
-                        k.rms_norm_rows(cuda, pf_q, qn.dptr, pf_q, head_dim as u32, rms_eps, (n * n_heads) as u32)?;
+                        k.rms_norm_rows(
+                            cuda,
+                            pf_q,
+                            qn.dptr,
+                            pf_q,
+                            head_dim as u32,
+                            rms_eps,
+                            (n * n_heads) as u32,
+                        )?;
                     }
                     if let Some(kn) = &layer.k_norm {
-                        k.rms_norm_rows(cuda, pf_k, kn.dptr, pf_k, head_dim as u32, rms_eps, (n * n_kv_heads) as u32)?;
+                        k.rms_norm_rows(
+                            cuda,
+                            pf_k,
+                            kn.dptr,
+                            pf_k,
+                            head_dim as u32,
+                            rms_eps,
+                            (n * n_kv_heads) as u32,
+                        )?;
                     }
-                    k.rope_rows(cuda, pf_q, rope_cos, rope_sin, n_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
-                    k.rope_rows(cuda, pf_k, rope_cos, rope_sin, n_kv_heads as u32, head_dim as u32, neox, pos_base, n as u32)?;
+                    k.rope_rows(
+                        cuda,
+                        pf_q,
+                        rope_cos,
+                        rope_sin,
+                        n_heads as u32,
+                        head_dim as u32,
+                        neox,
+                        pos_base,
+                        n as u32,
+                    )?;
+                    k.rope_rows(
+                        cuda,
+                        pf_k,
+                        rope_cos,
+                        rope_sin,
+                        n_kv_heads as u32,
+                        head_dim as u32,
+                        neox,
+                        pos_base,
+                        n as u32,
+                    )?;
                 });
                 phase!(t_kv, ST_KV, {
-                    k.kv_write_rows(cuda, self.kv.read_k(l, 0), pf_k, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
-                    k.kv_write_rows(cuda, self.kv.read_v(l, 0), pf_v, pos_base, head_dim as u32, n_kv_heads as u32, head_stride, n as u32)?;
+                    k.kv_write_rows(
+                        cuda,
+                        self.kv.read_k(l, 0),
+                        pf_k,
+                        pos_base,
+                        head_dim as u32,
+                        n_kv_heads as u32,
+                        head_stride,
+                        n as u32,
+                    )?;
+                    k.kv_write_rows(
+                        cuda,
+                        self.kv.read_v(l, 0),
+                        pf_v,
+                        pos_base,
+                        head_dim as u32,
+                        n_kv_heads as u32,
+                        head_stride,
+                        n as u32,
+                    )?;
                 });
                 phase!(t_ac, ST_AC, {
                     // Causal by construction: row t reads cached_len = pos+1
                     // rows, so later rows (already written above) are never seen.
+                    // The last row has cached_len=base+n, which is therefore
+                    // the exact dynamic score-buffer capacity for every CTA
+                    // in this launch.
                     k.attn_decode_rows(
-                        cuda, pf_q, self.kv.read_k(l, 0), self.kv.read_v(l, 0), pf_attn,
-                        n_heads as u32, head_dim as u32, pos_base, heads_per_kv, head_stride, scale,
+                        cuda,
+                        pf_q,
+                        self.kv.read_k(l, 0),
+                        self.kv.read_v(l, 0),
+                        pf_attn,
+                        n_heads as u32,
+                        head_dim as u32,
+                        pos_base,
+                        heads_per_kv,
+                        head_stride,
+                        scale,
                         n as u32,
+                        (base + n) as u32,
                     )?;
                 });
 
@@ -830,26 +1118,97 @@ impl GpuModel {
                 // below — no outer phase! wrapper, so the inner syncs don't
                 // double-count. wo (o-proj) GEMM is grouped into t_dn.
                 phase!(t_elt, ST_ELT, {
-                    k.quantize_q8(cuda, pf_attn, pf_qs, pf_scales, (n * q_dim) as u32)?;
+                    quantize_for(
+                        cuda,
+                        k,
+                        &layer.wo.w,
+                        pf_attn,
+                        pf_qs,
+                        pf_scales,
+                        n as u32,
+                        q_dim as u32,
+                    )?;
                 });
                 phase!(t_dn, ST_AO, {
-                    gemm_rows(cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj, n as u32)?;
+                    gemm_rows(
+                        cuda, k, &layer.wo, 0, dim as u32, pf_attn, pf_qs, pf_scales, pf_proj,
+                        n as u32,
+                    )?;
                 });
                 phase!(t_elt, ST_ELT, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
-                    k.rms_norm_rows(cuda, pf_x, layer.ffn_norm.dptr, pf_xn, dim as u32, rms_eps, n as u32)?;
-                    k.quantize_q8(cuda, pf_xn, pf_qs, pf_scales, (n * dim) as u32)?;
+                    k.rms_norm_rows(
+                        cuda,
+                        pf_x,
+                        layer.ffn_norm.dptr,
+                        pf_xn,
+                        dim as u32,
+                        rms_eps,
+                        n as u32,
+                    )?;
+                    quantize_for(
+                        cuda,
+                        k,
+                        &layer.w_gate_up.w,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        n as u32,
+                        dim as u32,
+                    )?;
                 });
                 phase!(t_gu, ST_GU, {
-                    gemm_rows(cuda, k, &layer.w_gate_up, 0, hidden as u32, pf_xn, pf_qs, pf_scales, pf_gate, n as u32)?;
-                    gemm_rows(cuda, k, &layer.w_gate_up, hidden as u32, hidden as u32, pf_xn, pf_qs, pf_scales, pf_up, n as u32)?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.w_gate_up,
+                        0,
+                        hidden as u32,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        pf_gate,
+                        n as u32,
+                    )?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.w_gate_up,
+                        hidden as u32,
+                        hidden as u32,
+                        pf_xn,
+                        pf_qs,
+                        pf_scales,
+                        pf_up,
+                        n as u32,
+                    )?;
                 });
                 phase!(t_elt, ST_ELT, {
                     k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
-                    k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
+                    quantize_for(
+                        cuda,
+                        k,
+                        &layer.w_down.w,
+                        pf_gate,
+                        pf_qs,
+                        pf_scales,
+                        n as u32,
+                        hidden as u32,
+                    )?;
                 });
                 phase!(t_dn, ST_DN, {
-                    gemm_rows(cuda, k, &layer.w_down, 0, dim as u32, pf_gate, pf_qs, pf_scales, pf_proj, n as u32)?;
+                    gemm_rows(
+                        cuda,
+                        k,
+                        &layer.w_down,
+                        0,
+                        dim as u32,
+                        pf_gate,
+                        pf_qs,
+                        pf_scales,
+                        pf_proj,
+                        n as u32,
+                    )?;
                 });
                 phase!(t_elt, ST_ELT, {
                     k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
@@ -868,7 +1227,14 @@ impl GpuModel {
             // Logits only for the final prompt token (last row of the last chunk).
             if base + n == p {
                 let last = fq(pf_x, (n - 1) * dim);
-                k.rms_norm(cuda, last, self.output_norm.dptr, single_xn, dim as u32, rms_eps)?;
+                k.rms_norm(
+                    cuda,
+                    last,
+                    self.output_norm.dptr,
+                    single_xn,
+                    dim as u32,
+                    rms_eps,
+                )?;
                 gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
             }
             // Per-chunk weight traffic, per stage. This is the number that
@@ -877,8 +1243,21 @@ impl GpuModel {
             // stated as bytes, which is what a roofline can actually judge.
             if want_profile {
                 let nn = n as u32;
+                // Logical weight reads must follow the arm that actually ran.
+                // Wave 2 telemetry always charged 64-row slabs, so its r256
+                // arm overstated GEMM bytes by 4x at n<=256. grid2d still has
+                // one logical read per 64-row y-CTA (concurrent L2 hits are a
+                // cache effect, not fewer kernel loads); r128/r256 use their
+                // respective row spans when their measured-policy gates fire.
+                let slab_rows = if k.r128_enabled() && r128_pays(nn) {
+                    128
+                } else if !k.grid2d_enabled() && k.r256_enabled() && r256_pays(nn) {
+                    256
+                } else {
+                    64
+                };
                 let mut add = |st: usize, m: &GpuMat| {
-                    stage_bytes[st] += weight_bytes(&m.w) * weight_reads(&m.w, nn, 64);
+                    stage_bytes[st] += weight_bytes(&m.w) * weight_reads(&m.w, nn, slab_rows);
                     stage_macs[st] += nn as u64 * m.out_dim as u64 * m.in_dim as u64;
                 };
                 for layer in self.layers.iter() {
@@ -926,15 +1305,30 @@ impl GpuModel {
             let pc = |d: std::time::Duration| 100.0 * d.as_secs_f64() / tot;
             eprintln!(
                 "[prefill split] {p} tok | qkv {:.0}ms ({:.0}%) | attn {:.0}ms ({:.0}%) | ffn {:.0}ms ({:.0}%)",
-                ms(t_qkv), pc(t_qkv), ms(t_attn), pc(t_attn), ms(t_ffn), pc(t_ffn),
+                ms(t_qkv),
+                pc(t_qkv),
+                ms(t_attn),
+                pc(t_attn),
+                ms(t_ffn),
+                pc(t_ffn),
             );
             eprintln!(
                 "[attn detail]  norm+rope {:.0}ms ({:.0}%) | kv-write {:.0}ms ({:.0}%) | attn core {:.0}ms ({:.0}%)",
-                ms(t_an), pc(t_an), ms(t_kv), pc(t_kv), ms(t_ac), pc(t_ac),
+                ms(t_an),
+                pc(t_an),
+                ms(t_kv),
+                pc(t_kv),
+                ms(t_ac),
+                pc(t_ac),
             );
             eprintln!(
                 "[ffn detail]   gate+up GEMM {:.0}ms ({:.0}%) | down+o GEMM {:.0}ms ({:.0}%) | elementwise {:.0}ms ({:.0}%)",
-                ms(t_gu), pc(t_gu), ms(t_dn), pc(t_dn), ms(t_elt), pc(t_elt),
+                ms(t_gu),
+                pc(t_gu),
+                ms(t_dn),
+                pc(t_dn),
+                ms(t_elt),
+                pc(t_elt),
             );
         }
         Ok(())
@@ -1027,14 +1421,15 @@ impl GpuModel {
         let dim = self.config.dim;
         let row = token as usize;
         if row >= self.config.vocab_size {
-            return Err(GlError::Engine(format!("token id {token} out of embedding range")));
+            return Err(GlError::Engine(format!(
+                "token id {token} out of embedding range"
+            )));
         }
         match &self.token_embd {
-            crate::model::HostWeight::F32(v) => {
-                out.copy_from_slice(&v[row * dim..(row + 1) * dim])
-            }
+            crate::model::HostWeight::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
             crate::model::HostWeight::Q8_0(b) => crate::dequant::q8_0_row_into(b, row, dim, out),
             crate::model::HostWeight::Q8_0Soa { .. }
+            | crate::model::HostWeight::W8PcSoa { .. }
             | crate::model::HostWeight::Q4_0Soa { .. }
             | crate::model::HostWeight::Q4KSoa { .. }
             | crate::model::HostWeight::Q6KSoa { .. } => {
@@ -1149,7 +1544,8 @@ impl GpuModel {
                 generated.len(),
                 t_gpu.as_secs_f64() * 1e3 / n,
                 t_host.as_secs_f64() * 1e3 / n,
-                100.0 * t_host.as_secs_f64() / (t_gpu.as_secs_f64() + t_host.as_secs_f64()).max(1e-9),
+                100.0 * t_host.as_secs_f64()
+                    / (t_gpu.as_secs_f64() + t_host.as_secs_f64()).max(1e-9),
             );
         }
         Ok((
@@ -1165,7 +1561,7 @@ impl GpuModel {
 
 #[cfg(test)]
 mod tests {
-    use super::{consumes_q8_act, r256_pays};
+    use super::{consumes_q8_act, r128_pays, r256_pays};
     use crate::buffer::DevSlice;
     use crate::model::GpuWeight;
 
@@ -1186,9 +1582,26 @@ mod tests {
             DevSlice { dptr: 0, bytes: b }
         }
         assert_eq!(weight_bytes(&GpuWeight::F32(sl(100))), 100);
-        assert_eq!(weight_bytes(&GpuWeight::Q8_0Soa { qs: sl(64), scales: sl(4) }), 68);
         assert_eq!(
-            weight_bytes(&GpuWeight::Q4KSoa { qs: sl(32), scales: sl(8), mins: sl(8) }),
+            weight_bytes(&GpuWeight::Q8_0Soa {
+                qs: sl(64),
+                scales: sl(4)
+            }),
+            68
+        );
+        assert_eq!(
+            weight_bytes(&GpuWeight::W8PcSoa {
+                qs: sl(64),
+                scales: sl(8)
+            }),
+            72
+        );
+        assert_eq!(
+            weight_bytes(&GpuWeight::Q4KSoa {
+                qs: sl(32),
+                scales: sl(8),
+                mins: sl(8)
+            }),
             48
         );
         assert_eq!(
@@ -1215,12 +1628,27 @@ mod tests {
         fn sl() -> DevSlice {
             DevSlice { dptr: 0, bytes: 1 }
         }
-        let gemm = GpuWeight::Q8_0Soa { qs: sl(), scales: sl() };
-        let gemv = GpuWeight::Q6KSoa { ql: sl(), qh: sl(), scales: sl(), d: sl() };
+        let gemm = GpuWeight::Q8_0Soa {
+            qs: sl(),
+            scales: sl(),
+        };
+        let gemv = GpuWeight::Q6KSoa {
+            ql: sl(),
+            qh: sl(),
+            scales: sl(),
+            d: sl(),
+        };
+        let w8pc = GpuWeight::W8PcSoa {
+            qs: sl(),
+            scales: sl(),
+        };
 
         assert_eq!(weight_reads(&gemm, 512, 64), 8);
         assert_eq!(weight_reads(&gemv, 512, 64), 512);
-        assert_eq!(weight_reads(&gemv, 512, 64) / weight_reads(&gemm, 512, 64), 64);
+        assert_eq!(
+            weight_reads(&gemv, 512, 64) / weight_reads(&gemm, 512, 64),
+            64
+        );
 
         // A single token is the decode shape: both read the weights once, and
         // GEMV is the right kernel there. The trap is prefill-only.
@@ -1231,6 +1659,7 @@ mod tests {
         // still costs a full weight read.
         assert_eq!(weight_reads(&gemm, 65, 64), 2);
         assert_eq!(weight_reads(&gemm, 220, 64), 4);
+        assert_eq!(weight_reads(&w8pc, 220, 256), 4);
     }
 
     /// Hoisting the q/k/v quantize out of `gemv_w` made this predicate the
@@ -1247,8 +1676,18 @@ mod tests {
 
         // Read ws.q8_qs / ws.q8_scales: these REQUIRE a caller-side quantize.
         assert!(consumes_q8_act(&GpuWeight::Q8_0(slice())));
-        assert!(consumes_q8_act(&GpuWeight::Q8_0Soa { qs: slice(), scales: slice() }));
-        assert!(consumes_q8_act(&GpuWeight::Q4_0Soa { qs: slice(), scales: slice() }));
+        assert!(consumes_q8_act(&GpuWeight::Q8_0Soa {
+            qs: slice(),
+            scales: slice()
+        }));
+        assert!(consumes_q8_act(&GpuWeight::W8PcSoa {
+            qs: slice(),
+            scales: slice()
+        }));
+        assert!(consumes_q8_act(&GpuWeight::Q4_0Soa {
+            qs: slice(),
+            scales: slice()
+        }));
         assert!(consumes_q8_act(&GpuWeight::Q4KSoa {
             qs: slice(),
             scales: slice(),
@@ -1269,7 +1708,10 @@ mod tests {
     #[test]
     fn a_single_quantized_projection_still_triggers_the_shared_quantize() {
         let f32_w = GpuWeight::F32(slice());
-        let q8_w = GpuWeight::Q8_0Soa { qs: slice(), scales: slice() };
+        let q8_w = GpuWeight::Q8_0Soa {
+            qs: slice(),
+            scales: slice(),
+        };
         assert!(
             consumes_q8_act(&f32_w) || consumes_q8_act(&q8_w),
             "one quantized projection among three must still make the copy"
@@ -1288,15 +1730,31 @@ mod tests {
         // Ties: both kernels read the weights exactly once. r256 adds 4x the
         // shared memory for nothing.
         for n in [1u32, 8, 63, 64] {
-            assert!(!r256_pays(n), "n={n}: one slab either way, r256 buys nothing");
+            assert!(
+                !r256_pays(n),
+                "n={n}: one slab either way, r256 buys nothing"
+            );
         }
         // 65..=256 is one r256 slab against two, three or four 64-row slabs.
         for n in [65u32, 128, 192, 220, 256] {
-            assert!(r256_pays(n), "n={n}: r256 reads the weights once, 64-row several times");
+            assert!(
+                r256_pays(n),
+                "n={n}: r256 reads the weights once, 64-row several times"
+            );
         }
         // Above 256 the ratio narrows but never inverts.
         for n in [257u32, 384, 512] {
             assert!(r256_pays(n), "n={n}");
+        }
+    }
+
+    #[test]
+    fn r128_only_pays_when_it_saves_a_weight_read() {
+        for n in [1u32, 8, 63, 64] {
+            assert!(!r128_pays(n), "n={n}: r128 ties grid64 on weight reads");
+        }
+        for n in [65u32, 96, 128, 129, 192, 193, 220, 256, 257, 320, 384, 512] {
+            assert!(r128_pays(n), "n={n}: r128 must remove one grid64 stream");
         }
     }
 
@@ -1305,13 +1763,15 @@ mod tests {
     #[test]
     fn weight_read_counts_are_what_the_rule_compares() {
         let reads = |n: u32, slab: u32| n.div_ceil(slab);
+        assert_eq!((reads(244, 64), reads(244, 128)), (4, 2)); // Wave 6 prompt
         assert_eq!((reads(220, 64), reads(220, 256)), (4, 1)); // the prefill case
-        assert_eq!((reads(64, 64), reads(64, 256)), (1, 1));   // the tie
+        assert_eq!((reads(64, 64), reads(64, 256)), (1, 1)); // the tie
         assert_eq!((reads(512, 64), reads(512, 256)), (8, 2)); // a full chunk
     }
 
     #[test]
     fn zero_rows_is_a_tie_not_a_panic() {
+        assert!(!r128_pays(0));
         assert!(!r256_pays(0));
     }
 }
