@@ -8,7 +8,9 @@
 
 use glcore::GlError;
 
+use crate::analysis::ceiling::CeilingBasis;
 use crate::analysis::summary;
+use crate::core::availability::{self, ENAvailability};
 use crate::behavior::BehaviorReport;
 use crate::core::metrics::MeasurementSet;
 use crate::core::result::SessionMetadata;
@@ -167,6 +169,27 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     }
 
     session.analysis = Some(summary::analyze(&session));
+
+    // A null `ceiling_efficiency` has two very different causes, and the
+    // default D-10 classification ("could exist, not collected this run")
+    // describes neither. Declare the real one here, where the basis is still
+    // in hand — an explicit declaration wins over `classify_null`'s default.
+    if let Some(a) = &session.analysis {
+        if a.ceiling_efficiency.is_none() {
+            let note = if a.ceiling_basis == CeilingBasis::Undetermined {
+                "no bandwidth figure for the device that ran the model, so there is                  no ceiling to be a fraction of"
+            } else {
+                "a ceiling was computed and rejected as impossible; see analysis.notes"
+            };
+            availability::set_with_note(
+                &mut session.availability,
+                "analysis.ceiling_efficiency",
+                ENAvailability::Unavailable,
+                note,
+            )
+            .ok();
+        }
+    }
     let mut validation = integrity::validate(&session);
 
     // 9. Automatic token-stream cross-check against an oracle engine, if the

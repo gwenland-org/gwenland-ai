@@ -57,7 +57,7 @@ fn main() -> ExitCode {
         #[cfg(not(feature = "train-bench"))]
         Some(cmd @ ("train" | "unified")) => Err(format!(
             "'{cmd}' requires a build with --features train-bench \
-             (it links stumman, which a default build never compiles)"
+             (it links gltrain, which a default build never compiles)"
         )),
         Some("quant-info") => cmd_quant_info(&args[1..]),
         #[cfg(feature = "gllm-bench")]
@@ -148,16 +148,16 @@ training observation (needs --features train-bench):
                   [--epochs N] [--lr F] [--seed N] [--dataset-seed N]
                   [--step-sample N] [--target-loss F] [--bit-scope <list>]
                   [--label <name>] [--out <file.json>]
-                  (runs a LoRA fine-tune on stumman under observation and
+                  (runs a LoRA fine-tune on gltrain under observation and
                    archives it as a training_only v2 session. glbench does not
                    drive the loop — it installs an observer and calls
-                   stumman's own Trainer::train)
+                   gltrain's own Trainer::train)
   glbench unified [same options as train]
                   (a training run with inference roles labelled either side of
                    it: the outer envelope is pre_training, training.post_eval
                    is post_training)
 
-                  There is deliberately no --model or --dataset: stumman M2
+                  There is deliberately no --model or --dataset: gltrain M2
                   generates its frozen base weight from a seed and builds its
                   dataset in memory, so neither flag has a subject. The shape
                   and seed flags above fully determine the run, which makes it
@@ -681,11 +681,11 @@ fn cmd_thread_scale(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `glbench train` / `glbench unified` — observe a stumman training run.
+/// `glbench train` / `glbench unified` — observe a gltrain training run.
 ///
 /// D-05: glbench never drives the loop. It builds a `Trainer`, installs a
 /// collector, and calls `Trainer::train`; every number archived is something
-/// stumman reported.
+/// gltrain reported.
 #[cfg(feature = "train-bench")]
 fn cmd_train(args: &[String], mode: glbench::core::mode::ENSessionMode) -> Result<(), String> {
     let mut a = TrainArgs { mode, ..TrainArgs::default() };
@@ -746,7 +746,7 @@ fn cmd_train(args: &[String], mode: glbench::core::mode::ENSessionMode) -> Resul
             // than reporting an unknown flag.
             "--model" | "--dataset" => {
                 return Err(format!(
-                    "'{flag}' has no subject at stumman M2: the frozen base weight is \
+                    "'{flag}' has no subject at gltrain M2: the frozen base weight is \
                      generated from --seed and the dataset is built in memory from \
                      --samples/--dataset-seed. See `glbench help`."
                 ))

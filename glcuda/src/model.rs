@@ -73,6 +73,10 @@ pub enum HostWeight {
     /// `[out, in]` + contiguous f16 block `scales` `[out, in/32]`. Enables the
     /// coalesced `gl_gemv_q8_0_soa` kernel (no interleaved-scale/padding BW loss).
     Q8_0Soa { qs: Vec<u8>, scales: Vec<u8> },
+    /// Wave 7 W8A8 representation: contiguous signed INT8 weights with one
+    /// f32 scale per output row. The scale is invariant across K, so MMA can
+    /// accumulate the full dot in s32 and dequantize once in its epilogue.
+    W8PcSoa { qs: Vec<u8>, scales: Vec<f32> },
     /// Raw GGML Q4_0 blocks, rows contiguous, `in_features % 32 == 0`.
     /// Embedding-table only since M2.2 (host row dequant); matmul weights
     /// use `Q4_0Soa`. The legacy AoS `gl_gemv_q4_0` kernel still accepts it.
@@ -97,13 +101,22 @@ pub enum HostWeight {
     /// GB/s compute stall — see `repack::q6_k_to_soa`), verbatim i8
     /// sub-block `scales` `[out, in/16]`, verbatim f16 super-block `d`
     /// `[out, in/256]`. 7.0625 bpw; the layout `gl_gemv_q6_k_soa` reads.
-    Q6KSoa { ql: Vec<u8>, qh: Vec<u8>, scales: Vec<u8>, d: Vec<u8> },
+    Q6KSoa {
+        ql: Vec<u8>,
+        qh: Vec<u8>,
+        scales: Vec<u8>,
+        d: Vec<u8>,
+    },
     /// Structure-of-Arrays Q4_K for matmul weights (M2.1 Task A): contiguous
     /// packed nibbles `qs` `[out, in/2]` + f16 PRE-MULTIPLIED sub-block
     /// `scales` (`d*sc`) and `mins` (`dmin*m`), each `[out, in/32]` f16.
     /// 5.0 bpw streamed per decode token vs 8.5 for Q8_0 SoA — the layout
     /// `gl_gemv_q4_k_soa` reads (see `repack::q4_k_to_soa`).
-    Q4KSoa { qs: Vec<u8>, scales: Vec<u8>, mins: Vec<u8> },
+    Q4KSoa {
+        qs: Vec<u8>,
+        scales: Vec<u8>,
+        mins: Vec<u8>,
+    },
 }
 
 impl HostWeight {
@@ -117,10 +130,13 @@ impl HostWeight {
             HostWeight::F32(v) => a(v.len() * 4),
             HostWeight::Q8_0(b) => a(b.len()),
             HostWeight::Q8_0Soa { qs, scales } => a(qs.len()) + a(scales.len()),
+            HostWeight::W8PcSoa { qs, scales } => a(qs.len()) + a(scales.len() * 4),
             HostWeight::Q4_0(b) => a(b.len()),
             HostWeight::Q4_0Soa { qs, scales } => a(qs.len()) + a(scales.len()),
             HostWeight::Q4K(b) => a(b.len()),
-            HostWeight::Q4KSoa { qs, scales, mins } => a(qs.len()) + a(scales.len()) + a(mins.len()),
+            HostWeight::Q4KSoa { qs, scales, mins } => {
+                a(qs.len()) + a(scales.len()) + a(mins.len())
+            }
             HostWeight::Q6K(b) => a(b.len()),
             HostWeight::Q6KSoa { ql, qh, scales, d } => {
                 a(ql.len()) + a(qh.len()) + a(scales.len()) + a(d.len())
@@ -158,14 +174,40 @@ impl HostMat {
                 HostWeight::Q8_0(a)
             }
             (
-                HostWeight::Q8_0Soa { qs: mut aq, scales: mut asc },
-                HostWeight::Q8_0Soa { qs: bq, scales: bsc },
+                HostWeight::Q8_0Soa {
+                    qs: mut aq,
+                    scales: mut asc,
+                },
+                HostWeight::Q8_0Soa {
+                    qs: bq,
+                    scales: bsc,
+                },
             ) => {
                 // qs and scales are both row-major [out, ..]; concatenating
                 // each stacks the rows (gate rows then up rows).
                 aq.extend_from_slice(&bq);
                 asc.extend_from_slice(&bsc);
-                HostWeight::Q8_0Soa { qs: aq, scales: asc }
+                HostWeight::Q8_0Soa {
+                    qs: aq,
+                    scales: asc,
+                }
+            }
+            (
+                HostWeight::W8PcSoa {
+                    qs: mut aq,
+                    scales: mut asc,
+                },
+                HostWeight::W8PcSoa {
+                    qs: bq,
+                    scales: bsc,
+                },
+            ) => {
+                aq.extend_from_slice(&bq);
+                asc.extend_from_slice(&bsc);
+                HostWeight::W8PcSoa {
+                    qs: aq,
+                    scales: asc,
+                }
             }
             (HostWeight::Q4_0(mut a), HostWeight::Q4_0(b)) => {
                 // Rows are whole Q4_0 blocks; concatenation stacks them.
@@ -173,41 +215,81 @@ impl HostMat {
                 HostWeight::Q4_0(a)
             }
             (
-                HostWeight::Q4_0Soa { qs: mut aq, scales: mut asc },
-                HostWeight::Q4_0Soa { qs: bq, scales: bsc },
+                HostWeight::Q4_0Soa {
+                    qs: mut aq,
+                    scales: mut asc,
+                },
+                HostWeight::Q4_0Soa {
+                    qs: bq,
+                    scales: bsc,
+                },
             ) => {
                 // Both streams row-major; concatenation stacks the rows.
                 aq.extend_from_slice(&bq);
                 asc.extend_from_slice(&bsc);
-                HostWeight::Q4_0Soa { qs: aq, scales: asc }
+                HostWeight::Q4_0Soa {
+                    qs: aq,
+                    scales: asc,
+                }
             }
             (
-                HostWeight::Q4KSoa { qs: mut aq, scales: mut asc, mins: mut amn },
-                HostWeight::Q4KSoa { qs: bq, scales: bsc, mins: bmn },
+                HostWeight::Q4KSoa {
+                    qs: mut aq,
+                    scales: mut asc,
+                    mins: mut amn,
+                },
+                HostWeight::Q4KSoa {
+                    qs: bq,
+                    scales: bsc,
+                    mins: bmn,
+                },
             ) => {
                 // All three streams are row-major [out, ..]; concatenating
                 // each stacks the rows (gate rows then up rows).
                 aq.extend_from_slice(&bq);
                 asc.extend_from_slice(&bsc);
                 amn.extend_from_slice(&bmn);
-                HostWeight::Q4KSoa { qs: aq, scales: asc, mins: amn }
+                HostWeight::Q4KSoa {
+                    qs: aq,
+                    scales: asc,
+                    mins: amn,
+                }
             }
             (
-                HostWeight::Q6KSoa { ql: mut al, qh: mut ah, scales: mut asc, d: mut ad },
-                HostWeight::Q6KSoa { ql: bl, qh: bh, scales: bsc, d: bd },
+                HostWeight::Q6KSoa {
+                    ql: mut al,
+                    qh: mut ah,
+                    scales: mut asc,
+                    d: mut ad,
+                },
+                HostWeight::Q6KSoa {
+                    ql: bl,
+                    qh: bh,
+                    scales: bsc,
+                    d: bd,
+                },
             ) => {
                 // All four streams row-major; concatenation stacks the rows.
                 al.extend_from_slice(&bl);
                 ah.extend_from_slice(&bh);
                 asc.extend_from_slice(&bsc);
                 ad.extend_from_slice(&bd);
-                HostWeight::Q6KSoa { ql: al, qh: ah, scales: asc, d: ad }
+                HostWeight::Q6KSoa {
+                    ql: al,
+                    qh: ah,
+                    scales: asc,
+                    d: ad,
+                }
             }
             // Mixed representations shouldn't happen for a matched gate/up
             // pair, but if they do, the caller must keep them separate.
             _ => panic!("stack_rows: mismatched weight representations"),
         };
-        HostMat { w, out_dim: self.out_dim + other.out_dim, in_dim: self.in_dim }
+        HostMat {
+            w,
+            out_dim: self.out_dim + other.out_dim,
+            in_dim: self.in_dim,
+        }
     }
 
     /// True when `self` and `other` can be [`stack_rows`]-fused (same input
@@ -219,6 +301,7 @@ impl HostMat {
                 (HostWeight::F32(_), HostWeight::F32(_))
                     | (HostWeight::Q8_0(_), HostWeight::Q8_0(_))
                     | (HostWeight::Q8_0Soa { .. }, HostWeight::Q8_0Soa { .. })
+                    | (HostWeight::W8PcSoa { .. }, HostWeight::W8PcSoa { .. })
                     | (HostWeight::Q4_0(_), HostWeight::Q4_0(_))
                     | (HostWeight::Q4_0Soa { .. }, HostWeight::Q4_0Soa { .. })
                     | (HostWeight::Q4KSoa { .. }, HostWeight::Q4KSoa { .. })
@@ -283,12 +366,15 @@ impl HostModel {
         debug_assert_eq!(out.len(), dim);
         let row = token as usize;
         if row >= self.config.vocab_size {
-            return Err(GlError::Engine(format!("token id {token} out of embedding range")));
+            return Err(GlError::Engine(format!(
+                "token id {token} out of embedding range"
+            )));
         }
         match &self.token_embd {
             HostWeight::F32(v) => out.copy_from_slice(&v[row * dim..(row + 1) * dim]),
             HostWeight::Q8_0(b) => q8_0_row_into(b, row, dim, out),
             HostWeight::Q8_0Soa { .. }
+            | HostWeight::W8PcSoa { .. }
             | HostWeight::Q4_0Soa { .. }
             | HostWeight::Q4KSoa { .. }
             | HostWeight::Q6KSoa { .. } => {
@@ -310,14 +396,25 @@ pub enum GpuWeight {
     Q8_0(DevSlice),
     /// SoA Q8_0: contiguous int8 `qs` + separate f16 `scales`.
     Q8_0Soa { qs: DevSlice, scales: DevSlice },
+    /// Wave 7 signed INT8 rows + one f32 scale per output row.
+    W8PcSoa { qs: DevSlice, scales: DevSlice },
     /// Q4_0 blocks (AoS legacy — no loader path produces this since M2.2).
     Q4_0(DevSlice),
     /// SoA Q4_0: packed nibbles + verbatim f16 block scales.
     Q4_0Soa { qs: DevSlice, scales: DevSlice },
     /// SoA Q4_K: packed nibbles + pre-multiplied f16 sub-block scales/mins.
-    Q4KSoa { qs: DevSlice, scales: DevSlice, mins: DevSlice },
+    Q4KSoa {
+        qs: DevSlice,
+        scales: DevSlice,
+        mins: DevSlice,
+    },
     /// SoA Q6_K: low nibbles + 2-bit highs + i8 sub-block scales + f16 d.
-    Q6KSoa { ql: DevSlice, qh: DevSlice, scales: DevSlice, d: DevSlice },
+    Q6KSoa {
+        ql: DevSlice,
+        qh: DevSlice,
+        scales: DevSlice,
+        d: DevSlice,
+    },
 }
 
 /// A VRAM weight matrix with launch dimensions.
@@ -416,6 +513,40 @@ pub(crate) struct Workspace {
     pub pf_scales: DevSlice,
 }
 
+impl Workspace {
+    /// Total device bytes this workspace holds.
+    ///
+    /// Every field is a bump sub-allocation made once at upload, so this
+    /// is a constant for the model's lifetime -- summed rather than
+    /// tracked, because there is nothing to track.
+    pub(crate) fn total_bytes(&self) -> u64 {
+        self.x.bytes
+            + self.xn.bytes
+            + self.qkv.bytes
+            + self.attn_out.bytes
+            + self.proj.bytes
+            + self.gate_up.bytes
+            + self.logits.bytes
+            + self.rope_cos.bytes
+            + self.rope_sin.bytes
+            + self.token_params.bytes
+            + self.pos_seq.bytes
+            + self.q8_qs.bytes
+            + self.q8_scales.bytes
+            + self.pf_x.bytes
+            + self.pf_xn.bytes
+            + self.pf_q.bytes
+            + self.pf_k.bytes
+            + self.pf_v.bytes
+            + self.pf_attn.bytes
+            + self.pf_proj.bytes
+            + self.pf_gate.bytes
+            + self.pf_up.bytes
+            + self.pf_qs.bytes
+            + self.pf_scales.bytes
+    }
+}
+
 /// Prompt tokens resident per batched-prefill pass. Bounds the batched
 /// workspace VRAM; longer prompts are processed in consecutive chunks.
 ///
@@ -446,6 +577,12 @@ pub struct GpuModel {
     /// decode step and replayed thereafter. `None` until captured; the
     /// prefill path never uses it.
     pub(crate) graph: Option<crate::driver::GraphExec>,
+    /// Per-stage prefill cost from the most recent `prefill_batched`.
+    ///
+    /// `None` until a prefill has run with profiling available -- and it must
+    /// stay `None` rather than becoming zeros, because glbench treats absent
+    /// telemetry as "not measured" and zeros as "measured, and free".
+    pub(crate) prefill_profile: Option<crate::runner::PrefillProfile>,
     buffer: BackendBuffer,
     /// Total VRAM reserved, for the load-time report.
     pub total_vram_bytes: u64,
@@ -472,12 +609,20 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
         for m in [&l.wq, &l.wk, &l.wv, &l.wo, &l.w_gate_up, &l.w_down] {
             total += mat(m);
         }
-        for v in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm].into_iter().flatten() {
+        for v in [&l.bq, &l.bk, &l.bv, &l.q_norm, &l.k_norm]
+            .into_iter()
+            .flatten()
+        {
             total += f32s(v.len());
         }
     }
     total += f32s(host.output_norm.len()) + mat(&host.output);
-    total += f32s(KvCacheDev::numel(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity));
+    total += f32s(KvCacheDev::numel(
+        c.n_layers,
+        c.n_kv_heads,
+        c.head_dim,
+        kv_capacity,
+    ));
     // Workspace.
     total += f32s(c.dim) * 3; // x, xn, proj
     total += f32s(q_dim + 2 * kv_dim); // qkv
@@ -489,7 +634,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     total += align_up(((kv_capacity + 1) * 4) as u64); // pos_seq 0..=capacity
     total += align_up(c.hidden_dim as u64); // q8_qs
     total += f32s(c.hidden_dim / 32); // q8_scales
-    // Batched prefill scratch (PREFILL_BATCH rows each).
+                                      // Batched prefill scratch (PREFILL_BATCH rows each).
     let b = PREFILL_BATCH;
     total += f32s(b * c.dim) * 3; // pf_x, pf_xn, pf_proj
     total += f32s(b * q_dim) * 2; // pf_q, pf_attn
@@ -531,6 +676,12 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
             cuda.htod(ds.dptr, scales)?;
             GpuWeight::Q8_0Soa { qs: dq, scales: ds }
         }
+        HostWeight::W8PcSoa { qs, scales } => {
+            let dq = buf.alloc(qs.len() as u64)?;
+            cuda.htod(dq.dptr, qs)?;
+            let ds = up_f32(cuda, buf, scales)?;
+            GpuWeight::W8PcSoa { qs: dq, scales: ds }
+        }
         HostWeight::Q4_0(b) => {
             let s = buf.alloc(b.len() as u64)?;
             cuda.htod(s.dptr, b)?;
@@ -555,7 +706,12 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
             cuda.htod(ds.dptr, scales)?;
             let dd = buf.alloc(d.len() as u64)?;
             cuda.htod(dd.dptr, d)?;
-            GpuWeight::Q6KSoa { ql: dl, qh: dh, scales: ds, d: dd }
+            GpuWeight::Q6KSoa {
+                ql: dl,
+                qh: dh,
+                scales: ds,
+                d: dd,
+            }
         }
         HostWeight::Q4KSoa { qs, scales, mins } => {
             let dq = buf.alloc(qs.len() as u64)?;
@@ -564,10 +720,18 @@ fn up_mat(cuda: &Cuda, buf: &mut BackendBuffer, m: &HostMat) -> Result<GpuMat, G
             cuda.htod(ds.dptr, scales)?;
             let dm = buf.alloc(mins.len() as u64)?;
             cuda.htod(dm.dptr, mins)?;
-            GpuWeight::Q4KSoa { qs: dq, scales: ds, mins: dm }
+            GpuWeight::Q4KSoa {
+                qs: dq,
+                scales: ds,
+                mins: dm,
+            }
         }
     };
-    Ok(GpuMat { w, out_dim: m.out_dim as u32, in_dim: m.in_dim as u32 })
+    Ok(GpuMat {
+        w,
+        out_dim: m.out_dim as u32,
+        in_dim: m.in_dim as u32,
+    })
 }
 
 impl GpuModel {
@@ -611,8 +775,12 @@ impl GpuModel {
         let output_norm = up_f32(cuda, &mut buf, &host.output_norm)?;
         let output = up_mat(cuda, &mut buf, &host.output)?;
 
-        let kv_slice =
-            buf.alloc_f32(KvCacheDev::numel(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity))?;
+        let kv_slice = buf.alloc_f32(KvCacheDev::numel(
+            c.n_layers,
+            c.n_kv_heads,
+            c.head_dim,
+            kv_capacity,
+        ))?;
         let kv = KvCacheDev::new(kv_slice, c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity);
 
         // RoPE tables for every position, computed on the host with exactly
@@ -677,12 +845,31 @@ impl GpuModel {
             kv,
             ws,
             graph: None,
+            prefill_profile: None,
             buffer: buf,
             total_vram_bytes: total,
         })
     }
 
     /// Release the model's VRAM (the whole backend buffer).
+    /// Split total VRAM into weights / KV cache / scratch, bytes.
+    ///
+    /// The KV figure is what was RESERVED, not what is in use: the region is
+    /// sized for `max_context` at load and the cursor never shrinks it. That
+    /// distinction matters when reading a memory report -- a cache 2% filled
+    /// still occupies all of this.
+    pub fn vram_breakdown(&self) -> Option<(u64, u64, u64)> {
+        let kv = (KvCacheDev::numel(
+            self.kv.n_layers,
+            self.kv.n_heads,
+            self.kv.head_dim,
+            self.kv.max_context,
+        ) * 4) as u64;
+        let scratch: u64 = self.ws.total_bytes();
+        let weights = self.total_vram_bytes.saturating_sub(kv + scratch);
+        Some((weights, kv, scratch))
+    }
+
     pub fn free(self, cuda: &Cuda) -> Result<(), GlError> {
         self.buffer.free(cuda)
     }

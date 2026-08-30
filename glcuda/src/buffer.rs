@@ -25,7 +25,10 @@ pub struct BumpLayout {
 impl BumpLayout {
     /// A layout over `capacity` bytes, cursor at 0.
     pub fn new(capacity: u64) -> Self {
-        BumpLayout { capacity, cursor: 0 }
+        BumpLayout {
+            capacity,
+            cursor: 0,
+        }
     }
 
     /// Reserve `bytes`, returning the region's ALIGN-aligned start offset,
@@ -95,7 +98,10 @@ impl BackendBuffer {
     /// insufficient — never mid-generation.
     pub fn new(cuda: &Cuda, bytes: u64) -> Result<BackendBuffer, GlError> {
         let base = cuda.mem_alloc(bytes as usize)?;
-        Ok(BackendBuffer { base, layout: BumpLayout::new(bytes) })
+        Ok(BackendBuffer {
+            base,
+            layout: BumpLayout::new(bytes),
+        })
     }
 
     /// Carve out `bytes` from the region.
@@ -107,7 +113,10 @@ impl BackendBuffer {
                 self.layout.capacity(),
             ))
         })?;
-        Ok(DevSlice { dptr: self.base + off, bytes })
+        Ok(DevSlice {
+            dptr: self.base + off,
+            bytes,
+        })
     }
 
     /// Carve out space for `n` f32 values.
