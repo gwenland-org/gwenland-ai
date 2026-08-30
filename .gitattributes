@@ -1,4 +1,8 @@
 # Hand-authored PTX is fed verbatim to ptxas, which is ASCII-only and
 # line-oriented. Pin it to LF so checkout on any platform delivers exactly
 # what was committed, regardless of core.autocrlf.
+.gitattributes text eol=lf
 *.ptx text eol=lf
+
+# Wave 20's notebook is byte-for-byte benchmark evidence from Kaggle v2/v3.
+notebooks/glcuda_t4_wave20_production.ipynb binary
