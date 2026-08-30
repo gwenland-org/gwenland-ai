@@ -1,0 +1,4 @@
+interface:
+  display_name: "Readable Efficient Rust"
+  short_description: "Write GwenLand code that is clear to review and lean at runtime."
+  default_prompt: "Improve this GwenLand Rust code for readability and runtime efficiency without changing its contract."
