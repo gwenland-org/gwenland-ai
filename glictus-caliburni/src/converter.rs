@@ -1,13 +1,13 @@
-﻿//! GGUF â†’ GLLM converter (ARTX07-lite). Feature-gated behind
+﻿//! GGUF → GLLM converter (ARTX07-lite). Feature-gated behind
 //! `converter` so the core format library stays zero-workspace-dep.
 //!
-//! Pipeline (per ARTX7): parse GGUF â†’ group tensors into shared/layers â†’
-//! write unit files via [`crate::layer_io::write_unit_file`] â†’ generate
-//! `gllm.json` + `checksums.sha256` â†’ re-open with [`GllmPackage`] and
+//! Pipeline (per ARTX7): parse GGUF → group tensors into shared/layers →
+//! write unit files via [`crate::layer_io::write_unit_file`] → generate
+//! `gllm.json` + `checksums.sha256` → re-open with [`GllmPackage`] and
 //! cross-check every layer as the final validation gate.
 //!
 //! Declared deviations from the ARTX7 spec text (lite scope):
-//! - RoPE tables are NOT materialized into `GLLMShared.gllm` â€” they are
+//! - RoPE tables are NOT materialized into `GLLMShared.gllm` — they are
 //!   derivable (Minimalism principle); the runtime computes them.
 //! - Unmapped non-`blk.*` tensors go to `GLLMShared.gllm` under their
 //!   original names (with a warning), not to `GLLMProj.gllm`.
@@ -93,7 +93,7 @@ pub struct ConvertReport {
     pub num_layers: u32,
     /// Tensors placed in `GLLMShared.gllm`.
     pub shared_tensors: usize,
-    /// Non-fatal notes (unmapped tensors, tokenizer skip, â€¦).
+    /// Non-fatal notes (unmapped tensors, tokenizer skip, …).
     pub warnings: Vec<String>,
     /// EOS token ids extracted from the source GGUF (see
     /// `extract_eos_token_ids`), same value written to
@@ -107,7 +107,7 @@ fn convert_err(msg: impl Into<String>) -> GllmError {
 }
 
 /// Map a GGUF/GGML dtype onto the GLLM dtype table. Loud error on types
-/// the format cannot represent â€” never a silent fallback.
+/// the format cannot represent — never a silent fallback.
 fn map_dtype(dtype: GgufDType, tensor: &str) -> Result<DType, GllmError> {
     match dtype {
         GgufDType::F32 => Ok(DType::F32),
@@ -258,7 +258,7 @@ fn extract_eos_token_ids(gguf: &GgufFile) -> Vec<u32> {
 ///
 /// Writes `gllm.json`, `GLLMShared.gllm`, `GLLMTensorLayer-NNNN.gllm`, and
 /// `checksums.sha256` into `out_dir` (created if absent), then re-opens
-/// the result with [`GllmPackage::open`] and cross-checks every layer â€”
+/// the result with [`GllmPackage::open`] and cross-checks every layer —
 /// the converter validates its own output rather than trusting the write
 /// path (ARTX7).
 pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<ConvertReport, GllmError> {
@@ -268,7 +268,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     let gguf = GgufFile::open(input_str).map_err(|e| convert_err(format!("{input_str}: {e}")))?;
     let mut warnings = Vec::new();
 
-    // --- Metadata mapping (ARTX7 Â§Metadata Extraction) ---
+    // --- Metadata mapping (ARTX7 §Metadata Extraction) ---
     let arch = gguf
         .get_meta("general.architecture")
         .and_then(|v| v.as_str())
@@ -348,7 +348,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         .or_else(|| input.file_stem().and_then(|s| s.to_str()).map(str::to_string))
         .ok_or_else(|| convert_err("cannot determine model_id; pass --model-id"))?;
 
-    // --- Tensor grouping (ARTX7 Â§Layer Extraction), preserving GGUF file order ---
+    // --- Tensor grouping (ARTX7 §Layer Extraction), preserving GGUF file order ---
     struct Planned {
         gllm_name: String,
         shape: Vec<u64>,
@@ -369,7 +369,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
         if opts.quant == QuantTarget::F32 {
             dtype = DType::F32;
         } else if opts.quant != QuantTarget::None {
-            // G-Quant assignment (Pridwen v5 Â§9 step 3): CPP Stage 1
+            // G-Quant assignment (Pridwen v5 §9 step 3): CPP Stage 1
             // hardcoded sensitivity table overrides the GGUF-native dtype.
             // Both GQ4A and GQ2A are 256-weight-superblock formats, so the
             // same eligibility constraints apply to whichever one the
@@ -450,7 +450,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     }
     if gguf.get_meta("tokenizer.ggml.tokens").is_some() {
         warnings.push(
-            "tokenizer metadata present in GGUF but NOT packaged â€” GLLM tokenizer \
+            "tokenizer metadata present in GGUF but NOT packaged — GLLM tokenizer \
              packaging is an open spec question (ARTX1 OQ3)"
                 .into(),
         );
@@ -602,7 +602,7 @@ pub fn convert(input: &Path, out_dir: &Path, opts: &ConvertOptions) -> Result<Co
     }
     std::fs::write(out_dir.join(CHECKSUMS_FILENAME), checksum_lines)?;
 
-    // --- Final gate: re-open + cross-check own output (ARTX7 Â§Validation) ---
+    // --- Final gate: re-open + cross-check own output (ARTX7 §Validation) ---
     let pkg = GllmPackage::open(out_dir)?;
     for idx in 0..num_layers {
         let mismatches = pkg.cross_check_layer(idx)?;

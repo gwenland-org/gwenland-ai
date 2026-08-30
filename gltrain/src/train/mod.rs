@@ -1,26 +1,31 @@
-// train/mod.rs — Training pipeline modules.
-//
-// Candle is now an unconditional dependency (no feature gate), so all
-// submodules compile on every build.
+//! Stummañ Deskiñ: the training loop and the data it runs on.
+//!
+//! [`Trainer`] closes the loop M1 and M2 built the pieces for: forward through
+//! a frozen base plus a LoRA adapter, MSE against a target, backward through
+//! the tape, one AdamW step, checkpoint. [`VLMicroDataset`] is the small
+//! synthetic task M2's exit criterion is measured on.
+//!
+//! Deskiñ is Breton for "to learn". The five sub-systems M1 named (Kevrin,
+//! Karg, Kevskrid, Gwiskadur, Gwellaer, Pik) each own a piece; this module owns
+//! the order they run in, which is where KL-006 lives. See
+//! [`Trainer::train_step`].
 
-pub(crate) mod adamw_state;
-pub mod checkpoint_resumer;
-pub mod config;
-pub mod layer_loader;
-pub mod layered_training_loop;
-pub use layer_loader::{LayerIndex, LayerLoader, LayerSlice, LoadedLayer};
-pub use layered_training_loop::LayeredTrainingLoop;
+pub mod chatml;
 pub mod dataset;
-pub mod dry_run;
-pub mod lora;
-pub mod lora_bridge;
-pub mod lora_cli;
-pub mod lora_merger;
-pub mod native_runner;
-pub mod progress;
-pub mod runner;
-pub mod samples;
-pub mod script;
-pub mod training_loop;
-pub mod transformer_layer;
-pub mod vram;
+pub mod observability;
+pub mod observe;
+pub mod tokenizer;
+pub mod trainer;
+
+pub use chatml::{
+    DTChatMl, ENChatRole, VLBatch, VLChatMlConfig, VLChatSample, VLChatTurn, VLTokenizedSample,
+    IGNORE_INDEX,
+};
+pub use dataset::VLMicroDataset;
+pub use observability::{
+    ENHealthLevel, ENVerdict, VLAnomaly, VLBatchInfo, VLObservedStep, VLObserverConfig,
+    VLParamSnapshot, VLRunConfig, VLStepHealth, VLTrainingObserver,
+};
+pub use observe::{StepObserver, VLTrainingStep};
+pub use tokenizer::{ABByteTokenizer, ABGllmTokenizer, Tokenizer, IM_END, IM_START};
+pub use trainer::{mse_loss, Trainer, VLTrainerConfig};

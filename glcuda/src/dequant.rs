@@ -259,7 +259,8 @@ mod tests {
     /// random bytes can encode inf/NaN scales, which are not comparable.
     fn set_scales(data: &mut [u8], block_bytes: usize, scale_off: usize) {
         for block in data.chunks_exact_mut(block_bytes) {
-            block[scale_off..scale_off + 2].copy_from_slice(&0x2e66u16.to_le_bytes()); // ~0.1
+            block[scale_off..scale_off + 2].copy_from_slice(&0x2e66u16.to_le_bytes());
+            // ~0.1
         }
     }
 
@@ -297,14 +298,14 @@ mod tests {
         let mut data = rand_bytes(rows * dim / 32 * 34, 4);
         set_scales(&mut data, 34, 0);
         let full = glproc::kernels::dequant::q8_0::scalar::run(&data);
-        
+
         let mut padded = Vec::with_capacity((data.len() / 34) * 36);
         for block in data.chunks_exact(34) {
             padded.extend_from_slice(&block[0..2]);
             padded.extend_from_slice(&[0, 0]);
             padded.extend_from_slice(&block[2..34]);
         }
-        
+
         for row in 0..rows {
             let mut out = vec![0f32; dim];
             q8_0_row_into(&padded, row, dim, &mut out);

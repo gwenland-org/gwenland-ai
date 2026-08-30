@@ -10,8 +10,8 @@ use std::sync::{Arc, OnceLock};
 use glcore::GlError;
 
 use crate::ffi::{
-    CUcontext, CUdevice, CUdeviceptr, CUfunction, CUgraph, CUgraphExec, CUmodule, CUresult,
-    CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
+    CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule,
+    CUresult, CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
     ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
 };
 
@@ -20,8 +20,96 @@ use crate::ffi::{
 /// load, not a filesystem search.
 fn api() -> Option<&'static Arc<DriverApi>> {
     static API: OnceLock<Option<Arc<DriverApi>>> = OnceLock::new();
-    API.get_or_init(|| DriverApi::load().ok().map(Arc::new)).as_ref()
+    API.get_or_init(|| DriverApi::load().ok().map(Arc::new))
+        .as_ref()
 }
+
+/// A fixed pool of reusable CUDA events used as stage boundaries.
+///
+/// The point is what it does NOT do: `record` only enqueues a timestamp in
+/// stream order, so marking a stage boundary costs no host synchronization.
+/// Marks accumulate through a whole chunk and are read once, at the end, with
+/// a single sync — where the alternative (wrapping each stage in
+/// `cuCtxSynchronize`) drains the pipeline at every boundary and reports
+/// timings for an execution schedule that never runs in production.
+pub struct EventRing {
+    api: Arc<DriverApi>,
+    events: Vec<CUevent>,
+}
+
+impl EventRing {
+    /// How many boundaries this ring can mark.
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Never true for a ring built by [`Cuda::event_ring`]; present because
+    /// clippy asks for it alongside `len`.
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    /// Enqueue mark `i` on the current launch stream. Out-of-range indices are
+    /// ignored: a ring too small to hold a run's marks degrades to partial
+    /// timing rather than aborting the inference that carries it.
+    pub fn record(&self, cuda: &Cuda, i: usize) {
+        let (Some(rec), Some(&e)) = (self.api.cu_event_record, self.events.get(i)) else {
+            return;
+        };
+        let stream = cuda
+            .launch_stream
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: e is a live event from this ring; stream is NULL or a live
+        // stream owned for the length of the call.
+        unsafe {
+            let _ = rec(e, stream);
+        }
+    }
+
+    /// Milliseconds between marks `a` and `b`, after waiting for `b`.
+    ///
+    /// Returns `None` when either index is unmarked or the driver refuses —
+    /// an unmeasured stage must read as absent, never as zero.
+    pub fn elapsed_ms(&self, a: usize, b: usize) -> Option<f64> {
+        let (sync, elapsed) = (
+            self.api.cu_event_synchronize?,
+            self.api.cu_event_elapsed_time?,
+        );
+        let (&ea, &eb) = (self.events.get(a)?, self.events.get(b)?);
+        let mut ms = 0f32;
+        // SAFETY: both events belong to this ring and were created above.
+        unsafe {
+            if sync(eb) != CUDA_SUCCESS || elapsed(&mut ms, ea, eb) != CUDA_SUCCESS {
+                return None;
+            }
+        }
+        Some(ms as f64)
+    }
+}
+
+impl Drop for EventRing {
+    fn drop(&mut self) {
+        if let Some(destroy) = self.api.cu_event_destroy {
+            for e in self.events.drain(..) {
+                // SAFETY: each event was created by this ring; teardown
+                // errors are unreportable.
+                unsafe {
+                    let _ = destroy(e);
+                }
+            }
+        }
+    }
+}
+
+// SAFETY: events are context-level objects and the driver API is thread-safe.
+unsafe impl Send for EventRing {}
+unsafe impl Sync for EventRing {}
+
+/// Returned when graph capture or replay is asked of a driver that does not
+/// export the CUDA Graph API. Not a failure state: the caller is expected to
+/// fall back to issuing kernels individually.
+const GRAPHS_UNSUPPORTED: &str = "CUDA Graph API not available on this driver (needs CUDA 10+); \
+     the caller should issue kernels individually instead";
 
 /// Map a `CUresult` to a `GlError`, naming the failing call.
 fn check(api: &DriverApi, res: CUresult, what: &str) -> Result<(), GlError> {
@@ -34,7 +122,9 @@ fn check(api: &DriverApi, res: CUresult, what: &str) -> Result<(), GlError> {
     let known = unsafe { (api.cu_get_error_name)(res, &mut name) } == CUDA_SUCCESS;
     let name = if known && !name.is_null() {
         // SAFETY: the driver returns a NUL-terminated static string.
-        unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned()
+        unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
     } else {
         format!("CUDA error {res}")
     };
@@ -89,9 +179,60 @@ pub struct Cuda {
     /// graph instead of executing. `AtomicPtr` so `Cuda` stays `Sync`;
     /// only ever flipped between launches by the single owning thread.
     launch_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// Streams for issuing independent prefill sub-slabs concurrently.
+    ///
+    /// `None` unless `GLCUDA_MULTI_STREAM_PREFILL` is set, and never created
+    /// otherwise — the default execution model stays one stream, as
+    /// documented in the crate root. See [`Cuda::prefill_streams`].
+    prefill_streams: std::sync::OnceLock<Option<StreamPool>>,
     /// Facts about the device this handle is bound to.
     pub info: DeviceInfo,
 }
+
+/// How many streams the prefill pool holds when enabled without an explicit
+/// count. A 220-token prompt splits into four 64-row sub-slabs, so four
+/// covers the shape that motivated this.
+const DEFAULT_PREFILL_STREAMS: usize = 4;
+
+/// A set of non-blocking streams for issuing independent work concurrently.
+///
+/// Owns its streams and destroys them on drop. Non-blocking is required: a
+/// stream created without that flag implicitly synchronizes with the default
+/// stream, which would serialize exactly the work this exists to overlap.
+pub struct StreamPool {
+    api: Arc<DriverApi>,
+    streams: Vec<CUstream>,
+}
+
+impl StreamPool {
+    /// Number of streams in the pool. Always >= 1 when the pool exists.
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Never true for a pool that was successfully created; present because
+    /// clippy asks for it alongside `len`.
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+}
+
+impl Drop for StreamPool {
+    fn drop(&mut self) {
+        for s in self.streams.drain(..) {
+            // SAFETY: each stream was created by this pool and is no longer
+            // referenced. Teardown errors are unreportable.
+            unsafe {
+                let _ = (self.api.cu_stream_destroy)(s);
+            }
+        }
+    }
+}
+
+// SAFETY: CUDA streams are context-level objects and the driver API is
+// thread-safe; the pool hands out no interior mutability of its own.
+unsafe impl Send for StreamPool {}
+unsafe impl Sync for StreamPool {}
 
 // SAFETY: the CUDA driver API is thread-safe; the context handle is a
 // process-wide primary context, valid from any thread once retained.
@@ -116,7 +257,11 @@ impl Cuda {
         unsafe {
             check(&api, (api.cu_init)(0), "cuInit")?;
             let mut count = 0i32;
-            check(&api, (api.cu_device_get_count)(&mut count), "cuDeviceGetCount")?;
+            check(
+                &api,
+                (api.cu_device_get_count)(&mut count),
+                "cuDeviceGetCount",
+            )?;
             if count == 0 {
                 return Err(GlError::Engine("no CUDA device present".into()));
             }
@@ -129,22 +274,43 @@ impl Cuda {
                 (api.cu_device_get_name)(name_buf.as_mut_ptr(), name_buf.len() as i32, device),
                 "cuDeviceGetName",
             )?;
-            let name_len = name_buf.iter().position(|&b| b == 0).unwrap_or(name_buf.len());
+            let name_len = name_buf
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_buf.len());
             let name = String::from_utf8_lossy(&name_buf[..name_len]).into_owned();
 
             let attr = |sel: i32, what: &str| -> Result<i32, GlError> {
                 let mut v = 0i32;
-                check(&api, (api.cu_device_get_attribute)(&mut v, sel, device), what)?;
+                check(
+                    &api,
+                    (api.cu_device_get_attribute)(&mut v, sel, device),
+                    what,
+                )?;
                 Ok(v)
             };
-            let sm_major = attr(ATTR_COMPUTE_CAPABILITY_MAJOR, "cuDeviceGetAttribute(cc major)")?;
-            let sm_minor = attr(ATTR_COMPUTE_CAPABILITY_MINOR, "cuDeviceGetAttribute(cc minor)")?;
+            let sm_major = attr(
+                ATTR_COMPUTE_CAPABILITY_MAJOR,
+                "cuDeviceGetAttribute(cc major)",
+            )?;
+            let sm_minor = attr(
+                ATTR_COMPUTE_CAPABILITY_MINOR,
+                "cuDeviceGetAttribute(cc minor)",
+            )?;
             let sm_count = attr(ATTR_MULTIPROCESSOR_COUNT, "cuDeviceGetAttribute(sm count)")?;
 
             let mut total_mem = 0usize;
-            check(&api, (api.cu_device_total_mem)(&mut total_mem, device), "cuDeviceTotalMem")?;
+            check(
+                &api,
+                (api.cu_device_total_mem)(&mut total_mem, device),
+                "cuDeviceTotalMem",
+            )?;
             let mut driver_version = 0i32;
-            check(&api, (api.cu_driver_get_version)(&mut driver_version), "cuDriverGetVersion")?;
+            check(
+                &api,
+                (api.cu_driver_get_version)(&mut driver_version),
+                "cuDriverGetVersion",
+            )?;
 
             if sm_major < 7 {
                 return Err(GlError::Engine(format!(
@@ -169,7 +335,15 @@ impl Cuda {
                 device,
                 ctx,
                 launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-                info: DeviceInfo { name, sm_major, sm_minor, sm_count, total_mem, driver_version },
+                prefill_streams: std::sync::OnceLock::new(),
+                info: DeviceInfo {
+                    name,
+                    sm_major,
+                    sm_minor,
+                    sm_count,
+                    total_mem,
+                    driver_version,
+                },
             })
         }
     }
@@ -178,7 +352,13 @@ impl Cuda {
     /// `Cuda` created on one thread is used from another.
     pub fn make_current(&self) -> Result<(), GlError> {
         // SAFETY: ctx is a live retained primary context.
-        unsafe { check(&self.api, (self.api.cu_ctx_set_current)(self.ctx), "cuCtxSetCurrent") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_ctx_set_current)(self.ctx),
+                "cuCtxSetCurrent",
+            )
+        }
     }
 
     /// Allocate raw VRAM. Cold path only — the hot path never allocates
@@ -188,7 +368,13 @@ impl Cuda {
         let mut dptr: CUdeviceptr = 0;
         // SAFETY: out pointer valid; nonzero size enforced by caller logic
         // (cuMemAlloc rejects 0 with an error we surface).
-        unsafe { check(&self.api, (self.api.cu_mem_alloc)(&mut dptr, bytes), "cuMemAlloc")? };
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_mem_alloc)(&mut dptr, bytes),
+                "cuMemAlloc",
+            )?
+        };
         Ok(dptr)
     }
 
@@ -204,7 +390,11 @@ impl Cuda {
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: out pointers are valid locals.
         unsafe {
-            check(&self.api, (self.api.cu_mem_get_info)(&mut free, &mut total), "cuMemGetInfo")?
+            check(
+                &self.api,
+                (self.api.cu_mem_get_info)(&mut free, &mut total),
+                "cuMemGetInfo",
+            )?
         };
         Ok((free, total))
     }
@@ -233,7 +423,13 @@ impl Cuda {
     /// Copy device → device (stream-0 ordered) — the KV-cache write path.
     pub fn dtod(&self, dst: CUdeviceptr, src: CUdeviceptr, bytes: usize) -> Result<(), GlError> {
         // SAFETY: caller guarantees both regions are live and sized.
-        unsafe { check(&self.api, (self.api.cu_memcpy_dtod)(dst, src, bytes), "cuMemcpyDtoD") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_memcpy_dtod)(dst, src, bytes),
+                "cuMemcpyDtoD",
+            )
+        }
     }
 
     /// Copy device → host f32 slice.
@@ -243,11 +439,7 @@ impl Cuda {
         unsafe {
             check(
                 &self.api,
-                (self.api.cu_memcpy_dtoh)(
-                    dst.as_mut_ptr().cast(),
-                    src,
-                    std::mem::size_of_val(dst),
-                ),
+                (self.api.cu_memcpy_dtoh)(dst.as_mut_ptr().cast(), src, std::mem::size_of_val(dst)),
                 "cuMemcpyDtoH",
             )
         }
@@ -256,7 +448,13 @@ impl Cuda {
     /// Block until all queued work on this context has finished.
     pub fn synchronize(&self) -> Result<(), GlError> {
         // SAFETY: no preconditions beyond a current context.
-        unsafe { check(&self.api, (self.api.cu_ctx_synchronize)(), "cuCtxSynchronize") }
+        unsafe {
+            check(
+                &self.api,
+                (self.api.cu_ctx_synchronize)(),
+                "cuCtxSynchronize",
+            )
+        }
     }
 
     /// JIT-load a PTX image. The driver compiles it for the actual device
@@ -289,7 +487,10 @@ impl Cuda {
         // (CUDA's documented convention for scalar JIT options).
         let (mut options, mut values): (Vec<i32>, Vec<*mut std::ffi::c_void>) = (
             vec![JIT_ERROR_LOG_BUFFER, JIT_ERROR_LOG_BUFFER_SIZE_BYTES],
-            vec![err_log.as_mut_ptr().cast(), err_cap as *mut std::ffi::c_void],
+            vec![
+                err_log.as_mut_ptr().cast(),
+                err_cap as *mut std::ffi::c_void,
+            ],
         );
         if want_info {
             options.extend_from_slice(&[
@@ -336,7 +537,10 @@ impl Cuda {
                 eprintln!("[glcuda jit] register/smem usage (ptxas -v):\n{log}");
             }
         }
-        Ok(Module { api: self.api.clone(), raw })
+        Ok(Module {
+            api: self.api.clone(),
+            raw,
+        })
     }
 
     /// Launch `f` with the given geometry onto the current launch stream
@@ -352,7 +556,9 @@ impl Cuda {
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<(), GlError> {
-        let stream = self.launch_stream.load(std::sync::atomic::Ordering::Relaxed);
+        let stream = self
+            .launch_stream
+            .load(std::sync::atomic::Ordering::Relaxed);
         // SAFETY: f belongs to a live module on this context; params
         // pointers are valid for the duration of the call; stream is NULL
         // or a live stream owned for the length of a capture.
@@ -377,6 +583,59 @@ impl Cuda {
         }
     }
 
+    /// True when this driver exports the CUDA event entry points, i.e.
+    /// [`EventRing`] can time stages on-stream.
+    pub fn events_available(&self) -> bool {
+        self.api.events_available()
+    }
+
+    /// Allocate `n` reusable events for on-stream stage timing.
+    ///
+    /// `None` when the driver does not export the event API — the caller
+    /// falls back to coarse timing rather than failing.
+    pub fn event_ring(&self, n: usize) -> Option<EventRing> {
+        if !self.api.events_available() {
+            return None;
+        }
+        let create = self.api.cu_event_create?;
+        let mut events = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut e: CUevent = std::ptr::null_mut();
+            // SAFETY: out pointer valid; flag 0 = CU_EVENT_DEFAULT, which
+            // enables timing (CU_EVENT_DISABLE_TIMING would not).
+            if unsafe { create(&mut e, 0) } != CUDA_SUCCESS {
+                drop(EventRing {
+                    api: self.api.clone(),
+                    events,
+                });
+                return None;
+            }
+            events.push(e);
+        }
+        Some(EventRing {
+            api: self.api.clone(),
+            events,
+        })
+    }
+
+    /// True when this driver exports the CUDA Graph entry points, i.e.
+    /// [`Cuda::capture`] can succeed.
+    ///
+    /// Callers on the decode path should branch on this rather than treating
+    /// a capture failure as fatal: replaying a captured graph is an
+    /// optimization, and issuing the same kernels individually is the
+    /// supported degraded mode (see `GpuModel::decode_step`).
+    pub fn graphs_available(&self) -> bool {
+        self.api.graphs_available()
+    }
+
+    /// The optional `cuGraphLaunch` entry point, if the driver exports it.
+    fn cu_graph_launch_fn(
+        &self,
+    ) -> Option<unsafe extern "system" fn(CUgraphExec, CUstream) -> CUresult> {
+        self.api.cu_graph_launch
+    }
+
     /// Capture everything launched by `body` into a replayable [`GraphExec`].
     ///
     /// Creates a fresh non-blocking stream, points all launches at it for
@@ -392,6 +651,19 @@ impl Cuda {
     {
         use crate::ffi::{CU_STREAM_CAPTURE_MODE_GLOBAL, CU_STREAM_NON_BLOCKING};
         use std::sync::atomic::Ordering;
+
+        // Resolve the optional graph entry points BEFORE touching a stream.
+        // Bailing here leaves nothing to unwind; discovering a missing symbol
+        // after `cuStreamBeginCapture` would strand the stream in capture mode.
+        let (begin, end, instantiate, destroy) = match (
+            self.api.cu_stream_begin_capture,
+            self.api.cu_stream_end_capture,
+            self.api.cu_graph_instantiate,
+            self.api.cu_graph_destroy,
+        ) {
+            (Some(b), Some(e), Some(i), Some(d)) if self.api.graphs_available() => (b, e, i, d),
+            _ => return Err(GlError::Engine(GRAPHS_UNSUPPORTED.into())),
+        };
 
         // Dedicated capturable stream.
         let mut stream: CUstream = std::ptr::null_mut();
@@ -411,35 +683,33 @@ impl Cuda {
             unsafe {
                 check(
                     &self.api,
-                    (self.api.cu_stream_begin_capture)(stream, CU_STREAM_CAPTURE_MODE_GLOBAL),
+                    begin(stream, CU_STREAM_CAPTURE_MODE_GLOBAL),
                     "cuStreamBeginCapture",
                 )?
             };
             body()?;
             let mut graph: CUgraph = std::ptr::null_mut();
             // SAFETY: ends the capture opened above; out pointer valid.
-            unsafe {
-                check(
-                    &self.api,
-                    (self.api.cu_stream_end_capture)(stream, &mut graph),
-                    "cuStreamEndCapture",
-                )?
-            };
+            unsafe { check(&self.api, end(stream, &mut graph), "cuStreamEndCapture")? };
             let mut exec: CUgraphExec = std::ptr::null_mut();
             // SAFETY: graph is a valid captured graph; flags 0.
-            let inst = unsafe { (self.api.cu_graph_instantiate)(&mut exec, graph, 0) };
+            let inst = unsafe { instantiate(&mut exec, graph, 0) };
             // The graph template is no longer needed once instantiated.
             // SAFETY: graph is live and owned here.
             unsafe {
-                let _ = (self.api.cu_graph_destroy)(graph);
+                let _ = destroy(graph);
             }
             check(&self.api, inst, "cuGraphInstantiate")?;
-            Ok(GraphExec { api: self.api.clone(), exec })
+            Ok(GraphExec {
+                api: self.api.clone(),
+                exec,
+            })
         })();
 
         // Restore normal (default-stream) execution and free the capture
         // stream regardless of outcome.
-        self.launch_stream.store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.launch_stream
+            .store(std::ptr::null_mut(), Ordering::Relaxed);
         // SAFETY: stream is live and no longer referenced.
         unsafe {
             let _ = (self.api.cu_stream_destroy)(stream);
@@ -447,13 +717,140 @@ impl Cuda {
         result
     }
 
+    /// The prefill stream pool, or `None` when multi-stream prefill is off.
+    ///
+    /// # Why this exists
+    ///
+    /// The MMA GEMM's grid is `ceil_div(out_dim, 64)` — nothing splits K or
+    /// tokens — so `out_dim` alone decides how much of the device is used. On
+    /// a 40-SM T4 running Qwen2.5-0.5B that is 76 blocks for `gate`/`up` and
+    /// **14 for `down`**, which a measured prefill profile put at 66% of
+    /// prefill time while `gate`+`up`, moving twice the weight bytes, took
+    /// 10%.
+    ///
+    /// A prompt longer than 64 tokens is already issued as several
+    /// independent sub-slabs: same weights, different activation rows,
+    /// disjoint output. They are only sequential because they share one
+    /// stream. Issuing them on separate streams puts 4x the blocks in flight
+    /// without touching the kernel — and, as a side effect, the concurrent
+    /// sub-slabs read the same weights, which L2 may serve once instead of
+    /// four times.
+    ///
+    /// # Why it is opt-in
+    ///
+    /// The crate root documents one stream and one sync per token. This is an
+    /// experiment against that invariant, so it is off unless
+    /// `GLCUDA_MULTI_STREAM_PREFILL` is set, and a failure to create the pool
+    /// degrades to the single-stream path rather than failing the run. Set the
+    /// variable to a number to choose the pool size.
+    pub fn prefill_streams(&self) -> Option<&StreamPool> {
+        self.prefill_streams
+            .get_or_init(|| {
+                let raw = std::env::var_os("GLCUDA_MULTI_STREAM_PREFILL")?;
+                let n = raw
+                    .to_str()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+                    .filter(|n| *n >= 2)
+                    .unwrap_or(DEFAULT_PREFILL_STREAMS);
+                match self.make_stream_pool(n) {
+                    Ok(pool) => {
+                        eprintln!("[glcuda] multi-stream prefill: {n} streams");
+                        Some(pool)
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[glcuda] multi-stream prefill unavailable ({e}); \
+                             staying on the single-stream path"
+                        );
+                        None
+                    }
+                }
+            })
+            .as_ref()
+    }
+
+    /// Create `n` non-blocking streams.
+    fn make_stream_pool(&self, n: usize) -> Result<StreamPool, GlError> {
+        use crate::ffi::CU_STREAM_NON_BLOCKING;
+        let mut streams = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut s: CUstream = std::ptr::null_mut();
+            // SAFETY: out pointer valid; flag is the documented non-blocking
+            // constant.
+            unsafe {
+                check(
+                    &self.api,
+                    (self.api.cu_stream_create)(&mut s, CU_STREAM_NON_BLOCKING),
+                    "cuStreamCreate",
+                )
+            }
+            // Streams already created are freed by the partial pool's Drop.
+            .map_err(|e| {
+                drop(StreamPool {
+                    api: self.api.clone(),
+                    streams: std::mem::take(&mut streams),
+                });
+                e
+            })?;
+            streams.push(s);
+        }
+        Ok(StreamPool {
+            api: self.api.clone(),
+            streams,
+        })
+    }
+
+    /// Point launches at `pool`'s stream `i` for the duration of `body`.
+    ///
+    /// The previous launch target is saved and restored rather than reset to
+    /// NULL: forcing the default stream here would silently break an enclosing
+    /// graph capture. Prefill is not captured today, and this keeps that from
+    /// becoming a trap if it ever is.
+    pub fn on_stream<F>(&self, pool: &StreamPool, i: usize, body: F) -> Result<(), GlError>
+    where
+        F: FnOnce() -> Result<(), GlError>,
+    {
+        use std::sync::atomic::Ordering;
+        let previous = self.launch_stream.load(Ordering::Relaxed);
+        self.launch_stream
+            .store(pool.streams[i % pool.streams.len()], Ordering::Relaxed);
+        let result = body();
+        self.launch_stream.store(previous, Ordering::Relaxed);
+        result
+    }
+
+    /// Wait for every stream in `pool`.
+    ///
+    /// Blunt on purpose: without an event API this is what makes work issued
+    /// across the pool visible to the next kernel on the default stream. It
+    /// costs a host round-trip per call, which is the price of measuring the
+    /// idea before building the machinery to do it properly.
+    pub fn sync_pool(&self, pool: &StreamPool) -> Result<(), GlError> {
+        for s in &pool.streams {
+            // SAFETY: streams are live and owned by the pool.
+            unsafe {
+                check(
+                    &self.api,
+                    (self.api.cu_stream_synchronize)(*s),
+                    "cuStreamSynchronize",
+                )?
+            };
+        }
+        Ok(())
+    }
+
     /// Replay a captured graph on the default stream and wait for it.
     pub fn graph_launch(&self, exec: &GraphExec) -> Result<(), GlError> {
+        // A live GraphExec can only exist if capture succeeded, so this is
+        // always Some in practice; the check keeps the unwrap out of the code.
+        let launch = self
+            .cu_graph_launch_fn()
+            .ok_or_else(|| GlError::Engine(GRAPHS_UNSUPPORTED.into()))?;
         // SAFETY: exec is a live instantiated graph; NULL = default stream.
         unsafe {
             check(
                 &self.api,
-                (self.api.cu_graph_launch)(exec.exec, std::ptr::null_mut()),
+                launch(exec.exec, std::ptr::null_mut()),
                 "cuGraphLaunch",
             )?
         };
@@ -463,6 +860,21 @@ impl Cuda {
 
 impl Drop for Cuda {
     fn drop(&mut self) {
+        // ⛔ Streams first, context second, and the order is not stylistic.
+        //
+        // Rust drops a struct's fields AFTER its own `Drop::drop` body runs,
+        // so leaving `prefill_streams` to the implicit path would call
+        // cuStreamDestroy against a context this function had already
+        // released — SIGSEGV at exit, which is exactly what the drop-order
+        // note in the crate root warns about for `GlcudaEngine`'s fields.
+        // That note protects resources held *beside* `Cuda`; it cannot
+        // protect one held *inside* it, which is how this got in.
+        //
+        // Observed as rc=-11 on every run that created a pool: the archive
+        // was already written, so the measurements survived and only the
+        // process died. A crash that arrives after the useful work is the
+        // easiest kind to dismiss and still means undefined behaviour ran.
+        drop(self.prefill_streams.take());
         // SAFETY: releasing a context we retained; errors on teardown are
         // unreportable, so they are intentionally ignored.
         unsafe {
@@ -537,8 +949,12 @@ unsafe impl Sync for GraphExec {}
 impl Drop for GraphExec {
     fn drop(&mut self) {
         // SAFETY: exec is live and owned by us; teardown errors ignored.
-        unsafe {
-            let _ = (self.api.cu_graph_exec_destroy)(self.exec);
+        // The symbol must exist — this object could not have been built
+        // without it — but a missing one leaks rather than panics in drop.
+        if let Some(destroy) = self.api.cu_graph_exec_destroy {
+            unsafe {
+                let _ = destroy(self.exec);
+            }
         }
     }
 }

@@ -6,7 +6,7 @@
 //! actually have?* — so the parameter counts and their ratio are recorded next
 //! to the numbers they explain.
 //!
-//! Read from `VLTrainerConfig`, which glbench hands to stumman in the first
+//! Read from `VLTrainerConfig`, which glbench hands to gltrain in the first
 //! place. Nothing here is inferred.
 
 use crate::core::schema::ToJson;
@@ -18,7 +18,7 @@ const BYTES_PER_F32: u64 = 4;
 /// The adapter a training run used.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VLAdapterObservation {
-    /// Adapter family. `"lora"` is the only one stumman M2 implements.
+    /// Adapter family. `"lora"` is the only one gltrain M2 implements.
     pub kind: String,
     /// LoRA rank.
     pub rank: usize,

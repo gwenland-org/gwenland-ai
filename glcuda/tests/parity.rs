@@ -10,6 +10,7 @@
 use glcuda::buffer::BackendBuffer;
 use glcuda::driver::{cuda_available, Cuda};
 use glcuda::kernels::{rope_tables, KernelSet};
+use glcuda::repack::f32_to_w8pc_soa;
 
 // Per-operation tolerances from the architecture document (§8).
 // Per-operation tolerances. The doc (§8) lists aspirational values assuming
@@ -60,8 +61,7 @@ fn randv(n: usize, seed: u64, scale: f32) -> Vec<f32> {
             state ^= state >> 12;
             state ^= state << 25;
             state ^= state >> 27;
-            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32
-                - 0.5)
+            ((state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 40) as f32 / (1u64 << 24) as f32 - 0.5)
                 * 2.0
                 * scale
         })
@@ -92,8 +92,43 @@ fn q8_round_trip(x: &[f32]) -> Vec<f32> {
         let amax = blk_in.iter().fold(0f32, |m, &v| m.max(v.abs()));
         let scale = amax / 127.0;
         for (o, &v) in blk_out.iter_mut().zip(blk_in) {
-            let q = if scale != 0.0 { (v / scale).round().clamp(-128.0, 127.0) } else { 0.0 };
+            let q = if scale != 0.0 {
+                (v / scale).round().clamp(-128.0, 127.0)
+            } else {
+                0.0
+            };
             *o = q * scale;
+        }
+    }
+    out
+}
+
+/// Wave 7 activation contract: one symmetric int8 scale for each complete
+/// token row, rather than one scale per K32 block. The Tensor Core kernel can
+/// therefore keep one exact s32 accumulator through the whole K reduction and
+/// apply `x_scale * w_scale` once in its epilogue.
+fn q8_row_round_trip(x: &[f32], row_len: usize) -> Vec<f32> {
+    let mut out = vec![0f32; x.len()];
+    for (row_in, row_out) in x.chunks_exact(row_len).zip(out.chunks_exact_mut(row_len)) {
+        let amax = row_in.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let scale = amax / 127.0;
+        for (o, &v) in row_out.iter_mut().zip(row_in) {
+            let q = if scale != 0.0 {
+                (v / scale).round().clamp(-127.0, 127.0)
+            } else {
+                0.0
+            };
+            *o = q * scale;
+        }
+    }
+    out
+}
+
+fn dequant_w8pc(qs: &[u8], scales: &[f32], out_dim: usize, in_dim: usize) -> Vec<f32> {
+    let mut out = vec![0f32; out_dim * in_dim];
+    for row in 0..out_dim {
+        for col in 0..in_dim {
+            out[row * in_dim + col] = qs[row * in_dim + col] as i8 as f32 * scales[row];
         }
     }
     out
@@ -137,11 +172,16 @@ fn gemv_matches_glproc_scalar() {
         let mut want = vec![0f32; out_dim];
         glproc::kernels::matmul::scalar::run_matvec(&w, &x, &mut want, out_dim, in_dim);
 
-        let mut buf = BackendBuffer::new(&cuda, ((out_dim * in_dim + in_dim + out_dim) * 4 + 4096) as u64).unwrap();
+        let mut buf = BackendBuffer::new(
+            &cuda,
+            ((out_dim * in_dim + in_dim + out_dim) * 4 + 4096) as u64,
+        )
+        .unwrap();
         let dw = upload(&cuda, &mut buf, &w);
         let dx = upload(&cuda, &mut buf, &x);
         let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-        k.gemv(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32).unwrap();
+        k.gemv(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32)
+            .unwrap();
         cuda.synchronize().unwrap();
         let mut got = vec![0f32; out_dim];
         cuda.dtoh_f32(&mut got, dy).unwrap();
@@ -183,15 +223,69 @@ fn gemv_q8_0_matches_dequantized_reference() {
     let dx = upload(&cuda, &mut buf, &x);
     let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
-    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32)
+        .unwrap();
     let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q8_0(&cuda, dw, d_qs, d_scales, dy, out_dim as u32, in_dim as u32).unwrap();
+    k.gemv_q8_0(&cuda, dw, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+        .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(&cuda).unwrap();
 
     assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0");
+}
+
+/// Wave 8 changes only CTA ownership: every warp must emit exactly the same
+/// 32 quant bytes and f32 scale bits as the retained one-warp kernel. The
+/// 896-wide case exercises 28 blocks per row, including the four-warp tail.
+#[test]
+fn quantize_q8_rowcta_is_byte_identical_to_the_k32_kernel() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (rows, cols) = (3usize, 896usize); // Qwen2.5-0.5B hidden width
+    let mut x = randv(rows * cols, 0x8a11, 1.0);
+    // Pin edge cases that rounding/reduction rewrites commonly mishandle.
+    x[32..64].fill(0.0);
+    x[64] = 3.5;
+    x[65] = -3.5;
+
+    let q_bytes = rows * cols;
+    let scale_count = q_bytes / 32;
+    let bytes = (x.len() * 4 + q_bytes * 2 + scale_count * 4 * 2 + 16 * 1024) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dx = upload(&cuda, &mut buf, &x);
+    let q_old = buf.alloc(q_bytes as u64).unwrap().dptr;
+    let s_old = buf.alloc_f32(scale_count).unwrap().dptr;
+    let q_row = buf.alloc(q_bytes as u64).unwrap().dptr;
+    let s_row = buf.alloc_f32(scale_count).unwrap().dptr;
+
+    k.quantize_q8(&cuda, dx, q_old, s_old, q_bytes as u32)
+        .unwrap();
+    k.quantize_q8_rowcta(&cuda, dx, q_row, s_row, rows as u32, cols as u32)
+        .unwrap();
+    cuda.synchronize().unwrap();
+
+    // dtoh_f32 is a raw byte copy. Comparing the bit patterns preserves all
+    // four int8 bytes packed into each temporary f32 word, including NaNs.
+    let mut q_old_words = vec![0.0f32; q_bytes / 4];
+    let mut q_row_words = vec![0.0f32; q_bytes / 4];
+    cuda.dtoh_f32(&mut q_old_words, q_old).unwrap();
+    cuda.dtoh_f32(&mut q_row_words, q_row).unwrap();
+    let q_old_bits: Vec<u32> = q_old_words.iter().map(|x| x.to_bits()).collect();
+    let q_row_bits: Vec<u32> = q_row_words.iter().map(|x| x.to_bits()).collect();
+    assert_eq!(q_row_bits, q_old_bits, "row-CTA quant bytes changed");
+
+    let mut scales_old = vec![0.0f32; scale_count];
+    let mut scales_row = vec![0.0f32; scale_count];
+    cuda.dtoh_f32(&mut scales_old, s_old).unwrap();
+    cuda.dtoh_f32(&mut scales_row, s_row).unwrap();
+    let scales_old_bits: Vec<u32> = scales_old.iter().map(|x| x.to_bits()).collect();
+    let scales_row_bits: Vec<u32> = scales_row.iter().map(|x| x.to_bits()).collect();
+    assert_eq!(
+        scales_row_bits, scales_old_bits,
+        "row-CTA scale bits changed"
+    );
+    buf.free(&cuda).unwrap();
 }
 
 /// The SoA Q8_0 GEMV (contiguous qs + separate f16 scales) must match the same
@@ -229,16 +323,69 @@ fn gemv_q8_0_soa_matches_dequantized_reference() {
     let dx = upload(&cuda, &mut buf, &x);
     let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
-    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
-    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q8_0_soa(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32)
         .unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q8_0_soa(
+        &cuda,
+        dwqs,
+        dwsc,
+        d_qs,
+        d_scales,
+        dy,
+        out_dim as u32,
+        in_dim as u32,
+    )
+    .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(&cuda).unwrap();
 
     assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0_soa");
+}
+
+#[test]
+fn gemv_w8pc_matches_row_scaled_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    let (out_dim, in_dim) = (48usize, 128usize);
+    let w_f32 = randv(out_dim * in_dim, 140, 0.1);
+    let (w_qs, w_scales) = f32_to_w8pc_soa(&w_f32, out_dim, in_dim).unwrap();
+    let w_deq = dequant_w8pc(&w_qs, &w_scales, out_dim, in_dim);
+    let x = randv(in_dim, 141, 1.0);
+    let x_deq = q8_row_round_trip(&x, in_dim);
+    let mut want = vec![0f32; out_dim];
+    glproc::kernels::matmul::scalar::run_matvec(&w_deq, &x_deq, &mut want, out_dim, in_dim);
+
+    let bytes =
+        (w_qs.len() + w_scales.len() * 4 + x.len() * 4 + x.len() + 4 + out_dim * 4 + 4096) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dwqs = buf.alloc(w_qs.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &w_qs).unwrap();
+    let dwsc = upload(&cuda, &mut buf, &w_scales);
+    let dx = upload(&cuda, &mut buf, &x);
+    let dxqs = buf.alloc(in_dim as u64).unwrap().dptr;
+    let dxsc = buf.alloc_f32(1).unwrap().dptr;
+    k.quantize_q8_rows(&cuda, dx, dxqs, dxsc, 1, in_dim as u32)
+        .unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_w8pc(
+        &cuda,
+        dwqs,
+        dwsc,
+        dxqs,
+        dxsc,
+        dy,
+        out_dim as u32,
+        in_dim as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(&cuda).unwrap();
+
+    assert_close(&got, &want, EPS_Q8_GEMV, "gemv_w8pc");
 }
 
 /// M2.1 Task A: the native Q4_K SoA GEMV against the glproc scalar ground
@@ -280,10 +427,21 @@ fn gemv_q4_k_soa_matches_dequantized_reference() {
     let dx = upload(&cuda, &mut buf, &x);
     let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
-    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
-    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q4_k_soa(&cuda, dwqs, dwsc, dwmn, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32)
         .unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q4_k_soa(
+        &cuda,
+        dwqs,
+        dwsc,
+        dwmn,
+        d_qs,
+        d_scales,
+        dy,
+        out_dim as u32,
+        in_dim as u32,
+    )
+    .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
@@ -315,7 +473,8 @@ fn gemv_q6_k_soa_matches_dequantized_reference() {
 
     let (wql, wqh, wsc, wd) = glcuda::repack::q6_k_to_soa(&blocks).unwrap();
 
-    let bytes = (wql.len() + wqh.len() + wsc.len() + wd.len() + (in_dim + out_dim) * 4 + 8192) as u64;
+    let bytes =
+        (wql.len() + wqh.len() + wsc.len() + wd.len() + (in_dim + out_dim) * 4 + 8192) as u64;
     let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
     let dql = buf.alloc(wql.len() as u64).unwrap().dptr;
     cuda.htod(dql, &wql).unwrap();
@@ -328,10 +487,22 @@ fn gemv_q6_k_soa_matches_dequantized_reference() {
     let dx = upload(&cuda, &mut buf, &x);
     let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
-    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
-    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q6_k_soa(&cuda, dql, dqh, dsc, dd, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+    k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32)
         .unwrap();
+    let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+    k.gemv_q6_k_soa(
+        &cuda,
+        dql,
+        dqh,
+        dsc,
+        dd,
+        d_qs,
+        d_scales,
+        dy,
+        out_dim as u32,
+        in_dim as u32,
+    )
+    .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
@@ -377,16 +548,31 @@ fn gemv_q4_0_soa_matches_dequantized_reference() {
         let dx = upload(&cuda, &mut buf, &x);
         let d_qs = buf.alloc(in_dim as u64).unwrap().dptr;
         let d_scales = buf.alloc_f32(in_dim / 32).unwrap().dptr;
-        k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32).unwrap();
-        let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-        k.gemv_q4_0_soa(&cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32)
+        k.quantize_q8(&cuda, dx, d_qs, d_scales, in_dim as u32)
             .unwrap();
+        let dy = buf.alloc_f32(out_dim).unwrap().dptr;
+        k.gemv_q4_0_soa(
+            &cuda,
+            dwqs,
+            dwsc,
+            d_qs,
+            d_scales,
+            dy,
+            out_dim as u32,
+            in_dim as u32,
+        )
+        .unwrap();
         cuda.synchronize().unwrap();
         let mut got = vec![0f32; out_dim];
         cuda.dtoh_f32(&mut got, dy).unwrap();
         buf.free(&cuda).unwrap();
 
-        assert_close(&got, &want, EPS_Q8_GEMV, &format!("gemv_q4_0_soa({out_dim}x{in_dim})"));
+        assert_close(
+            &got,
+            &want,
+            EPS_Q8_GEMV,
+            &format!("gemv_q4_0_soa({out_dim}x{in_dim})"),
+        );
     }
 }
 
@@ -411,7 +597,8 @@ fn gemv_q4_0_matches_dequantized_reference() {
     cuda.htod(dw, &blocks).unwrap();
     let dx = upload(&cuda, &mut buf, &x);
     let dy = buf.alloc_f32(out_dim).unwrap().dptr;
-    k.gemv_q4_0(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32).unwrap();
+    k.gemv_q4_0(&cuda, dw, dx, dy, out_dim as u32, in_dim as u32)
+        .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
@@ -434,9 +621,238 @@ fn gemm_mma_q8_matches_dequantized_reference() {
         return;
     }
     for (out_dim, in_dim, ntok) in [(16usize, 64usize, 5usize), (16, 64, 20), (16, 64, 64)] {
-        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, false);
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, 64);
+    }
+    for (out_dim, in_dim, ntok) in REAL_SHAPES {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, 64);
     }
 }
+
+/// Wave 3: the 8-m-tile kernel now spans token slabs through grid.y instead
+/// of a serial host loop. These cases cross the 64-row CTA boundary, include
+/// ragged tails, and pin the non-power-of-two dim-896 production geometry.
+#[test]
+fn gemm_mma_q8_grid2d_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 — no tensor-core module");
+        return;
+    }
+    for (out_dim, in_dim, ntok) in [
+        (16usize, 64usize, 65usize),
+        (16, 64, 200),
+        (16, 64, 256),
+        (256, 896, 200),
+    ] {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, 64);
+    }
+}
+
+/// Wave 9 changes only CTA ordering. Both launch rasters must therefore write
+/// bit-identical f32 outputs, including across four token slabs and a ragged
+/// production-sized tail.
+#[test]
+fn gemm_mma_q8_l2_raster_is_bit_identical() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 - no tensor-core module");
+        return;
+    }
+    gemm_mma_l2_bit_case(&cuda, &k, 256, 896, 244);
+}
+
+fn gemm_mma_l2_bit_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize) {
+    let ntok_pad = ntok.div_ceil(8) * 8;
+    let blocks =
+        glproc::kernels::dequant::q8_0::scalar::quantize(&randv(out_dim * in_dim, 190, 0.1));
+    let mut qs = Vec::with_capacity(out_dim * in_dim);
+    let mut scales = Vec::with_capacity(out_dim * in_dim / 16);
+    for block in blocks.chunks_exact(34) {
+        scales.extend_from_slice(&block[0..2]);
+        qs.extend_from_slice(&block[2..34]);
+    }
+    let x = randv(ntok_pad * in_dim, 191, 1.0);
+    let bytes = (qs.len()
+        + scales.len()
+        + x.len() * 4
+        + ntok_pad * in_dim
+        + ntok_pad * (in_dim / 32) * 4
+        + 2 * ntok * out_dim * 4
+        + 64 * 1024) as u64;
+    let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
+    let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
+    let dwsc = buf.alloc(scales.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &qs).unwrap();
+    cuda.htod(dwsc, &scales).unwrap();
+    let dx = upload(cuda, &mut buf, &x);
+    let dxqs = buf.alloc((ntok_pad * in_dim) as u64).unwrap().dptr;
+    let dxsc = buf.alloc_f32(ntok_pad * in_dim / 32).unwrap().dptr;
+    k.quantize_q8(cuda, dx, dxqs, dxsc, (ntok_pad * in_dim) as u32)
+        .unwrap();
+    let y_grid = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
+    let y_l2 = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
+    k.gemm_mma_q8(
+        cuda,
+        dwqs,
+        dwsc,
+        dxqs,
+        dxsc,
+        y_grid,
+        out_dim as u32,
+        in_dim as u32,
+        ntok as u32,
+    )
+    .unwrap();
+    k.gemm_mma_q8_l2(
+        cuda,
+        dwqs,
+        dwsc,
+        dxqs,
+        dxsc,
+        y_l2,
+        out_dim as u32,
+        in_dim as u32,
+        ntok as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+    let mut grid = vec![0f32; ntok * out_dim];
+    let mut l2 = vec![0f32; ntok * out_dim];
+    cuda.dtoh_f32(&mut grid, y_grid).unwrap();
+    cuda.dtoh_f32(&mut l2, y_l2).unwrap();
+    buf.free(cuda).unwrap();
+    assert!(
+        grid.iter()
+            .zip(&l2)
+            .all(|(a, b)| a.to_bits() == b.to_bits()),
+        "Wave 9 CTA raster changed GEMM output bits"
+    );
+}
+
+/// Wave 7 contract parity across a partial tile, a cross-CTA ragged tail,
+/// and Qwen2.5-0.5B's dim-896 production geometry.
+#[test]
+fn gemm_mma_w8pc_matches_row_scaled_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 - no tensor-core module");
+        return;
+    }
+    for (out_dim, in_dim, ntok) in [
+        (16usize, 64usize, 5usize),
+        (16, 64, 65),
+        (256, 896, 200),
+        (896, 4864, 64),
+    ] {
+        gemm_mma_w8pc_case(&cuda, &k, out_dim, in_dim, ntok);
+    }
+}
+
+fn gemm_mma_w8pc_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize) {
+    let ntok_pad = ntok.div_ceil(8) * 8;
+    let w_f32 = randv(out_dim * in_dim, 150, 0.1);
+    let (w_qs, w_scales) = f32_to_w8pc_soa(&w_f32, out_dim, in_dim).unwrap();
+    let w_deq = dequant_w8pc(&w_qs, &w_scales, out_dim, in_dim);
+    let x = randv(ntok_pad * in_dim, 151, 1.0);
+    let x_deq = q8_row_round_trip(&x, in_dim);
+    let mut want = vec![0f32; ntok * out_dim];
+    for t in 0..ntok {
+        glproc::kernels::matmul::scalar::run_matvec(
+            &w_deq,
+            &x_deq[t * in_dim..(t + 1) * in_dim],
+            &mut want[t * out_dim..(t + 1) * out_dim],
+            out_dim,
+            in_dim,
+        );
+    }
+
+    let bytes = (w_qs.len()
+        + w_scales.len() * 4
+        + x.len() * 4
+        + ntok_pad * in_dim
+        + ntok_pad * 4
+        + ntok * out_dim * 4
+        + 64 * 1024) as u64;
+    let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
+    let dwqs = buf.alloc(w_qs.len() as u64).unwrap().dptr;
+    cuda.htod(dwqs, &w_qs).unwrap();
+    let dwsc = upload(cuda, &mut buf, &w_scales);
+    let dx = upload(cuda, &mut buf, &x);
+    let dxqs = buf.alloc((ntok_pad * in_dim) as u64).unwrap().dptr;
+    let dxsc = buf.alloc_f32(ntok_pad).unwrap().dptr;
+    k.quantize_q8_rows(cuda, dx, dxqs, dxsc, ntok_pad as u32, in_dim as u32)
+        .unwrap();
+    let dy = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
+    k.gemm_mma_w8pc(
+        cuda,
+        dwqs,
+        dwsc,
+        dxqs,
+        dxsc,
+        dy,
+        out_dim as u32,
+        in_dim as u32,
+        ntok as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+    let mut got = vec![0f32; ntok * out_dim];
+    cuda.dtoh_f32(&mut got, dy).unwrap();
+    buf.free(cuda).unwrap();
+
+    assert_close(
+        &got,
+        &want,
+        EPS_Q8_GEMV,
+        &format!("gemm_mma_w8pc(out={out_dim}, in={in_dim}, ntok={ntok})"),
+    );
+}
+
+/// Wave 6 r128 kernel: 16 internal m-tiles plus grid.y token slabs. The ladder
+/// crosses both the 64-row dispatch threshold and the 128-row CTA boundary;
+/// the production shape pins the 128-thread `ceil(out/32)` launch geometry.
+#[test]
+fn gemm_mma_q8_r128_matches_dequantized_reference() {
+    let Some((cuda, k)) = gpu() else { return };
+    if !k.has_mma() {
+        eprintln!("SKIP: device below sm_75 - no tensor-core module");
+        return;
+    }
+    for (out_dim, in_dim, ntok) in [
+        (16usize, 64usize, 5usize),
+        (16, 64, 65),
+        (16, 64, 128),
+        (16, 64, 129),
+        (16, 64, 256),
+        (16, 64, 512),
+        (896, 4864, 244),
+    ] {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, 128);
+    }
+}
+
+/// The shapes this engine actually runs, for Qwen2.5-0.5B (dim 896,
+/// intermediate 4864).
+///
+/// ⛔ Every GEMM case here used to be `out_dim=16, in_dim=64`: one block, two
+/// of eight warps in range, a K-loop of two 32-blocks. No shape the model
+/// executes was covered by any GEMM test, so both "pass" and "fail" said
+/// almost nothing about production behaviour — a gap found only when the r256
+/// kernel failed and the failure turned out to be unrepresentative either way.
+///
+/// The x-axis block counts remain important: 76 for `gate`/`up`, 14 for
+/// `down`/`o`/`q`, and 2 for `k`/`v` on a 40-SM T4. Wave 3 multiplies those
+/// by `ceil_div(ntok, 64)` through grid.y; these ntok=64 cases deliberately
+/// keep grid.y=1 and pin the original launch as a no-op boundary.
+///
+/// Keeping ntok at one full CTA exercises all eight m-tiles; the separate
+/// grid2d test covers cross-CTA and ragged-tail behavior.
+const REAL_SHAPES: [(usize, usize, usize); 4] = [
+    (896, 896, 64),  // q and o_proj: 14 blocks, square
+    (128, 896, 64),  // k and v: 2 blocks — the narrowest output in the model
+    (4864, 896, 64), // gate and up: 76 blocks, the wide output
+    (896, 4864, 64), // down: 14 blocks over the longest K in the model
+];
 
 /// Phase B r256 kernel: same math as the 8-tile GEMM but 32 m-tiles (256
 /// rows/read). ntok cases span the guard boundaries — 5 (tile 0 only), 128
@@ -448,14 +864,32 @@ fn gemm_mma_q8_r256_matches_dequantized_reference() {
         eprintln!("SKIP: device below sm_75 — no tensor-core module");
         return;
     }
-    for (out_dim, in_dim, ntok) in
-        [(16usize, 64usize, 5usize), (16, 64, 128), (16, 64, 200), (16, 64, 256)]
-    {
-        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, true);
+    for (out_dim, in_dim, ntok) in [
+        (16usize, 64usize, 5usize),
+        (16, 64, 128),
+        (16, 64, 200),
+        (16, 64, 256),
+    ] {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, ntok, 256);
+    }
+    // Real shapes at the token count a 220-token prompt would actually use in
+    // one r256 call — the whole reason the kernel exists. Currently
+    // unreachable: this test fails at (16, 64, 5) first. Kept so that whoever
+    // fixes the indexing defect is held to production shapes, not to the toy
+    // case that reported 41-43% on a wrong answer.
+    for (out_dim, in_dim, _) in REAL_SHAPES {
+        gemm_mma_case(&cuda, &k, out_dim, in_dim, 220, 256);
     }
 }
 
-fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok: usize, r256: bool) {
+fn gemm_mma_case(
+    cuda: &Cuda,
+    k: &KernelSet,
+    out_dim: usize,
+    in_dim: usize,
+    ntok: usize,
+    slab_rows: u32,
+) {
     let ntok_pad = ntok.div_ceil(8) * 8;
 
     let w_f32 = randv(out_dim * in_dim, 50, 0.1);
@@ -482,7 +916,19 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
         qs.extend_from_slice(&block[2..34]);
     }
 
-    let bytes = (qs.len() + scales.len() + (ntok_pad * in_dim) * 5 + ntok * out_dim * 4 + 8192) as u64;
+    // Sized per allocation rather than by a rule of thumb. The old
+    // `(ntok_pad * in_dim) * 5 + 8192` happened to cover the toy shapes: the
+    // *5 is x-as-f32 (4) plus x-as-int8 (1), leaving the per-32 scale buffer
+    // to come out of the 8 KiB slack. At in_dim=4864 that buffer alone is
+    // 38 KiB and the allocation would have failed — a limit invisible while
+    // every case was 16x64.
+    let bytes = (qs.len()                        // weights, int8
+        + scales.len()                           // weight scales, f16
+        + ntok_pad * in_dim * 4                  // x, f32
+        + ntok_pad * in_dim                      // x, quantized int8
+        + (ntok_pad * in_dim / 32) * 4           // x scales, f32
+        + ntok * out_dim * 4                     // y
+        + 64 * 1024) as u64; // alignment slack, six allocations
     let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
     let dwqs = buf.alloc(qs.len() as u64).unwrap().dptr;
     cuda.htod(dwqs, &qs).unwrap();
@@ -492,22 +938,74 @@ fn gemm_mma_case(cuda: &Cuda, k: &KernelSet, out_dim: usize, in_dim: usize, ntok
     // Quantize all padded rows in one pass, exactly as prefill does.
     let d_qs = buf.alloc((ntok_pad * in_dim) as u64).unwrap().dptr;
     let d_scales = buf.alloc_f32(ntok_pad * in_dim / 32).unwrap().dptr;
-    k.quantize_q8(cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32).unwrap();
+    k.quantize_q8(cuda, dx, d_qs, d_scales, (ntok_pad * in_dim) as u32)
+        .unwrap();
     let dy = buf.alloc_f32(ntok * out_dim).unwrap().dptr;
-    if r256 {
-        k.gemm_mma_q8_r256(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
-            .unwrap();
-    } else {
-        k.gemm_mma_q8(cuda, dwqs, dwsc, d_qs, d_scales, dy, out_dim as u32, in_dim as u32, ntok as u32)
-            .unwrap();
+    match slab_rows {
+        64 => k
+            .gemm_mma_q8(
+                cuda,
+                dwqs,
+                dwsc,
+                d_qs,
+                d_scales,
+                dy,
+                out_dim as u32,
+                in_dim as u32,
+                ntok as u32,
+            )
+            .unwrap(),
+        128 => k
+            .gemm_mma_q8_r128(
+                cuda,
+                dwqs,
+                dwsc,
+                d_qs,
+                d_scales,
+                dy,
+                out_dim as u32,
+                in_dim as u32,
+                ntok as u32,
+            )
+            .unwrap(),
+        256 => k
+            .gemm_mma_q8_r256(
+                cuda,
+                dwqs,
+                dwsc,
+                d_qs,
+                d_scales,
+                dy,
+                out_dim as u32,
+                in_dim as u32,
+                ntok as u32,
+            )
+            .unwrap(),
+        _ => panic!("unsupported MMA slab_rows={slab_rows}"),
     }
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; ntok * out_dim];
     cuda.dtoh_f32(&mut got, dy).unwrap();
     buf.free(cuda).unwrap();
 
-    let name = if r256 { "gemm_mma_q8_r256" } else { "gemm_mma_q8" };
-    assert_close(&got, &want, EPS_Q8_GEMV, &format!("{name}(ntok={ntok})"));
+    let name = match slab_rows {
+        64 => "gemm_mma_q8",
+        128 => "gemm_mma_q8_r128",
+        256 => "gemm_mma_q8_r256",
+        _ => unreachable!(),
+    };
+    // The shape belongs in the label: with several cases per test, a message
+    // that names only ntok forces you to reproduce the failure before you can
+    // tell which matrix produced it.
+    assert_close(
+        &got,
+        &want,
+        EPS_Q8_GEMV,
+        &format!(
+            "{name}(out={out_dim}, in={in_dim}, ntok={ntok}, blocks={})",
+            out_dim.div_ceil(64)
+        ),
+    );
 }
 
 #[test]
@@ -618,7 +1116,10 @@ fn softmax_matches_scalar_reference() {
 
         assert_close(&got, &want, EPS_SOFTMAX, "softmax");
         let total: f32 = got.iter().sum();
-        assert!((total - 1.0).abs() < 1e-5, "softmax must sum to 1, got {total}");
+        assert!(
+            (total - 1.0).abs() < 1e-5,
+            "softmax must sum to 1, got {total}"
+        );
     }
 }
 
@@ -631,7 +1132,11 @@ fn rope_ref(x: &mut [f32], pos: usize, n_heads: usize, head_dim: usize, base: f3
             let freq = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
             let theta = pos as f32 * freq;
             let (sin, cos) = theta.sin_cos();
-            let (a, b) = if neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
+            let (a, b) = if neox {
+                (i, i + half)
+            } else {
+                (2 * i, 2 * i + 1)
+            };
             let x0 = seg[a];
             let x1 = seg[b];
             seg[a] = x0 * cos - x1 * sin;
@@ -653,14 +1158,23 @@ fn rope_matches_reference_both_styles() {
         // the table for exactly this `pos` as row 0 and pass a device pos=0,
         // so row 0 holds this position's cos/sin.
         let (cos, sin) = rope_tables(pos, head_dim, base);
-        let mut buf =
-            BackendBuffer::new(&cuda, ((x.len() + head_dim) * 4 + 4096) as u64).unwrap();
+        let mut buf = BackendBuffer::new(&cuda, ((x.len() + head_dim) * 4 + 4096) as u64).unwrap();
         let dx = upload(&cuda, &mut buf, &x);
         let dcos = upload(&cuda, &mut buf, &cos);
         let dsin = upload(&cuda, &mut buf, &sin);
         let dpos = buf.alloc(4).unwrap().dptr;
         cuda.htod(dpos, &0u32.to_ne_bytes()).unwrap();
-        k.rope(&cuda, dx, dcos, dsin, n_heads as u32, head_dim as u32, neox, dpos).unwrap();
+        k.rope(
+            &cuda,
+            dx,
+            dcos,
+            dsin,
+            n_heads as u32,
+            head_dim as u32,
+            neox,
+            dpos,
+        )
+        .unwrap();
         cuda.synchronize().unwrap();
         let mut got = vec![0f32; x.len()];
         cuda.dtoh_f32(&mut got, dx).unwrap();
@@ -713,9 +1227,12 @@ fn attention_decode_composition_matches_reference() {
     let dout = buf.alloc_f32(head_dim).unwrap().dptr;
 
     let scale = 1.0 / (head_dim as f32).sqrt();
-    k.gemv(&cuda, dk, dq, dscores, cached_len as u32, head_dim as u32).unwrap();
-    k.softmax_scale(&cuda, dscores, cached_len as u32, scale).unwrap();
-    k.gemv_t(&cuda, dv, dscores, dout, cached_len as u32, head_dim as u32).unwrap();
+    k.gemv(&cuda, dk, dq, dscores, cached_len as u32, head_dim as u32)
+        .unwrap();
+    k.softmax_scale(&cuda, dscores, cached_len as u32, scale)
+        .unwrap();
+    k.gemv_t(&cuda, dv, dscores, dout, cached_len as u32, head_dim as u32)
+        .unwrap();
     cuda.synchronize().unwrap();
 
     let mut got = vec![0f32; head_dim];
@@ -733,7 +1250,8 @@ fn attention_decode_composition_matches_reference() {
 #[test]
 fn fused_attn_decode_matches_per_head_reference() {
     let Some((cuda, k)) = gpu() else { return };
-    let (head_dim, n_heads, n_kv, cached_len, max_ctx) = (64usize, 8usize, 2usize, 100usize, 128usize);
+    let (head_dim, n_heads, n_kv, cached_len, max_ctx) =
+        (64usize, 8usize, 2usize, 100usize, 128usize);
     let heads_per_kv = n_heads / n_kv;
     let head_stride = max_ctx * head_dim;
     let scale = 1.0 / (head_dim as f32).sqrt();
@@ -770,7 +1288,8 @@ fn fused_attn_decode_matches_per_head_reference() {
     let dout = buf.alloc_f32(n_heads * head_dim).unwrap().dptr;
     // cached_len is now read from device memory (token-invariant graph args).
     let dclen = buf.alloc(4).unwrap().dptr;
-    cuda.htod(dclen, &(cached_len as u32).to_ne_bytes()).unwrap();
+    cuda.htod(dclen, &(cached_len as u32).to_ne_bytes())
+        .unwrap();
 
     k.attn_decode(
         &cuda,
@@ -844,9 +1363,8 @@ fn attn_decode_rows_matches_per_token_reference() {
     // pos_seq identity array, as the model uploads at load.
     let pos_vals: Vec<u32> = (0..=(max_ctx as u32)).collect();
     let dpos = buf.alloc(((max_ctx + 1) * 4) as u64).unwrap().dptr;
-    let pos_bytes = unsafe {
-        std::slice::from_raw_parts(pos_vals.as_ptr().cast::<u8>(), pos_vals.len() * 4)
-    };
+    let pos_bytes =
+        unsafe { std::slice::from_raw_parts(pos_vals.as_ptr().cast::<u8>(), pos_vals.len() * 4) };
     cuda.htod(dpos, pos_bytes).unwrap();
 
     k.attn_decode_rows(
@@ -862,6 +1380,7 @@ fn attn_decode_rows_matches_per_token_reference() {
         head_stride as u32,
         scale,
         ntok as u32,
+        filled as u32,
     )
     .unwrap();
     cuda.synchronize().unwrap();
@@ -884,14 +1403,24 @@ fn kv_write_places_rows_at_device_pos() {
     let head_stride = max_ctx * head_dim;
     let src = randv(n_kv * head_dim, 90, 1.0); // both heads' rows, contiguous
 
-    let mut buf = BackendBuffer::new(&cuda, ((n_kv * head_stride + src.len()) * 4 + 4096) as u64).unwrap();
+    let mut buf =
+        BackendBuffer::new(&cuda, ((n_kv * head_stride + src.len()) * 4 + 4096) as u64).unwrap();
     let dst = buf.alloc_f32(n_kv * head_stride).unwrap().dptr; // zeroed region
     cuda.htod_f32(dst, &vec![0f32; n_kv * head_stride]).unwrap();
     let dsrc = upload(&cuda, &mut buf, &src);
     let dpos = buf.alloc(4).unwrap().dptr;
     cuda.htod(dpos, &(pos as u32).to_ne_bytes()).unwrap();
 
-    k.kv_write(&cuda, dst, dsrc, dpos, head_dim as u32, n_kv as u32, head_stride as u32).unwrap();
+    k.kv_write(
+        &cuda,
+        dst,
+        dsrc,
+        dpos,
+        head_dim as u32,
+        n_kv as u32,
+        head_stride as u32,
+    )
+    .unwrap();
     cuda.synchronize().unwrap();
 
     let mut got = vec![0f32; n_kv * head_stride];
@@ -948,7 +1477,11 @@ fn cuda_graph_capture_replay_executes() {
     buf.free(&cuda).unwrap();
 
     for (g, b) in got.iter().zip(&base) {
-        assert_eq!(*g, b + 6.0, "graph replay did not execute the recorded adds");
+        assert_eq!(
+            *g,
+            b + 6.0,
+            "graph replay did not execute the recorded adds"
+        );
     }
 }
 

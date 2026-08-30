@@ -26,6 +26,10 @@
 .target sm_70
 .address_size 64
 
+// One launch-sized shared segment, partitioned by the prefill attention
+// kernels into score_capacity f32 scores followed by 36 B reduction scratch.
+.extern .shared .align 4 .b8 sm_attn_rows[];
+
 // ---------------------------------------------------------------------------
 // gl_add_f32: y[i] += x[i].  Launch: grid ceil(n/256) x 256 threads.
 // ---------------------------------------------------------------------------
@@ -358,6 +362,231 @@ QUANT_STORE:
     st.global.f32 [%rd12], %f5;
 
 QUANT_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_quantize_q8_rowcta: Q8_0 activation quantization with one CTA per row.
+// launch: grid=(rows), block=(256); each of the eight warps owns one K32
+// block at a time and advances by eight blocks. The warp math and output
+// layout are instruction-for-instruction equivalent to gl_quantize_q8:
+// qs[rows,cols] plus one f32 scale for every contiguous K32 block.
+// No shared memory and no CTA barrier are required.
+// ---------------------------------------------------------------------------
+.visible .entry gl_quantize_q8_rowcta(
+    .param .u64 p_x,
+    .param .u64 p_qs,
+    .param .u64 p_scales,
+    .param .u32 p_rows,
+    .param .u32 p_cols
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<16>;
+    .reg .f32 %f<10>;
+    .reg .b64 %rd<14>;
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_qs];
+    ld.param.u64 %rd3, [p_scales];
+    ld.param.u32 %r1, [p_rows];
+    ld.param.u32 %r2, [p_cols];
+
+    mov.u32 %r3, %ctaid.x;               // row
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra Q8RC_DONE;
+    mov.u32 %r4, %tid.x;
+    and.b32 %r5, %r4, 31;                // lane
+    shr.u32 %r6, %r4, 5;                 // warp 0..7
+    shr.u32 %r7, %r2, 5;                 // K32 blocks per row
+    mul.lo.u32 %r8, %r3, %r2;            // row element base
+    mov.u32 %r9, %r6;                    // block within row
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+Q8RC_BLOCK_LOOP:
+    setp.ge.u32 %p2, %r9, %r7;
+    @%p2 bra Q8RC_DONE;
+    mad.lo.u32 %r10, %r9, 32, %r5;
+    add.s32 %r10, %r10, %r8;
+    mul.wide.u32 %rd7, %r10, 4;
+    add.s64 %rd8, %rd4, %rd7;
+    ld.global.f32 %f1, [%rd8];
+
+    abs.f32 %f2, %f1;
+    shfl.sync.down.b32 %f3, %f2, 16, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f3;
+    shfl.sync.down.b32 %f3, %f2, 8, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f3;
+    shfl.sync.down.b32 %f3, %f2, 4, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f3;
+    shfl.sync.down.b32 %f3, %f2, 2, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f3;
+    shfl.sync.down.b32 %f3, %f2, 1, 31, 0xffffffff;
+    max.f32 %f2, %f2, %f3;
+    shfl.sync.idx.b32 %f4, %f2, 0, 31, 0xffffffff;
+
+    div.rn.f32 %f5, %f4, 127.0;
+    mov.f32 %f6, 0f00000000;
+    setp.eq.f32 %p3, %f5, %f6;
+    @%p3 bra Q8RC_STORE;
+    rcp.rn.f32 %f6, %f5;
+
+Q8RC_STORE:
+    mul.rn.f32 %f7, %f1, %f6;
+    cvt.rni.s32.f32 %r11, %f7;
+    min.s32 %r11, %r11, 127;
+    max.s32 %r11, %r11, -128;
+    cvt.s8.s32 %r12, %r11;
+
+    cvt.u64.u32 %rd9, %r10;
+    add.s64 %rd10, %rd5, %rd9;
+    st.global.u8 [%rd10], %r12;
+
+    setp.ne.u32 %p4, %r5, 0;
+    @%p4 bra Q8RC_NEXT;
+    mad.lo.u32 %r13, %r3, %r7, %r9;
+    mul.wide.u32 %rd11, %r13, 4;
+    add.s64 %rd12, %rd6, %rd11;
+    st.global.f32 [%rd12], %f5;
+
+Q8RC_NEXT:
+    add.s32 %r9, %r9, 8;
+    bra Q8RC_BLOCK_LOOP;
+
+Q8RC_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_quantize_q8_rows: row-wise dynamic signed-INT8 quantization for Wave 7.
+// launch: grid=(rows), block=(256); reads x[rows,cols], writes qs[rows,cols]
+// and one f32 scale per row. Each CTA performs max(abs(x)) reduction, then a
+// second coalesced pass. Static shared holds eight warp maxima + broadcast.
+// ---------------------------------------------------------------------------
+.visible .entry gl_quantize_q8_rows(
+    .param .u64 p_x,
+    .param .u64 p_qs,
+    .param .u64 p_scales,
+    .param .u32 p_rows,
+    .param .u32 p_cols
+)
+{
+    .reg .pred %p<8>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<16>;
+    .shared .align 4 .b8 sm_w8q[36];
+
+    ld.param.u64 %rd1, [p_x];
+    ld.param.u64 %rd2, [p_qs];
+    ld.param.u64 %rd3, [p_scales];
+    ld.param.u32 %r1, [p_rows];
+    ld.param.u32 %r2, [p_cols];
+    mov.u32 %r3, %ctaid.x;               // row
+    setp.ge.u32 %p1, %r3, %r1;
+    @%p1 bra W8Q_DONE;
+    mov.u32 %r4, %tid.x;
+    and.b32 %r5, %r4, 31;                // lane
+    shr.u32 %r6, %r4, 5;                 // warp
+
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+    mul.wide.u32 %rd7, %r3, %r2;
+    shl.b64 %rd8, %rd7, 2;
+    add.s64 %rd9, %rd4, %rd8;            // x row
+    add.s64 %rd10, %rd5, %rd7;           // qs row
+
+    mov.f32 %f1, 0f00000000;             // local amax
+    mov.u32 %r7, %r4;
+W8Q_MAX_LOOP:
+    setp.ge.u32 %p2, %r7, %r2;
+    @%p2 bra W8Q_WARP_MAX;
+    mul.wide.u32 %rd11, %r7, 4;
+    add.s64 %rd12, %rd9, %rd11;
+    ld.global.f32 %f2, [%rd12];
+    abs.f32 %f2, %f2;
+    max.f32 %f1, %f1, %f2;
+    add.s32 %r7, %r7, 256;
+    bra W8Q_MAX_LOOP;
+
+W8Q_WARP_MAX:
+    shfl.sync.down.b32 %f3, %f1, 16, 31, 0xffffffff;
+    max.f32 %f1, %f1, %f3;
+    shfl.sync.down.b32 %f3, %f1, 8, 31, 0xffffffff;
+    max.f32 %f1, %f1, %f3;
+    shfl.sync.down.b32 %f3, %f1, 4, 31, 0xffffffff;
+    max.f32 %f1, %f1, %f3;
+    shfl.sync.down.b32 %f3, %f1, 2, 31, 0xffffffff;
+    max.f32 %f1, %f1, %f3;
+    shfl.sync.down.b32 %f3, %f1, 1, 31, 0xffffffff;
+    max.f32 %f1, %f1, %f3;
+    setp.ne.u32 %p3, %r5, 0;
+    @%p3 bra W8Q_MAX_BAR;
+    shl.b32 %r8, %r6, 2;
+    mov.u32 %r9, sm_w8q;
+    add.s32 %r10, %r9, %r8;
+    st.shared.f32 [%r10], %f1;
+W8Q_MAX_BAR:
+    bar.sync 0;
+
+    // Warp 0 reduces the eight warp maxima. Lanes 8..31 contribute zero.
+    setp.ne.u32 %p4, %r6, 0;
+    @%p4 bra W8Q_SCALE_BAR;
+    setp.lt.u32 %p5, %r5, 8;
+    mov.f32 %f4, 0f00000000;
+    @%p5 shl.b32 %r11, %r5, 2;
+    @%p5 mov.u32 %r12, sm_w8q;
+    @%p5 add.s32 %r13, %r12, %r11;
+    @%p5 ld.shared.f32 %f4, [%r13];
+    shfl.sync.down.b32 %f5, %f4, 16, 31, 0xffffffff;
+    max.f32 %f4, %f4, %f5;
+    shfl.sync.down.b32 %f5, %f4, 8, 31, 0xffffffff;
+    max.f32 %f4, %f4, %f5;
+    shfl.sync.down.b32 %f5, %f4, 4, 31, 0xffffffff;
+    max.f32 %f4, %f4, %f5;
+    shfl.sync.down.b32 %f5, %f4, 2, 31, 0xffffffff;
+    max.f32 %f4, %f4, %f5;
+    shfl.sync.down.b32 %f5, %f4, 1, 31, 0xffffffff;
+    max.f32 %f4, %f4, %f5;
+    setp.ne.u32 %p6, %r5, 0;
+    @%p6 bra W8Q_SCALE_BAR;
+    div.rn.f32 %f6, %f4, 127.0;
+    mov.u32 %r14, sm_w8q;
+    st.shared.f32 [%r14+32], %f6;
+    mul.wide.u32 %rd13, %r3, 4;
+    add.s64 %rd14, %rd6, %rd13;
+    st.global.f32 [%rd14], %f6;
+W8Q_SCALE_BAR:
+    bar.sync 0;
+
+    mov.u32 %r15, sm_w8q;
+    ld.shared.f32 %f7, [%r15+32];
+    mov.f32 %f8, 0f00000000;
+    setp.eq.f32 %p7, %f7, 0f00000000;
+    @!%p7 rcp.rn.f32 %f8, %f7;
+    mov.u32 %r16, %r4;
+W8Q_STORE_LOOP:
+    setp.ge.u32 %p2, %r16, %r2;
+    @%p2 bra W8Q_DONE;
+    mul.wide.u32 %rd11, %r16, 4;
+    add.s64 %rd12, %rd9, %rd11;
+    ld.global.f32 %f9, [%rd12];
+    mul.rn.f32 %f10, %f9, %f8;
+    cvt.rni.s32.f32 %r17, %f10;
+    min.s32 %r17, %r17, 127;
+    max.s32 %r17, %r17, -128;
+    cvt.s8.s32 %r18, %r17;
+    cvt.u64.u32 %rd15, %r16;
+    add.s64 %rd15, %rd10, %rd15;
+    st.global.u8 [%rd15], %r18;
+    add.s32 %r16, %r16, 256;
+    bra W8Q_STORE_LOOP;
+
+W8Q_DONE:
     ret;
 }
 
@@ -817,6 +1046,94 @@ SOA_REDUCE:
     st.global.f32 [%rd31], %f1;
 
 SOA_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemv_w8pc: Wave 7 row-scaled W8A8 GEMV fallback/decode path.
+// launch: ceil(out/8) blocks x 256 threads (one warp/output row).
+// Reads signed INT8 W[out,in], one f32 scale/output row, signed INT8 x[in],
+// and one f32 activation scale. Accumulates the complete dot in s32, then
+// converts and scales once. in must be a multiple of 4.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_w8pc(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<24>;
+    .reg .f32 %f<8>;
+    .reg .b64 %rd<20>;
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    mov.u32 %r3, %tid.x;
+    shr.u32 %r4, %r3, 5;                 // warp
+    and.b32 %r5, %r3, 31;                // lane
+    mov.u32 %r6, %ctaid.x;
+    mad.lo.s32 %r7, %r6, 8, %r4;         // output row
+    setp.ge.u32 %p1, %r7, %r1;
+    @%p1 bra W8V_DONE;
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+    mul.wide.u32 %rd11, %r7, %r2;
+    add.s64 %rd12, %rd6, %rd11;          // weight row
+    shl.b32 %r8, %r5, 2;
+    cvt.u64.u32 %rd13, %r8;
+    add.s64 %rd14, %rd12, %rd13;
+    add.s64 %rd15, %rd8, %rd13;
+    shr.u32 %r9, %r2, 2;                 // int8x4 groups
+    mov.u32 %r10, %r5;
+    mov.u32 %r11, 0;                     // full-K s32 partial
+W8V_LOOP:
+    setp.ge.u32 %p2, %r10, %r9;
+    @%p2 bra W8V_REDUCE;
+    ld.global.u32 %r12, [%rd14];
+    ld.global.u32 %r13, [%rd15];
+    dp4a.s32.s32 %r11, %r12, %r13, %r11;
+    add.s64 %rd14, %rd14, 128;
+    add.s64 %rd15, %rd15, 128;
+    add.s32 %r10, %r10, 32;
+    bra W8V_LOOP;
+
+W8V_REDUCE:
+    shfl.sync.down.b32 %r14, %r11, 16, 31, 0xffffffff;
+    add.s32 %r11, %r11, %r14;
+    shfl.sync.down.b32 %r14, %r11, 8, 31, 0xffffffff;
+    add.s32 %r11, %r11, %r14;
+    shfl.sync.down.b32 %r14, %r11, 4, 31, 0xffffffff;
+    add.s32 %r11, %r11, %r14;
+    shfl.sync.down.b32 %r14, %r11, 2, 31, 0xffffffff;
+    add.s32 %r11, %r11, %r14;
+    shfl.sync.down.b32 %r14, %r11, 1, 31, 0xffffffff;
+    add.s32 %r11, %r11, %r14;
+    setp.ne.u32 %p3, %r5, 0;
+    @%p3 bra W8V_DONE;
+    mul.wide.u32 %rd16, %r7, 4;
+    add.s64 %rd17, %rd7, %rd16;
+    add.s64 %rd18, %rd10, %rd16;
+    ld.global.f32 %f1, [%rd17];
+    ld.global.f32 %f2, [%rd9];
+    cvt.rn.f32.s32 %f3, %r11;
+    mul.rn.f32 %f4, %f1, %f2;
+    mul.rn.f32 %f5, %f3, %f4;
+    st.global.f32 [%rd18], %f5;
+W8V_DONE:
     ret;
 }
 
@@ -2754,8 +3071,9 @@ KVWR_DONE:
 // cached_len = pos_seq[t] + 1, so row t attends to exactly the first
 // pos_seq[t]+1 cache rows (its own KV row was written by the preceding
 // gl_kv_write_rows launch; later rows exist but are never read - causal).
-// Launch: grid (n_heads, ntok) x 128 threads. Same shared plan as the
-// original (16 KiB scores + 36 B reduction scratch).
+// Launch: grid (n_heads, ntok) x 128 threads, dynamic shared bytes =
+// score_capacity*4 + 36. score_capacity is the largest cached_len in this
+// launch, so short prompts no longer reserve 4096 scores for every CTA.
 // Stage 2c.1: Pass 1 here is v2 (one WARP per key row, coalesced lane-
 // strided loads + shfl-tree reduce) and deliberately DIVERGES from the
 // single-token kernel above, which keeps the thread-per-row v1 dot - the
@@ -2771,15 +3089,14 @@ KVWR_DONE:
     .param .u64 p_pos_seq,
     .param .u32 p_heads_per_kv,
     .param .u32 p_head_stride,
-    .param .f32 p_scale
+    .param .f32 p_scale,
+    .param .u32 p_score_capacity
 )
 {
     .reg .pred %p<8>;
     .reg .b32 %r<48>;
     .reg .f32 %f<32>;
     .reg .b64 %rd<44>;
-    .shared .align 4 .b8 sm_scr[16384];  // scores[0..4096]
-    .shared .align 4 .b8 sm_redr[36];    // warp partials + broadcast
 
     ld.param.u64 %rd1, [p_q];
     ld.param.u64 %rd2, [p_k];
@@ -2790,6 +3107,7 @@ KVWR_DONE:
     ld.param.u32 %r3, [p_heads_per_kv];
     ld.param.u32 %r4, [p_head_stride];
     ld.param.f32 %f1, [p_scale];
+    ld.param.u32 %r46, [p_score_capacity];
 
     // Token row t and its causal length: cached_len = pos_seq[t] + 1.
     mov.u32 %r42, %ctaid.y;
@@ -2806,8 +3124,9 @@ KVWR_DONE:
     shr.u32 %r9, %r6, 5;                 // warp id
     add.s32 %r10, %r7, 31;
     shr.u32 %r11, %r10, 5;               // n_warps
-    mov.u32 %r12, sm_scr;                // scores base (shared)
-    mov.u32 %r13, sm_redr;               // reduction base (shared)
+    mov.u32 %r12, sm_attn_rows;          // dynamic scores base
+    shl.b32 %r47, %r46, 2;               // score_capacity * sizeof(f32)
+    add.s32 %r13, %r12, %r47;            // reduction scratch base
 
     cvta.to.global.u64 %rd5, %rd1;       // q global
     cvta.to.global.u64 %rd6, %rd2;       // k global
@@ -2904,7 +3223,7 @@ ATTNR_SCORE_NEXT:
 ATTNR_SCORE_DONE:
     bar.sync 0;
 
-    // ---- Pass 2: softmax over sm_scr[0..cached_len] ----
+    // ---- Pass 2: softmax over dynamic scores[0..cached_len] ----
     mov.f32 %f5, 0fFF800000;             // -inf
     mov.u32 %r22, %r6;
 ATTNR_MAX:
@@ -3073,7 +3392,7 @@ ATTNR_OUT_DONE:
 // p_stop is a kernel param (warp-uniform), so the early ret is uniform and
 // cannot deadlock a barrier. Each exit stores one score to out[0] first:
 // an observable global write so ptxas cannot dead-code-eliminate the very
-// pass being timed. Same launch shape and shared plan as the original.
+// pass being timed. Same launch shape and dynamic shared plan as the original.
 // ---------------------------------------------------------------------------
 .visible .entry gl_attn_rows_probe(
     .param .u64 p_q,
@@ -3085,6 +3404,7 @@ ATTNR_OUT_DONE:
     .param .u32 p_heads_per_kv,
     .param .u32 p_head_stride,
     .param .f32 p_scale,
+    .param .u32 p_score_capacity,
     .param .u32 p_stop
 )
 {
@@ -3092,8 +3412,6 @@ ATTNR_OUT_DONE:
     .reg .b32 %r<49>;
     .reg .f32 %f<32>;
     .reg .b64 %rd<44>;
-    .shared .align 4 .b8 sm_scp[16384];  // scores[0..4096]
-    .shared .align 4 .b8 sm_redp[36];    // warp partials + broadcast
 
     ld.param.u64 %rd1, [p_q];
     ld.param.u64 %rd2, [p_k];
@@ -3104,6 +3422,7 @@ ATTNR_OUT_DONE:
     ld.param.u32 %r3, [p_heads_per_kv];
     ld.param.u32 %r4, [p_head_stride];
     ld.param.f32 %f1, [p_scale];
+    ld.param.u32 %r46, [p_score_capacity];
     ld.param.u32 %r48, [p_stop];
 
     // Token row t and its causal length: cached_len = pos_seq[t] + 1.
@@ -3121,8 +3440,9 @@ ATTNR_OUT_DONE:
     shr.u32 %r9, %r6, 5;                 // warp id
     add.s32 %r10, %r7, 31;
     shr.u32 %r11, %r10, 5;               // n_warps
-    mov.u32 %r12, sm_scp;                // scores base (shared)
-    mov.u32 %r13, sm_redp;               // reduction base (shared)
+    mov.u32 %r12, sm_attn_rows;          // dynamic scores base
+    shl.b32 %r47, %r46, 2;               // score_capacity * sizeof(f32)
+    add.s32 %r13, %r12, %r47;            // reduction scratch base
 
     cvta.to.global.u64 %rd5, %rd1;       // q global
     cvta.to.global.u64 %rd6, %rd2;       // k global
@@ -3221,7 +3541,7 @@ ATTNP_S1_RET:
     ret;
 ATTNP_S1_SKIP:
 
-    // ---- Pass 2: softmax over sm_scp[0..cached_len] ----
+    // ---- Pass 2: softmax over dynamic scores[0..cached_len] ----
     mov.f32 %f5, 0fFF800000;             // -inf
     mov.u32 %r22, %r6;
 ATTNP_MAX:

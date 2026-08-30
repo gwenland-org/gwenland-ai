@@ -1,4 +1,4 @@
-﻿//! The top-level orchestrator (ARTX05 Â§"Execution Model").
+﻿//! The top-level orchestrator (ARTX05 §"Execution Model").
 //!
 //! [`GllmRuntime`] ties the previous phases together into one forward pass:
 //! map a layer, resolve its device, hand it to a backend, record timings,
@@ -6,7 +6,7 @@
 //!
 //! ## What a pass is, and is not
 //!
-//! [`run`](GllmRuntime::run) executes every layer once, in order â€” one
+//! [`run`](GllmRuntime::run) executes every layer once, in order — one
 //! forward pass over an activation the caller supplies. It is not a
 //! generation loop: there is no sampling, no token loop, and no tokenizer
 //! (ARTX1 OQ3 is unresolved, so a package carries no vocabulary). Turning a
@@ -129,7 +129,7 @@ impl GllmRuntime {
         self.device_map = device_map;
     }
 
-    /// Replace the device resolver â€” used to declare which accelerators are
+    /// Replace the device resolver — used to declare which accelerators are
     /// present. Defaults to CPU-only.
     pub fn set_device_resolver(&mut self, resolver: DeviceMapResolver) {
         self.resolver = resolver;
@@ -145,7 +145,7 @@ impl GllmRuntime {
         let started = Instant::now();
         self.scheduler.reset();
         // Stats describe *this* pass. Without clearing them, a second run()
-        // would report the sum of both â€” the KV cache and logger are left
+        // would report the sum of both — the KV cache and logger are left
         // alone, since carrying a sequence across passes is a valid use.
         self.stats = ExecutionStats::default();
         self.state = ExecutionState::LoadingShared;
@@ -290,7 +290,7 @@ impl GllmRuntime {
 
     /// Clear stats, KV cache, and state, ready for another pass.
     ///
-    /// Keeps the KV allocation â€” that is the point of pre-allocating.
+    /// Keeps the KV allocation — that is the point of pre-allocating.
     pub fn reset(&mut self) {
         self.scheduler.reset();
         self.kv_cache.reset_all();

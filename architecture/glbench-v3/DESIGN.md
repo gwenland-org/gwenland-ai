@@ -39,10 +39,18 @@ Per `gl-agent-skills/README.md` precedence: *measured production numbers →
 `architecture/` specs → skills → anything else*. The research document is a
 spec. The tree wins.
 
-### F-01 — `gltrain` is not the training arm v3 should observe
+### F-01 — the candle `gltrain` is not the training arm v3 should observe
+
+> **Renamed 2026-08-20.** When this was written, `gltrain/` held a
+> candle-backed crate (package `gwenland-core`) and the from-scratch
+> training framework was `stumman/`. That candle crate has since been
+> deleted and Stummañ was renamed into its place, so **`gltrain` now means
+> the crate this finding recommends**. Below, the candle crate is called
+> *legacy `gltrain`* to keep the finding readable.
 
 The research document §10 states the chain `glbench → gltrain → glproc → glcore`
-and calls `gltrain` an unconditional dependency "paralleling `glproc`".
+and calls the legacy `gltrain` an unconditional dependency "paralleling
+`glproc`".
 
 Measured:
 
@@ -63,9 +71,11 @@ actix-web and tokio into the inference tree, and break
 `gl-agent-skills/architecture-skills/inference-first.md` rule 6 and
 `glbench/DESIGN.md` §9 in the same commit.
 
-**Consequence:** v3 observes **`stumman`**, not `gltrain`. Every occurrence of
-"gltrain" in the research document reads as "stumman" for the rest of this
-design. `gltrain` is out of v3's scope entirely.
+**Consequence:** v3 observes **Stummañ** (today's `gltrain` crate), not the
+legacy candle crate. Every occurrence of "gltrain" in the research document
+refers to that legacy crate, and reads as "Stummañ" for the rest of this
+design. The legacy crate is out of v3's scope entirely — and was deleted on
+2026-08-20.
 
 ### F-02 — `VLTrainingStep` does not exist, and nothing equivalent does
 
@@ -73,7 +83,7 @@ The research document §4 Q4 says gltrain "exposes a `VLTrainingStep` struct …
 after each optimizer step" and that "gltrain pushes the measurements, glbench
 receives and archives them."
 
-Measured, `stumman/src/train/trainer.rs:187`:
+Measured, `gltrain/src/train/trainer.rs:187`:
 
 ```rust
 pub fn train_step(&mut self, x: &Tensor<B>, target: &Tensor<B>) -> Result<f32>
@@ -85,24 +95,24 @@ It returns the loss scalar. Nothing else. `Trainer::train` (`:212`) returns
 `VLNamedTensor` — and no `VLTrainingStep`.
 
 Of the roughly thirty fields in the research document §22 `TrainingStep` tree,
-exactly **one** — loss — is obtainable from stumman today. The gradient store is
+exactly **one** — loss — is obtainable from gltrain today. The gradient store is
 a local inside `train_step` and is dropped before the function returns; no
 duration is measured anywhere; there is no FLOP counter.
 
 **Consequence:** v3's training observer has **no data source**. The type must be
-created and stumman must be instrumented to fill it. This is the largest
+created and gltrain must be instrumented to fill it. This is the largest
 correction in this document, and §2 works through what it does to the shape of
 the project.
 
 ### F-03 — `VLManifest` and `Optimizer::state_tensors` are real
 
-The research document's other two named stumman reads check out:
+The research document's other two named gltrain reads check out:
 
-- `VLManifest` — `stumman/src/checkpoint/manifest.rs`, reachable from
+- `VLManifest` — `gltrain/src/checkpoint/manifest.rs`, reachable from
   `Trainer::manifest()` (`trainer.rs:237`). It is a *checkpoint* manifest
   (adapter config plus step count), not a training-run descriptor; v3 uses it
   for what it is.
-- `Optimizer::state_tensors` — `stumman/src/optim/mod.rs:155`, returning
+- `Optimizer::state_tensors` — `gltrain/src/optim/mod.rs:155`, returning
   `Result<Vec<VLNamedTensor>>`, implemented by `OPAdamW`, `OPAdafactor`,
   `OPLion`, and deliberately erroring on `OPAdamW8bit`.
 
@@ -111,7 +121,7 @@ The research document's other two named stumman reads check out:
 Better news than the research document assumed, and it removes a constraint the
 design would otherwise have had to work around.
 
-`stumman/KNOWN_ISSUES.md` KL-001 records that `Backend` is not dyn-compatible
+`gltrain/KNOWN_ISSUES.md` KL-001 records that `Backend` is not dyn-compatible
 (the `Clone` supertrait alone is sufficient to exclude it), so `Box<dyn Backend>`
 does not compile and `Trainer<B>` is generic. A naive observer API would have to
 be generic over `B` and monomorphize into glbench.
@@ -119,20 +129,20 @@ be generic over `B` and monomorphize into glbench.
 But the two types that actually carry numbers across the boundary are both
 **plain, non-generic f32 data**:
 
-- `stumman/src/autograd/grad_store.rs:22` —
+- `gltrain/src/autograd/grad_store.rs:22` —
   `VLGradStore { grads: HashMap<TensorId, (Vec<f32>, Vec<usize>)> }`
-- `stumman/src/optim/mod.rs:170` —
+- `gltrain/src/optim/mod.rs:170` —
   `VLNamedTensor { name: String, data: Vec<f32>, shape: Vec<usize> }`
 
-Only `TPParameter<B>` (`stumman/src/nn/param.rs:30`) is generic, and glbench
+Only `TPParameter<B>` (`gltrain/src/nn/param.rs:30`) is generic, and glbench
 never needs the parameter itself — it needs the parameter's *values*, which
 `state_tensors` already hands over as `VLNamedTensor`.
 
-**Consequence:** the entire glbench↔stumman numerical surface is `&[f32]` +
+**Consequence:** the entire glbench↔gltrain numerical surface is `&[f32]` +
 shape + name. KL-001 does not block v3. GLBitProf gets one uniform input type
 for weights, gradients, and optimizer state. Locked as D-07.
 
-### F-05 — stumman M2 trains one linear layer, not a model
+### F-05 — gltrain M2 trains one linear layer, not a model
 
 `VLTrainerConfig` (`trainer.rs:54`) is `{d_in, d_out, r, alpha, lr,
 weight_decay, adapter_seed, base_seed}`. `Trainer` holds one `ABLinear<B>` and
@@ -240,28 +250,28 @@ added to a training crate. F-02 and F-05 say otherwise.
 
 Measured against the research document §22 `TrainingStep` tree:
 
-| Field group | Available from stumman today | Needs |
+| Field group | Available from gltrain today | Needs |
 |---|---|---|
 | Loss value | ✅ `train_step` return | — |
-| Step index | ⚠️ `step_count()` only; epoch not exposed | stumman: expose epoch |
-| Forward / backward / optimizer duration | ❌ nothing measured | stumman: instrumentation |
+| Step index | ⚠️ `step_count()` only; epoch not exposed | gltrain: expose epoch |
+| Forward / backward / optimizer duration | ❌ nothing measured | gltrain: instrumentation |
 | Forward / backward FLOPs | ❌ no counter | glbench: derive from shapes |
-| Gradient norm / mean / variance / sparsity | ❌ `VLGradStore` dropped inside `train_step` | stumman: expose at hand-off |
-| Gradient NaN / Inf / overflow | ❌ same | stumman: expose at hand-off |
-| Optimizer state | ⚠️ `state_tensors` exists as a checkpoint path | stumman: none — reuse |
-| Parameter delta | ❌ not tracked | stumman: expose, or glbench diffs |
-| Memory (param / grad / activation / peak) | ❌ nothing measured | stumman: instrumentation |
+| Gradient norm / mean / variance / sparsity | ❌ `VLGradStore` dropped inside `train_step` | gltrain: expose at hand-off |
+| Gradient NaN / Inf / overflow | ❌ same | gltrain: expose at hand-off |
+| Optimizer state | ⚠️ `state_tensors` exists as a checkpoint path | gltrain: none — reuse |
+| Parameter delta | ❌ not tracked | gltrain: expose, or glbench diffs |
+| Memory (param / grad / activation / peak) | ❌ nothing measured | gltrain: instrumentation |
 | Tokens, tokens/sec, tokens-to-target | ❌ no tokens exist at M2 | `not_applicable` |
 | Synchronization / communication | ❌ single-device | `not_applicable` |
 
-So: **v3's training observation is roughly 85% a stumman instrumentation project
+So: **v3's training observation is roughly 85% a gltrain instrumentation project
 and 15% a glbench schema project.** That is not a reason to shrink the ambition.
 It is a reason to sequence and gate it, because the glbench half is unbuildable
-and untestable until the stumman half lands.
+and untestable until the gltrain half lands.
 
 Three structural consequences, locked in §3:
 
-1. **Wave 3 is stumman work, not glbench work** (D-01). glbench's training
+1. **Wave 3 is gltrain work, not glbench work** (D-01). glbench's training
    modules cannot be written against a data source that does not exist. The
    alternative — glbench timing `train_step` from outside with `Instant` — buys
    only a wall-clock total and cannot produce the phase attribution that is the
@@ -271,13 +281,13 @@ Three structural consequences, locked in §3:
    reversing the research document §10. Its own argument for gating
    `glictus-caliburni` — "a build without it is a complete, useful glbench" —
    applies with more force here, because glbench lives in the inference
-   workspace and stumman deliberately does not.
+   workspace and gltrain deliberately does not.
 
 3. **The parts of v3 with no training dependency ship first** (D-03). Null
    semantics, the content digest, the session envelope, GLBitProf's math and its
    weights scope, and the join manifest are all buildable today against the tree
    as it stands. They are ordered ahead of the training work so v3 delivers
-   value before the stumman instrumentation lands.
+   value before the gltrain instrumentation lands.
 
 ---
 
@@ -288,28 +298,28 @@ re-litigates them.
 
 ### Dependency and structure
 
-**D-01 — v3 observes `stumman`; `gltrain` is out of scope.**
-Rationale: F-01. `gltrain` is candle-based, workspace-excluded, and has no edge
-to glproc/glcore. If GwenLand later wants gltrain observed, that is a separate
+**D-01 — v3 observes Stummañ (`gltrain`); the legacy candle crate is out of scope.**
+Rationale: F-01. The legacy crate was candle-based, workspace-excluded, and had
+no edge to glproc/glcore. If GwenLand later wants gltrain observed, that is a separate
 project with a separate dependency story, not a v3 wave.
 
-**D-02 — the stumman dependency is optional, behind a `train-bench` feature.**
+**D-02 — the gltrain dependency is optional, behind a `train-bench` feature.**
 
 ```toml
-stumman = { path = "../stumman", optional = true }
+gltrain = { path = "../gltrain", optional = true }
 
 [features]
-train-bench = ["dep:stumman"]
+train-bench = ["dep:gltrain"]
 ```
 
-Rationale: F-01 plus stumman's own `Cargo.toml`, which declares an empty
+Rationale: F-01 plus gltrain's own `Cargo.toml`, which declares an empty
 `[workspace]` specifically so the inference tree never builds it. An optional
 dependency preserves that: `cargo build --workspace` without the feature never
-compiles stumman, exactly as `gllm-bench` works for `glictus-caliburni`. This
+compiles gltrain, exactly as `gllm-bench` works for `glictus-caliburni`. This
 reverses the research document §10.
 
-Accepted cost, stated rather than hidden: stumman and `anyhow` enter the root
-`Cargo.lock` as optional entries even when unbuilt, and stumman may resolve its
+Accepted cost, stated rather than hidden: gltrain and `anyhow` enter the root
+`Cargo.lock` as optional entries even when unbuilt, and gltrain may resolve its
 own dependency versions differently standalone (own lock file) than from the
 root. Neither affects a default build. Recorded so a future reader does not
 discover it as a surprise.
@@ -324,7 +334,7 @@ They are populated with `not_applicable` (M2 has no tokens) or `unsupported`
 (M2 is single-device), never omitted and never zero. This is the null-semantics
 vocabulary earning its place on its first real use.
 
-**D-05 — glbench does not drive training; it observes a run that stumman
+**D-05 — glbench does not drive training; it observes a run that gltrain
 drives.**
 `glbench train` constructs a `Trainer`, installs an observer, and calls
 `Trainer::train`. It never calls `train_step` in a loop of its own, never
@@ -345,7 +355,7 @@ two sessions*, so it is its own top-level type with its own schema (`VLJoinManif
 §6.6) and no mode variant. Resolves the internal contradiction in favour of the
 part the research document argued for explicitly.
 
-**D-07 — the glbench↔stumman boundary is non-generic.**
+**D-07 — the glbench↔gltrain boundary is non-generic.**
 Per F-04. The observer trait, `VLTrainingStep`, and every numerical payload are
 free of `B: Backend`. Consequence: KL-001 never reaches glbench, and GLBitProf
 takes one input type everywhere.
@@ -570,7 +580,7 @@ training/           [NEW dir] all gated: #[cfg(feature = "train-bench")]
   mod.rs
   session.rs        [NEW]     VLTrainingSession
   step.rs           [NEW]     VLTrainingStep (glbench's archived form)
-  collector.rs      [NEW]     implements stumman's StepObserver
+  collector.rs      [NEW]     implements gltrain's StepObserver
   attribution.rs    [NEW]     VLTrainingAttribution (phase breakdown)
   convergence.rs    [NEW]     VLConvergence: slope, EMA, plateau, targets, CV
   memory.rs         [NEW]     VLTrainingMemory
@@ -611,10 +621,10 @@ Cross-crate (§7):
 glcore/src/hash.rs        [NEW]  sha256_bytes, sha256_file, sha256_128_hex
 glictus-caliburni/
   src/checksum.rs         [EDIT] delegate to glcore::hash, keep re-exports
-stumman/src/train/
+gltrain/src/train/
   observe.rs              [NEW]  VLTrainingStep, trait StepObserver
   trainer.rs              [EDIT] optional observer, phase timing, epoch index
-stumman/src/autograd/
+gltrain/src/autograd/
   grad_store.rs           [EDIT] add iter() so an observer can enumerate
 ```
 
@@ -638,7 +648,7 @@ types take a prefix; existing types are untouched.
 | `VLAvailabilityMap` | plain data, no identity | `core::availability` |
 | `VLInferenceSession` | plain data | `core::inference` |
 | `VLTrainingSession` | plain data | `training::session` |
-| `VLTrainingStep` | plain data | `training::step` (+ stumman origin) |
+| `VLTrainingStep` | plain data | `training::step` (+ gltrain origin) |
 | `VLTrainingAttribution` | plain data | `training::attribution` |
 | `VLTrainingMemory` | plain data | `training::memory` |
 | `VLConvergence` | plain data | `training::convergence` |
@@ -648,7 +658,7 @@ types take a prefix; existing types are untouched.
 | `VLIntegrity` | plain data | `storage::digest` |
 | `VLJoinManifest` | plain data | `storage::join` |
 | `VLJoinSource` | plain data | `storage::join` |
-| `StepObserver` | **trait — no prefix** (rule 2) | `stumman::train::observe` |
+| `StepObserver` | **trait — no prefix** (rule 2) | `gltrain::train::observe` |
 
 Two names deserve a note.
 
@@ -815,10 +825,10 @@ knows it was chosen rather than overlooked.
 
 ### 6.3 The training observation boundary (D-05, D-07)
 
-**Direction.** `glbench → stumman`. stumman never imports glbench, transitively
+**Direction.** `glbench → gltrain`. gltrain never imports glbench, transitively
 or otherwise. A cycle fails `cargo check`, which is the enforcement.
 
-**stumman side** — new file `stumman/src/train/observe.rs`:
+**gltrain side** — new file `gltrain/src/train/observe.rs`:
 
 ```rust
 /// One step, as facts. No `B`: everything here is a scalar or a count,
@@ -849,7 +859,7 @@ pub trait StepObserver {
     fn wants_tensors(&self) -> bool { false }
 
     /// Gradients and optimizer state as flat f32, only when `wants_tensors`.
-    /// Both are already non-generic in stumman (F-04).
+    /// Both are already non-generic in gltrain (F-04).
     fn on_tensors(&mut self, _grads: &VLGradStore, _opt_state: &[VLNamedTensor]) {}
 }
 ```
@@ -1058,7 +1068,7 @@ anticipates.
 v3 is not a glbench-only project. Three crates change. Each change is additive
 and independently landable.
 
-### 7.1 `stumman` — instrumentation (the bulk of the work)
+### 7.1 `gltrain` — instrumentation (the bulk of the work)
 
 | Change | File | Kind |
 |---|---|---|
@@ -1067,8 +1077,8 @@ and independently landable.
 | `VLGradStore::iter` | `src/autograd/grad_store.rs` | additive |
 | Re-exports | `src/lib.rs` | additive |
 
-Constraints this must respect, from `gl-agent-skills/stumman-naming/SKILL.md`
-and `stumman/KNOWN_ISSUES.md`:
+Constraints this must respect, from `gl-agent-skills/gltrain-naming/SKILL.md`
+and `gltrain/KNOWN_ISSUES.md`:
 
 - Breton sub-system codename in the module header. `observe.rs` sits under
   Deskiñ (training).
@@ -1085,7 +1095,7 @@ and `stumman/KNOWN_ISSUES.md`:
   `optimizer.step()`, which satisfies KL-006 for the reason above — the
   invariant never depended on the position. Reading `grads` late is safe: it is
   a local `train_step` owns, and `Optimizer::step` borrows it shared. Signed
-  off by JinXSuper; see `stumman/M2_5_OBSERVABILITY.md` for the full record.
+  off by JinXSuper; see `gltrain/M2_5_OBSERVABILITY.md` for the full record.
 - No new external dependency. `Instant`, `f32`, and `HashMap` are all std.
 
 ### 7.2 `glcore` — the hash primitive (D-15)
@@ -1214,11 +1224,11 @@ table stops being an inference from a citation and becomes a measurement.
 Bit-profile divergence run against the known GQ4A/Q6_K case from the research
 document §12 Case 2, with the result recorded whichever way it comes out.
 
-### Wave 3 — stumman instrumentation
+### Wave 3 — gltrain instrumentation
 
-**This is stumman work.** No glbench module in this wave.
+**This is gltrain work.** No glbench module in this wave.
 
-- `stumman/src/train/observe.rs`
+- `gltrain/src/train/observe.rs`
 - `Trainer` observer plumbing, phase timing, epoch index
 - `VLGradStore::iter`
 
@@ -1238,7 +1248,7 @@ Depends on Wave 3. Nothing here is written before Gate 3 clears.
 - Gradient and optimizer bit scopes
 - `comparison::training`
 
-**Gate 4:** a real LoRA training run on stumman produces a v2 archive that
+**Gate 4:** a real LoRA training run on gltrain produces a v2 archive that
 passes D-10 with every M2-absent field carrying an honest status (F-05). The
 convergence numbers are reported with their window and threshold, per the
 research document §14. A `unified` session has both inference roles populated
@@ -1315,7 +1325,7 @@ restated so it is not re-evaluated speculatively:
 - **Automatic LR recommendation** — an optimisation action. `DESIGN.md` §1.
 - **Cross-framework training comparison** — needs PyTorch. Python dependency.
 - **W&B / MLflow / TensorBoard** — external service. `DESIGN.md` §9.
-- **Gradient checkpointing analysis** — not implemented in stumman M2.
+- **Gradient checkpointing analysis** — not implemented in gltrain M2.
 - **Activation capture during inference** — engine-side instrumentation project.
   `--bit-scope activations` is recognised and errors with a pointer here.
 - **HTML export** — Phase 4 open item, not v3.
@@ -1326,7 +1336,7 @@ Added by this document:
 - **`gltrain` observation** — F-01. Not a deferral of v3 work; a different
   project with a different dependency story.
 - **Token-denominated training metrics** — F-05. Schema-present, status
-  `not_applicable`, populated when stumman gains a tokenised training loop. No
+  `not_applicable`, populated when gltrain gains a tokenised training loop. No
   glbench change needed at that point, which is the point of D-04.
 - **N-way join** — schema-compatible (D-18), CLI-rejected in v3.
 
@@ -1341,9 +1351,9 @@ Six items. Waves do not start on the affected areas until these are answered.
    it is the difference between `cargo build --workspace` staying clean and not.
    Confirm.
 
-2. **Wave 3 is stumman work.** Roughly 85% of v3's training observation is
-   instrumentation inside stumman (§2), not glbench. This changes who owns the
-   work and how long v3 takes. Confirm the sequencing, or say if stumman
+2. **Wave 3 is gltrain work.** Roughly 85% of v3's training observation is
+   instrumentation inside gltrain (§2), not glbench. This changes who owns the
+   work and how long v3 takes. Confirm the sequencing, or say if gltrain
    instrumentation should be its own milestone (M2.5) outside v3 entirely.
 
 3. **D-15 moves SHA-256 into `glcore`.** Touches `glcore` and

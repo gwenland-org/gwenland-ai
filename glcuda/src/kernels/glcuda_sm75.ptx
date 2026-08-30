@@ -26,7 +26,7 @@
 // every warp was re-reading the ENTIRE activation slab from L2 on its own -
 // for the gate GEMM, 2368 warps x 229 KB = ~540 MB of L2 traffic per launch
 // for a 229 KB matrix. All 8 warps of a block share the same tokens, so the
-// per-k-block activation slice (64 rows x 32 B = 2 KB) and its 64 f32
+// per-k-block activation slice (64 rows x 48 B = 3 KB) and its 64 f32
 // activation scales are now STAGED IN SHARED MEMORY once per block and
 // consumed by every warp: A traffic drops 8x, FFN GEMMs go DRAM-bound.
 //
@@ -36,7 +36,7 @@
 //     Q8_0 SoA qs stream IS this layout (W row-major == B^T col-major).
 //   D (8x8, s32)         = 8 tokens x 8 weight rows.
 // Per-thread fragments (groupID = lane/4, tig = lane%4):
-//   a0 = smem_a[(t0 + groupID)*32 + half*16 + tig*4 ..+4]  (one u32)
+//   a0 = smem_a[(t0 + groupID)*48 + half*16 + tig*4 ..+4]  (one u32)
 //   b0 = W[n0 + groupID][kb*32 + half*16 + tig*4 ..+4]     (one u32)
 //   d0, d1 = Y-tile row (t0+groupID), cols 2*tig, 2*tig+1  (two s32)
 //
@@ -51,11 +51,13 @@
 // legal). Staging is guarded to round8(ntok) rows, so nothing reads beyond
 // the padding contract.
 //
-// Requirements: out % 8 == 0, in % 32 == 0, ntok <= 64 (the runner chunks
-// at PREFILL_BATCH = 64); x_qs/x_scales rows must be ALLOCATED up to
+// Requirements: out % 8 == 0, in % 32 == 0; each y-CTA clamps itself to at
+// most 64 rows, while x_qs/x_scales rows must be ALLOCATED up to
 // round8(ntok) (extra rows are read, never written).
-// Launch: grid ceil(out / (8 * ntid/32)) x 256 threads.
-// Shared: 2048 B activation slice + 256 B activation scales.
+// Launch: normal grid=(ceil(out/64),ceil(ntok/64)); L2 raster swaps x/y so
+// token slabs are adjacent in linear CTA order for each output/weight tile.
+// The p_l2_raster flag selects only that coordinate mapping; math is unchanged.
+// Shared: 3072 B activation slice + 256 B activation scales.
 // ---------------------------------------------------------------------------
 .visible .entry gl_gemm_mma_q8(
     .param .u64 p_wqs,
@@ -65,7 +67,8 @@
     .param .u64 p_y,
     .param .u32 p_out,
     .param .u32 p_in,
-    .param .u32 p_ntok
+    .param .u32 p_ntok,
+    .param .u32 p_l2_raster
 )
 {
     .reg .pred %p<14>;
@@ -73,7 +76,17 @@
     .reg .b32 %r<48>;
     .reg .f32 %f<32>;
     .reg .b64 %rd<44>;
-    .shared .align 16 .b8 sm_a[2048];    // 64 token rows x 32 K bytes
+    // Wave 3: named registers cannot alias the numbered hand allocation.
+    .reg .b32 %r_gy_t0, %r_gy_nb, %r_gy_rem;
+    .reg .b64 %rd_gy_xo, %rd_gy_so, %rd_gy_yo;
+    // Wave 9: uniform CTA-coordinate swizzle; arithmetic remains bit-identical.
+    .reg .b32 %r_l2_mode, %r_l2_out, %r_l2_slab;
+    .reg .pred %p_l2;
+    // NEXT B fragment/scales for the software-pipelined k-loop.
+    .reg .b32 %bfrag0n, %bfrag1n;
+    .reg .f32 %wsc0n, %wsc1n;
+    .reg .pred %pnext;
+    .shared .align 16 .b8 sm_a[3072];    // 64 token rows x 48 B padded pitch
     .shared .align 4 .b8 sm_xs[256];     // 64 f32 activation scales
 
     ld.param.u64 %rd1, [p_wqs];
@@ -84,13 +97,40 @@
     ld.param.u32 %r1, [p_out];
     ld.param.u32 %r2, [p_in];
     ld.param.u32 %r3, [p_ntok];
+    ld.param.u32 %r_l2_mode, [p_l2_raster];
+
+    mov.u32 %r_l2_out, %ctaid.x;
+    mov.u32 %r_l2_slab, %ctaid.y;
+    setp.ne.u32 %p_l2, %r_l2_mode, 0;
+    @%p_l2 mov.u32 %r_l2_out, %ctaid.y;
+    @%p_l2 mov.u32 %r_l2_slab, %ctaid.x;
+
+    // Wave 3: move the host's serial 64-row slab loop into grid.y. Rebasing
+    // the three token-indexed pointers and clamping ntok makes every
+    // instruction below see exactly the original single-slab contract.
+    // t0 is a multiple of 64 (and therefore 8), so the existing round8(ntok)
+    // activation-padding contract remains sufficient for a ragged tail CTA.
+    mov.u32 %r_gy_t0, %r_l2_slab;
+    shl.b32 %r_gy_t0, %r_gy_t0, 6;          // t0 = ctaid.y * 64
+    mul.wide.u32 %rd_gy_xo, %r_gy_t0, %r2;  // int8 x row offset
+    add.s64 %rd3, %rd3, %rd_gy_xo;
+    shr.u32 %r_gy_nb, %r2, 5;               // scale blocks per x row
+    mul.wide.u32 %rd_gy_so, %r_gy_t0, %r_gy_nb;
+    shl.b64 %rd_gy_so, %rd_gy_so, 2;        // f32 scale row offset
+    add.s64 %rd4, %rd4, %rd_gy_so;
+    mul.wide.u32 %rd_gy_yo, %r_gy_t0, %r1;
+    shl.b64 %rd_gy_yo, %rd_gy_yo, 2;        // f32 output row offset
+    add.s64 %rd5, %rd5, %rd_gy_yo;
+    sub.s32 %r_gy_rem, %r3, %r_gy_t0;
+    max.s32 %r_gy_rem, %r_gy_rem, 0;
+    min.s32 %r3, %r_gy_rem, 64;             // rows owned by this CTA
 
     mov.u32 %r4, %tid.x;
     shr.u32 %r5, %r4, 5;                 // warp_id
     and.b32 %r6, %r4, 31;                // lane
     mov.u32 %r7, %ntid.x;
     shr.u32 %r8, %r7, 5;                 // warps per block
-    mov.u32 %r9, %ctaid.x;
+    mov.u32 %r9, %r_l2_out;
     mad.lo.s32 %r10, %r9, %r8, %r5;      // global warp = output tile index
     shl.b32 %r11, %r10, 3;               // n0 = first weight row of the tile
     // No early exit: bar.sync needs the whole block. p11 = this warp has
@@ -149,7 +189,7 @@
     add.s64 %rd20, %rd8, %rd20;
     cvt.u64.u32 %rd21, %r27;
     add.s64 %rd20, %rd20, %rd21;         // global stage ptr (advances +32/kb)
-    shl.b32 %r28, %r25, 5;
+    mul.lo.u32 %r28, %r25, 48;
     add.s32 %r28, %r28, %r27;
     mov.u32 %r29, sm_a;
     add.s32 %r28, %r29, %r28;            // shared stage addr (fixed)
@@ -166,9 +206,9 @@
     add.s32 %r31, %r32, %r31;            // shared xsc addr (fixed)
 
     // Per-warp shared READ bases: fragment of row (m*8 + groupID).
-    shl.b32 %r33, %r12, 5;               // groupID * 32
+    mul.lo.u32 %r33, %r12, 48;            // groupID * 48
     add.s32 %r33, %r33, %r16;            // + tig*4
-    add.s32 %r33, %r29, %r33;            // smem A read addr (m stride 256)
+    add.s32 %r33, %r29, %r33;            // smem A read addr (m stride 384)
     shl.b32 %r34, %r12, 2;
     add.s32 %r34, %r32, %r34;            // smem xsc read addr (m stride 32)
 
@@ -193,6 +233,26 @@
 
     mov.u32 %r20, 0;                     // kb (K block index)
 
+    // Prime CURRENT B fragment/scales for kb=0 via the NEXT registers. The
+    // explicit rotate keeps the steady-state loop identical to r256: each
+    // iteration prefetches kb+1 while tensor cores consume kb.
+    mov.b32 %bfrag0n, 0;
+    mov.b32 %bfrag1n, 0;
+    mov.f32 %wsc0n, 0f00000000;
+    mov.f32 %wsc1n, 0f00000000;
+    setp.gt.u32 %pnext, %r14, 0;
+    @!%pnext bra MMA_KLOOP;
+    @%p11 ld.global.u32 %bfrag0n, [%rd11];
+    @%p11 ld.global.u32 %bfrag1n, [%rd11+16];
+    @%p11 ld.global.u16 %h1, [%rd13];
+    @%p11 cvt.f32.f16 %wsc0n, %h1;
+    @%p11 ld.global.u16 %h2, [%rd14];
+    @%p11 cvt.f32.f16 %wsc1n, %h2;
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    mov.f32 %f2, %wsc0n;
+    mov.f32 %f3, %wsc1n;
+
 MMA_KLOOP:
     setp.ge.u32 %p9, %r20, %r14;
     @%p9 bra MMA_WRITE;
@@ -211,13 +271,15 @@ MMA_STAGE_BAR:
     // ---- per-warp compute (skipped whole by out-of-range warps) ----
     @!%p11 bra MMA_KSYNC;
 
-    // Weight fragment + scales: loaded ONCE, reused by every m-tile below.
-    ld.global.u32 %r26, [%rd11];         // B half 0 (k 0..15 of block)
-    ld.global.u32 %r27, [%rd11+16];      // B half 1 (k 16..31)
-    ld.global.u16 %h1, [%rd13];
-    cvt.f32.f16 %f2, %h1;                // wsc[nc0][kb]
-    ld.global.u16 %h2, [%rd14];
-    cvt.f32.f16 %f3, %h2;                // wsc[nc1][kb]
+    // Prefetch NEXT B fragment/scales before consuming the current block.
+    add.s32 %r47, %r20, 1;
+    setp.lt.u32 %pnext, %r47, %r14;
+    @%pnext ld.global.u32 %bfrag0n, [%rd11+32];
+    @%pnext ld.global.u32 %bfrag1n, [%rd11+48];
+    @%pnext ld.global.u16 %h1, [%rd13+2];
+    @%pnext cvt.f32.f16 %wsc0n, %h1;
+    @%pnext ld.global.u16 %h2, [%rd14+2];
+    @%pnext cvt.f32.f16 %wsc1n, %h2;
 
     // Running shared-memory readers, reset to m-tile 0 each k block.
     mov.u32 %r35, %r33;                  // A frag addr
@@ -242,7 +304,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 1 ----
     @!%p1 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -262,7 +324,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 2 ----
     @!%p2 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -282,7 +344,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 3 ----
     @!%p3 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -302,7 +364,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 4 ----
     @!%p4 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -322,7 +384,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 5 ----
     @!%p5 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -342,7 +404,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 6 ----
     @!%p6 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -362,7 +424,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 7 ----
     @!%p7 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -383,6 +445,10 @@ MMA_STAGE_BAR:
 MMA_KSYNC:
     // Everyone (active or not) meets here before the next stage overwrite.
     bar.sync 0;
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    mov.f32 %f2, %wsc0n;
+    mov.f32 %f3, %wsc1n;
     add.s64 %rd11, %rd11, 32;            // next K block
     add.s64 %rd13, %rd13, 2;
     add.s64 %rd14, %rd14, 2;
@@ -402,8 +468,7 @@ MMA_WRITE:
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f10;
-    st.global.f32 [%rd32+4], %f11;
+    st.global.v2.f32 [%rd32], {%f10, %f11};
 MMA_W1:
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
@@ -411,57 +476,1225 @@ MMA_W1:
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f12;
-    st.global.f32 [%rd32+4], %f13;
+    st.global.v2.f32 [%rd32], {%f12, %f13};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f14;
-    st.global.f32 [%rd32+4], %f15;
+    st.global.v2.f32 [%rd32], {%f14, %f15};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f16;
-    st.global.f32 [%rd32+4], %f17;
+    st.global.v2.f32 [%rd32], {%f16, %f17};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f18;
-    st.global.f32 [%rd32+4], %f19;
+    st.global.v2.f32 [%rd32], {%f18, %f19};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f20;
-    st.global.f32 [%rd32+4], %f21;
+    st.global.v2.f32 [%rd32], {%f20, %f21};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f22;
-    st.global.f32 [%rd32+4], %f23;
+    st.global.v2.f32 [%rd32], {%f22, %f23};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_DONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f24;
-    st.global.f32 [%rd32+4], %f25;
+    st.global.v2.f32 [%rd32], {%f24, %f25};
 
+MMA_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemm_mma_w8pc: Wave 7 row-scaled W8A8 Tensor Core GEMM.
+//
+// Computes Y[ntok,out] = X[ntok,in] @ W[out,in]^T. W and X are signed INT8;
+// W has one f32 scale per output row and X one f32 scale per token row. The
+// retained grid64 mapping, 48-byte conflict-free A pitch, vector stores, and
+// bar.sync schedule match gl_gemm_mma_q8. Because both scales are invariant
+// across K, every D fragment accumulates in s32 for all in/32 blocks and is
+// converted/scaled exactly once in the output epilogue.
+//
+// launch: grid=(ceil(out/64),ceil(ntok/64)), block=(256)
+// shared: 3072 B A slice + 256 B row scales. Requirements: out%8=0,in%32=0;
+// X storage is padded to round8(ntok) rows.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemm_mma_w8pc(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in,
+    .param .u32 p_ntok
+)
+{
+    .reg .pred %p<14>;
+    .reg .b32 %r<50>;
+    .reg .b32 %acc<16>;
+    .reg .f32 %wscale0, %wscale1, %xscale, %scale0, %scale1;
+    .reg .f32 %out0, %out1;
+    .reg .b64 %rd<44>;
+    .reg .b32 %r_w8_t0, %r_w8_nb, %r_w8_rem;
+    .reg .b64 %rd_w8_xo, %rd_w8_so, %rd_w8_yo;
+    .reg .b32 %bfrag0n, %bfrag1n;
+    .reg .pred %pnext;
+    .shared .align 16 .b8 sm_w8a[3072];
+    .shared .align 4 .b8 sm_w8xs[256];
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    ld.param.u32 %r3, [p_ntok];
+
+    mov.u32 %r_w8_t0, %ctaid.y;
+    shl.b32 %r_w8_t0, %r_w8_t0, 6;
+    mul.wide.u32 %rd_w8_xo, %r_w8_t0, %r2;
+    add.s64 %rd3, %rd3, %rd_w8_xo;
+    mul.wide.u32 %rd_w8_so, %r_w8_t0, 4;
+    add.s64 %rd4, %rd4, %rd_w8_so;
+    mul.wide.u32 %rd_w8_yo, %r_w8_t0, %r1;
+    shl.b64 %rd_w8_yo, %rd_w8_yo, 2;
+    add.s64 %rd5, %rd5, %rd_w8_yo;
+    sub.s32 %r_w8_rem, %r3, %r_w8_t0;
+    max.s32 %r_w8_rem, %r_w8_rem, 0;
+    min.s32 %r3, %r_w8_rem, 64;
+
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;
+    and.b32 %r6, %r4, 31;
+    mov.u32 %r7, %ntid.x;
+    shr.u32 %r8, %r7, 5;
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.s32 %r10, %r9, %r8, %r5;
+    shl.b32 %r11, %r10, 3;
+    setp.lt.u32 %p11, %r11, %r1;
+    shr.u32 %r12, %r6, 2;
+    and.b32 %r13, %r6, 3;
+    shr.u32 %r14, %r2, 5;
+    add.s32 %r22, %r3, 7;
+    and.b32 %r22, %r22, 0xFFFFFFF8;
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+
+    add.s32 %r15, %r11, %r12;
+    setp.ge.u32 %p12, %r15, %r1;
+    @%p12 mov.u32 %r15, 0;
+    mul.wide.u32 %rd11, %r15, %r2;
+    add.s64 %rd11, %rd6, %rd11;
+    shl.b32 %r16, %r13, 2;
+    cvt.u64.u32 %rd12, %r16;
+    add.s64 %rd11, %rd11, %rd12;
+
+    shl.b32 %r17, %r13, 1;
+    add.s32 %r18, %r11, %r17;
+    mov.u32 %r23, %r18;
+    setp.ge.u32 %p12, %r23, %r1;
+    @%p12 mov.u32 %r23, 0;
+    mul.wide.u32 %rd13, %r23, 4;
+    add.s64 %rd13, %rd7, %rd13;
+    add.s32 %r19, %r18, 1;
+    mov.u32 %r24, %r19;
+    setp.ge.u32 %p12, %r24, %r1;
+    @%p12 mov.u32 %r24, 0;
+    mul.wide.u32 %rd14, %r24, 4;
+    add.s64 %rd14, %rd7, %rd14;
+    ld.global.f32 %wscale0, [%rd13];
+    ld.global.f32 %wscale1, [%rd14];
+
+    shr.u32 %r25, %r4, 2;
+    and.b32 %r26, %r4, 3;
+    shl.b32 %r27, %r26, 3;
+    setp.lt.u32 %p13, %r25, %r22;
+    mul.wide.u32 %rd20, %r25, %r2;
+    add.s64 %rd20, %rd8, %rd20;
+    cvt.u64.u32 %rd21, %r27;
+    add.s64 %rd20, %rd20, %rd21;
+    mul.lo.u32 %r28, %r25, 48;
+    add.s32 %r28, %r28, %r27;
+    mov.u32 %r29, sm_w8a;
+    add.s32 %r28, %r29, %r28;
+
+    setp.lt.u32 %p10, %r4, 64;
+    and.b32 %r30, %r4, 63;
+    setp.lt.u32 %p9, %r30, %r22;
+    and.pred %p10, %p10, %p9;
+    mul.wide.u32 %rd22, %r4, 4;
+    add.s64 %rd22, %rd9, %rd22;
+    shl.b32 %r31, %r4, 2;
+    mov.u32 %r32, sm_w8xs;
+    add.s32 %r31, %r32, %r31;
+
+    mul.lo.u32 %r33, %r12, 48;
+    add.s32 %r33, %r33, %r16;
+    add.s32 %r33, %r29, %r33;
+    shl.b32 %r34, %r12, 2;
+    add.s32 %r34, %r32, %r34;
+
+    setp.lt.u32 %p1, 8, %r3;
+    setp.lt.u32 %p2, 16, %r3;
+    setp.lt.u32 %p3, 24, %r3;
+    setp.lt.u32 %p4, 32, %r3;
+    setp.lt.u32 %p5, 40, %r3;
+    setp.lt.u32 %p6, 48, %r3;
+    setp.lt.u32 %p7, 56, %r3;
+
+    mov.u32 %acc0, 0;  mov.u32 %acc1, 0;
+    mov.u32 %acc2, 0;  mov.u32 %acc3, 0;
+    mov.u32 %acc4, 0;  mov.u32 %acc5, 0;
+    mov.u32 %acc6, 0;  mov.u32 %acc7, 0;
+    mov.u32 %acc8, 0;  mov.u32 %acc9, 0;
+    mov.u32 %acc10, 0; mov.u32 %acc11, 0;
+    mov.u32 %acc12, 0; mov.u32 %acc13, 0;
+    mov.u32 %acc14, 0; mov.u32 %acc15, 0;
+    mov.u32 %r20, 0;
+    mov.b32 %bfrag0n, 0;
+    mov.b32 %bfrag1n, 0;
+    setp.gt.u32 %pnext, %r14, 0;
+    @!%pnext bra MMA_W8_KLOOP;
+    @%p11 ld.global.u32 %bfrag0n, [%rd11];
+    @%p11 ld.global.u32 %bfrag1n, [%rd11+16];
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+
+MMA_W8_KLOOP:
+    setp.ge.u32 %p9, %r20, %r14;
+    @%p9 bra MMA_W8_WRITE;
+    @!%p13 bra MMA_W8_STAGE_XS;
+    ld.global.u64 %rd24, [%rd20];
+    st.shared.u64 [%r28], %rd24;
+MMA_W8_STAGE_XS:
+    setp.ne.u32 %p8, %r20, 0;
+    @%p8 bra MMA_W8_STAGE_BAR;
+    @!%p10 bra MMA_W8_STAGE_BAR;
+    ld.global.f32 %xscale, [%rd22];
+    st.shared.f32 [%r31], %xscale;
+MMA_W8_STAGE_BAR:
+    bar.sync 0;
+    @!%p11 bra MMA_W8_KSYNC;
+
+    add.s32 %r47, %r20, 1;
+    setp.lt.u32 %pnext, %r47, %r14;
+    @%pnext ld.global.u32 %bfrag0n, [%rd11+32];
+    @%pnext ld.global.u32 %bfrag1n, [%rd11+48];
+    mov.u32 %r35, %r33;
+
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc0, %acc1}, {%r24}, {%r26}, {%acc0, %acc1};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc0, %acc1}, {%r25}, {%r27}, {%acc0, %acc1};
+
+    @!%p1 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc2, %acc3}, {%r24}, {%r26}, {%acc2, %acc3};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc2, %acc3}, {%r25}, {%r27}, {%acc2, %acc3};
+
+    @!%p2 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc4, %acc5}, {%r24}, {%r26}, {%acc4, %acc5};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc4, %acc5}, {%r25}, {%r27}, {%acc4, %acc5};
+
+    @!%p3 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc6, %acc7}, {%r24}, {%r26}, {%acc6, %acc7};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc6, %acc7}, {%r25}, {%r27}, {%acc6, %acc7};
+
+    @!%p4 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc8, %acc9}, {%r24}, {%r26}, {%acc8, %acc9};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc8, %acc9}, {%r25}, {%r27}, {%acc8, %acc9};
+
+    @!%p5 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc10, %acc11}, {%r24}, {%r26}, {%acc10, %acc11};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc10, %acc11}, {%r25}, {%r27}, {%acc10, %acc11};
+
+    @!%p6 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc12, %acc13}, {%r24}, {%r26}, {%acc12, %acc13};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc12, %acc13}, {%r25}, {%r27}, {%acc12, %acc13};
+
+    @!%p7 bra MMA_W8_KSYNC;
+    add.s32 %r35, %r35, 384;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc14, %acc15}, {%r24}, {%r26}, {%acc14, %acc15};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%acc14, %acc15}, {%r25}, {%r27}, {%acc14, %acc15};
+
+MMA_W8_KSYNC:
+    bar.sync 0;
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    add.s64 %rd11, %rd11, 32;
+    add.s64 %rd20, %rd20, 32;
+    add.s32 %r20, %r20, 1;
+    bra MMA_W8_KLOOP;
+
+MMA_W8_WRITE:
+    @!%p11 bra MMA_W8_DONE;
+    mov.u32 %r30, %r12;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_W1;
+    ld.shared.f32 %xscale, [%r34];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc0;
+    cvt.rn.f32.s32 %out1, %acc1;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+MMA_W8_W1:
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+32];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc2;
+    cvt.rn.f32.s32 %out1, %acc3;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+64];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc4;
+    cvt.rn.f32.s32 %out1, %acc5;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+96];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc6;
+    cvt.rn.f32.s32 %out1, %acc7;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+128];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc8;
+    cvt.rn.f32.s32 %out1, %acc9;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+160];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc10;
+    cvt.rn.f32.s32 %out1, %acc11;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+192];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc12;
+    cvt.rn.f32.s32 %out1, %acc13;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_W8_DONE;
+    ld.shared.f32 %xscale, [%r34+224];
+    mul.rn.f32 %scale0, %wscale0, %xscale;
+    mul.rn.f32 %scale1, %wscale1, %xscale;
+    cvt.rn.f32.s32 %out0, %acc14;
+    cvt.rn.f32.s32 %out1, %acc15;
+    mul.rn.f32 %out0, %out0, %scale0;
+    mul.rn.f32 %out1, %out1, %scale1;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%out0, %out1};
+
+MMA_W8_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// gl_gemm_mma_q8_r128: Wave 6 midpoint between grid64 and r256. Each warp
+// holds 16 m-tiles (128 token rows) while a 128-thread CTA owns four output
+// tiles. Launch grid = (ceil(out/32), ceil(ntok/128), 1), block = 128.
+// For the 244-token production prompt this keeps down/o at 56 CTAs (enough
+// to cover 40 T4 SMs) while halving weight-fragment streams from four to two.
+// A uses the same 48-byte conflict-free pitch and four 32-row staging passes.
+// Contract: out%8==0, in%32==0, x rows allocated to round8(ntok).
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemm_mma_q8_r128(
+    .param .u64 p_wqs,
+    .param .u64 p_wsc,
+    .param .u64 p_xqs,
+    .param .u64 p_xsc,
+    .param .u64 p_y,
+    .param .u32 p_out,
+    .param .u32 p_in,
+    .param .u32 p_ntok
+)
+{
+    .reg .pred %p<140>;
+    .reg .b16 %h<4>;
+    .reg .b32 %r<48>;
+    .reg .f32 %f<48>;
+    .reg .b64 %rd<44>;
+    // Wave 6: one grid.y CTA owns a 128-row token slab.
+    .reg .b32 %r_gy_t0, %r_gy_nb, %r_gy_rem;
+    .reg .b64 %rd_gy_xo, %rd_gy_so, %rd_gy_yo;
+    // Prefetch half of the B double-buffer. The CURRENT block stays in
+    // %r26/%r27/%f2/%f3 so the 16 m-tile bodies below are untouched; these
+    // hold the NEXT block until the swap at MMA_KSYNC.
+    .reg .b32 %bfrag0n, %bfrag1n;
+    .reg .f32 %wsc0n, %wsc1n;
+    .reg .pred %pnext;
+    .shared .align 16 .b8 sm_a[6144];    // 128 token rows x 48 B padded pitch
+    .shared .align 4 .b8 sm_xs[512];     // 128 f32 activation scales
+
+    ld.param.u64 %rd1, [p_wqs];
+    ld.param.u64 %rd2, [p_wsc];
+    ld.param.u64 %rd3, [p_xqs];
+    ld.param.u64 %rd4, [p_xsc];
+    ld.param.u64 %rd5, [p_y];
+    ld.param.u32 %r1, [p_out];
+    ld.param.u32 %r2, [p_in];
+    ld.param.u32 %r3, [p_ntok];
+
+
+    // A 128-row grid.y slab halves weight re-streaming versus grid64. t0 is
+    // a multiple of 128, so the existing round8 allocation contract holds.
+    mov.u32 %r_gy_t0, %ctaid.y;
+    shl.b32 %r_gy_t0, %r_gy_t0, 7;          // t0 = ctaid.y * 128
+    mul.wide.u32 %rd_gy_xo, %r_gy_t0, %r2;
+    add.s64 %rd3, %rd3, %rd_gy_xo;
+    shr.u32 %r_gy_nb, %r2, 5;
+    mul.wide.u32 %rd_gy_so, %r_gy_t0, %r_gy_nb;
+    shl.b64 %rd_gy_so, %rd_gy_so, 2;
+    add.s64 %rd4, %rd4, %rd_gy_so;
+    mul.wide.u32 %rd_gy_yo, %r_gy_t0, %r1;
+    shl.b64 %rd_gy_yo, %rd_gy_yo, 2;
+    add.s64 %rd5, %rd5, %rd_gy_yo;
+    sub.s32 %r_gy_rem, %r3, %r_gy_t0;
+    max.s32 %r_gy_rem, %r_gy_rem, 0;
+    min.s32 %r3, %r_gy_rem, 128;
+
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;                 // warp_id
+    and.b32 %r6, %r4, 31;                // lane
+    mov.u32 %r7, %ntid.x;
+    shr.u32 %r8, %r7, 5;                 // warps per block
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.s32 %r10, %r9, %r8, %r5;      // global warp = output tile index
+    shl.b32 %r11, %r10, 3;               // n0 = first weight row of the tile
+    setp.lt.u32 %p11, %r11, %r1;         // this warp has real output rows
+
+    shr.u32 %r12, %r6, 2;                // groupID = lane / 4
+    and.b32 %r13, %r6, 3;                // tig = lane % 4
+    shr.u32 %r14, %r2, 5;                // nb = in / 32 (K blocks)
+    add.s32 %r22, %r3, 7;
+    and.b32 %r22, %r22, 0xFFFFFFF8;      // ntok_pad8 = round8(ntok)
+
+    cvta.to.global.u64 %rd6, %rd1;
+    cvta.to.global.u64 %rd7, %rd2;
+    cvta.to.global.u64 %rd8, %rd3;
+    cvta.to.global.u64 %rd9, %rd4;
+    cvta.to.global.u64 %rd10, %rd5;
+
+    // B fragment walker: weight row (n0 + groupID), k byte offset tig*4.
+    add.s32 %r15, %r11, %r12;
+    setp.ge.u32 %p12, %r15, %r1;
+    @%p12 mov.u32 %r15, 0;
+    mul.wide.u32 %rd11, %r15, %r2;
+    add.s64 %rd11, %rd6, %rd11;
+    shl.b32 %r16, %r13, 2;               // tig * 4
+    cvt.u64.u32 %rd12, %r16;
+    add.s64 %rd11, %rd11, %rd12;         // wqs fragment ptr (advances +32/kb)
+
+    // Epilogue scale walkers: nc0 = n0 + 2*tig, nc1 = nc0 + 1.
+    shl.b32 %r17, %r13, 1;
+    add.s32 %r18, %r11, %r17;            // nc0
+    mov.u32 %r23, %r18;
+    setp.ge.u32 %p12, %r23, %r1;
+    @%p12 mov.u32 %r23, 0;
+    mul.wide.u32 %rd13, %r23, %r14;
+    shl.b64 %rd13, %rd13, 1;
+    add.s64 %rd13, %rd7, %rd13;          // wsc row nc0 (advances +2/kb)
+    add.s32 %r19, %r18, 1;               // nc1
+    mov.u32 %r24, %r19;
+    setp.ge.u32 %p12, %r24, %r1;
+    @%p12 mov.u32 %r24, 0;
+    mul.wide.u32 %rd14, %r24, %r14;
+    shl.b64 %rd14, %rd14, 1;
+    add.s64 %rd14, %rd7, %rd14;          // wsc row nc1
+
+    // Staging base: thread i handles 8 bytes at byte offset (i%4)*8 of
+    // the k-slice, for a set of rows starting at i/4. With 128 threads
+    // that is rows 0..31 per pass; r128 needs 128 rows, so the k-loop
+    // staging runs FOUR passes (row += 32) to cover 0..127. Here we set
+    // up the pass-0 pointers; the per-pass loop lives in MMA_KLOOP.
+    shr.u32 %r46, %r4, 2;                // stage row0 = tid / 4
+    and.b32 %r45, %r4, 3;
+    shl.b32 %r45, %r45, 3;               // stage byte offset = (tid%4)*8
+    // NB: BOTH loop-carried staging values live in registers the m-tile
+    // bodies never touch - the byte offset in %r45 and the row in %r46.
+    //
+    // The hazard: this kernel stages in FOUR passes per k-block, so both
+    // values are read INSIDE the k-loop, while the 16 m-tiles below use
+    // %r24..%r27 and %r38/%r39 as scratch every single tile. Any staging
+    // value parked in one of those is destroyed by the first m-tile and every
+    // k-block after the first stages from garbage.
+    //
+    // The offset was moved to %r45 for exactly this reason. The row was NOT,
+    // and sat in %r25 - which `ld.shared.u32 %r25, [%r35+16]` overwrites 32
+    // times per k-block. With in_dim=64 (nb=2) that made k-block 0 correct and
+    // k-block 1 read rows derived from an A-fragment, which is what the parity
+    // failure `gpu 1.5951226 vs cpu 2.4754333` at ntok=5 was, and the most
+    // likely source of the CUDA_ERROR_MISALIGNED_ADDRESS seen when this kernel
+    // was wired into the engine: a garbage row index becomes a global address.
+    //
+    // The 8-tile kernel does not have this bug because it stages in ONE pass
+    // and consumes %r25 into its pointers in the prologue, never re-reading it
+    // in the loop.
+    // (per-k-block base pointers rebuilt each pass from %r46 in the loop)
+    mov.u32 %r29, sm_a;
+    // xsc staging base: thread tid handles scale row (tid & 255) but with
+    // 128 threads and up to 128 rows that is one row/thread ? a single
+    // pass covers it (unlike the 8-tile kernel's 64-thread pass).
+    and.b32 %r30, %r4, 127;             // xsc row = tid (0..127)
+    mov.u32 %r32, sm_xs;
+
+    // Per-warp shared READ bases: fragment of row (m*8 + groupID).
+    mul.lo.u32 %r33, %r12, 48;            // groupID * 48
+    add.s32 %r33, %r33, %r16;            // + tig*4
+    add.s32 %r33, %r29, %r33;            // smem A read addr (m stride 384)
+    shl.b32 %r34, %r12, 2;
+    add.s32 %r34, %r32, %r34;            // smem xsc read addr (m stride 32)
+
+    // Warp-uniform m-tile guards: tile m runs iff 8m < ntok. p{100+m}.
+    setp.lt.u32 %p101, 8, %r3;
+    setp.lt.u32 %p102, 16, %r3;
+    setp.lt.u32 %p103, 24, %r3;
+    setp.lt.u32 %p104, 32, %r3;
+    setp.lt.u32 %p105, 40, %r3;
+    setp.lt.u32 %p106, 48, %r3;
+    setp.lt.u32 %p107, 56, %r3;
+    setp.lt.u32 %p108, 64, %r3;
+    setp.lt.u32 %p109, 72, %r3;
+    setp.lt.u32 %p110, 80, %r3;
+    setp.lt.u32 %p111, 88, %r3;
+    setp.lt.u32 %p112, 96, %r3;
+    setp.lt.u32 %p113, 104, %r3;
+    setp.lt.u32 %p114, 112, %r3;
+    setp.lt.u32 %p115, 120, %r3;
+
+    // Per-m-tile f32 accumulators (nc0, nc1) x 16 tiles: %f10..%f41.
+    mov.f32 %f10, 0f00000000; mov.f32 %f11, 0f00000000;
+    mov.f32 %f12, 0f00000000; mov.f32 %f13, 0f00000000;
+    mov.f32 %f14, 0f00000000; mov.f32 %f15, 0f00000000;
+    mov.f32 %f16, 0f00000000; mov.f32 %f17, 0f00000000;
+    mov.f32 %f18, 0f00000000; mov.f32 %f19, 0f00000000;
+    mov.f32 %f20, 0f00000000; mov.f32 %f21, 0f00000000;
+    mov.f32 %f22, 0f00000000; mov.f32 %f23, 0f00000000;
+    mov.f32 %f24, 0f00000000; mov.f32 %f25, 0f00000000;
+    mov.f32 %f26, 0f00000000; mov.f32 %f27, 0f00000000;
+    mov.f32 %f28, 0f00000000; mov.f32 %f29, 0f00000000;
+    mov.f32 %f30, 0f00000000; mov.f32 %f31, 0f00000000;
+    mov.f32 %f32, 0f00000000; mov.f32 %f33, 0f00000000;
+    mov.f32 %f34, 0f00000000; mov.f32 %f35, 0f00000000;
+    mov.f32 %f36, 0f00000000; mov.f32 %f37, 0f00000000;
+    mov.f32 %f38, 0f00000000; mov.f32 %f39, 0f00000000;
+    mov.f32 %f40, 0f00000000; mov.f32 %f41, 0f00000000;
+
+    mov.u32 %r20, 0;                     // kb (K block index)
+
+    // ---- Software pipelining: prime the B fragment for kb = 0 ----
+    //
+    // sm_75 has no cp.async (Ampere+), so the only way to overlap a global
+    // load with tensor-core work is to issue it a full k-block early. The
+    // weight fragment and its two scales are the only global reads left in
+    // the hot path -- the A slice is in shared memory by the time any
+    // mma.sync runs -- and they are read once per k-block and reused by all
+    // 16 m-tiles, which makes them exactly the right thing to prefetch.
+    //
+    // The pattern is: prime kb=0 here, then each iteration issues kb+1 before
+    // running kb's tiles, and swaps at MMA_KSYNC.
+    //
+    // Zeroed unconditionally first: warps with no output rows branch straight
+    // to MMA_KSYNC and still execute the swap, so the prefetch registers must
+    // not be read while uninitialized even though the values go nowhere.
+    mov.b32 %bfrag0n, 0;
+    mov.b32 %bfrag1n, 0;
+    mov.f32 %wsc0n, 0f00000000;
+    mov.f32 %wsc1n, 0f00000000;
+    // nb == 0 means the k-loop falls straight through to MMA_WRITE; these
+    // addresses would be out of range.
+    setp.gt.u32 %pnext, %r14, 0;
+    @!%pnext bra MMA_KLOOP;
+    @%p11 ld.global.u32 %r26, [%rd11];
+    @%p11 ld.global.u32 %r27, [%rd11+16];
+    @%p11 ld.global.u16 %h1, [%rd13];
+    @%p11 cvt.f32.f16 %f2, %h1;
+    @%p11 ld.global.u16 %h2, [%rd14];
+    @%p11 cvt.f32.f16 %f3, %h2;
+
+MMA_KLOOP:
+    setp.ge.u32 %p9, %r20, %r14;
+    @%p9 bra MMA_WRITE;
+
+    // ---- cooperative stage: this k-block's A slice (4 row-passes) + xsc ----
+    // kb byte base into the global qs/xsc streams for this block.
+    mul.lo.s32 %r40, %r20, 32;          // kb * 32 (qs bytes/block/row-elem)
+    shl.b32 %r41, %r20, 2;              // kb * 4 (xsc f32/block)
+    // A-slice pass 0: rows 0..31 (row = tid/4 + 0).
+    add.s32 %r42, %r46, 0;      // this pass's row
+    setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
+    @!%p13 bra MMA_STAGE_A0;
+    mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
+    add.s64 %rd20, %rd8, %rd20;
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
+    add.s64 %rd20, %rd20, %rd21;
+    mul.wide.u32 %rd23, %r40, 1;        // + kb*32
+    add.s64 %rd20, %rd20, %rd23;
+    ld.global.u64 %rd24, [%rd20];
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
+    add.s32 %r43, %r43, %r45;           // + byte offset
+    add.s32 %r43, %r29, %r43;
+    st.shared.u64 [%r43], %rd24;
+MMA_STAGE_A0:
+    // A-slice pass 1: rows 32..63 (row = tid/4 + 32).
+    add.s32 %r42, %r46, 32;      // this pass's row
+    setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
+    @!%p13 bra MMA_STAGE_A1;
+    mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
+    add.s64 %rd20, %rd8, %rd20;
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
+    add.s64 %rd20, %rd20, %rd21;
+    mul.wide.u32 %rd23, %r40, 1;        // + kb*32
+    add.s64 %rd20, %rd20, %rd23;
+    ld.global.u64 %rd24, [%rd20];
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
+    add.s32 %r43, %r43, %r45;           // + byte offset
+    add.s32 %r43, %r29, %r43;
+    st.shared.u64 [%r43], %rd24;
+MMA_STAGE_A1:
+    // A-slice pass 2: rows 64..95 (row = tid/4 + 64).
+    add.s32 %r42, %r46, 64;      // this pass's row
+    setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
+    @!%p13 bra MMA_STAGE_A2;
+    mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
+    add.s64 %rd20, %rd8, %rd20;
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
+    add.s64 %rd20, %rd20, %rd21;
+    mul.wide.u32 %rd23, %r40, 1;        // + kb*32
+    add.s64 %rd20, %rd20, %rd23;
+    ld.global.u64 %rd24, [%rd20];
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
+    add.s32 %r43, %r43, %r45;           // + byte offset
+    add.s32 %r43, %r29, %r43;
+    st.shared.u64 [%r43], %rd24;
+MMA_STAGE_A2:
+    // A-slice pass 3: rows 96..127 (row = tid/4 + 96).
+    add.s32 %r42, %r46, 96;      // this pass's row
+    setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
+    @!%p13 bra MMA_STAGE_A3;
+    mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
+    add.s64 %rd20, %rd8, %rd20;
+    cvt.u64.u32 %rd21, %r45;            // + (tid%4)*8
+    add.s64 %rd20, %rd20, %rd21;
+    mul.wide.u32 %rd23, %r40, 1;        // + kb*32
+    add.s64 %rd20, %rd20, %rd23;
+    ld.global.u64 %rd24, [%rd20];
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
+    add.s32 %r43, %r43, %r45;           // + byte offset
+    add.s32 %r43, %r29, %r43;
+    st.shared.u64 [%r43], %rd24;
+MMA_STAGE_A3:
+    // xsc pass: thread tid stages scale row tid (0..255), one pass.
+    setp.lt.u32 %p10, %r30, %r22;       // xsc row < ntok_pad8
+    @!%p10 bra MMA_STAGE_BAR;
+    mul.wide.u32 %rd22, %r30, %r14;     // row * nb
+    shl.b64 %rd22, %rd22, 2;            // * 4 (f32)
+    add.s64 %rd22, %rd9, %rd22;
+    mul.wide.u32 %rd23, %r41, 1;        // + kb*4
+    add.s64 %rd22, %rd22, %rd23;
+    ld.global.f32 %f4, [%rd22];
+    shl.b32 %r44, %r30, 2;              // row * 4 (shared xsc stride)
+    add.s32 %r44, %r32, %r44;
+    st.shared.f32 [%r44], %f4;
+MMA_STAGE_BAR:
+    bar.sync 0;
+
+    @!%p11 bra MMA_KSYNC;
+
+    // ---- Prefetch the NEXT k-block's B fragment and scales ----
+    //
+    // Issued BEFORE the 16 m-tiles, so the global latency is overlapped by
+    // flight while the tensor cores consume the CURRENT block already sitting
+    // in %r26/%r27/%f2/%f3.
+    //
+    // %rd11/%rd13/%rd14 still address the CURRENT block here -- MMA_KSYNC
+    // advances them after the tiles -- so kb+1 is at +32 (B half 0), +48
+    // (B half 1, i.e. +32+16) and +2 (the next f16 scale).
+    //
+    // One predicate, not two: PTX allows a single guard per instruction, and
+    // this block already sits behind `@!%p11 bra MMA_KSYNC`, so every warp
+    // reaching it is active.
+    add.s32 %r47, %r20, 1;
+    setp.lt.u32 %pnext, %r47, %r14;      // kb+1 < nb
+    @%pnext ld.global.u32 %bfrag0n, [%rd11+32];
+    @%pnext ld.global.u32 %bfrag1n, [%rd11+48];
+    @%pnext ld.global.u16 %h1, [%rd13+2];
+    @%pnext cvt.f32.f16 %wsc0n, %h1;
+    @%pnext ld.global.u16 %h2, [%rd14+2];
+    @%pnext cvt.f32.f16 %wsc1n, %h2;
+
+    mov.u32 %r35, %r33;                  // A frag addr (reset to tile 0)
+    mov.u32 %r36, %r34;                  // xsc addr
+
+    // ---- m-tile 0 ----
+    // (always active: ntok >= 1)
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f10, %f7, %f5, %f10;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f11, %f8, %f6, %f11;
+
+    // ---- m-tile 1 ----
+    @!%p101 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f12, %f7, %f5, %f12;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f13, %f8, %f6, %f13;
+
+    // ---- m-tile 2 ----
+    @!%p102 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f14, %f7, %f5, %f14;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f15, %f8, %f6, %f15;
+
+    // ---- m-tile 3 ----
+    @!%p103 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f16, %f7, %f5, %f16;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f17, %f8, %f6, %f17;
+
+    // ---- m-tile 4 ----
+    @!%p104 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f18, %f7, %f5, %f18;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f19, %f8, %f6, %f19;
+
+    // ---- m-tile 5 ----
+    @!%p105 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f20, %f7, %f5, %f20;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f21, %f8, %f6, %f21;
+
+    // ---- m-tile 6 ----
+    @!%p106 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f22, %f7, %f5, %f22;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f23, %f8, %f6, %f23;
+
+    // ---- m-tile 7 ----
+    @!%p107 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f24, %f7, %f5, %f24;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f25, %f8, %f6, %f25;
+
+    // ---- m-tile 8 ----
+    @!%p108 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f26, %f7, %f5, %f26;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f27, %f8, %f6, %f27;
+
+    // ---- m-tile 9 ----
+    @!%p109 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f28, %f7, %f5, %f28;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f29, %f8, %f6, %f29;
+
+    // ---- m-tile 10 ----
+    @!%p110 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f30, %f7, %f5, %f30;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f31, %f8, %f6, %f31;
+
+    // ---- m-tile 11 ----
+    @!%p111 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f32, %f7, %f5, %f32;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f33, %f8, %f6, %f33;
+
+    // ---- m-tile 12 ----
+    @!%p112 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f34, %f7, %f5, %f34;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f35, %f8, %f6, %f35;
+
+    // ---- m-tile 13 ----
+    @!%p113 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f36, %f7, %f5, %f36;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f37, %f8, %f6, %f37;
+
+    // ---- m-tile 14 ----
+    @!%p114 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f38, %f7, %f5, %f38;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f39, %f8, %f6, %f39;
+
+    // ---- m-tile 15 ----
+    @!%p115 bra MMA_KSYNC;
+    add.s32 %r35, %r35, 384;
+    add.s32 %r36, %r36, 32;
+    ld.shared.u32 %r24, [%r35];
+    ld.shared.u32 %r25, [%r35+16];
+    mov.u32 %r38, 0;
+    mov.u32 %r39, 0;
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r24}, {%r26}, {%r38, %r39};
+    mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32
+        {%r38, %r39}, {%r25}, {%r27}, {%r38, %r39};
+    ld.shared.f32 %f4, [%r36];
+    cvt.rn.f32.s32 %f7, %r38;
+    cvt.rn.f32.s32 %f8, %r39;
+    mul.rn.f32 %f5, %f2, %f4;
+    fma.rn.f32 %f40, %f7, %f5, %f40;
+    mul.rn.f32 %f6, %f3, %f4;
+    fma.rn.f32 %f41, %f8, %f6, %f41;
+
+MMA_KSYNC:
+    bar.sync 0;
+    // Rotate the double buffer: what was prefetched becomes current.
+    // Unconditional -- inactive warps and warps that left the tile chain
+    // early also land here, and neither ever reads the result. On the last
+    // k-block %pnext was false, so this moves stale values into %r26/%r27,
+    // which the loop exit then discards.
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    mov.f32 %f2, %wsc0n;
+    mov.f32 %f3, %wsc1n;
+    add.s64 %rd11, %rd11, 32;            // next K block (weight walker)
+    add.s64 %rd13, %rd13, 2;             // wsc nc0
+    add.s64 %rd14, %rd14, 2;             // wsc nc1
+    // staging pointers are rebuilt from kb (%r20) each pass, not advanced.
+    add.s32 %r20, %r20, 1;
+    bra MMA_KLOOP;
+
+MMA_WRITE:
+    @!%p11 bra MMA_DONE;
+    mov.u32 %r30, %r12;                  // t = groupID (m-tile 0)
+
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f10, %f11};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f12, %f13};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f14, %f15};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f16, %f17};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f18, %f19};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f20, %f21};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f22, %f23};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f24, %f25};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f26, %f27};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f28, %f29};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f30, %f31};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f32, %f33};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f34, %f35};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f36, %f37};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f38, %f39};
+    add.s32 %r30, %r30, 8;
+    setp.ge.u32 %p10, %r30, %r3;
+    @%p10 bra MMA_WDONE;
+    mad.lo.s32 %r31, %r30, %r1, %r18;
+    mul.wide.u32 %rd32, %r31, 4;
+    add.s64 %rd32, %rd10, %rd32;
+    st.global.v2.f32 [%rd32], {%f40, %f41};
+MMA_WDONE:
 MMA_DONE:
     ret;
 }
@@ -473,7 +1706,7 @@ MMA_DONE:
 // reused across up to 256 rows, so a 512-token chunk re-streams weights
 // twice instead of eight times. Contract: out%8==0, in%32==0, ntok<=256,
 // x_qs/x_scales allocated to round8(ntok). GENERATED (emit_r256.py) so the
-// 32-fold unroll is provably regular. Registers ~92, smem 9216 B -> ~2
+// 32-fold unroll is provably regular. Registers ~92, smem 13312 B -> ~2
 // blocks/SM (~50% occupancy); the bench [gemm-phaseb] A/B decides whether
 // this net-beats the 8-tile kernel on the BW-bound FFN GEMMs.
 // ---------------------------------------------------------------------------
@@ -493,7 +1726,13 @@ MMA_DONE:
     .reg .b32 %r<48>;
     .reg .f32 %f<80>;
     .reg .b64 %rd<44>;
-    .shared .align 16 .b8 sm_a[8192];    // 256 token rows x 32 K bytes
+    // Prefetch half of the B double-buffer. The CURRENT block stays in
+    // %r26/%r27/%f2/%f3 so the 32 m-tile bodies below are untouched; these
+    // hold the NEXT block until the swap at MMA_KSYNC.
+    .reg .b32 %bfrag0n, %bfrag1n;
+    .reg .f32 %wsc0n, %wsc1n;
+    .reg .pred %pnext;
+    .shared .align 16 .b8 sm_a[12288];   // 256 token rows x 48 B padded pitch
     .shared .align 4 .b8 sm_xs[1024];    // 256 f32 activation scales
 
     ld.param.u64 %rd1, [p_wqs];
@@ -559,14 +1798,30 @@ MMA_DONE:
     // that is rows 0..63 per pass; r256 needs 256 rows, so the k-loop
     // staging runs FOUR passes (row += 64) to cover 0..255. Here we set
     // up the pass-0 pointers; the per-pass loop lives in MMA_KLOOP.
-    shr.u32 %r25, %r4, 2;                // stage row0 = tid / 4
+    shr.u32 %r46, %r4, 2;                // stage row0 = tid / 4
     and.b32 %r45, %r4, 3;
     shl.b32 %r45, %r45, 3;               // stage byte offset = (tid%4)*8
-    // NB: staging byte offset lives in %r45, NOT %r27 ? the weight
-    // fragment load (ld.global.u32 %r27) clobbers %r27 every k-block, and
-    // this offset is read INSIDE the k-loop (4-pass staging), so a shared
-    // register corrupts all staging after the first block.
-    // (per-k-block base pointers rebuilt each pass from %r25 in the loop)
+    // NB: BOTH loop-carried staging values live in registers the m-tile
+    // bodies never touch - the byte offset in %r45 and the row in %r46.
+    //
+    // The hazard: this kernel stages in FOUR passes per k-block, so both
+    // values are read INSIDE the k-loop, while the 32 m-tiles below use
+    // %r24..%r27 and %r38/%r39 as scratch every single tile. Any staging
+    // value parked in one of those is destroyed by the first m-tile and every
+    // k-block after the first stages from garbage.
+    //
+    // The offset was moved to %r45 for exactly this reason. The row was NOT,
+    // and sat in %r25 - which `ld.shared.u32 %r25, [%r35+16]` overwrites 32
+    // times per k-block. With in_dim=64 (nb=2) that made k-block 0 correct and
+    // k-block 1 read rows derived from an A-fragment, which is what the parity
+    // failure `gpu 1.5951226 vs cpu 2.4754333` at ntok=5 was, and the most
+    // likely source of the CUDA_ERROR_MISALIGNED_ADDRESS seen when this kernel
+    // was wired into the engine: a garbage row index becomes a global address.
+    //
+    // The 8-tile kernel does not have this bug because it stages in ONE pass
+    // and consumes %r25 into its pointers in the prologue, never re-reading it
+    // in the loop.
+    // (per-k-block base pointers rebuilt each pass from %r46 in the loop)
     mov.u32 %r29, sm_a;
     // xsc staging base: thread tid handles scale row (tid & 255) but with
     // 256 threads and up to 256 rows that is one row/thread ? a single
@@ -575,9 +1830,9 @@ MMA_DONE:
     mov.u32 %r32, sm_xs;
 
     // Per-warp shared READ bases: fragment of row (m*8 + groupID).
-    shl.b32 %r33, %r12, 5;               // groupID * 32
+    mul.lo.u32 %r33, %r12, 48;            // groupID * 48
     add.s32 %r33, %r33, %r16;            // + tig*4
-    add.s32 %r33, %r29, %r33;            // smem A read addr (m stride 256)
+    add.s32 %r33, %r29, %r33;            // smem A read addr (m stride 384)
     shl.b32 %r34, %r12, 2;
     add.s32 %r34, %r32, %r34;            // smem xsc read addr (m stride 32)
 
@@ -650,6 +1905,36 @@ MMA_DONE:
 
     mov.u32 %r20, 0;                     // kb (K block index)
 
+    // ---- Software pipelining: prime the B fragment for kb = 0 ----
+    //
+    // sm_75 has no cp.async (Ampere+), so the only way to overlap a global
+    // load with tensor-core work is to issue it a full k-block early. The
+    // weight fragment and its two scales are the only global reads left in
+    // the hot path -- the A slice is in shared memory by the time any
+    // mma.sync runs -- and they are read once per k-block and reused by all
+    // 32 m-tiles, which makes them exactly the right thing to prefetch.
+    //
+    // The pattern is: prime kb=0 here, then each iteration issues kb+1 before
+    // running kb's tiles, and swaps at MMA_KSYNC.
+    //
+    // Zeroed unconditionally first: warps with no output rows branch straight
+    // to MMA_KSYNC and still execute the swap, so the prefetch registers must
+    // not be read while uninitialized even though the values go nowhere.
+    mov.b32 %bfrag0n, 0;
+    mov.b32 %bfrag1n, 0;
+    mov.f32 %wsc0n, 0f00000000;
+    mov.f32 %wsc1n, 0f00000000;
+    // nb == 0 means the k-loop falls straight through to MMA_WRITE; these
+    // addresses would be out of range.
+    setp.gt.u32 %pnext, %r14, 0;
+    @!%pnext bra MMA_KLOOP;
+    @%p11 ld.global.u32 %r26, [%rd11];
+    @%p11 ld.global.u32 %r27, [%rd11+16];
+    @%p11 ld.global.u16 %h1, [%rd13];
+    @%p11 cvt.f32.f16 %f2, %h1;
+    @%p11 ld.global.u16 %h2, [%rd14];
+    @%p11 cvt.f32.f16 %f3, %h2;
+
 MMA_KLOOP:
     setp.ge.u32 %p9, %r20, %r14;
     @%p9 bra MMA_WRITE;
@@ -659,7 +1944,7 @@ MMA_KLOOP:
     mul.lo.s32 %r40, %r20, 32;          // kb * 32 (qs bytes/block/row-elem)
     shl.b32 %r41, %r20, 2;              // kb * 4 (xsc f32/block)
     // A-slice pass 0: rows 0..63 (row = tid/4 + 0).
-    add.s32 %r42, %r25, 0;      // this pass's row
+    add.s32 %r42, %r46, 0;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A0;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -669,13 +1954,13 @@ MMA_KLOOP:
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
-    shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
     add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A0:
     // A-slice pass 1: rows 64..127 (row = tid/4 + 64).
-    add.s32 %r42, %r25, 64;      // this pass's row
+    add.s32 %r42, %r46, 64;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A1;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -685,13 +1970,13 @@ MMA_STAGE_A0:
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
-    shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
     add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A1:
     // A-slice pass 2: rows 128..191 (row = tid/4 + 128).
-    add.s32 %r42, %r25, 128;      // this pass's row
+    add.s32 %r42, %r46, 128;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A2;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -701,13 +1986,13 @@ MMA_STAGE_A1:
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
-    shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
     add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
 MMA_STAGE_A2:
     // A-slice pass 3: rows 192..255 (row = tid/4 + 192).
-    add.s32 %r42, %r25, 192;      // this pass's row
+    add.s32 %r42, %r46, 192;      // this pass's row
     setp.lt.u32 %p13, %r42, %r22;       // row < ntok_pad8
     @!%p13 bra MMA_STAGE_A3;
     mul.wide.u32 %rd20, %r42, %r2;      // row * in (qs bytes/row)
@@ -717,7 +2002,7 @@ MMA_STAGE_A2:
     mul.wide.u32 %rd23, %r40, 1;        // + kb*32
     add.s64 %rd20, %rd20, %rd23;
     ld.global.u64 %rd24, [%rd20];
-    shl.b32 %r43, %r42, 5;              // row * 32 (shared row stride)
+    mul.lo.u32 %r43, %r42, 48;           // row * 48 (shared row stride)
     add.s32 %r43, %r43, %r45;           // + byte offset
     add.s32 %r43, %r29, %r43;
     st.shared.u64 [%r43], %rd24;
@@ -739,13 +2024,27 @@ MMA_STAGE_BAR:
 
     @!%p11 bra MMA_KSYNC;
 
-    // Weight fragment + scales: loaded ONCE, reused by every m-tile below.
-    ld.global.u32 %r26, [%rd11];         // B half 0 (k 0..15)
-    ld.global.u32 %r27, [%rd11+16];      // B half 1 (k 16..31)
-    ld.global.u16 %h1, [%rd13];
-    cvt.f32.f16 %f2, %h1;                // wsc[nc0][kb]
-    ld.global.u16 %h2, [%rd14];
-    cvt.f32.f16 %f3, %h2;                // wsc[nc1][kb]
+    // ---- Prefetch the NEXT k-block's B fragment and scales ----
+    //
+    // Issued BEFORE the 32 m-tiles, so the ~200 cycle global latency is in
+    // flight while the tensor cores consume the CURRENT block already sitting
+    // in %r26/%r27/%f2/%f3.
+    //
+    // %rd11/%rd13/%rd14 still address the CURRENT block here -- MMA_KSYNC
+    // advances them after the tiles -- so kb+1 is at +32 (B half 0), +48
+    // (B half 1, i.e. +32+16) and +2 (the next f16 scale).
+    //
+    // One predicate, not two: PTX allows a single guard per instruction, and
+    // this block already sits behind `@!%p11 bra MMA_KSYNC`, so every warp
+    // reaching it is active.
+    add.s32 %r47, %r20, 1;
+    setp.lt.u32 %pnext, %r47, %r14;      // kb+1 < nb
+    @%pnext ld.global.u32 %bfrag0n, [%rd11+32];
+    @%pnext ld.global.u32 %bfrag1n, [%rd11+48];
+    @%pnext ld.global.u16 %h1, [%rd13+2];
+    @%pnext cvt.f32.f16 %wsc0n, %h1;
+    @%pnext ld.global.u16 %h2, [%rd14+2];
+    @%pnext cvt.f32.f16 %wsc1n, %h2;
 
     mov.u32 %r35, %r33;                  // A frag addr (reset to tile 0)
     mov.u32 %r36, %r34;                  // xsc addr
@@ -770,7 +2069,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 1 ----
     @!%p101 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -790,7 +2089,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 2 ----
     @!%p102 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -810,7 +2109,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 3 ----
     @!%p103 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -830,7 +2129,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 4 ----
     @!%p104 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -850,7 +2149,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 5 ----
     @!%p105 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -870,7 +2169,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 6 ----
     @!%p106 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -890,7 +2189,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 7 ----
     @!%p107 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -910,7 +2209,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 8 ----
     @!%p108 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -930,7 +2229,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 9 ----
     @!%p109 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -950,7 +2249,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 10 ----
     @!%p110 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -970,7 +2269,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 11 ----
     @!%p111 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -990,7 +2289,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 12 ----
     @!%p112 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1010,7 +2309,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 13 ----
     @!%p113 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1030,7 +2329,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 14 ----
     @!%p114 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1050,7 +2349,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 15 ----
     @!%p115 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1070,7 +2369,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 16 ----
     @!%p116 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1090,7 +2389,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 17 ----
     @!%p117 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1110,7 +2409,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 18 ----
     @!%p118 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1130,7 +2429,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 19 ----
     @!%p119 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1150,7 +2449,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 20 ----
     @!%p120 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1170,7 +2469,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 21 ----
     @!%p121 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1190,7 +2489,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 22 ----
     @!%p122 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1210,7 +2509,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 23 ----
     @!%p123 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1230,7 +2529,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 24 ----
     @!%p124 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1250,7 +2549,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 25 ----
     @!%p125 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1270,7 +2569,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 26 ----
     @!%p126 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1290,7 +2589,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 27 ----
     @!%p127 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1310,7 +2609,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 28 ----
     @!%p128 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1330,7 +2629,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 29 ----
     @!%p129 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1350,7 +2649,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 30 ----
     @!%p130 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1370,7 +2669,7 @@ MMA_STAGE_BAR:
 
     // ---- m-tile 31 ----
     @!%p131 bra MMA_KSYNC;
-    add.s32 %r35, %r35, 256;
+    add.s32 %r35, %r35, 384;
     add.s32 %r36, %r36, 32;
     ld.shared.u32 %r24, [%r35];
     ld.shared.u32 %r25, [%r35+16];
@@ -1390,6 +2689,15 @@ MMA_STAGE_BAR:
 
 MMA_KSYNC:
     bar.sync 0;
+    // Rotate the double buffer: what was prefetched becomes current.
+    // Unconditional -- inactive warps and warps that left the tile chain
+    // early also land here, and neither ever reads the result. On the last
+    // k-block %pnext was false, so this moves stale values into %r26/%r27,
+    // which the loop exit then discards.
+    mov.b32 %r26, %bfrag0n;
+    mov.b32 %r27, %bfrag1n;
+    mov.f32 %f2, %wsc0n;
+    mov.f32 %f3, %wsc1n;
     add.s64 %rd11, %rd11, 32;            // next K block (weight walker)
     add.s64 %rd13, %rd13, 2;             // wsc nc0
     add.s64 %rd14, %rd14, 2;             // wsc nc1
@@ -1406,256 +2714,224 @@ MMA_WRITE:
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f10;
-    st.global.f32 [%rd32+4], %f11;
+    st.global.v2.f32 [%rd32], {%f10, %f11};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f12;
-    st.global.f32 [%rd32+4], %f13;
+    st.global.v2.f32 [%rd32], {%f12, %f13};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f14;
-    st.global.f32 [%rd32+4], %f15;
+    st.global.v2.f32 [%rd32], {%f14, %f15};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f16;
-    st.global.f32 [%rd32+4], %f17;
+    st.global.v2.f32 [%rd32], {%f16, %f17};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f18;
-    st.global.f32 [%rd32+4], %f19;
+    st.global.v2.f32 [%rd32], {%f18, %f19};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f20;
-    st.global.f32 [%rd32+4], %f21;
+    st.global.v2.f32 [%rd32], {%f20, %f21};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f22;
-    st.global.f32 [%rd32+4], %f23;
+    st.global.v2.f32 [%rd32], {%f22, %f23};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f24;
-    st.global.f32 [%rd32+4], %f25;
+    st.global.v2.f32 [%rd32], {%f24, %f25};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f26;
-    st.global.f32 [%rd32+4], %f27;
+    st.global.v2.f32 [%rd32], {%f26, %f27};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f28;
-    st.global.f32 [%rd32+4], %f29;
+    st.global.v2.f32 [%rd32], {%f28, %f29};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f30;
-    st.global.f32 [%rd32+4], %f31;
+    st.global.v2.f32 [%rd32], {%f30, %f31};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f32;
-    st.global.f32 [%rd32+4], %f33;
+    st.global.v2.f32 [%rd32], {%f32, %f33};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f34;
-    st.global.f32 [%rd32+4], %f35;
+    st.global.v2.f32 [%rd32], {%f34, %f35};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f36;
-    st.global.f32 [%rd32+4], %f37;
+    st.global.v2.f32 [%rd32], {%f36, %f37};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f38;
-    st.global.f32 [%rd32+4], %f39;
+    st.global.v2.f32 [%rd32], {%f38, %f39};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f40;
-    st.global.f32 [%rd32+4], %f41;
+    st.global.v2.f32 [%rd32], {%f40, %f41};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f42;
-    st.global.f32 [%rd32+4], %f43;
+    st.global.v2.f32 [%rd32], {%f42, %f43};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f44;
-    st.global.f32 [%rd32+4], %f45;
+    st.global.v2.f32 [%rd32], {%f44, %f45};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f46;
-    st.global.f32 [%rd32+4], %f47;
+    st.global.v2.f32 [%rd32], {%f46, %f47};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f48;
-    st.global.f32 [%rd32+4], %f49;
+    st.global.v2.f32 [%rd32], {%f48, %f49};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f50;
-    st.global.f32 [%rd32+4], %f51;
+    st.global.v2.f32 [%rd32], {%f50, %f51};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f52;
-    st.global.f32 [%rd32+4], %f53;
+    st.global.v2.f32 [%rd32], {%f52, %f53};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f54;
-    st.global.f32 [%rd32+4], %f55;
+    st.global.v2.f32 [%rd32], {%f54, %f55};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f56;
-    st.global.f32 [%rd32+4], %f57;
+    st.global.v2.f32 [%rd32], {%f56, %f57};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f58;
-    st.global.f32 [%rd32+4], %f59;
+    st.global.v2.f32 [%rd32], {%f58, %f59};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f60;
-    st.global.f32 [%rd32+4], %f61;
+    st.global.v2.f32 [%rd32], {%f60, %f61};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f62;
-    st.global.f32 [%rd32+4], %f63;
+    st.global.v2.f32 [%rd32], {%f62, %f63};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f64;
-    st.global.f32 [%rd32+4], %f65;
+    st.global.v2.f32 [%rd32], {%f64, %f65};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f66;
-    st.global.f32 [%rd32+4], %f67;
+    st.global.v2.f32 [%rd32], {%f66, %f67};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f68;
-    st.global.f32 [%rd32+4], %f69;
+    st.global.v2.f32 [%rd32], {%f68, %f69};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f70;
-    st.global.f32 [%rd32+4], %f71;
+    st.global.v2.f32 [%rd32], {%f70, %f71};
     add.s32 %r30, %r30, 8;
     setp.ge.u32 %p10, %r30, %r3;
     @%p10 bra MMA_WDONE;
     mad.lo.s32 %r31, %r30, %r1, %r18;
     mul.wide.u32 %rd32, %r31, 4;
     add.s64 %rd32, %rd10, %rd32;
-    st.global.f32 [%rd32], %f72;
-    st.global.f32 [%rd32+4], %f73;
+    st.global.v2.f32 [%rd32], {%f72, %f73};
 MMA_WDONE:
 MMA_DONE:
     ret;

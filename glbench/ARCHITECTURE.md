@@ -60,7 +60,7 @@ glbench/
 │   │                         math is UNGATED (`&[f32] -> VLBitProfile`); its
 │   │                         sources are gated per source (v3 D-11)
 │   ├── training/           — training observation, all behind `train-bench`
-│   │                         so a default build never compiles stumman (D-02)
+│   │                         so a default build never compiles gltrain (D-02)
 │   ├── export/             — hand-rolled JSON / Markdown / CSV writers
 │   ├── render/             — terminal text + tables + ASCII flame graph +
 │   │                         ASCII loss curve (ungated, plots (step, loss))
@@ -168,17 +168,17 @@ done as part of this document, flagged for whoever picks it up.
 |---|---|---|
 | *(default)* | `glcore`, `glproc`, `glcuda` | everything except the two below |
 | `gllm-bench` | `glictus-caliburni` (`glproc-backend`, `converter`) | `ppl`, `kl-div`, `tensor-stats`, `--bit-scope weights` |
-| `train-bench` | `stumman` | `glbench train`, `glbench unified`, `--bit-scope gradients\|optimizer` |
+| `train-bench` | `gltrain` | `glbench train`, `glbench unified`, `--bit-scope gradients\|optimizer` |
 
 Both are optional for the same reason: a default `cargo build --workspace`
 must not compile them. Verified rather than assumed — building the workspace
-with no features compiles `stumman` **zero times**.
+with no features compiles `gltrain` **zero times**.
 
-`train-bench` needs one thing the design did not anticipate: `stumman` declares
+`train-bench` needs one thing the design did not anticipate: `gltrain` declares
 its own `[workspace]`, so it must also appear in the **root** `Cargo.toml`
 `exclude` list or cargo refuses the path dependency with "multiple workspace
 roots found in the same workspace". Both isolation properties still hold after
-that change — the default build ignores stumman, and `cd stumman && cargo test`
+that change — the default build ignores gltrain, and `cd gltrain && cargo test`
 still works standalone.
 
 ## The v3 envelope (schema v2)

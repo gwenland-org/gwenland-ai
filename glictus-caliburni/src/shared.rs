@@ -2,7 +2,7 @@
 //!
 //! `GLLMShared.gllm` holds the tensors every layer depends on: token
 //! embeddings, final norm, output head, and the RoPE tables. ARTX02 scope
-//! is structural validation only â€” header + optional checksum â€” actual
+//! is structural validation only — header + optional checksum — actual
 //! tensor loading is ARTX04+.
 
 use std::path::{Path, PathBuf};
@@ -38,8 +38,8 @@ pub struct SharedComponents {
 }
 
 impl SharedComponents {
-    /// Open `GLLMShared.gllm`, validate its header, and â€” when
-    /// `expected_checksum` is given â€” verify the whole file's SHA-256
+    /// Open `GLLMShared.gllm`, validate its header, and — when
+    /// `expected_checksum` is given — verify the whole file's SHA-256
     /// against it before trusting the contents.
     pub fn open(path: &Path, expected_checksum: Option<&str>) -> Result<Self, GllmError> {
         let unit = ExecutionUnit::open(path)?;

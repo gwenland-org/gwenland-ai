@@ -1,6 +1,6 @@
 //! Gate 4: a real LoRA training run archives as a valid v2 session.
 //!
-//! Everything here runs actual training on stumman — no fixtures, no mocks. The
+//! Everything here runs actual training on gltrain — no fixtures, no mocks. The
 //! claim being tested is the one Gate 4 makes: that a run produces an archive
 //! which passes the D-10 null-semantics check in **strict** mode, with every
 //! field M2 cannot fill carrying an honest status rather than a zero.
@@ -60,7 +60,7 @@ fn a_real_training_run_writes_an_archive_that_passes_strict_d10() {
     make_writable(&path);
 }
 
-/// F-05: the fields stumman M2 cannot fill must be present, null, and
+/// F-05: the fields gltrain M2 cannot fill must be present, null, and
 /// explained — not omitted, and never zero.
 #[test]
 fn fields_with_no_subject_at_m2_carry_an_honest_status() {
