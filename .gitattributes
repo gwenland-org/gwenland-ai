@@ -15,3 +15,6 @@ notebooks/glcuda_t4_wave22_fused_swiglu.ipynb binary
 
 # Wave 23 records the rejected K128 B-stage GEMM experiment byte-for-byte.
 notebooks/glcuda_t4_wave23_k128_gemm.ipynb binary
+
+# Wave 24 records the rejected independent-MMA-chain experiment byte-for-byte.
+notebooks/glcuda_t4_wave24_mma2_gemm.ipynb binary
