@@ -6,3 +6,6 @@
 
 # Wave 20's notebook is byte-for-byte benchmark evidence from Kaggle v2/v3.
 notebooks/glcuda_t4_wave20_production.ipynb binary
+
+# Wave 21 records the compile-rejected fused-SwiGLU experiment byte-for-byte.
+notebooks/glcuda_t4_wave21_fused_swiglu.ipynb binary
