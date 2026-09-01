@@ -18,3 +18,6 @@ notebooks/glcuda_t4_wave23_k128_gemm.ipynb binary
 
 # Wave 24 records the rejected independent-MMA-chain experiment byte-for-byte.
 notebooks/glcuda_t4_wave24_mma2_gemm.ipynb binary
+
+# Wave 25 records the 16-byte cooperative-stage GEMM experiment byte-for-byte.
+notebooks/glcuda_t4_wave25_v16_stage.ipynb binary
