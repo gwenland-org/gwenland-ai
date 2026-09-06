@@ -21,6 +21,11 @@ pub const PTX: &str = include_str!("glcuda.ptx");
 /// `.target` — loaded only when the device reports sm_75+.
 pub const PTX_SM75: &str = include_str!("glcuda_sm75.ptx");
 
+/// Wave 59's isolated narrow-grid candidate. Keeping this in a separate
+/// module means the retained sm_75 image and its default JIT cost do not
+/// change unless the experiment is explicitly enabled.
+pub const PTX_SM75_WAVE59: &str = include_str!("glcuda_sm75_wave59.ptx");
+
 /// Threads per block for element-wise and one-block-reduction kernels.
 const BLOCK: u32 = 256;
 /// Warp size — grid geometry for the one-warp-per-row GEMV.
@@ -155,6 +160,12 @@ struct MmaModule {
     attn_mma4_regq: Kernel,
 }
 
+/// Wave 59 is deliberately isolated from the retained tensor-core module.
+struct Wave59Module {
+    _module: Module,
+    n32_m32: Kernel,
+}
+
 /// One loaded module plus resolved handles for every kernel. Handles stay
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
@@ -168,6 +179,8 @@ pub struct KernelSet {
     /// (256 rows/weight-read); the bench A/B picks which design net-wins on the
     /// bandwidth-bound FFN GEMMs.
     mma: Option<MmaModule>,
+    /// Opt-in Wave 59 N32 x M32 narrow-grid candidate.
+    wave59: Option<Wave59Module>,
     /// Whether prefill should drive the r256 (256-row) GEMM instead of the
     /// 64-row one. Read once at load from `GLCUDA_R256`; see
     /// [`KernelSet::r256_enabled`].
@@ -186,6 +199,8 @@ pub struct KernelSet {
     bstage: bool,
     /// Wave 27: reuse each A fragment across an N16 per-warp output tile.
     gemm_n16: bool,
+    /// Whether narrow N16/M32 launches should use Wave 59's N32/M32 entry.
+    gemm_n32: bool,
     /// Wave 15A is retained and default; this forces the row kernel back,
     /// which is what an A/B against it needs.
     rows_forced: bool,
@@ -320,6 +335,18 @@ impl KernelSet {
         let bstage = mma.is_some() && std::env::var_os("GLCUDA_BSTAGE").is_some();
         let gemm_n16 =
             mma.is_some() && grid2d && bstage && std::env::var_os("GLCUDA_GEMM_N16").is_some();
+        let gemm_n32 = gemm_n16 && std::env::var_os("GLCUDA_GEMM_N32").is_some();
+        let wave59 = if gemm_n32 {
+            let module = cuda.load_module(PTX_SM75_WAVE59)?;
+            let n32_m32 = module.get_function("gl_gemm_mma_q8_bstage_n32_m32")?;
+            eprintln!("[glcuda] Wave 59 N32/M32 narrow-grid GEMM enabled");
+            Some(Wave59Module {
+                _module: module,
+                n32_m32,
+            })
+        } else {
+            None
+        };
         let rows_forced = std::env::var_os("GLCUDA_ATTN_ROWS").is_some();
         let mma4_attention = mma.is_some() && std::env::var_os("GLCUDA_ATTN_MMA4").is_some();
         let mma4_regq_attention =
@@ -330,12 +357,13 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{}}}",
-            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{}}}",
+            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
             mma,
+            wave59,
             r256,
             grid2d,
             fuse_q8_glue,
@@ -343,6 +371,7 @@ impl KernelSet {
             ntile128,
             bstage,
             gemm_n16,
+            gemm_n32,
             rows_forced,
             gqa7_chains,
             mma4_attention,
@@ -1556,6 +1585,11 @@ impl KernelSet {
         self.gemm_n16
     }
 
+    /// True when Wave 59 should replace only the retained narrow-grid arm.
+    pub fn gemm_n32_enabled(&self) -> bool {
+        self.gemm_n32
+    }
+
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
     pub fn wave27_n16_resource_kernel(&self) -> Option<Kernel> {
         self.mma.as_ref().map(|module| module.bstage_n16)
@@ -1564,6 +1598,11 @@ impl KernelSet {
     /// The Wave 27 narrow-grid M32 entry used by the driver's occupancy query.
     pub fn wave27_n16_m32_resource_kernel(&self) -> Option<Kernel> {
         self.mma.as_ref().map(|module| module.bstage_n16_m32)
+    }
+
+    /// Wave 59 entry used by the direct resource and occupancy gate.
+    pub fn wave59_n32_m32_resource_kernel(&self) -> Option<Kernel> {
+        self.wave59.as_ref().map(|module| module.n32_m32)
     }
 
     /// Whether this launch uses the narrow-grid M32 entry.
@@ -1901,6 +1940,52 @@ impl KernelSet {
             *f,
             (ceil_div(out_dim, n_tile), ceil_div(ntok, 64), 1),
             (threads, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 59 N32 x M32 narrow-grid candidate. One 128-thread CTA covers
+    /// exactly the same 4096 output elements as the retained N16/M32 CTA,
+    /// while four warps reuse each activation fragment across four N8 tiles.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8_bstage_n32_m32(
+        &self,
+        cuda: &Cuda,
+        tiled_w_qs: CUdeviceptr,
+        tiled_w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert!(self.gemm_n32, "N32 launch requires GLCUDA_GEMM_N32");
+        debug_assert_eq!(out_dim % 8, 0);
+        debug_assert_eq!(in_dim % 32, 0);
+        let f = self
+            .wave59
+            .as_ref()
+            .map(|module| module.n32_m32)
+            .ok_or_else(|| GlError::Engine("N32 GEMM called without Wave 59 module".into()))?;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) =
+            (tiled_w_qs, tiled_w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            f,
+            (ceil_div(out_dim, 128), ceil_div(ntok, 32), 1),
+            (128, 1, 1),
             0,
             &mut params,
         )
@@ -2923,6 +3008,64 @@ mod tests {
                 line.1
             );
         }
+    }
+
+    #[test]
+    fn wave59_n32_ptx_keeps_the_isolated_tile_contract() {
+        assert!(PTX_SM75_WAVE59.starts_with(".version 6.5\n.target sm_75\n"));
+        assert!(PTX_SM75_WAVE59.contains(".visible .entry gl_gemm_mma_q8_bstage_n32_m32("));
+        assert_eq!(
+            PTX_SM75_WAVE59.matches('{').count(),
+            PTX_SM75_WAVE59.matches('}').count()
+        );
+        assert_eq!(
+            PTX_SM75_WAVE59
+                .matches("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32")
+                .count(),
+            32
+        );
+        assert_eq!(
+            PTX_SM75_WAVE59
+                .matches("ldmatrix.sync.aligned.x2.m8n8.shared.b16")
+                .count(),
+            4
+        );
+        assert_eq!(
+            PTX_SM75_WAVE59
+                .matches("ldmatrix.sync.aligned.x4.m8n8.shared.b16")
+                .count(),
+            2
+        );
+        assert_eq!(PTX_SM75_WAVE59.matches("bar.sync 0;").count(), 2);
+        assert_eq!(PTX_SM75_WAVE59.matches("st.global.v2.f32").count(), 16);
+        assert_eq!(PTX_SM75_WAVE59.matches("st.shared.u64").count(), 5);
+        assert!(PTX_SM75_WAVE59.contains("sm_a[1536]"));
+        assert!(PTX_SM75_WAVE59.contains("sm_xs[128]"));
+        assert!(PTX_SM75_WAVE59.contains("sm_b[6144]"));
+        assert!(PTX_SM75_WAVE59.contains("sm_bs[256]"));
+        assert!(PTX_SM75_WAVE59.contains(".maxnreg 80"));
+        assert!(PTX_SM75_WAVE59.contains("add.s64 %rd14, %rd14, 4096"));
+        assert!(PTX_SM75_WAVE59.contains("add.s64 %rd18, %rd18, 256"));
+        assert!(!PTX_SM75_WAVE59.contains("wmma."));
+        assert!(!PTX_SM75_WAVE59.contains('\0'));
+        assert!(
+            !PTX_SM75_WAVE59.contains('\r'),
+            "CRLF would be rejected by ptxas"
+        );
+        if let Some(line) = PTX_SM75_WAVE59
+            .lines()
+            .enumerate()
+            .find(|(_, line)| !line.is_ascii())
+        {
+            panic!(
+                "Wave 59 PTX line {} contains non-ASCII: {:?}",
+                line.0 + 1,
+                line.1
+            );
+        }
+        // Retained narrow CTA: N64 x M64 at 256 threads. Candidate CTA:
+        // N128 x M32 at 128 threads. Only the work decomposition changes.
+        assert_eq!(64 * 64, 128 * 32);
     }
 
     #[test]

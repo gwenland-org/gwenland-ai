@@ -366,6 +366,26 @@ fn gemm_rows(
                         let tiled_qs = tiled.qs.dptr + qs_offset;
                         let tiled_scales = tiled.scales.dptr + scale_offset;
                         if k.gemm_n16_enabled() && n16_bstage_shape(rows, inb) {
+                            if k.gemm_n32_enabled() && k.gemm_n16_uses_m32(rows, n) {
+                                static N32_M32_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                                N32_M32_ANNOUNCED.call_once(|| {
+                                    eprintln!(
+                                        "[glcuda-gemm] {{\"path\":\"bstage-n32-m32\",\"out_dim\":{},\"in_dim\":{},\"ntok\":{}}}",
+                                        rows, inb, n
+                                    );
+                                });
+                                return k.gemm_mma_q8_bstage_n32_m32(
+                                    cuda,
+                                    tiled_qs,
+                                    tiled_scales,
+                                    x_qs,
+                                    x_scales,
+                                    y,
+                                    rows,
+                                    inb,
+                                    n,
+                                );
+                            }
                             if k.gemm_n16_uses_m32(rows, n) {
                                 static N16_M32_ANNOUNCED: std::sync::Once = std::sync::Once::new();
                                 N16_M32_ANNOUNCED.call_once(|| {
