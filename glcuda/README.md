@@ -37,11 +37,18 @@ GLCUDA_ATTN_MMA4_REGQ=1
 ```
 
 See the [Wave 50 production report](../architecture/glcuda-research/wave50-register-q-production-result.md)
-for the controlled protocol and raw evidence. In the pinned same-T4 Wave 55
-head-to-head, GwenLand measured **11,454.9 prefill tok/s** versus llama.cpp's
-**10,640.4 tok/s**, a 7.65% (+814.5 tok/s) lead across six position-balanced
-pairs. The effective ChatML prompt was 244/244 token-ID exact and every GwenLand
-session passed its 50/50 oracle. See the
+for the controlled protocol and raw evidence. A longer Wave 56 confirmation
+ran ten near-position-balanced repetitions (30 production sessions): the
+baseline median was 9,997.3 tok/s and the retained stack reached 11,173.1
+tok/s, a **+1,175.8 tok/s (+11.76%)** gain. All ten paired gains exceeded
++1,000 tok/s; the worst was +1,018.8 tok/s, and all 30 sessions passed their
+50/50 oracle. See the [ten-repeat report](../architecture/glcuda-research/wave56-ten-repeat-reproducibility.md)
+and [raw evidence](../benchmarks/glcuda-t4-wave56-repro10.json).
+
+In the pinned same-T4 Wave 55 head-to-head, GwenLand measured **11,454.9
+prefill tok/s** versus llama.cpp's **10,640.4 tok/s**, a 7.65% (+814.5 tok/s)
+lead across six position-balanced pairs. The effective ChatML prompt was
+244/244 token-ID exact and every GwenLand session passed its 50/50 oracle. See the
 [Wave 55 comparison](../architecture/glcuda-research/wave55-llamacpp-head-to-head.md)
 and [compact raw evidence](../benchmarks/glcuda-t4-wave55-h2h.json). llama.cpp
 uses its native Q4_K path while GwenLand repacks to Q8_0, so this is a matched
