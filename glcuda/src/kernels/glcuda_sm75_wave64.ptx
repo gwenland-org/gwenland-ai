@@ -1,0 +1,297 @@
+.version 7.0
+.target sm_75
+.address_size 64
+
+// Wave 64 diagnostic only. These entries are not loaded by KernelSet.
+//
+// Input probabilities are packed [heads, ntok, capacity] with causal-tail
+// zeros. The retained entry reads row-major V [heads, capacity, 64]. The
+// candidate reads its load-time/write-time transpose [heads, 64, capacity].
+// Both write packed f32 [heads, ntok, 64].
+//
+// Launch: grid (ceil(ntok/16), heads), block 128.
+// Candidate: one warp owns two adjacent N8 fragments of the 16x64 output.
+
+.visible .entry gl_wave64_av_scalar_f32(
+    .param .u64 p_prob,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u32 p_ntok,
+    .param .u32 p_capacity)
+{
+    .reg .pred %p<4>;
+    .reg .b32 %r<18>;
+    .reg .b64 %rd<16>;
+    .reg .f32 %f<5>;
+
+    ld.param.u64 %rd1, [p_prob];
+    ld.param.u64 %rd2, [p_v];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_ntok];
+    ld.param.u32 %r2, [p_capacity];
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r3, %ctaid.x;
+    shl.b32 %r3, %r3, 4;
+    mov.u32 %r4, %ctaid.y;
+    mov.u32 %r5, %tid.x;
+    mov.u32 %r6, %r5;
+
+W64_SCALAR_OUTPUT:
+    setp.ge.u32 %p1, %r6, 1024;
+    @%p1 bra W64_SCALAR_DONE;
+    shr.u32 %r7, %r6, 6;
+    and.b32 %r8, %r6, 63;
+    add.u32 %r9, %r3, %r7;
+    setp.ge.u32 %p2, %r9, %r1;
+    @%p2 bra W64_SCALAR_NEXT;
+
+    mul.lo.u32 %r10, %r4, %r1;
+    add.u32 %r10, %r10, %r9;
+    mul.lo.u32 %r10, %r10, %r2;
+    shl.b32 %r10, %r10, 2;
+    cvt.u64.u32 %rd7, %r10;
+    add.u64 %rd7, %rd4, %rd7;
+
+    mul.lo.u32 %r11, %r4, %r2;
+    shl.b32 %r11, %r11, 6;
+    add.u32 %r11, %r11, %r8;
+    shl.b32 %r11, %r11, 2;
+    cvt.u64.u32 %rd8, %r11;
+    add.u64 %rd8, %rd5, %rd8;
+
+    mov.f32 %f1, 0f00000000;
+    mov.u32 %r12, 0;
+W64_SCALAR_K:
+    setp.ge.u32 %p3, %r12, %r2;
+    @%p3 bra W64_SCALAR_STORE;
+    ld.global.f32 %f2, [%rd7];
+    ld.global.f32 %f3, [%rd8];
+    fma.rn.f32 %f1, %f2, %f3, %f1;
+    add.u64 %rd7, %rd7, 4;
+    add.u64 %rd8, %rd8, 256;
+    add.u32 %r12, %r12, 1;
+    bra W64_SCALAR_K;
+
+W64_SCALAR_STORE:
+    mul.lo.u32 %r13, %r4, %r1;
+    add.u32 %r13, %r13, %r9;
+    shl.b32 %r13, %r13, 6;
+    add.u32 %r13, %r13, %r8;
+    shl.b32 %r13, %r13, 2;
+    cvt.u64.u32 %rd9, %r13;
+    add.u64 %rd9, %rd6, %rd9;
+    st.global.f32 [%rd9], %f1;
+
+W64_SCALAR_NEXT:
+    add.u32 %r6, %r6, 128;
+    bra W64_SCALAR_OUTPUT;
+W64_SCALAR_DONE:
+    ret;
+}
+
+.visible .entry gl_wave64_av_mma4_f32(
+    .param .u64 p_prob,
+    .param .u64 p_vt,
+    .param .u64 p_out,
+    .param .u32 p_ntok,
+    .param .u32 p_capacity)
+{
+    .reg .pred %p<6>;
+    .reg .b16 %h<16>;
+    .reg .b32 %r<32>;
+    .reg .b32 %a_hi0, %a_hi1, %a_lo0, %a_lo1;
+    .reg .b32 %b0_hi, %b0_lo, %b1_hi, %b1_lo;
+    .reg .b64 %rd<20>;
+    .reg .f32 %f<20>;
+    .reg .f32 %c<8>;
+
+    ld.param.u64 %rd1, [p_prob];
+    ld.param.u64 %rd2, [p_vt];
+    ld.param.u64 %rd3, [p_out];
+    ld.param.u32 %r1, [p_ntok];
+    ld.param.u32 %r2, [p_capacity];
+    cvta.to.global.u64 %rd4, %rd1;
+    cvta.to.global.u64 %rd5, %rd2;
+    cvta.to.global.u64 %rd6, %rd3;
+
+    mov.u32 %r3, %tid.x;
+    shr.u32 %r4, %r3, 5;
+    and.b32 %r5, %r3, 31;
+    shr.u32 %r6, %r5, 2;
+    and.b32 %r7, %r5, 3;
+    mov.u32 %r8, %ctaid.x;
+    shl.b32 %r8, %r8, 4;
+    mov.u32 %r9, %ctaid.y;
+    shl.b32 %r10, %r4, 4;
+
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mov.f32 %c4, 0f00000000;
+    mov.f32 %c5, 0f00000000;
+    mov.f32 %c6, 0f00000000;
+    mov.f32 %c7, 0f00000000;
+    mov.u32 %r11, 0;
+
+W64_MMA_K:
+    setp.ge.u32 %p1, %r11, %r2;
+    @%p1 bra W64_MMA_STORE;
+    shl.b32 %r12, %r7, 1;
+    add.u32 %r12, %r12, %r11;
+
+    // A fragment: probability rows groupID and groupID+8, two K values.
+    add.u32 %r13, %r8, %r6;
+    mul.lo.u32 %r14, %r9, %r1;
+    add.u32 %r14, %r14, %r13;
+    mul.lo.u32 %r14, %r14, %r2;
+    add.u32 %r14, %r14, %r12;
+    shl.b32 %r14, %r14, 2;
+    cvt.u64.u32 %rd7, %r14;
+    add.u64 %rd7, %rd4, %rd7;
+    mov.f32 %f1, 0f00000000;
+    mov.f32 %f2, 0f00000000;
+    setp.lt.u32 %p2, %r12, %r2;
+    setp.lt.u32 %p3, %r13, %r1;
+    and.pred %p4, %p2, %p3;
+    @%p4 ld.global.f32 %f1, [%rd7];
+    add.u32 %r15, %r13, 8;
+    setp.lt.u32 %p3, %r15, %r1;
+    and.pred %p4, %p2, %p3;
+    @!%p4 bra W64_A_ROW8_ZERO;
+    mul.lo.u32 %r16, %r9, %r1;
+    add.u32 %r16, %r16, %r15;
+    mul.lo.u32 %r16, %r16, %r2;
+    add.u32 %r16, %r16, %r12;
+    shl.b32 %r16, %r16, 2;
+    cvt.u64.u32 %rd8, %r16;
+    add.u64 %rd8, %rd4, %rd8;
+    ld.global.f32 %f2, [%rd8];
+W64_A_ROW8_ZERO:
+    cvt.rn.f16.f32 %h0, %f1;
+    cvt.rn.f16.f32 %h1, %f2;
+    cvt.f32.f16 %f3, %h0;
+    cvt.f32.f16 %f4, %h1;
+    sub.rn.f32 %f5, %f1, %f3;
+    sub.rn.f32 %f6, %f2, %f4;
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    // Each register packs two adjacent K values for one row fragment. The
+    // second value is loaded explicitly to preserve the MMA lane contract.
+    add.u32 %r17, %r12, 1;
+    mov.f32 %f7, 0f00000000;
+    mov.f32 %f8, 0f00000000;
+    setp.lt.u32 %p2, %r17, %r2;
+    setp.lt.u32 %p3, %r13, %r1;
+    and.pred %p4, %p2, %p3;
+    @%p4 ld.global.f32 %f7, [%rd7+4];
+    setp.lt.u32 %p3, %r15, %r1;
+    and.pred %p4, %p2, %p3;
+    @%p4 ld.global.f32 %f8, [%rd8+4];
+    cvt.rn.f16.f32 %h4, %f7;
+    cvt.rn.f16.f32 %h5, %f8;
+    cvt.f32.f16 %f9, %h4;
+    cvt.f32.f16 %f10, %h5;
+    sub.rn.f32 %f11, %f7, %f9;
+    sub.rn.f32 %f12, %f8, %f10;
+    cvt.rn.f16.f32 %h6, %f11;
+    cvt.rn.f16.f32 %h7, %f12;
+    mov.b32 %a_hi0, {%h0, %h4};
+    mov.b32 %a_hi1, {%h1, %h5};
+    mov.b32 %a_lo0, {%h2, %h6};
+    mov.b32 %a_lo1, {%h3, %h7};
+
+    // B fragments: two adjacent N8 tiles owned by this warp. V is stored
+    // dimension-major, so each logical KxN operand is column-major.
+    add.u32 %r18, %r10, %r6;
+    mul.lo.u32 %r19, %r9, 64;
+    add.u32 %r19, %r19, %r18;
+    mul.lo.u32 %r19, %r19, %r2;
+    add.u32 %r19, %r19, %r12;
+    shl.b32 %r19, %r19, 2;
+    cvt.u64.u32 %rd9, %r19;
+    add.u64 %rd9, %rd5, %rd9;
+    ld.global.f32 %f13, [%rd9];
+    ld.global.f32 %f14, [%rd9+4];
+    cvt.rn.f16.f32 %h8, %f13;
+    cvt.rn.f16.f32 %h9, %f14;
+    cvt.f32.f16 %f15, %h8;
+    cvt.f32.f16 %f16, %h9;
+    sub.rn.f32 %f17, %f13, %f15;
+    sub.rn.f32 %f18, %f14, %f16;
+    cvt.rn.f16.f32 %h10, %f17;
+    cvt.rn.f16.f32 %h11, %f18;
+    mov.b32 %b0_hi, {%h8, %h9};
+    mov.b32 %b0_lo, {%h10, %h11};
+
+    add.u32 %r20, %r18, 8;
+    mul.lo.u32 %r21, %r9, 64;
+    add.u32 %r21, %r21, %r20;
+    mul.lo.u32 %r21, %r21, %r2;
+    add.u32 %r21, %r21, %r12;
+    shl.b32 %r21, %r21, 2;
+    cvt.u64.u32 %rd10, %r21;
+    add.u64 %rd10, %rd5, %rd10;
+    ld.global.f32 %f13, [%rd10];
+    ld.global.f32 %f14, [%rd10+4];
+    cvt.rn.f16.f32 %h12, %f13;
+    cvt.rn.f16.f32 %h13, %f14;
+    cvt.f32.f16 %f15, %h12;
+    cvt.f32.f16 %f16, %h13;
+    sub.rn.f32 %f17, %f13, %f15;
+    sub.rn.f32 %f18, %f14, %f16;
+    cvt.rn.f16.f32 %h14, %f17;
+    cvt.rn.f16.f32 %h15, %f18;
+    mov.b32 %b1_hi, {%h12, %h13};
+    mov.b32 %b1_lo, {%h14, %h15};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_hi0,%a_hi1}, {%b0_hi}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_hi0,%a_hi1}, {%b0_lo}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_lo0,%a_lo1}, {%b0_hi}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_lo0,%a_lo1}, {%b0_lo}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_hi0,%a_hi1}, {%b1_hi}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_hi0,%a_hi1}, {%b1_lo}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_lo0,%a_lo1}, {%b1_hi}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_lo0,%a_lo1}, {%b1_lo}, {%c4,%c5,%c6,%c7};
+    add.u32 %r11, %r11, 8;
+    bra W64_MMA_K;
+
+W64_MMA_STORE:
+    add.u32 %r22, %r8, %r6;
+    setp.ge.u32 %p5, %r22, %r1;
+    @%p5 bra W64_MMA_DONE;
+    shl.b32 %r23, %r7, 1;
+    add.u32 %r24, %r10, %r23;
+    mul.lo.u32 %r25, %r9, %r1;
+    add.u32 %r25, %r25, %r22;
+    shl.b32 %r25, %r25, 6;
+    add.u32 %r25, %r25, %r24;
+    shl.b32 %r25, %r25, 2;
+    cvt.u64.u32 %rd11, %r25;
+    add.u64 %rd11, %rd6, %rd11;
+    st.global.f32 [%rd11], %c0;
+    st.global.f32 [%rd11+4], %c1;
+    st.global.f32 [%rd11+32], %c4;
+    st.global.f32 [%rd11+36], %c5;
+    add.u32 %r22, %r22, 8;
+    setp.ge.u32 %p5, %r22, %r1;
+    @%p5 bra W64_MMA_DONE;
+    add.u64 %rd11, %rd11, 2048;
+    st.global.f32 [%rd11], %c2;
+    st.global.f32 [%rd11+4], %c3;
+    st.global.f32 [%rd11+32], %c6;
+    st.global.f32 [%rd11+36], %c7;
+W64_MMA_DONE:
+    ret;
+}
