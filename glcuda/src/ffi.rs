@@ -177,6 +177,13 @@ pub struct DriverApi {
     // timestamp, so timing a stage costs no host synchronization and does not
     // serialize the pipeline the way wrapping it in `cuCtxSynchronize` does.
     // The elapsed time is read once, after the work is already done.
+    /// Wave 15D: ask the driver how many blocks actually fit, instead of
+    /// deriving it from byte arithmetic. The Wave 15C sweep computed its own
+    /// occupancy targets, ignored the shared-memory allocation granule, and
+    /// mislabelled every point on its axis. Optional because a driver missing
+    /// it should cost a diagnostic, not the engine.
+    pub cu_occupancy_max_active_blocks:
+        Option<unsafe extern "system" fn(*mut i32, CUfunction, i32, usize) -> CUresult>,
     pub cu_event_create: Option<unsafe extern "system" fn(*mut CUevent, u32) -> CUresult>,
     pub cu_event_record: Option<unsafe extern "system" fn(CUevent, CUstream) -> CUresult>,
     pub cu_event_synchronize: Option<unsafe extern "system" fn(CUevent) -> CUresult>,
@@ -305,6 +312,10 @@ impl DriverApi {
             cu_stream_destroy: sym_v2(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,
             cu_stream_synchronize: sym(lib, b"cuStreamSynchronize\0")?,
 
+            cu_occupancy_max_active_blocks: sym_opt(
+                lib,
+                &[b"cuOccupancyMaxActiveBlocksPerMultiprocessor\0"],
+            ),
             cu_event_create: sym_opt(lib, &[b"cuEventCreate\0"]),
             cu_event_record: sym_opt(lib, &[b"cuEventRecord\0"]),
             cu_event_synchronize: sym_opt(lib, &[b"cuEventSynchronize\0"]),

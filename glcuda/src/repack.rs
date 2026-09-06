@@ -190,8 +190,8 @@ pub fn q4_0_to_soa(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>), GlError> {
     let mut sc_out = Vec::with_capacity(n_blocks * 2);
     for block in data.chunks_exact(Q4_0_BLOCK_BYTES) {
         sc_out.extend_from_slice(&block[0..2]); // f16 d, verbatim
-                                                // GGML order: byte i holds value i (low nibble) and value i+16
-                                                // (high nibble). Linearize, then repack in the kernel order.
+        // GGML order: byte i holds value i (low nibble) and value i+16
+        // (high nibble). Linearize, then repack in the kernel order.
         let mut v = [0u8; 32];
         for (i, &byte) in block[2..18].iter().enumerate() {
             v[i] = byte & 0x0F;
@@ -328,39 +328,59 @@ pub fn f32_to_q8_0_soa(values: &[f32]) -> (Vec<u8>, Vec<u8>) {
     (qs, scales)
 }
 
-/// Quantize a dense row-major matrix to signed INT8 with one f32 scale per
-/// output row. This is the Wave 7 W8A8 contract: unlike Q8_0's scale per K32,
-/// one row scale lets the Tensor Core kernel keep its accumulator in s32 for
-/// the whole K dimension and dequantize once in the output epilogue.
+/// Reorder row-major Q8_0 SoA streams into the Wave 12 prefill-only B tile.
 ///
-/// The returned streams are `(qs[out, in], scales[out])`. Zero rows map to a
-/// zero scale and all-zero quants. This is a load-time repack; callers replace
-/// the source representation rather than retaining a second full weight copy.
-pub fn f32_to_w8pc_soa(
-    values: &[f32],
+/// The retained decode image remains untouched.  This duplicate cold-path
+/// image is grouped as `[n_tile, k_block, row_in_tile, k_in_block]` for qs
+/// and `[n_tile, k_block, row_in_tile]` for f16 scales.  A CTA can therefore
+/// cooperatively stage 64 or 128 output rows for one K32 block while keeping
+/// the exact original quant bytes and scale bits.  The final N tile is padded
+/// with zero bytes/bits so inactive warps have an in-bounds source.
+pub fn q8_0_soa_to_bstage(
+    qs: &[u8],
+    scales: &[u8],
     out_dim: usize,
     in_dim: usize,
-) -> Result<(Vec<u8>, Vec<f32>), GlError> {
-    if out_dim == 0 || in_dim == 0 || values.len() != out_dim * in_dim {
+) -> Result<(Vec<u8>, Vec<u8>), GlError> {
+    const N_TILE: usize = 128;
+    if in_dim == 0 || !in_dim.is_multiple_of(32) {
         return Err(GlError::Parse(format!(
-            "W8PC matrix shape {out_dim}x{in_dim} does not match {} values",
-            values.len()
+            "Wave 12 B-stage requires non-zero in_dim divisible by 32, got {in_dim}"
+        )));
+    }
+    let nb = in_dim / 32;
+    if qs.len() != out_dim * in_dim || scales.len() != out_dim * nb * 2 {
+        return Err(GlError::Parse(format!(
+            "Wave 12 B-stage Q8_0 length mismatch: qs={} scales={} expected qs={} scales={}",
+            qs.len(),
+            scales.len(),
+            out_dim * in_dim,
+            out_dim * nb * 2,
         )));
     }
 
-    let mut qs = Vec::with_capacity(values.len());
-    let mut scales = Vec::with_capacity(out_dim);
-    for row in values.chunks_exact(in_dim) {
-        let amax = row.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let scale = amax / 127.0;
-        let inv = if scale > 0.0 { scale.recip() } else { 0.0 };
-        scales.push(scale);
-        for &v in row {
-            let q = (v * inv).round().clamp(-128.0, 127.0) as i8;
-            qs.push(q as u8);
+    let n_tiles = out_dim.div_ceil(N_TILE);
+    let mut tiled_qs = vec![0u8; n_tiles * nb * N_TILE * 32];
+    let mut tiled_scales = vec![0u8; n_tiles * nb * N_TILE * 2];
+    for tile in 0..n_tiles {
+        for kb in 0..nb {
+            let tile_qs = (tile * nb + kb) * N_TILE * 32;
+            let tile_sc = (tile * nb + kb) * N_TILE * 2;
+            for row in 0..N_TILE {
+                let global_row = tile * N_TILE + row;
+                if global_row >= out_dim {
+                    continue;
+                }
+                let src_qs = global_row * in_dim + kb * 32;
+                let dst_qs = tile_qs + row * 32;
+                tiled_qs[dst_qs..dst_qs + 32].copy_from_slice(&qs[src_qs..src_qs + 32]);
+                let src_sc = (global_row * nb + kb) * 2;
+                let dst_sc = tile_sc + row * 2;
+                tiled_scales[dst_sc..dst_sc + 2].copy_from_slice(&scales[src_sc..src_sc + 2]);
+            }
         }
     }
-    Ok((qs, scales))
+    Ok((tiled_qs, tiled_scales))
 }
 
 #[cfg(test)]
@@ -386,25 +406,6 @@ mod tests {
             block[0..2].copy_from_slice(&0x2e66u16.to_le_bytes()); // d ~0.1
             block[2..4].copy_from_slice(&0x2a66u16.to_le_bytes()); // dmin ~0.05
         }
-    }
-
-    #[test]
-    fn w8pc_uses_exactly_one_scale_per_output_row() {
-        let values = [
-            -2.0f32, -1.0, 0.0, 1.0, 2.0, 0.5, -0.5, 0.25, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
-        let (qs, scales) = f32_to_w8pc_soa(&values, 2, 8).unwrap();
-        assert_eq!(qs.len(), values.len());
-        assert_eq!(scales, vec![2.0 / 127.0, 0.0]);
-        assert_eq!(qs[0] as i8, -127);
-        assert_eq!(qs[4] as i8, 127);
-        assert!(qs[8..].iter().all(|&q| q == 0));
-    }
-
-    #[test]
-    fn w8pc_rejects_a_shape_that_does_not_match_the_payload() {
-        let err = f32_to_w8pc_soa(&[1.0, 2.0, 3.0], 2, 2).unwrap_err();
-        assert!(err.to_string().contains("does not match 3 values"));
     }
 
     /// Reconstruct weight `i` of super-block `bi` from the SoA arrays with
@@ -580,6 +581,40 @@ mod tests {
         let (qs, sc) = f32_to_q8_0_soa(&values);
         assert_eq!(qs, want_qs);
         assert_eq!(sc, want_sc);
+    }
+
+    #[test]
+    fn q8_0_bstage_preserves_every_real_byte_and_zero_pads_tail() {
+        let out = 130usize;
+        let input = 64usize;
+        let nb = input / 32;
+        let qs: Vec<u8> = (0..out * input).map(|i| i.wrapping_mul(29) as u8).collect();
+        let scales: Vec<u8> = (0..out * nb * 2)
+            .map(|i| i.wrapping_mul(17) as u8)
+            .collect();
+        let (tq, ts) = q8_0_soa_to_bstage(&qs, &scales, out, input).unwrap();
+
+        for row in 0..out.div_ceil(128) * 128 {
+            for kb in 0..nb {
+                let tile = row / 128;
+                let local = row % 128;
+                let qoff = ((tile * nb + kb) * 128 + local) * 32;
+                let soff = ((tile * nb + kb) * 128 + local) * 2;
+                if row < out {
+                    assert_eq!(
+                        &tq[qoff..qoff + 32],
+                        &qs[row * input + kb * 32..row * input + kb * 32 + 32]
+                    );
+                    assert_eq!(
+                        &ts[soff..soff + 2],
+                        &scales[(row * nb + kb) * 2..(row * nb + kb) * 2 + 2]
+                    );
+                } else {
+                    assert_eq!(&tq[qoff..qoff + 32], &[0u8; 32]);
+                    assert_eq!(&ts[soff..soff + 2], &[0u8; 2]);
+                }
+            }
+        }
     }
 
     /// RNE converter: exact values survive, ties round to even, the

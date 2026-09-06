@@ -99,3 +99,11 @@ packages/gui/src-tauri/gen/schemas/
 # -----------------------------------------------------------------------------
 bin/gwen-bin.exe
 bin/gwen-bin
+
+# Local benchmark orchestration and downloaded Kaggle artifacts. Final
+# notebooks and compact evidence live in notebooks/, benchmarks/, and
+# architecture/glcuda-research/ instead.
+.kaggle-*/
+.wave*-dev/
+.wave*-integration/
+.codex-tmp-wave*/

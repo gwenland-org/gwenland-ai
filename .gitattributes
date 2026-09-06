@@ -21,3 +21,8 @@ notebooks/glcuda_t4_wave24_mma2_gemm.ipynb binary
 
 # Wave 25 records the 16-byte cooperative-stage GEMM experiment byte-for-byte.
 notebooks/glcuda_t4_wave25_v16_stage.ipynb binary
+
+# Wave 50 is the retained N16 + register-Q production gate; Wave 55 is the
+# successful pinned same-T4 llama.cpp comparison.
+notebooks/glcuda_t4_wave50_regq_attention.ipynb binary
+notebooks/glcuda_t4_wave55_h2h_llamacpp.ipynb binary

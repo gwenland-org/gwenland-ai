@@ -19,6 +19,7 @@
 //! * [`runner`] — the static layer-graph walk, one stream, one sync/token
 //! * [`sampler`] — engine-owned sampler (ADR-001 duplication of glproc's)
 
+pub mod attention;
 pub mod buffer;
 pub mod cache;
 pub mod dequant;
@@ -85,10 +86,7 @@ impl GlcudaEngine {
 
     /// Create an engine with an explicit configuration.
     pub fn with_config(config: GlcudaConfig) -> Self {
-        GlcudaEngine {
-            config,
-            ..Self::default()
-        }
+        GlcudaEngine { config, ..Self::default() }
     }
 
     /// The probed device, once initialized.
@@ -106,9 +104,10 @@ impl GlcudaEngine {
     /// normally tokenizes upstream, but front-ends and examples that hold
     /// only the engine need a way in.
     pub fn encode(&self, text: &str) -> Result<Vec<u32>, GlError> {
-        let tok = self.tokenizer.as_ref().ok_or_else(|| {
-            GlError::Engine("no tokenizer loaded — call load_model() first".into())
-        })?;
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
         Ok(tok.encode(text, true)?)
     }
 
@@ -116,9 +115,10 @@ impl GlcudaEngine {
     /// Qwen/Llama-instruct families), falling back to plain [`Self::encode`]
     /// when the tokenizer defines no template.
     pub fn encode_chat(&self, user: &str) -> Result<Vec<u32>, GlError> {
-        let tok = self.tokenizer.as_ref().ok_or_else(|| {
-            GlError::Engine("no tokenizer loaded — call load_model() first".into())
-        })?;
+        let tok = self
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("no tokenizer loaded — call load_model() first".into()))?;
         match tok.encode_chat(user)? {
             Some(ids) => Ok(ids),
             None => Ok(tok.encode(user, true)?),
@@ -236,27 +236,15 @@ impl GlEngine for GlcudaEngine {
             PhaseProfile { stages, total_ms }
         });
 
-        let memory = m
-            .vram_breakdown()
-            .map(
-                |(model_bytes, kv_cache_bytes, scratch_bytes)| MemoryTelemetry {
-                    model_bytes,
-                    kv_cache_bytes,
-                    scratch_bytes,
-                },
-            );
+        let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
+            MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
+        });
 
         // Absence must read as "not measured", never as a zeroed report.
         if prefill.is_none() && memory.is_none() {
             return None;
         }
-        Some(EngineTelemetry {
-            prefill,
-            decode: None,
-            backend: None,
-            memory,
-            moe: None,
-        })
+        Some(EngineTelemetry { prefill, decode: None, backend: None, memory, moe: None })
     }
 
     fn init(&mut self) -> Result<(), GlError> {
@@ -364,17 +352,13 @@ mod tests {
         let mut e = GlcudaEngine::new();
         let available = e.capabilities().available;
         if available {
-            e.init()
-                .expect("driver reported available, init must succeed");
+            e.init().expect("driver reported available, init must succeed");
             assert!(e.cuda().is_some());
             assert!(e.kernels().is_some());
             e.shutdown();
             assert!(e.cuda().is_none());
         } else {
-            assert!(
-                e.init().is_err(),
-                "init must fail cleanly without a CUDA device"
-            );
+            assert!(e.init().is_err(), "init must fail cleanly without a CUDA device");
         }
     }
 

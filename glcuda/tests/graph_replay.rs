@@ -17,9 +17,9 @@
 //! Two model shapes, because the two paths through `record_forward` are not
 //! the same code:
 //!   * f32 weights   — no activation quantize; covers the batched per-head
-//!                     `rms_norm_rows` call.
+//!     `rms_norm_rows` call.
 //!   * Q8_0 weights  — exercises the ONE shared `quantize_q8` that q/k/v now
-//!                     divide between them, inside the captured region.
+//!     divide between them, inside the captured region.
 //!
 //! Skips (does not fail) with a note on machines without a CUDA device.
 
