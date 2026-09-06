@@ -28,3 +28,4 @@ notebooks/glcuda_t4_wave25_v16_stage.ipynb binary
 notebooks/glcuda_t4_wave50_regq_attention.ipynb binary
 notebooks/glcuda_t4_wave55_h2h_llamacpp.ipynb binary
 notebooks/glcuda_t4_wave56_repro10.ipynb binary
+notebooks/glcuda_t4_wave57_h2h_q8.ipynb binary

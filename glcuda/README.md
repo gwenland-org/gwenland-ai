@@ -56,6 +56,14 @@ model, prompt shape, GPU, and workload comparison rather than identical
 quantized bytes. `architecture/ArchGLML_X2.md` remains the ground truth for
 this crate.
 
+Wave 57's same-file Q8_0 comparison observed **11,499.7 vs 11,453.5 tok/s**
+(+0.40%, effectively tied; four of six pairs positive). Its correctness gate
+is unresolved: all six CUDA sessions matched only the first 29/50 oracle
+tokens. The rerun relaxed that gate to first-token agreement after the first
+failure; this is a protocol deviation, not a fix. See the
+[qualified Wave 57 report](../architecture/glcuda-research/wave57-q8-llamacpp-head-to-head.md)
+and [raw observations](../benchmarks/glcuda-t4-wave57-q8-h2h.json).
+
 ## Dependencies
 
 **Zero direct.** Fifteen crates in the tree, all inherited from `glcore`.
