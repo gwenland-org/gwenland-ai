@@ -236,12 +236,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let module = cuda.load_module(PTX)?;
     let scalar = module.get_function("gl_wave64_av_scalar_f32")?;
     let mma = module.get_function("gl_wave64_av_mma4_f32")?;
-    let scalar_blocks = cuda
-        .max_active_blocks_per_sm(scalar, 128, 0)
-        .ok_or("scalar occupancy unavailable")?;
-    let mma_blocks = cuda
-        .max_active_blocks_per_sm(mma, 128, 0)
-        .ok_or("MMA occupancy unavailable")?;
     let records = [
         screen(&cuda, scalar, mma, 1)?,
         screen(&cuda, scalar, mma, 17)?,
@@ -249,9 +243,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen(&cuda, scalar, mma, 244)?,
     ];
     println!(
-        "[wave64-resource] {{\"scalar_blocks_per_sm\":{},\"mma_blocks_per_sm\":{},\
-         \"threads\":128,\"dynamic_shared_bytes\":0}}",
-        scalar_blocks, mma_blocks,
+        "[wave64-resource] {{\"threads\":128,\"dynamic_shared_bytes\":0,\
+         \"occupancy_source\":\"ptxas-only\"}}",
     );
     println!(
         "[wave64-av] {{\"warmup\":{},\"iters\":{},\"repeats\":{},\"records\":[{}]}}",
