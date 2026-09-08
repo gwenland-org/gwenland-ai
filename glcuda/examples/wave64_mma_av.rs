@@ -58,19 +58,6 @@ fn causal_probabilities(ntok: usize, capacity: usize) -> Vec<f32> {
     out
 }
 
-fn transpose_v(v: &[f32], capacity: usize) -> Vec<f32> {
-    let mut vt = vec![0.0; v.len()];
-    for head in 0..HEADS {
-        for key in 0..capacity {
-            for dim in 0..WIDTH {
-                vt[(head * WIDTH + dim) * capacity + key] =
-                    v[(head * capacity + key) * WIDTH + dim];
-            }
-        }
-    }
-    vt
-}
-
 fn launch_av(
     cuda: &Cuda,
     kernel: Kernel,
@@ -150,18 +137,15 @@ fn screen(
     let ntok = capacity;
     let prob = causal_probabilities(ntok, capacity);
     let v = values(HEADS * capacity * WIDTH, 6400 + capacity as u64);
-    let vt = transpose_v(&v, capacity);
     let output_len = HEADS * ntok * WIDTH;
-    let bytes = ((prob.len() + v.len() + vt.len() + 2 * output_len) * 4 + 1_048_576) as u64;
+    let bytes = ((prob.len() + v.len() + 2 * output_len) * 4 + 1_048_576) as u64;
     let mut buffer = BackendBuffer::new(cuda, bytes)?;
     let dprob = buffer.alloc_f32(prob.len())?.dptr;
     let dv = buffer.alloc_f32(v.len())?.dptr;
-    let dvt = buffer.alloc_f32(vt.len())?.dptr;
     let dscalar = buffer.alloc_f32(output_len)?.dptr;
     let dmma = buffer.alloc_f32(output_len)?.dptr;
     cuda.htod_f32(dprob, &prob)?;
     cuda.htod_f32(dv, &v)?;
-    cuda.htod_f32(dvt, &vt)?;
 
     let scalar_launch = || {
         launch_av(
@@ -174,7 +158,7 @@ fn screen(
             capacity as u32,
         )
     };
-    let mma_launch = || launch_av(cuda, mma, dprob, dvt, dmma, ntok as u32, capacity as u32);
+    let mma_launch = || launch_av(cuda, mma, dprob, dv, dmma, ntok as u32, capacity as u32);
     scalar_launch()?;
     mma_launch()?;
     cuda.synchronize()?;
@@ -235,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let module = cuda.load_module(PTX)?;
     let scalar = module.get_function("gl_wave64_av_scalar_f32")?;
-    let mma = module.get_function("gl_wave64_av_mma4_f32")?;
+    let mma = module.get_function("gl_wave75_av_mma4_row_f32")?;
     let records = [
         screen(&cuda, scalar, mma, 1)?,
         screen(&cuda, scalar, mma, 17)?,

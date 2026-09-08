@@ -1,0 +1,19 @@
+{
+  "wave": 75,
+  "route": "kaggle_cli_auto_allocation",
+  "status": "invalid_hardware_allocation",
+  "decision": "no_sm75_verdict",
+  "kaggle_kernel": "jinxsuperdev/glcuda-t4-wave75-mma-av-row-major",
+  "version": 1,
+  "required_gpu": "Tesla T4",
+  "allocated_gpu": "Tesla P100-PCIE-16GB",
+  "allocated_compute_capability": "6.0",
+  "driver": "580.159.04",
+  "failure": "Wave 75 requires Tesla T4 sm_75, got Tesla P100-PCIE-16GB, 6.0, 580.159.04",
+  "notebook_sha256": "eeedcaae19fb450ea03fd73436bfb3ea50a5a27320cdc2dcc2b8e37f7c3726a2",
+  "archive_sha256": "d8f6d9e675c04d9c6d8837c610c5e31c391eefc009e444033c4381805d41e33a",
+  "ptxas_ran": false,
+  "device_numeric_ran": false,
+  "device_timing_ran": false,
+  "target_15000_tps_achieved": false
+}

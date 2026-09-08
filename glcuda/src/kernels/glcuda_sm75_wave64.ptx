@@ -6,7 +6,9 @@
 //
 // Input probabilities are packed [heads, ntok, capacity] with causal-tail
 // zeros. The retained entry reads row-major V [heads, capacity, 64]. The
-// candidate reads its load-time/write-time transpose [heads, 64, capacity].
+// Wave 75 evolves the candidate to read retained row-major V directly. The
+// warp's MMA lane mapping covers an 8x8 K/N tile; its two K values are one
+// 64-float row apart rather than adjacent in a transposed image.
 // Both write packed f32 [heads, ntok, 64].
 //
 // Launch: grid (ceil(ntok/16), heads), block 128.
@@ -92,9 +94,9 @@ W64_SCALAR_DONE:
     ret;
 }
 
-.visible .entry gl_wave64_av_mma4_f32(
+.visible .entry gl_wave75_av_mma4_row_f32(
     .param .u64 p_prob,
-    .param .u64 p_vt,
+    .param .u64 p_v,
     .param .u64 p_out,
     .param .u32 p_ntok,
     .param .u32 p_capacity)
@@ -109,7 +111,7 @@ W64_SCALAR_DONE:
     .reg .f32 %c<8>;
 
     ld.param.u64 %rd1, [p_prob];
-    ld.param.u64 %rd2, [p_vt];
+    ld.param.u64 %rd2, [p_v];
     ld.param.u64 %rd3, [p_out];
     ld.param.u32 %r1, [p_ntok];
     ld.param.u32 %r2, [p_capacity];
@@ -204,18 +206,24 @@ W64_A_ROW8_ZERO:
     mov.b32 %a_lo0, {%h2, %h6};
     mov.b32 %a_lo1, {%h3, %h7};
 
-    // B fragments: two adjacent N8 tiles owned by this warp. V is stored
-    // dimension-major, so each logical KxN operand is column-major.
+    // B fragments: two adjacent N8 tiles owned by this warp. Retained V is
+    // [head, K, 64]. Across the warp, groupID selects N and threadInGroup
+    // selects the K pair, covering the complete 8x8 operand without a
+    // permanent transpose.
     add.u32 %r18, %r10, %r6;
-    mul.lo.u32 %r19, %r9, 64;
-    add.u32 %r19, %r19, %r18;
-    mul.lo.u32 %r19, %r19, %r2;
+    mul.lo.u32 %r19, %r9, %r2;
     add.u32 %r19, %r19, %r12;
+    shl.b32 %r19, %r19, 6;
+    add.u32 %r19, %r19, %r18;
     shl.b32 %r19, %r19, 2;
     cvt.u64.u32 %rd9, %r19;
     add.u64 %rd9, %rd5, %rd9;
-    ld.global.f32 %f13, [%rd9];
-    ld.global.f32 %f14, [%rd9+4];
+    mov.f32 %f13, 0f00000000;
+    mov.f32 %f14, 0f00000000;
+    setp.lt.u32 %p2, %r12, %r2;
+    @%p2 ld.global.f32 %f13, [%rd9];
+    setp.lt.u32 %p2, %r17, %r2;
+    @%p2 ld.global.f32 %f14, [%rd9+256];
     cvt.rn.f16.f32 %h8, %f13;
     cvt.rn.f16.f32 %h9, %f14;
     cvt.f32.f16 %f15, %h8;
@@ -228,15 +236,19 @@ W64_A_ROW8_ZERO:
     mov.b32 %b0_lo, {%h10, %h11};
 
     add.u32 %r20, %r18, 8;
-    mul.lo.u32 %r21, %r9, 64;
-    add.u32 %r21, %r21, %r20;
-    mul.lo.u32 %r21, %r21, %r2;
+    mul.lo.u32 %r21, %r9, %r2;
     add.u32 %r21, %r21, %r12;
+    shl.b32 %r21, %r21, 6;
+    add.u32 %r21, %r21, %r20;
     shl.b32 %r21, %r21, 2;
     cvt.u64.u32 %rd10, %r21;
     add.u64 %rd10, %rd5, %rd10;
-    ld.global.f32 %f13, [%rd10];
-    ld.global.f32 %f14, [%rd10+4];
+    mov.f32 %f13, 0f00000000;
+    mov.f32 %f14, 0f00000000;
+    setp.lt.u32 %p2, %r12, %r2;
+    @%p2 ld.global.f32 %f13, [%rd10];
+    setp.lt.u32 %p2, %r17, %r2;
+    @%p2 ld.global.f32 %f14, [%rd10+256];
     cvt.rn.f16.f32 %h12, %f13;
     cvt.rn.f16.f32 %h13, %f14;
     cvt.f32.f16 %f15, %h12;
