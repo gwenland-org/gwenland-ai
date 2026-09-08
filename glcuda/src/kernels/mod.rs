@@ -158,6 +158,8 @@ struct MmaModule {
     attn_mma4: Kernel,
     /// Wave 48: Wave 20 arithmetic with Q fragments resident in registers.
     attn_mma4_regq: Kernel,
+    /// Wave 78: register-Q QK plus cooperative compensated-MMA AV.
+    attn_mma4_regq_avmma: Kernel,
 }
 
 /// Wave 59 is deliberately isolated from the retained tensor-core module.
@@ -215,6 +217,8 @@ pub struct KernelSet {
     mma4_attention: bool,
     /// Opt-in Wave 48 register-resident-Q schedule on the Wave 20 path.
     mma4_regq_attention: bool,
+    /// Opt-in Wave 78 compensated-MMA AV on top of register-resident Q.
+    mma4_regq_avmma_attention: bool,
     /// Device SM count used by the N128 coverage guard.
     sm_count: u32,
     f_add: Kernel,
@@ -285,6 +289,7 @@ impl KernelSet {
             let f_bsn16_m32 = m75.get_function("gl_gemm_mma_q8_bstage_n16_m32")?;
             let f_attn_mma4 = m75.get_function("gl_attn_mma4_fused_f32")?;
             let f_attn_mma4_regq = m75.get_function("gl_attn_mma4_regq_fused_f32")?;
+            let f_attn_mma4_regq_avmma = m75.get_function("gl_attn_mma4_regq_avmma_fused_f32")?;
             eprintln!(
                 "[glcuda] tensor-core MMA GEMM enabled (sm_{}{})",
                 cuda.info.sm_major, cuda.info.sm_minor
@@ -301,6 +306,7 @@ impl KernelSet {
                 bstage_n16_m32: f_bsn16_m32,
                 attn_mma4: f_attn_mma4,
                 attn_mma4_regq: f_attn_mma4_regq,
+                attn_mma4_regq_avmma: f_attn_mma4_regq_avmma,
             })
         } else {
             if sm >= (7, 5) {
@@ -351,14 +357,16 @@ impl KernelSet {
         let mma4_attention = mma.is_some() && std::env::var_os("GLCUDA_ATTN_MMA4").is_some();
         let mma4_regq_attention =
             mma4_attention && std::env::var_os("GLCUDA_ATTN_MMA4_REGQ").is_some();
+        let mma4_regq_avmma_attention =
+            mma4_regq_attention && std::env::var_os("GLCUDA_ATTN_MMA4_AV").is_some();
         let gqa7_chains = match std::env::var("GLCUDA_GQA7_CHAINS").as_deref() {
             Ok("2") => 2,
             Ok("4") => 4,
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{}}}",
-            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -376,6 +384,7 @@ impl KernelSet {
             gqa7_chains,
             mma4_attention,
             mma4_regq_attention,
+            mma4_regq_avmma_attention,
             sm_count: cuda.info.sm_count.max(1) as u32,
             f_add: module.get_function("gl_add_f32")?,
             f_silu_mul: module.get_function("gl_silu_mul_f32")?,
@@ -773,6 +782,12 @@ impl KernelSet {
         self.mma4_regq_attention
     }
 
+    /// Whether Wave 78's compensated-MMA AV candidate was selected on top of
+    /// the register-resident-Q path.
+    pub fn mma4_regq_avmma_attention_enabled(&self) -> bool {
+        self.mma4_regq_avmma_attention
+    }
+
     /// Whether one 16-query score tile fits the Wave 20 launch contract.
     pub fn mma4_attention_capacity_supported(&self, score_capacity: u32) -> bool {
         attn_mma4_shared_bytes(score_capacity).is_some()
@@ -1019,6 +1034,66 @@ impl KernelSet {
         )
     }
 
+    /// Wave 78 candidate. QK, causal masking, and softmax retain Wave 48's
+    /// arithmetic; only the final normalized P@V is computed cooperatively by
+    /// four compensated-f16 MMA warps over the retained row-major V cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attn_mma4_regq_avmma_fused(
+        &self,
+        cuda: &Cuda,
+        q: CUdeviceptr,
+        k_base: CUdeviceptr,
+        v_base: CUdeviceptr,
+        out: CUdeviceptr,
+        n_heads: u32,
+        head_dim: u32,
+        pos_seq: CUdeviceptr,
+        heads_per_kv: u32,
+        head_stride: u32,
+        scale: f32,
+        ntok: u32,
+        score_capacity: u32,
+        q_row_stride: u32,
+    ) -> Result<(), GlError> {
+        if head_dim != 64 {
+            return Err(GlError::Engine(format!(
+                "Wave 78 MMA AV attention requires head_dim=64; got {head_dim}"
+            )));
+        }
+        let mma = self.mma.as_ref().ok_or_else(|| {
+            GlError::Engine("Wave 78 MMA AV attention requires an sm_75 device".into())
+        })?;
+        let shared_bytes = attn_mma4_regq_shared_bytes(score_capacity).ok_or_else(|| {
+            GlError::Engine(format!(
+                "Wave 78 MMA AV attention score capacity must be in 1..={MMA4_ATTN_MAX_SCORE_CAPACITY}; got {score_capacity}"
+            ))
+        })?;
+        let (mut q, mut k, mut v, mut o) = (q, k_base, v_base, out);
+        let (mut hd, mut ps, mut hpk, mut hs, mut sc) =
+            (head_dim, pos_seq, heads_per_kv, head_stride, scale);
+        let (mut cap, mut qrs) = (score_capacity, q_row_stride);
+        let mut params = [
+            &mut q as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ps as *mut _ as *mut c_void,
+            &mut hpk as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut cap as *mut _ as *mut c_void,
+            &mut qrs as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            mma.attn_mma4_regq_avmma,
+            (ceil_div(ntok, 16), n_heads, 1),
+            (128, 1, 1),
+            shared_bytes,
+            &mut params,
+        )
+    }
+
     /// Explicit Wave 11 GQA7 path. The caller must provide the supported
     /// 7:1, head-dim-64 shape; the production dispatcher checks that contract.
     #[allow(clippy::too_many_arguments)]
@@ -1240,6 +1315,7 @@ impl KernelSet {
             attn_mma4_regq_shared_bytes(score_capacity),
         ) {
             entries.push(("mma4_regq", mma.attn_mma4_regq, shared));
+            entries.push(("mma4_regq_avmma", mma.attn_mma4_regq_avmma, shared));
         }
         entries
     }
@@ -2786,13 +2862,14 @@ mod tests {
         // shifted once under me, slicing one region over its neighbour. So the
         // regions are derived rather than assumed: find every entry, sort by
         // position, and cut each one at whichever entry follows it.
-        const GEMM_ENTRIES: [&str; 10] = [
+        const GEMM_ENTRIES: [&str; 11] = [
             "gl_gemm_mma_q8(",
             // A non-GEMM entry sits between the direct kernel and its probe;
             // include it as a region boundary so the direct-kernel assertions
             // cannot accidentally inspect Wave 20's attention body.
             "gl_attn_mma4_fused_f32(",
             "gl_attn_mma4_regq_fused_f32(",
+            "gl_attn_mma4_regq_avmma_fused_f32(",
             "gl_gemm_mma_q8_probe(",
             "gl_gemm_mma_q8_bstage(",
             "gl_gemm_mma_q8_bstage_n16(",
@@ -2830,6 +2907,7 @@ mod tests {
         let r256_kernel = region("gl_gemm_mma_q8_r256(");
         let mma4_attention = region("gl_attn_mma4_fused_f32(");
         let mma4_regq_attention = region("gl_attn_mma4_regq_fused_f32(");
+        let mma4_regq_avmma_attention = region("gl_attn_mma4_regq_avmma_fused_f32(");
         assert_eq!(base_kernel.matches("%ctaid.y").count(), 1);
         // The probe is a copy of the base kernel plus predicated skips, so
         // it must keep the base geometry exactly; if it drifts, it stops
@@ -2942,6 +3020,24 @@ mod tests {
         assert!(mma4_regq_attention.contains("W48_Q_PRELOAD_WAIT:"));
         assert!(!mma4_regq_attention.contains("wave20_q_smem[4096]"));
         assert!(!mma4_regq_attention.contains("W48_K_CHUNK:"));
+        assert_eq!(
+            mma4_regq_avmma_attention
+                .matches("mma.sync.aligned.m16n8k8")
+                .count(),
+            40
+        );
+        assert_eq!(mma4_regq_avmma_attention.matches("bar.sync 0;").count(), 4);
+        assert_eq!(
+            mma4_regq_avmma_attention
+                .matches("ld.shared.u32 %qa_")
+                .count(),
+            32
+        );
+        assert!(mma4_regq_avmma_attention.contains("W78_NORM_LOOP:"));
+        assert!(mma4_regq_avmma_attention.contains("W78_AV_MMA_K:"));
+        assert!(mma4_regq_avmma_attention.contains("W78_AV_MMA_STORE:"));
+        assert!(!mma4_regq_avmma_attention.contains("W78_AV_LOOP:"));
+        assert!(!mma4_regq_avmma_attention.contains("wave20_q_smem[4096]"));
         assert!(base_kernel.contains("min.s32 %r3, %r_gy_rem, 64"));
         assert!(bstage_kernel.contains("min.s32 %r3, %r_gy_rem, 64"));
         // Every D lane pair is adjacent and 8-byte aligned, so both kernels

@@ -36,6 +36,16 @@ GLCUDA_ATTN_MMA4=1
 GLCUDA_ATTN_MMA4_REGQ=1
 ```
 
+Wave 78's compensated-MMA AV production candidate is deliberately opt-in on
+top of that retained stack:
+
+```text
+GLCUDA_ATTN_MMA4_AV=1
+```
+
+It is not a retained/default path until T4 device parity and production
+`glbench` A/B both pass.
+
 See the [Wave 50 production report](../architecture/glcuda-research/wave50-register-q-production-result.md)
 for the controlled protocol and raw evidence. A longer Wave 56 confirmation
 ran ten near-position-balanced repetitions (30 production sessions): the

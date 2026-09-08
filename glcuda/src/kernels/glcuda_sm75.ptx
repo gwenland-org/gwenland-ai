@@ -1564,6 +1564,852 @@ W48_DONE:
     ret;
 }
 
+// gl_attn_mma4_regq_avmma_fused_f32: Wave 78 opt-in production candidate.
+// Keeps Wave 48 compensated-MMA QK and causal softmax, normalizes the 16
+// probability rows in place, then computes P@V with four compensated-f16 MMA
+// warps (one 16-column pair per warp). Retained V stays [kv_head, K, 64].
+// Launch: grid (ceil(ntok/16), n_heads), block 128; dynamic shared is the
+// Wave 48 max(4096, 16*padded_score_capacity*4) allocation. Tolerance 1e-5.
+.visible .entry gl_attn_mma4_regq_avmma_fused_f32(
+    .param .u64 p_q,
+    .param .u64 p_k,
+    .param .u64 p_v,
+    .param .u64 p_out,
+    .param .u32 p_head_dim,
+    .param .u64 p_pos_seq,
+    .param .u32 p_heads_per_kv,
+    .param .u32 p_head_stride,
+    .param .f32 p_scale,
+    .param .u32 p_score_capacity,
+    .param .u32 p_q_row_stride)
+{
+    .reg .pred %p<20>;
+    .reg .b16 %h<16>;
+    .reg .b32 %r<80>;
+    .reg .b32 %a_hi0, %a_hi1, %a_lo0, %a_lo1, %b_hi, %b_lo;
+    .reg .b32 %b0_hi, %b0_lo, %b1_hi, %b1_lo;
+    .reg .pred %av_p<8>;
+    .reg .b32 %av_r<32>;
+    .reg .b64 %av_rd<8>;
+    .reg .f32 %av_f<20>;
+    .reg .b32 %qa_hi00, %qa_hi01, %qa_hi02, %qa_hi03, %qa_hi04, %qa_hi05, %qa_hi06, %qa_hi07;
+    .reg .b32 %qa_hi10, %qa_hi11, %qa_hi12, %qa_hi13, %qa_hi14, %qa_hi15, %qa_hi16, %qa_hi17;
+    .reg .b32 %qa_lo00, %qa_lo01, %qa_lo02, %qa_lo03, %qa_lo04, %qa_lo05, %qa_lo06, %qa_lo07;
+    .reg .b32 %qa_lo10, %qa_lo11, %qa_lo12, %qa_lo13, %qa_lo14, %qa_lo15, %qa_lo16, %qa_lo17;
+    .reg .b64 %rd<24>;
+    .reg .f32 %f<24>;
+    .reg .f32 %c<8>;
+
+    ld.param.u64 %rd1, [p_q];
+    ld.param.u64 %rd2, [p_k];
+    ld.param.u64 %rd3, [p_v];
+    ld.param.u64 %rd4, [p_out];
+    ld.param.u32 %r1, [p_head_dim];
+    ld.param.u64 %rd5, [p_pos_seq];
+    ld.param.u32 %r2, [p_heads_per_kv];
+    ld.param.u32 %r3, [p_head_stride];
+    ld.param.f32 %f1, [p_scale];
+    ld.param.u32 %r4, [p_score_capacity];
+    ld.param.u32 %r5, [p_q_row_stride];
+
+    cvta.to.global.u64 %rd7, %rd1;
+    cvta.to.global.u64 %rd8, %rd2;
+    cvta.to.global.u64 %rd9, %rd3;
+    cvta.to.global.u64 %rd10, %rd4;
+    cvta.to.global.u64 %rd11, %rd5;
+
+    mov.u32 %r6, %tid.x;
+    shr.u32 %r7, %r6, 5;                // warp
+    and.b32 %r8, %r6, 31;               // lane
+    shr.u32 %r9, %r8, 2;                // MMA groupID
+    and.b32 %r10, %r8, 3;               // MMA threadID
+    mov.u32 %r11, %ctaid.y;             // query head
+    mov.u32 %r12, %ctaid.x;
+    shl.b32 %r12, %r12, 4;              // first query row
+    mov.u32 %r13, %nctaid.y;            // n_heads
+    mov.u32 %r14, sm_wave20_scores;
+    mov.u32 %r15, sm_wave20_scores;
+    add.u32 %r16, %r4, 3;
+    and.b32 %r16, %r16, 0xfffffffc;      // padded score pitch
+
+    // K/V base for this query head's shared KV head.
+    div.u32 %r17, %r11, %r2;
+    mul.lo.u32 %r17, %r17, %r3;
+    shl.b32 %r17, %r17, 2;
+    cvt.u64.u32 %rd12, %r17;
+    add.u64 %rd13, %rd8, %rd12;
+    add.u64 %rd14, %rd9, %rd12;
+
+    // Convert the 16x64 Q tile once. Tail rows stage zeros so every thread
+    // reaches the CTA barrier and warp 0 can run one legal MMA sequence.
+    mov.u32 %r18, %r6;
+W78_Q_STAGE:
+    setp.ge.u32 %p1, %r18, 1024;
+    @%p1 bra W78_Q_READY;
+    shr.u32 %r19, %r18, 6;              // local query row
+    and.b32 %r20, %r18, 63;             // dimension
+    add.u32 %r21, %r12, %r19;           // query row in chunk
+    mov.f32 %f2, 0f00000000;
+    // ntok is implicit in grid geometry: all non-final tiles have 16 rows;
+    // the final row count is score_capacity - pos_seq[0].
+    ld.global.u32 %r22, [%rd11];
+    sub.u32 %r22, %r4, %r22;
+    setp.le.u32 %p2, %r22, 0;
+    @%p2 mov.u32 %r22, 1;
+    setp.lt.u32 %p3, %r21, %r22;
+    @!%p3 bra W78_Q_ZERO;
+    mul.lo.u32 %r23, %r21, %r5;
+    shl.b32 %r24, %r11, 6;
+    add.u32 %r23, %r23, %r24;
+    add.u32 %r23, %r23, %r20;
+    shl.b32 %r23, %r23, 2;
+    cvt.u64.u32 %rd15, %r23;
+    add.u64 %rd15, %rd7, %rd15;
+    ld.global.f32 %f2, [%rd15];
+W78_Q_ZERO:
+    cvt.rn.f16.f32 %h0, %f2;
+    cvt.f32.f16 %f3, %h0;
+    sub.rn.f32 %f4, %f2, %f3;
+    cvt.rn.f16.f32 %h1, %f4;
+    shl.b32 %r25, %r18, 1;
+    add.u32 %r26, %r14, %r25;
+    st.shared.u16 [%r26], %h0;
+    st.shared.u16 [%r26+2048], %h1;
+    add.u32 %r18, %r18, 128;
+    bra W78_Q_STAGE;
+W78_Q_READY:
+    bar.sync 0;
+
+    // Warp 0 snapshots the complete compensated Q fragment before
+    // the score matrix reuses the same dynamic shared allocation.
+    setp.ne.u32 %p4, %r7, 0;
+    @%p4 bra W78_Q_PRELOAD_WAIT;
+    shl.b32 %r29, %r9, 6;
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r31, %r29, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi00, [%r31];
+    ld.shared.u32 %qa_hi10, [%r31+1024];
+    ld.shared.u32 %qa_lo00, [%r31+2048];
+    ld.shared.u32 %qa_lo10, [%r31+3072];
+    add.u32 %r31, %r29, 8;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi01, [%r31];
+    ld.shared.u32 %qa_hi11, [%r31+1024];
+    ld.shared.u32 %qa_lo01, [%r31+2048];
+    ld.shared.u32 %qa_lo11, [%r31+3072];
+    add.u32 %r31, %r29, 16;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi02, [%r31];
+    ld.shared.u32 %qa_hi12, [%r31+1024];
+    ld.shared.u32 %qa_lo02, [%r31+2048];
+    ld.shared.u32 %qa_lo12, [%r31+3072];
+    add.u32 %r31, %r29, 24;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi03, [%r31];
+    ld.shared.u32 %qa_hi13, [%r31+1024];
+    ld.shared.u32 %qa_lo03, [%r31+2048];
+    ld.shared.u32 %qa_lo13, [%r31+3072];
+    add.u32 %r31, %r29, 32;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi04, [%r31];
+    ld.shared.u32 %qa_hi14, [%r31+1024];
+    ld.shared.u32 %qa_lo04, [%r31+2048];
+    ld.shared.u32 %qa_lo14, [%r31+3072];
+    add.u32 %r31, %r29, 40;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi05, [%r31];
+    ld.shared.u32 %qa_hi15, [%r31+1024];
+    ld.shared.u32 %qa_lo05, [%r31+2048];
+    ld.shared.u32 %qa_lo15, [%r31+3072];
+    add.u32 %r31, %r29, 48;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi06, [%r31];
+    ld.shared.u32 %qa_hi16, [%r31+1024];
+    ld.shared.u32 %qa_lo06, [%r31+2048];
+    ld.shared.u32 %qa_lo16, [%r31+3072];
+    add.u32 %r31, %r29, 56;
+    add.u32 %r31, %r31, %r30;
+    shl.b32 %r31, %r31, 1;
+    add.u32 %r31, %r14, %r31;
+    ld.shared.u32 %qa_hi07, [%r31];
+    ld.shared.u32 %qa_hi17, [%r31+1024];
+    ld.shared.u32 %qa_lo07, [%r31+2048];
+    ld.shared.u32 %qa_lo17, [%r31+3072];
+W78_Q_PRELOAD_WAIT:
+    // All warps release the aliased dynamic region only after
+    // warp 0 has captured every Q half in registers.
+    bar.sync 0;
+    @%p4 bra W78_QK_WAIT;
+    mov.u32 %r27, 0;                    // first key in 8-key tile
+W78_KEY_TILE:
+    setp.ge.u32 %p5, %r27, %r4;
+    @%p5 bra W78_QK_WAIT;
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    // K dimensions 0..7; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_0;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_0:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi00, %qa_hi10}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi00, %qa_hi10}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo00, %qa_lo10}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo00, %qa_lo10}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 8..15; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 8;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_8;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_8:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi01, %qa_hi11}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi01, %qa_hi11}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo01, %qa_lo11}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo01, %qa_lo11}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 16..23; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 16;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_16;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_16:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi02, %qa_hi12}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi02, %qa_hi12}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo02, %qa_lo12}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo02, %qa_lo12}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 24..31; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 24;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_24;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_24:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi03, %qa_hi13}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi03, %qa_hi13}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo03, %qa_lo13}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo03, %qa_lo13}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 32..39; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 32;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_32;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_32:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi04, %qa_hi14}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi04, %qa_hi14}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo04, %qa_lo14}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo04, %qa_lo14}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 40..47; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 40;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_40;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_40:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi05, %qa_hi15}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi05, %qa_hi15}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo05, %qa_lo15}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo05, %qa_lo15}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 48..55; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 48;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_48;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_48:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi06, %qa_hi16}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi06, %qa_hi16}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo06, %qa_lo16}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo06, %qa_lo16}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    // K dimensions 56..63; Q fragments were loaded once above.
+    shl.b32 %r30, %r10, 1;
+    add.u32 %r30, %r30, 56;
+    add.u32 %r32, %r27, %r9;
+    mov.f32 %f5, 0f00000000;
+    mov.f32 %f6, 0f00000000;
+    setp.lt.u32 %p6, %r32, %r4;
+    @!%p6 bra W78_B_READY_56;
+    shl.b32 %r33, %r32, 6;
+    add.u32 %r33, %r33, %r30;
+    shl.b32 %r33, %r33, 2;
+    cvt.u64.u32 %rd16, %r33;
+    add.u64 %rd16, %rd13, %rd16;
+    ld.global.f32 %f5, [%rd16];
+    ld.global.f32 %f6, [%rd16+4];
+W78_B_READY_56:
+    cvt.rn.f16.f32 %h2, %f5;
+    cvt.rn.f16.f32 %h3, %f6;
+    cvt.f32.f16 %f7, %h2;
+    cvt.f32.f16 %f8, %h3;
+    sub.rn.f32 %f9, %f5, %f7;
+    sub.rn.f32 %f10, %f6, %f8;
+    cvt.rn.f16.f32 %h4, %f9;
+    cvt.rn.f16.f32 %h5, %f10;
+    mov.b32 %b_hi, {%h2, %h3};
+    mov.b32 %b_lo, {%h4, %h5};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi07, %qa_hi17}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_hi07, %qa_hi17}, {%b_lo}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo07, %qa_lo17}, {%b_hi}, {%c0, %c1, %c2, %c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0, %c1, %c2, %c3}, {%qa_lo07, %qa_lo17}, {%b_lo}, {%c0, %c1, %c2, %c3};
+
+    mul.rn.f32 %c0, %c0, %f1;
+    mul.rn.f32 %c1, %c1, %f1;
+    mul.rn.f32 %c2, %c2, %f1;
+    mul.rn.f32 %c3, %c3, %f1;
+    shl.b32 %r34, %r10, 1;
+    add.u32 %r35, %r27, %r34;           // key 0 for lane
+    add.u32 %r36, %r12, %r9;            // global query row 0
+    ld.global.u32 %r37, [%rd11];
+    sub.u32 %r37, %r4, %r37;            // ntok
+
+    // c0: local row groupID, key threadID*2.
+    setp.lt.u32 %p8, %r36, %r37;
+    setp.lt.u32 %p9, %r35, %r4;
+    mul.wide.u32 %rd17, %r36, 4;
+    add.u64 %rd17, %rd11, %rd17;
+    @%p8 ld.global.u32 %r38, [%rd17];
+    setp.le.u32 %p10, %r35, %r38;
+    and.pred %p11, %p8, %p9;
+    and.pred %p11, %p11, %p10;
+    @!%p11 bra W78_STORE_C1;
+    mad.lo.u32 %r39, %r9, %r16, %r35;
+    shl.b32 %r39, %r39, 2;
+    add.u32 %r40, %r15, %r39;
+    st.shared.f32 [%r40], %c0;
+W78_STORE_C1:
+    add.u32 %r41, %r35, 1;
+    setp.lt.u32 %p9, %r41, %r4;
+    setp.le.u32 %p10, %r41, %r38;
+    and.pred %p11, %p8, %p9;
+    and.pred %p11, %p11, %p10;
+    @!%p11 bra W78_STORE_C2;
+    mad.lo.u32 %r39, %r9, %r16, %r41;
+    shl.b32 %r39, %r39, 2;
+    add.u32 %r40, %r15, %r39;
+    st.shared.f32 [%r40], %c1;
+W78_STORE_C2:
+    add.u32 %r42, %r36, 8;
+    add.u32 %r43, %r9, 8;
+    setp.lt.u32 %p8, %r42, %r37;
+    mul.wide.u32 %rd17, %r42, 4;
+    add.u64 %rd17, %rd11, %rd17;
+    @%p8 ld.global.u32 %r44, [%rd17];
+    setp.lt.u32 %p9, %r35, %r4;
+    setp.le.u32 %p10, %r35, %r44;
+    and.pred %p11, %p8, %p9;
+    and.pred %p11, %p11, %p10;
+    @!%p11 bra W78_STORE_C3;
+    mad.lo.u32 %r39, %r43, %r16, %r35;
+    shl.b32 %r39, %r39, 2;
+    add.u32 %r40, %r15, %r39;
+    st.shared.f32 [%r40], %c2;
+W78_STORE_C3:
+    setp.lt.u32 %p9, %r41, %r4;
+    setp.le.u32 %p10, %r41, %r44;
+    and.pred %p11, %p8, %p9;
+    and.pred %p11, %p11, %p10;
+    @!%p11 bra W78_TILE_NEXT;
+    mad.lo.u32 %r39, %r43, %r16, %r41;
+    shl.b32 %r39, %r39, 2;
+    add.u32 %r40, %r15, %r39;
+    st.shared.f32 [%r40], %c3;
+W78_TILE_NEXT:
+    add.u32 %r27, %r27, 8;
+    bra W78_KEY_TILE;
+
+W78_QK_WAIT:
+    bar.sync 0;
+
+    // Warp w owns local rows w, w+4, w+8, w+12. A warp reduction is enough
+    // for softmax because every lane walks keys lane+32*n.
+    mov.u32 %r45, %r7;
+W78_ROW_LOOP:
+    setp.ge.u32 %p12, %r45, 16;
+    @%p12 bra W78_AV_READY;
+    add.u32 %r46, %r12, %r45;
+    ld.global.u32 %r47, [%rd11];
+    sub.u32 %r47, %r4, %r47;            // ntok
+    setp.ge.u32 %p13, %r46, %r47;
+    @%p13 bra W78_ROW_NEXT;
+    mul.wide.u32 %rd18, %r46, 4;
+    add.u64 %rd18, %rd11, %rd18;
+    ld.global.u32 %r48, [%rd18];
+    add.u32 %r48, %r48, 1;              // cached_len
+    mul.lo.u32 %r49, %r45, %r16;
+    shl.b32 %r49, %r49, 2;
+    add.u32 %r50, %r15, %r49;           // score row base
+
+    mov.f32 %f11, 0fFF800000;
+    mov.u32 %r51, %r8;
+W78_MAX_LOOP:
+    setp.ge.u32 %p14, %r51, %r48;
+    @%p14 bra W78_MAX_RED;
+    shl.b32 %r52, %r51, 2;
+    add.u32 %r53, %r50, %r52;
+    ld.shared.f32 %f12, [%r53];
+    max.f32 %f11, %f11, %f12;
+    add.u32 %r51, %r51, 32;
+    bra W78_MAX_LOOP;
+W78_MAX_RED:
+    mov.b32 %r54, %f11;
+    shfl.sync.down.b32 %r55, %r54, 16, 31, 0xffffffff;
+    mov.b32 %f12, %r55; max.f32 %f11, %f11, %f12;
+    mov.b32 %r54, %f11;
+    shfl.sync.down.b32 %r55, %r54, 8, 31, 0xffffffff;
+    mov.b32 %f12, %r55; max.f32 %f11, %f11, %f12;
+    mov.b32 %r54, %f11;
+    shfl.sync.down.b32 %r55, %r54, 4, 31, 0xffffffff;
+    mov.b32 %f12, %r55; max.f32 %f11, %f11, %f12;
+    mov.b32 %r54, %f11;
+    shfl.sync.down.b32 %r55, %r54, 2, 31, 0xffffffff;
+    mov.b32 %f12, %r55; max.f32 %f11, %f11, %f12;
+    mov.b32 %r54, %f11;
+    shfl.sync.down.b32 %r55, %r54, 1, 31, 0xffffffff;
+    mov.b32 %f12, %r55; max.f32 %f11, %f11, %f12;
+    mov.b32 %r54, %f11;
+    shfl.sync.idx.b32 %r55, %r54, 0, 31, 0xffffffff;
+    mov.b32 %f11, %r55;
+
+    mov.f32 %f13, 0f00000000;
+    mov.u32 %r51, %r8;
+W78_EXP_LOOP:
+    setp.ge.u32 %p14, %r51, %r48;
+    @%p14 bra W78_SUM_RED;
+    shl.b32 %r52, %r51, 2;
+    add.u32 %r53, %r50, %r52;
+    ld.shared.f32 %f12, [%r53];
+    sub.rn.f32 %f12, %f12, %f11;
+    mul.rn.f32 %f12, %f12, 0f3FB8AA3B;
+    ex2.approx.f32 %f14, %f12;
+    st.shared.f32 [%r53], %f14;
+    add.rn.f32 %f13, %f13, %f14;
+    add.u32 %r51, %r51, 32;
+    bra W78_EXP_LOOP;
+W78_SUM_RED:
+    mov.b32 %r54, %f13;
+    shfl.sync.down.b32 %r55, %r54, 16, 31, 0xffffffff;
+    mov.b32 %f14, %r55; add.rn.f32 %f13, %f13, %f14;
+    mov.b32 %r54, %f13;
+    shfl.sync.down.b32 %r55, %r54, 8, 31, 0xffffffff;
+    mov.b32 %f14, %r55; add.rn.f32 %f13, %f13, %f14;
+    mov.b32 %r54, %f13;
+    shfl.sync.down.b32 %r55, %r54, 4, 31, 0xffffffff;
+    mov.b32 %f14, %r55; add.rn.f32 %f13, %f13, %f14;
+    mov.b32 %r54, %f13;
+    shfl.sync.down.b32 %r55, %r54, 2, 31, 0xffffffff;
+    mov.b32 %f14, %r55; add.rn.f32 %f13, %f13, %f14;
+    mov.b32 %r54, %f13;
+    shfl.sync.down.b32 %r55, %r54, 1, 31, 0xffffffff;
+    mov.b32 %f14, %r55; add.rn.f32 %f13, %f13, %f14;
+    mov.b32 %r54, %f13;
+    shfl.sync.idx.b32 %r55, %r54, 0, 31, 0xffffffff;
+    mov.b32 %f13, %r55;
+    rcp.rn.f32 %f15, %f13;
+
+    // Materialize normalized P in the score tile. Every warp owns four rows;
+    // the following CTA barrier makes all 16 rows visible to cooperative MMA.
+    mov.u32 %r56, %r8;
+W78_NORM_LOOP:
+    setp.ge.u32 %p15, %r56, %r48;
+    @%p15 bra W78_ROW_NEXT;
+    shl.b32 %r58, %r56, 2;
+    add.u32 %r59, %r50, %r58;
+    ld.shared.f32 %f18, [%r59];
+    mul.rn.f32 %f18, %f18, %f15;
+    st.shared.f32 [%r59], %f18;
+    add.u32 %r56, %r56, 32;
+    bra W78_NORM_LOOP;
+W78_ROW_NEXT:
+    add.u32 %r45, %r45, 4;
+    bra W78_ROW_LOOP;
+
+W78_AV_READY:
+    bar.sync 0;
+
+    // Four warps cover the 64 output dimensions. Each warp computes adjacent
+    // N8 tiles and retains the Wave 75 row-major V fragment mapping.
+    ld.global.u32 %av_r15, [%rd11];
+    sub.u32 %av_r15, %r4, %av_r15;      // ntok
+    mov.u32 %av_r3, %r9;
+    add.u32 %av_r4, %r12, %av_r3;       // global row groupID
+    mov.u32 %av_r5, 0;                  // invalid tail row has no causal K
+    setp.lt.u32 %av_p1, %av_r4, %av_r15;
+    @!%av_p1 bra W78_AV_META_ROW0_DONE;
+    mul.wide.u32 %av_rd0, %av_r4, 4;
+    add.u64 %av_rd0, %rd11, %av_rd0;
+    ld.global.u32 %av_r5, [%av_rd0];
+    add.u32 %av_r5, %av_r5, 1;
+W78_AV_META_ROW0_DONE:
+    add.u32 %av_r7, %av_r3, 8;
+    add.u32 %av_r8, %r12, %av_r7;       // global row groupID+8
+    mov.u32 %av_r9, 0;
+    setp.lt.u32 %av_p1, %av_r8, %av_r15;
+    @!%av_p1 bra W78_AV_META_ROW8_DONE;
+    mul.wide.u32 %av_rd1, %av_r8, 4;
+    add.u64 %av_rd1, %rd11, %av_rd1;
+    ld.global.u32 %av_r9, [%av_rd1];
+    add.u32 %av_r9, %av_r9, 1;
+W78_AV_META_ROW8_DONE:
+    mov.f32 %c0, 0f00000000;
+    mov.f32 %c1, 0f00000000;
+    mov.f32 %c2, 0f00000000;
+    mov.f32 %c3, 0f00000000;
+    mov.f32 %c4, 0f00000000;
+    mov.f32 %c5, 0f00000000;
+    mov.f32 %c6, 0f00000000;
+    mov.f32 %c7, 0f00000000;
+    mov.u32 %av_r0, 0;
+
+W78_AV_MMA_K:
+    setp.ge.u32 %av_p0, %av_r0, %r4;
+    @%av_p0 bra W78_AV_MMA_STORE;
+    shl.b32 %av_r1, %r10, 1;
+    add.u32 %av_r1, %av_r1, %av_r0;     // lane K0
+    add.u32 %av_r2, %av_r1, 1;          // lane K1
+
+    // A fragment row groupID. Scores outside that row's causal prefix stay 0.
+    mad.lo.u32 %av_r6, %av_r3, %r16, %av_r1;
+    shl.b32 %av_r6, %av_r6, 2;
+    add.u32 %av_r6, %r15, %av_r6;
+    mov.f32 %av_f0, 0f00000000;
+    mov.f32 %av_f6, 0f00000000;
+    setp.lt.u32 %av_p2, %av_r1, %av_r5;
+    @%av_p2 ld.shared.f32 %av_f0, [%av_r6];
+    setp.lt.u32 %av_p2, %av_r2, %av_r5;
+    @%av_p2 ld.shared.f32 %av_f6, [%av_r6+4];
+    // A fragment row groupID+8, including the final partial query tile.
+    mad.lo.u32 %av_r10, %av_r7, %r16, %av_r1;
+    shl.b32 %av_r10, %av_r10, 2;
+    add.u32 %av_r10, %r15, %av_r10;
+    mov.f32 %av_f1, 0f00000000;
+    mov.f32 %av_f7, 0f00000000;
+    setp.lt.u32 %av_p2, %av_r1, %av_r9;
+    @%av_p2 ld.shared.f32 %av_f1, [%av_r10];
+    setp.lt.u32 %av_p2, %av_r2, %av_r9;
+    @%av_p2 ld.shared.f32 %av_f7, [%av_r10+4];
+    cvt.rn.f16.f32 %h0, %av_f0;
+    cvt.rn.f16.f32 %h1, %av_f1;
+    cvt.f32.f16 %av_f2, %h0;
+    cvt.f32.f16 %av_f3, %h1;
+    sub.rn.f32 %av_f4, %av_f0, %av_f2;
+    sub.rn.f32 %av_f5, %av_f1, %av_f3;
+    cvt.rn.f16.f32 %h2, %av_f4;
+    cvt.rn.f16.f32 %h3, %av_f5;
+    cvt.rn.f16.f32 %h4, %av_f6;
+    cvt.rn.f16.f32 %h5, %av_f7;
+    cvt.f32.f16 %av_f8, %h4;
+    cvt.f32.f16 %av_f9, %h5;
+    sub.rn.f32 %av_f10, %av_f6, %av_f8;
+    sub.rn.f32 %av_f11, %av_f7, %av_f9;
+    cvt.rn.f16.f32 %h6, %av_f10;
+    cvt.rn.f16.f32 %h7, %av_f11;
+    mov.b32 %a_hi0, {%h0, %h4};
+    mov.b32 %a_hi1, {%h1, %h5};
+    mov.b32 %a_lo0, {%h2, %h6};
+    mov.b32 %a_lo1, {%h3, %h7};
+
+    // B fragments: retained V is [kv_head, K, 64]. groupID selects N;
+    // threadInGroup selects the adjacent K pair consumed by MMA.
+    shl.b32 %av_r11, %r7, 4;
+    add.u32 %av_r11, %av_r11, %r9;
+    shl.b32 %av_r13, %av_r1, 6;
+    add.u32 %av_r13, %av_r13, %av_r11;
+    shl.b32 %av_r13, %av_r13, 2;
+    cvt.u64.u32 %av_rd2, %av_r13;
+    add.u64 %av_rd2, %rd14, %av_rd2;
+    mov.f32 %av_f12, 0f00000000;
+    mov.f32 %av_f13, 0f00000000;
+    setp.lt.u32 %av_p2, %av_r1, %r4;
+    @%av_p2 ld.global.f32 %av_f12, [%av_rd2];
+    setp.lt.u32 %av_p2, %av_r2, %r4;
+    @%av_p2 ld.global.f32 %av_f13, [%av_rd2+256];
+    cvt.rn.f16.f32 %h8, %av_f12;
+    cvt.rn.f16.f32 %h9, %av_f13;
+    cvt.f32.f16 %av_f14, %h8;
+    cvt.f32.f16 %av_f15, %h9;
+    sub.rn.f32 %av_f16, %av_f12, %av_f14;
+    sub.rn.f32 %av_f17, %av_f13, %av_f15;
+    cvt.rn.f16.f32 %h10, %av_f16;
+    cvt.rn.f16.f32 %h11, %av_f17;
+    mov.b32 %b0_hi, {%h8, %h9};
+    mov.b32 %b0_lo, {%h10, %h11};
+
+    add.u32 %av_r12, %av_r11, 8;
+    shl.b32 %av_r13, %av_r1, 6;
+    add.u32 %av_r13, %av_r13, %av_r12;
+    shl.b32 %av_r13, %av_r13, 2;
+    cvt.u64.u32 %av_rd3, %av_r13;
+    add.u64 %av_rd3, %rd14, %av_rd3;
+    mov.f32 %av_f12, 0f00000000;
+    mov.f32 %av_f13, 0f00000000;
+    setp.lt.u32 %av_p2, %av_r1, %r4;
+    @%av_p2 ld.global.f32 %av_f12, [%av_rd3];
+    setp.lt.u32 %av_p2, %av_r2, %r4;
+    @%av_p2 ld.global.f32 %av_f13, [%av_rd3+256];
+    cvt.rn.f16.f32 %h12, %av_f12;
+    cvt.rn.f16.f32 %h13, %av_f13;
+    cvt.f32.f16 %av_f14, %h12;
+    cvt.f32.f16 %av_f15, %h13;
+    sub.rn.f32 %av_f16, %av_f12, %av_f14;
+    sub.rn.f32 %av_f17, %av_f13, %av_f15;
+    cvt.rn.f16.f32 %h14, %av_f16;
+    cvt.rn.f16.f32 %h15, %av_f17;
+    mov.b32 %b1_hi, {%h12, %h13};
+    mov.b32 %b1_lo, {%h14, %h15};
+
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_hi0,%a_hi1}, {%b0_hi}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_hi0,%a_hi1}, {%b0_lo}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_lo0,%a_lo1}, {%b0_hi}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c0,%c1,%c2,%c3}, {%a_lo0,%a_lo1}, {%b0_lo}, {%c0,%c1,%c2,%c3};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_hi0,%a_hi1}, {%b1_hi}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_hi0,%a_hi1}, {%b1_lo}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_lo0,%a_lo1}, {%b1_hi}, {%c4,%c5,%c6,%c7};
+    mma.sync.aligned.m16n8k8.row.col.f32.f16.f16.f32
+        {%c4,%c5,%c6,%c7}, {%a_lo0,%a_lo1}, {%b1_lo}, {%c4,%c5,%c6,%c7};
+    add.u32 %av_r0, %av_r0, 8;
+    bra W78_AV_MMA_K;
+
+W78_AV_MMA_STORE:
+    shl.b32 %av_r14, %r7, 4;
+    shl.b32 %av_r16, %r10, 1;
+    add.u32 %av_r14, %av_r14, %av_r16;
+    add.u32 %av_r4, %r12, %r9;
+    setp.ge.u32 %av_p4, %av_r4, %av_r15;
+    @%av_p4 bra W78_AV_STORE_ROW8;
+    mul.lo.u32 %av_r16, %av_r4, %r13;
+    add.u32 %av_r16, %av_r16, %r11;
+    shl.b32 %av_r16, %av_r16, 6;
+    add.u32 %av_r16, %av_r16, %av_r14;
+    shl.b32 %av_r16, %av_r16, 2;
+    cvt.u64.u32 %av_rd4, %av_r16;
+    add.u64 %av_rd4, %rd10, %av_rd4;
+    st.global.f32 [%av_rd4], %c0;
+    st.global.f32 [%av_rd4+4], %c1;
+    st.global.f32 [%av_rd4+32], %c4;
+    st.global.f32 [%av_rd4+36], %c5;
+W78_AV_STORE_ROW8:
+    add.u32 %av_r8, %av_r4, 8;
+    setp.ge.u32 %av_p4, %av_r8, %av_r15;
+    @%av_p4 bra W78_DONE;
+    mul.lo.u32 %av_r16, %av_r8, %r13;
+    add.u32 %av_r16, %av_r16, %r11;
+    shl.b32 %av_r16, %av_r16, 6;
+    add.u32 %av_r16, %av_r16, %av_r14;
+    shl.b32 %av_r16, %av_r16, 2;
+    cvt.u64.u32 %av_rd5, %av_r16;
+    add.u64 %av_rd5, %rd10, %av_rd5;
+    st.global.f32 [%av_rd5], %c2;
+    st.global.f32 [%av_rd5+4], %c3;
+    st.global.f32 [%av_rd5+32], %c6;
+    st.global.f32 [%av_rd5+36], %c7;
+W78_DONE:
+    ret;
+}
+
 .visible .entry gl_gemm_mma_q8_probe(
     .param .u64 p_wqs,
     .param .u64 p_wsc,

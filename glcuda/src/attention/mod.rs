@@ -111,6 +111,8 @@ pub enum ENAttentionPath {
     /// Wave 48: Wave 20's exact arithmetic with Q fragments captured once in
     /// registers so the static 4 KiB shared tile disappears.
     Mma4RegQ,
+    /// Wave 78: Wave 48 QK/softmax with compensated-f16 MMA for the final AV.
+    Mma4RegQAvMma,
 }
 
 impl ENAttentionPath {
@@ -122,6 +124,7 @@ impl ENAttentionPath {
             ENAttentionPath::Qk4 => "qk4",
             ENAttentionPath::Mma4 => "mma4-fused",
             ENAttentionPath::Mma4RegQ => "mma4-regq",
+            ENAttentionPath::Mma4RegQAvMma => "mma4-regq-avmma",
             ENAttentionPath::Gqa7Qk2 => "gqa7+qk2",
             ENAttentionPath::Gqa7Qk4 => "gqa7+qk4",
         }
@@ -135,7 +138,8 @@ impl ENAttentionPath {
             ENAttentionPath::Rows
             | ENAttentionPath::Qk4
             | ENAttentionPath::Mma4
-            | ENAttentionPath::Mma4RegQ => u64::from(call.n_heads),
+            | ENAttentionPath::Mma4RegQ
+            | ENAttentionPath::Mma4RegQAvMma => u64::from(call.n_heads),
             // The chained GQA7 kernels share GQA7's one-CTA-per-group shape,
             // so they stream exactly the same K/V history.
             ENAttentionPath::Gqa7 | ENAttentionPath::Gqa7Qk2 | ENAttentionPath::Gqa7Qk4 => {
@@ -236,6 +240,12 @@ pub fn select(kernels: &KernelSet, call: &VLAttentionCall) -> ENAttentionPath {
     if kernels.rows_forced() {
         return ENAttentionPath::Rows;
     }
+    if kernels.mma4_regq_avmma_attention_enabled()
+        && call.head_dim == 64
+        && kernels.mma4_regq_attention_capacity_supported(call.score_capacity())
+    {
+        return ENAttentionPath::Mma4RegQAvMma;
+    }
     if kernels.mma4_regq_attention_enabled()
         && call.head_dim == 64
         && kernels.mma4_regq_attention_capacity_supported(call.score_capacity())
@@ -326,6 +336,25 @@ pub fn prefill(
         }
         ENAttentionPath::Mma4RegQ => {
             kernels.attn_mma4_regq_fused(
+                cuda,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                call.n_heads,
+                call.head_dim,
+                pos_seq,
+                call.heads_per_kv(),
+                call.head_stride,
+                call.scale,
+                call.n_tokens,
+                call.score_capacity(),
+                q_row_stride,
+            )?;
+            return Ok(path);
+        }
+        ENAttentionPath::Mma4RegQAvMma => {
+            kernels.attn_mma4_regq_avmma_fused(
                 cuda,
                 q,
                 k_cache,

@@ -1367,12 +1367,12 @@ fn wave15_qk4_case(
     );
 }
 
-/// Wave 20: the compensated-f16 MMA score tile is now fused with the exact
-/// production contract (causal positions, strided Q, softmax and AV). This is
-/// deliberately a tolerance gate against the host oracle, not a comparison to
-/// the Wave 19 score diagnostic.
+/// Waves 20/48/78: compensated-f16 MMA attention under the exact production
+/// contract (causal positions, strided Q, softmax and AV). Wave 78 replaces
+/// only AV with cooperative MMA. All candidates are tolerance-gated against
+/// the host oracle, including ragged and non-zero-base shapes.
 #[test]
-fn wave20_fused_mma4_attention_matches_oracle_at_production_and_tail_shapes() {
+fn fused_mma4_attention_matches_oracle_at_production_and_tail_shapes() {
     let Some((cuda, k)) = gpu() else { return };
     if !k.has_mma() {
         eprintln!("SKIP: device below sm_75 - no tensor-core module");
@@ -1420,7 +1420,7 @@ fn wave20_mma4_attention_case(
     let mut want = vec![0f32; ntok * width];
     glcuda::attention::reference::prefill(&q, q_stride, &kc, &vc, &mut want, &call);
 
-    let bytes = ((q.len() + kc.len() + vc.len() + 2 * want.len()) * 4
+    let bytes = ((q.len() + kc.len() + vc.len() + 3 * want.len()) * 4
         + (filled + 1) * 4
         + 64 * 1024) as u64;
     let mut buf = BackendBuffer::new(cuda, bytes).unwrap();
@@ -1429,6 +1429,7 @@ fn wave20_mma4_attention_case(
     let dv = upload(cuda, &mut buf, &vc);
     let dout = buf.alloc_f32(want.len()).unwrap().dptr;
     let dregq = buf.alloc_f32(want.len()).unwrap().dptr;
+    let davmma = buf.alloc_f32(want.len()).unwrap().dptr;
     let pos_vals: Vec<u32> = (0..=filled as u32).collect();
     let dpos = buf.alloc((pos_vals.len() * 4) as u64).unwrap().dptr;
     let pos_bytes =
@@ -1468,11 +1469,30 @@ fn wave20_mma4_attention_case(
         q_stride as u32,
     )
     .unwrap();
+    k.attn_mma4_regq_avmma_fused(
+        cuda,
+        dq,
+        dk,
+        dv,
+        davmma,
+        n_heads as u32,
+        head_dim as u32,
+        dpos + (base * 4) as u64,
+        heads_per_kv as u32,
+        head_stride as u32,
+        scale,
+        ntok as u32,
+        filled as u32,
+        q_stride as u32,
+    )
+    .unwrap();
     cuda.synchronize().unwrap();
     let mut got = vec![0f32; want.len()];
     let mut regq = vec![0f32; want.len()];
+    let mut avmma = vec![0f32; want.len()];
     cuda.dtoh_f32(&mut got, dout).unwrap();
     cuda.dtoh_f32(&mut regq, dregq).unwrap();
+    cuda.dtoh_f32(&mut avmma, davmma).unwrap();
     buf.free(cuda).unwrap();
     assert_close(
         &got,
@@ -1487,6 +1507,14 @@ fn wave20_mma4_attention_case(
         &got,
         &format!(
             "Wave48 register-Q vs Wave20 heads={n_heads} kv={n_kv} base={base} ntok={ntok} qpad={q_pad}"
+        ),
+    );
+    assert_close(
+        &avmma,
+        &want,
+        EPS_MATMUL,
+        &format!(
+            "Wave78 compensated-MMA AV heads={n_heads} kv={n_kv} base={base} ntok={ntok} qpad={q_pad}"
         ),
     );
 }
