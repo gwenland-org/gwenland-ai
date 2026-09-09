@@ -1,0 +1,62 @@
+{
+  "wave": 103,
+  "kernel": "jinxsuperdev/glcuda-wave-102-n16-prefetch-production",
+  "version": 2,
+  "status": "production_measured",
+  "decision": "reject_retention_keep_experimental",
+  "method": {
+    "quant": "Q8_0",
+    "prompt_tokens": 244,
+    "pairs": 10,
+    "sessions": 20,
+    "cold_iters": 1,
+    "warmup_iters": 5,
+    "measure_iters": 10,
+    "position_balanced": true,
+    "oracle": "glproc"
+  },
+  "summary": {
+    "retained_n16": {
+      "prefill_p50_median": 11700.373292723109,
+      "latency_p50_median_ms": 20.85419675,
+      "latency_max_median_ms": 22.116533000000004,
+      "decode_p50_median": 204.9661106035325
+    },
+    "candidate_n16_prefetch": {
+      "prefill_p50_median": 12232.744196796972,
+      "latency_p50_median_ms": 19.955015500000002,
+      "latency_max_median_ms": 23.4084905,
+      "decode_p50_median": 204.668003777985
+    }
+  },
+  "comparison": {
+    "ratio_of_session_p50_medians": 0.04550033496836936,
+    "absolute_gain_tps": 532.3709040738631,
+    "median_paired_delta": 0.04136447071132521,
+    "worst_paired_delta": -0.009906869465364343,
+    "positive_pairs": 9,
+    "pairs": 10,
+    "tail_session_max_delta": 0.05841591446543615,
+    "oracle_ok": true,
+    "decode_ok": true,
+    "tail_ok": false,
+    "all_positive": false
+  },
+  "target": {
+    "tps": 15000.0,
+    "achieved": false,
+    "gap_tps_from_fastest_measured": 2767.2558032030283,
+    "gap_ratio_from_fastest_measured": 0.2262170906776264
+  },
+  "direct_gate": {
+    "minimum_speedup": 1.2281,
+    "all_bit_exact": true
+  },
+  "source_revision": "ec4a6332558070cb6b3c6371d3bdacb8f18b6d78",
+  "source_patch_sha256": "272ae9add1a8b1b9f56ff4bee97d95aad2fdb461c29f2224388257896cae0279",
+  "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+  "archive": "glcuda-t4-wave103-n16-prefetch-production-v2.zip",
+  "archive_sha256": "b4679a2b5ef1ffd5b97f27fcf54f93db552c60003ebc88ce76f19aba05a47f5d",
+  "upstream_numeric_wave_field": 80,
+  "upstream_numeric_wave_field_stale": true
+}
