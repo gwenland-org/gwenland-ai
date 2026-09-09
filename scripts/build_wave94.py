@@ -1,4 +1,4 @@
-"""Build the self-contained Wave 94 Kaggle T4 direct-gate notebook."""
+"""Build the self-contained Wave 101 Kaggle T4 direct-gate notebook."""
 
 from __future__ import annotations
 
@@ -51,19 +51,20 @@ import re
 import shutil
 import subprocess
 import traceback
+import urllib.request
 import zipfile
 
-BUILD = "wave94-n16-prefetch-v1"
+BUILD = "wave101-n16-prefetch-v2"
 REPO_URL = "https://github.com/gwenland-org/gwenland-ai.git"
 BASE_REV = "__BASE_REV__"
 SOURCE_REV = "__HEAD_REV__"
 PATCH_SHA256 = "__PATCH_SHA__"
 PATCH_GZIP_B64 = """__PATCH_B64__"""
-ROOT = Path("/kaggle/working/wave94")
+ROOT = Path("/kaggle/working/wave101")
 TREE = ROOT / "repo"
 RESULTS = ROOT / "results"
 TARGET = ROOT / "target"
-FINAL_ZIP = Path("/kaggle/working/glcuda-t4-wave94-n16-prefetch-results.zip")
+FINAL_ZIP = Path("/kaggle/working/glcuda-t4-wave101-n16-prefetch-results.zip")
 
 if ROOT.exists():
     shutil.rmtree(ROOT)
@@ -113,7 +114,7 @@ def fail(phase):
         encoding="utf-8",
     )
     archive()
-    raise RuntimeError(f"Wave 94 failed in {phase}")
+    raise RuntimeError(f"Wave 101 failed in {phase}")
 
 
 def resource(log, entry):
@@ -156,7 +157,7 @@ try:
     save("nvidia-smi.log", gpu)
     fields = [x.strip() for x in gpu.stdout.splitlines()[0].split(",")]
     if len(fields) < 5 or fields[1] != "Tesla T4" or fields[2] != "7.5":
-        raise RuntimeError(f"Wave 94 requires Tesla T4 sm_75, got {fields}")
+        raise RuntimeError(f"Wave 101 requires Tesla T4 sm_75, got {fields}")
 
     phase = "reconstruct"
     clone = run(["git", "clone", "--filter=blob:none", REPO_URL, TREE], timeout=1800)
@@ -199,10 +200,54 @@ try:
             raise RuntimeError(f"stack/spill gate failed: {resources}")
 
     phase = "build-test"
-    cargo = shutil.which("cargo") or str(Path.home() / ".cargo/bin/cargo")
+    cargo_candidates = [
+        shutil.which("cargo"),
+        Path.home() / ".cargo/bin/cargo",
+        "/usr/local/cargo/bin/cargo",
+        "/opt/rust/bin/cargo",
+        "/opt/conda/bin/cargo",
+        "/usr/local/bin/cargo",
+        "/usr/bin/cargo",
+    ]
+    cargo = next(
+        (str(path) for path in cargo_candidates if path and Path(path).is_file()),
+        None,
+    )
+    cargo_env = {}
+    bootstrapped = False
+    if cargo is None:
+        bootstrapped = True
+        rustup_url = "https://sh.rustup.rs"
+        rustup_script = ROOT / "rustup-init.sh"
+        with urllib.request.urlopen(rustup_url, timeout=120) as response:
+            rustup_script.write_bytes(response.read())
+        cargo_home = ROOT / "cargo-home"
+        rustup_home = ROOT / "rustup-home"
+        cargo_env = {
+            "CARGO_HOME": cargo_home,
+            "RUSTUP_HOME": rustup_home,
+        }
+        install = run(
+            ["bash", rustup_script, "-y", "--profile", "minimal",
+             "--default-toolchain", "stable", "--no-modify-path"],
+            env=cargo_env, timeout=1800,
+        )
+        save("rustup-install.log", install)
+        cargo = str(cargo_home / "bin/cargo")
     if not Path(cargo).is_file():
-        raise RuntimeError(f"cargo unavailable: {cargo}")
-    common = {"CARGO_TARGET_DIR": TARGET, "CUDA_VISIBLE_DEVICES": "0"}
+        raise RuntimeError(f"cargo unavailable after discovery/bootstrap: {cargo}")
+    (RESULTS / "cargo-discovery.json").write_text(json.dumps({
+        "selected": cargo,
+        "bootstrapped": bootstrapped,
+        "candidates": [str(path) for path in cargo_candidates if path],
+    }, indent=2), encoding="utf-8")
+    cargo_version = run([cargo, "--version"], env=cargo_env, timeout=60)
+    save("cargo-version.log", cargo_version)
+    common = {
+        **cargo_env,
+        "CARGO_TARGET_DIR": TARGET,
+        "CUDA_VISIBLE_DEVICES": "0",
+    }
     tests = run([cargo, "test", "-p", "glcuda", "--lib", "--locked"],
                 cwd=TREE, env=common)
     save("cargo-lib-tests.log", tests)
@@ -254,7 +299,7 @@ try:
     (RESULTS / "verdict.json").write_text(
         json.dumps(verdict, indent=2), encoding="utf-8"
     )
-    print("WAVE94_VERDICT", json.dumps(verdict), flush=True)
+    print("WAVE101_VERDICT", json.dumps(verdict), flush=True)
     archive()
 except Exception:
     fail(phase)
@@ -273,7 +318,7 @@ notebook = {
             "cell_type": "markdown",
             "metadata": {},
             "source": [
-                "# GwenLand glcuda Wave 94 — N16 prefetch T4 gate\n",
+                "# GwenLand glcuda Wave 101 — N16 prefetch T4 gate\n",
                 "\n",
                 "Self-contained SM75 resource, parity, and two-run direct A/B gate.\n",
             ],
