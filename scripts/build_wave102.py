@@ -71,9 +71,10 @@ production_code = replace_once(
     '    if paths != {"bstage-n16-m32", "bstage-n16"} or any(\n'
     '        row.get("ntok") != 244 for row in gemm\n'
     '    ):\n',
-    '    expected_paths = {"bstage-n16-m32", "bstage-n16"}\n'
-    '    if candidate:\n'
-    '        expected_paths.add("bstage-n16-prefetch")\n'
+    '    expected_paths = {\n'
+    '        "bstage-n16-m32",\n'
+    '        "bstage-n16-prefetch" if candidate else "bstage-n16",\n'
+    '    }\n'
     '    if paths != expected_paths or any(\n'
     '        row.get("ntok") != 244 for row in gemm\n'
     '    ):\n',
@@ -119,7 +120,7 @@ required = (
     '"gemm_n16_prefetch": candidate',
     '"attn_mma4_av": True',
     '"GLCUDA_GEMM_N16_PREFETCH": "1"',
-    'expected_paths.add("bstage-n16-prefetch")',
+    '"bstage-n16-prefetch" if candidate else "bstage-n16"',
     'PRODUCTION_REPEATS = 10',
     'target_reached = candidate["prefill_p50_median"] >= 15_000.0',
     '"quant": "Q8_0"',
