@@ -26,6 +26,10 @@ pub const PTX_SM75: &str = include_str!("glcuda_sm75.ptx");
 /// change unless the experiment is explicitly enabled.
 pub const PTX_SM75_WAVE59: &str = include_str!("glcuda_sm75_wave59.ptx");
 
+/// Wave 88's isolated N16 register-prefetch candidate. It is loaded only for
+/// the explicit experiment so the retained sm_75 module and JIT stay fixed.
+pub const PTX_SM75_WAVE88: &str = include_str!("glcuda_sm75_wave88.ptx");
+
 /// Threads per block for element-wise and one-block-reduction kernels.
 const BLOCK: u32 = 256;
 /// Warp size — grid geometry for the one-warp-per-row GEMV.
@@ -72,6 +76,12 @@ fn n16_threads(ntile128: bool) -> u32 {
 /// only the shared-to-register fragment load inside those two entries.
 fn n16_uses_m32(ntile128: bool, out_dim: u32, ntok: u32, sm_count: u32) -> bool {
     ntile128 && !ntile128_covers(out_dim, ntok, sm_count)
+}
+
+/// Wave 88 deliberately covers only the pinned FFN gate/up projection. The
+/// exact shape guard prevents the experiment from leaking into QKV or down.
+fn n16_prefetch_shape(out_dim: u32, in_dim: u32, ntok: u32) -> bool {
+    out_dim == 4_864 && in_dim == 896 && ntok == 244
 }
 
 /// Dynamic shared memory for prefill attention: one f32 score per causal row
@@ -168,6 +178,12 @@ struct Wave59Module {
     n32_m32: Kernel,
 }
 
+/// Wave 88 is isolated so enabling it cannot mutate the retained module.
+struct Wave88Module {
+    _module: Module,
+    n16_prefetch: Kernel,
+}
+
 /// One loaded module plus resolved handles for every kernel. Handles stay
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
@@ -183,6 +199,8 @@ pub struct KernelSet {
     mma: Option<MmaModule>,
     /// Opt-in Wave 59 N32 x M32 narrow-grid candidate.
     wave59: Option<Wave59Module>,
+    /// Opt-in Wave 88 wide-grid N16 register-prefetch candidate.
+    wave88: Option<Wave88Module>,
     /// Whether prefill should drive the r256 (256-row) GEMM instead of the
     /// 64-row one. Read once at load from `GLCUDA_R256`; see
     /// [`KernelSet::r256_enabled`].
@@ -203,6 +221,8 @@ pub struct KernelSet {
     gemm_n16: bool,
     /// Whether narrow N16/M32 launches should use Wave 59's N32/M32 entry.
     gemm_n32: bool,
+    /// Whether the pinned FFN gate/up shape should use Wave 88 prefetch.
+    gemm_n16_prefetch: bool,
     /// Wave 15A is retained and default; this forces the row kernel back,
     /// which is what an A/B against it needs.
     rows_forced: bool,
@@ -353,6 +373,20 @@ impl KernelSet {
         } else {
             None
         };
+        let gemm_n16_prefetch =
+            gemm_n16 && std::env::var_os("GLCUDA_GEMM_N16_PREFETCH").is_some();
+        let wave88 = if gemm_n16_prefetch {
+            let module = cuda.load_module(PTX_SM75_WAVE88)?;
+            let n16_prefetch =
+                module.get_function("gl_gemm_mma_q8_bstage_n16_prefetch")?;
+            eprintln!("[glcuda] Wave 88 N16 register-prefetch GEMM enabled");
+            Some(Wave88Module {
+                _module: module,
+                n16_prefetch,
+            })
+        } else {
+            None
+        };
         let rows_forced = std::env::var_os("GLCUDA_ATTN_ROWS").is_some();
         let mma4_attention = mma.is_some() && std::env::var_os("GLCUDA_ATTN_MMA4").is_some();
         let mma4_regq_attention =
@@ -365,13 +399,14 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
             mma,
             wave59,
+            wave88,
             r256,
             grid2d,
             fuse_q8_glue,
@@ -380,6 +415,7 @@ impl KernelSet {
             bstage,
             gemm_n16,
             gemm_n32,
+            gemm_n16_prefetch,
             rows_forced,
             gqa7_chains,
             mma4_attention,
@@ -1666,6 +1702,11 @@ impl KernelSet {
         self.gemm_n32
     }
 
+    /// Whether Wave 88 is requested and this exact launch is in its scope.
+    pub fn gemm_n16_prefetch_enabled(&self, out_dim: u32, in_dim: u32, ntok: u32) -> bool {
+        self.gemm_n16_prefetch && n16_prefetch_shape(out_dim, in_dim, ntok)
+    }
+
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
     pub fn wave27_n16_resource_kernel(&self) -> Option<Kernel> {
         self.mma.as_ref().map(|module| module.bstage_n16)
@@ -1679,6 +1720,11 @@ impl KernelSet {
     /// Wave 59 entry used by the direct resource and occupancy gate.
     pub fn wave59_n32_m32_resource_kernel(&self) -> Option<Kernel> {
         self.wave59.as_ref().map(|module| module.n32_m32)
+    }
+
+    /// Wave 88 entry used by the direct resource and occupancy gate.
+    pub fn wave88_n16_prefetch_resource_kernel(&self) -> Option<Kernel> {
+        self.wave88.as_ref().map(|module| module.n16_prefetch)
     }
 
     /// Whether this launch uses the narrow-grid M32 entry.
@@ -2014,6 +2060,53 @@ impl KernelSet {
         ];
         cuda.launch(
             *f,
+            (ceil_div(out_dim, n_tile), ceil_div(ntok, 64), 1),
+            (threads, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 88 exact N16 register-prefetch candidate. Its output tile,
+    /// arithmetic, shared image and launch geometry match the retained wide
+    /// N16 entry; only the next K32 global-load issue point changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8_bstage_n16_prefetch(
+        &self,
+        cuda: &Cuda,
+        tiled_w_qs: CUdeviceptr,
+        tiled_w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert!(self.gemm_n16_prefetch_enabled(out_dim, in_dim, ntok));
+        debug_assert!(!self.gemm_n16_uses_m32(out_dim, ntok));
+        let f = self
+            .wave88
+            .as_ref()
+            .map(|module| module.n16_prefetch)
+            .ok_or_else(|| GlError::Engine("Wave 88 GEMM called without its module".into()))?;
+        let threads = n16_threads(self.ntile128);
+        let n_tile = threads / 2;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) =
+            (tiled_w_qs, tiled_w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            f,
             (ceil_div(out_dim, n_tile), ceil_div(ntok, 64), 1),
             (threads, 1, 1),
             0,
@@ -3162,6 +3255,46 @@ mod tests {
         // Retained narrow CTA: N64 x M64 at 256 threads. Candidate CTA:
         // N128 x M32 at 128 threads. Only the work decomposition changes.
         assert_eq!(64 * 64, 128 * 32);
+    }
+
+    #[test]
+    fn wave88_n16_prefetch_keeps_the_isolated_exact_tile_contract() {
+        assert!(PTX_SM75_WAVE88.starts_with(".version 6.5\n.target sm_75\n"));
+        assert!(PTX_SM75_WAVE88
+            .contains(".visible .entry gl_gemm_mma_q8_bstage_n16_prefetch("));
+        assert_eq!(
+            PTX_SM75_WAVE88.matches('{').count(),
+            PTX_SM75_WAVE88.matches('}').count()
+        );
+        assert_eq!(PTX_SM75_WAVE88.matches("mma.sync.aligned").count(), 32);
+        assert_eq!(PTX_SM75_WAVE88.matches("bar.sync 0;").count(), 2);
+        assert_eq!(
+            PTX_SM75_WAVE88
+                .matches("ldmatrix.sync.aligned.x2.m8n8.shared.b16")
+                .count(),
+            8
+        );
+        assert_eq!(
+            PTX_SM75_WAVE88
+                .matches("ldmatrix.sync.aligned.x4.m8n8.shared.b16")
+                .count(),
+            1
+        );
+        assert!(PTX_SM75_WAVE88.contains("sm_a[3072]"));
+        assert!(PTX_SM75_WAVE88.contains("sm_xs[256]"));
+        assert!(PTX_SM75_WAVE88.contains("sm_b[6144]"));
+        assert!(PTX_SM75_WAVE88.contains("sm_bs[256]"));
+        assert!(PTX_SM75_WAVE88.contains(".maxnreg 80"));
+        assert!(PTX_SM75_WAVE88.contains("%rdP_a0"));
+        assert!(PTX_SM75_WAVE88.contains("%rdP_a1"));
+        assert!(PTX_SM75_WAVE88.contains("%rdP_b0"));
+        assert!(PTX_SM75_WAVE88.contains("%rdP_b1"));
+        assert!(!PTX_SM75_WAVE88.contains("wmma."));
+        assert!(!PTX_SM75_WAVE88.contains('\0'));
+        assert!(!PTX_SM75_WAVE88.contains('\r'));
+        assert!(n16_prefetch_shape(4_864, 896, 244));
+        assert!(!n16_prefetch_shape(896, 4_864, 244));
+        assert!(!n16_prefetch_shape(4_864, 896, 243));
     }
 
     #[test]
