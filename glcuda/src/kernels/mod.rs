@@ -33,6 +33,9 @@ pub const PTX_SM75_WAVE88: &str = include_str!("glcuda_sm75_wave88.ptx");
 /// Wave 105's isolated N16/M32 register-prefetch candidate for FFN-down.
 pub const PTX_SM75_WAVE105: &str = include_str!("glcuda_sm75_wave105.ptx");
 
+/// Wave 109 rematerializes epilogue-only state to preserve M32 occupancy.
+pub const PTX_SM75_WAVE109: &str = include_str!("glcuda_sm75_wave109.ptx");
+
 /// Threads per block for element-wise and one-block-reduction kernels.
 const BLOCK: u32 = 256;
 /// Warp size — grid geometry for the one-warp-per-row GEMV.
@@ -199,6 +202,12 @@ struct Wave105Module {
     n16_m32_prefetch: Kernel,
 }
 
+/// Wave 109 is isolated from both the retained and Wave 105 modules.
+struct Wave109Module {
+    _module: Module,
+    n16_m32_prefetch_remat: Kernel,
+}
+
 /// One loaded module plus resolved handles for every kernel. Handles stay
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
@@ -218,6 +227,8 @@ pub struct KernelSet {
     wave88: Option<Wave88Module>,
     /// Opt-in Wave 105 M32 register-prefetch candidate for FFN-down.
     wave105: Option<Wave105Module>,
+    /// Opt-in Wave 109 occupancy-neutral M32 prefetch candidate.
+    wave109: Option<Wave109Module>,
     /// Whether prefill should drive the r256 (256-row) GEMM instead of the
     /// 64-row one. Read once at load from `GLCUDA_R256`; see
     /// [`KernelSet::r256_enabled`].
@@ -242,6 +253,8 @@ pub struct KernelSet {
     gemm_n16_prefetch: bool,
     /// Whether the pinned FFN-down shape should use Wave 105 prefetch.
     gemm_n16_m32_prefetch: bool,
+    /// Whether FFN-down should use Wave 109's epilogue-rematerialized entry.
+    gemm_n16_m32_prefetch_remat: bool,
     /// Wave 15A is retained and default; this forces the row kernel back,
     /// which is what an A/B against it needs.
     rows_forced: bool,
@@ -417,6 +430,20 @@ impl KernelSet {
         } else {
             None
         };
+        let gemm_n16_m32_prefetch_remat =
+            gemm_n16 && std::env::var_os("GLCUDA_GEMM_N16_M32_PREFETCH_REMAT").is_some();
+        let wave109 = if gemm_n16_m32_prefetch_remat {
+            let module = cuda.load_module(PTX_SM75_WAVE109)?;
+            let n16_m32_prefetch_remat =
+                module.get_function("gl_gemm_mma_q8_bstage_n16_m32_prefetch_remat")?;
+            eprintln!("[glcuda] Wave 109 occupancy-neutral N16/M32 prefetch enabled");
+            Some(Wave109Module {
+                _module: module,
+                n16_m32_prefetch_remat,
+            })
+        } else {
+            None
+        };
         let rows_forced = std::env::var_os("GLCUDA_ATTN_ROWS").is_some();
         let mma4_attention = mma.is_some() && std::env::var_os("GLCUDA_ATTN_MMA4").is_some();
         let mma4_regq_attention =
@@ -429,8 +456,8 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"gemm_n16_m32_prefetch\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, gemm_n16_m32_prefetch, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"gemm_n16_m32_prefetch\":{},\"gemm_n16_m32_prefetch_remat\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, gemm_n16_m32_prefetch, gemm_n16_m32_prefetch_remat, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -438,6 +465,7 @@ impl KernelSet {
             wave59,
             wave88,
             wave105,
+            wave109,
             r256,
             grid2d,
             fuse_q8_glue,
@@ -448,6 +476,7 @@ impl KernelSet {
             gemm_n32,
             gemm_n16_prefetch,
             gemm_n16_m32_prefetch,
+            gemm_n16_m32_prefetch_remat,
             rows_forced,
             gqa7_chains,
             mma4_attention,
@@ -1744,6 +1773,16 @@ impl KernelSet {
         self.gemm_n16_m32_prefetch && n16_m32_prefetch_shape(out_dim, in_dim, ntok)
     }
 
+    /// Whether Wave 109 is requested and this exact M32 launch is in scope.
+    pub fn gemm_n16_m32_prefetch_remat_enabled(
+        &self,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> bool {
+        self.gemm_n16_m32_prefetch_remat && n16_m32_prefetch_shape(out_dim, in_dim, ntok)
+    }
+
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
     pub fn wave27_n16_resource_kernel(&self) -> Option<Kernel> {
         self.mma.as_ref().map(|module| module.bstage_n16)
@@ -1767,6 +1806,13 @@ impl KernelSet {
     /// Wave 105 entry used by the direct resource and occupancy gate.
     pub fn wave105_n16_m32_prefetch_resource_kernel(&self) -> Option<Kernel> {
         self.wave105.as_ref().map(|module| module.n16_m32_prefetch)
+    }
+
+    /// Wave 109 entry used by the direct resource and occupancy gate.
+    pub fn wave109_n16_m32_prefetch_remat_resource_kernel(&self) -> Option<Kernel> {
+        self.wave109
+            .as_ref()
+            .map(|module| module.n16_m32_prefetch_remat)
     }
 
     /// Whether this launch uses the narrow-grid M32 entry.
@@ -2179,6 +2225,49 @@ impl KernelSet {
             .as_ref()
             .map(|module| module.n16_m32_prefetch)
             .ok_or_else(|| GlError::Engine("Wave 105 GEMM called without its module".into()))?;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) =
+            (tiled_w_qs, tiled_w_scales, x_qs, x_scales, y);
+        let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            f,
+            (ceil_div(out_dim, 64), ceil_div(ntok, 64), 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 109 rematerialized variant of the complete M32 prefetch schedule.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8_bstage_n16_m32_prefetch_remat(
+        &self,
+        cuda: &Cuda,
+        tiled_w_qs: CUdeviceptr,
+        tiled_w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y: CUdeviceptr,
+        out_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert!(self.gemm_n16_m32_prefetch_remat_enabled(out_dim, in_dim, ntok));
+        debug_assert!(self.gemm_n16_uses_m32(out_dim, ntok));
+        let f = self
+            .wave109
+            .as_ref()
+            .map(|module| module.n16_m32_prefetch_remat)
+            .ok_or_else(|| GlError::Engine("Wave 109 GEMM called without its module".into()))?;
         let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) =
             (tiled_w_qs, tiled_w_scales, x_qs, x_scales, y);
         let (mut o, mut i, mut n) = (out_dim, in_dim, ntok);
@@ -3422,6 +3511,40 @@ mod tests {
         assert!(n16_m32_prefetch_shape(896, 4_864, 244));
         assert!(!n16_m32_prefetch_shape(4_864, 896, 244));
         assert!(!n16_m32_prefetch_shape(896, 4_864, 243));
+    }
+
+    #[test]
+    fn wave109_rematerializes_only_epilogue_state() {
+        assert!(PTX_SM75_WAVE109
+            .contains(".visible .entry gl_gemm_mma_q8_bstage_n16_m32_prefetch_remat("));
+        assert_eq!(
+            PTX_SM75_WAVE109.matches('{').count(),
+            PTX_SM75_WAVE109.matches('}').count()
+        );
+        assert_eq!(PTX_SM75_WAVE109.matches("mma.sync.aligned").count(), 16);
+        assert_eq!(PTX_SM75_WAVE109.matches("bar.sync 0;").count(), 2);
+        assert_eq!(
+            PTX_SM75_WAVE109
+                .matches("ld.param.u32 %r1, [p_out]")
+                .count(),
+            2
+        );
+        assert_eq!(
+            PTX_SM75_WAVE109
+                .matches("ld.param.u32 %r3, [p_ntok]")
+                .count(),
+            2
+        );
+        assert_eq!(
+            PTX_SM75_WAVE109.matches("ld.param.u64 %rd5, [p_y]").count(),
+            2
+        );
+        assert!(PTX_SM75_WAVE109.contains("%rdP_a0"));
+        assert!(PTX_SM75_WAVE109.contains("%rdP_a1"));
+        assert!(PTX_SM75_WAVE109.contains("%rdP_b0"));
+        assert!(!PTX_SM75_WAVE109.contains("wmma."));
+        assert!(!PTX_SM75_WAVE109.contains('\0'));
+        assert!(!PTX_SM75_WAVE109.contains('\r'));
     }
 
     #[test]

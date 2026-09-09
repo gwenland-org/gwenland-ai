@@ -366,6 +366,27 @@ fn gemm_rows(
                         let tiled_qs = tiled.qs.dptr + qs_offset;
                         let tiled_scales = tiled.scales.dptr + scale_offset;
                         if k.gemm_n16_enabled() && n16_bstage_shape(rows, inb) {
+                            if k.gemm_n16_m32_prefetch_remat_enabled(rows, inb, n) {
+                                static N16_M32_PREFETCH_REMAT_ANNOUNCED: std::sync::Once =
+                                    std::sync::Once::new();
+                                N16_M32_PREFETCH_REMAT_ANNOUNCED.call_once(|| {
+                                    eprintln!(
+                                        "[glcuda-gemm] {{\"path\":\"bstage-n16-m32-prefetch-remat\",\"out_dim\":{},\"in_dim\":{},\"ntok\":{}}}",
+                                        rows, inb, n
+                                    );
+                                });
+                                return k.gemm_mma_q8_bstage_n16_m32_prefetch_remat(
+                                    cuda,
+                                    tiled_qs,
+                                    tiled_scales,
+                                    x_qs,
+                                    x_scales,
+                                    y,
+                                    rows,
+                                    inb,
+                                    n,
+                                );
+                            }
                             if k.gemm_n16_m32_prefetch_enabled(rows, inb, n) {
                                 static N16_M32_PREFETCH_ANNOUNCED: std::sync::Once =
                                     std::sync::Once::new();
