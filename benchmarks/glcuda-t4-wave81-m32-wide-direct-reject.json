@@ -1,0 +1,39 @@
+{
+  "wave": 81,
+  "status": "direct_gate_reject",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave-81-m32-wide-production",
+  "version": 1,
+  "gpu": "Tesla T4",
+  "compute_capability": "7.5",
+  "driver": "580.159.04",
+  "source_revision": "910fe0697d01341ecd76c507ceca031e1a556e31+wave81",
+  "patch_sha256": "68cc5e6e1672787d03563a1782208eda97b9755d09a3612958c4c863d5ab2c16",
+  "archive_sha256": "175c1b8cd1de5c8cb3bf701ccc7c5fb0a8a296485d459b41fa0e2820055dfaee",
+  "shape": {
+    "out_dim": 4864,
+    "in_dim": 896,
+    "tokens": 244
+  },
+  "protocol": {
+    "warmup": 10,
+    "iterations": 100,
+    "counterbalanced_repeats": 5,
+    "minimum_direct_speedup": 1.10,
+    "production_runs_allowed_only_after_direct_pass": true
+  },
+  "resources": {
+    "retained_wide": {"registers": 72, "barriers": 1, "blocks_per_sm": 3, "spills": 0},
+    "candidate_m32": {"registers": 64, "barriers": 1, "blocks_per_sm": 4, "spills": 0}
+  },
+  "result": {
+    "retained_wide_us": 161.380,
+    "candidate_m32_us": 173.699,
+    "speedup": 0.9291,
+    "candidate_delta": -0.0709,
+    "bit_exact": true,
+    "cuda_parity": "33/33"
+  },
+  "decision": "REJECT_BEFORE_PRODUCTION",
+  "production_measured": false,
+  "target_15000_tps_achieved": false
+}
