@@ -126,4 +126,4 @@ header = """// Wave 105: M32 production geometry with complete next-K32 prefetch
 
 """
 with TARGET.open("w", newline="\n") as target:
-    target.write(header + entry)
+    target.write((header + entry).rstrip() + "\n")
