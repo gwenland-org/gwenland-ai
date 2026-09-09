@@ -1,0 +1,63 @@
+{
+  "wave": 101,
+  "kernel": "jinxsuperdev/glcuda-wave-94-n16-prefetch-t4-gate",
+  "version": 3,
+  "status": "direct_gate_pass",
+  "shape": {
+    "out_dim": 4864,
+    "in_dim": 896,
+    "ntok": 244
+  },
+  "protocol": {
+    "warmup": 10,
+    "iters": 100,
+    "repeats": 5,
+    "runs": 2,
+    "speedup_gate": 1.1
+  },
+  "records": [
+    {
+      "run": 1,
+      "retained_us": 185.628,
+      "candidate_us": 154.838,
+      "speedup": 1.1989,
+      "bit_exact": true,
+      "retained_active_blocks_per_sm": 3,
+      "candidate_active_blocks_per_sm": 3
+    },
+    {
+      "run": 2,
+      "retained_us": 157.25,
+      "candidate_us": 123.527,
+      "speedup": 1.273,
+      "bit_exact": true,
+      "retained_active_blocks_per_sm": 3,
+      "candidate_active_blocks_per_sm": 3
+    }
+  ],
+  "minimum_speedup": 1.1989,
+  "all_bit_exact": true,
+  "host_tests": {
+    "passed": 65,
+    "failed": 0
+  },
+  "resources": {
+    "retained": {
+      "registers": 72,
+      "static_shared_bytes": 9728,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    "candidate": {
+      "registers": 80,
+      "static_shared_bytes": 9728,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    }
+  },
+  "source_revision": "ec4a6332558070cb6b3c6371d3bdacb8f18b6d78",
+  "source_patch_sha256": "272ae9add1a8b1b9f56ff4bee97d95aad2fdb461c29f2224388257896cae0279",
+  "archive": "glcuda-t4-wave101-n16-prefetch-direct-pass.zip",
+  "archive_sha256": "d5b1919279fc0c6ac550cc6ad4d4171c3843e9d4e5492c7a73247376f8f6521f",
+  "decision": "retain_for_production_integration"
+}
