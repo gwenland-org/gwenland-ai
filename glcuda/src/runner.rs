@@ -141,6 +141,17 @@ pub(crate) fn elementwise_read_bytes(
     bytes + f32s(2 * n * dim)
 }
 
+/// Number of FFN residual adds that move into the following layer's
+/// attention RMS+Q8 pass. The final layer must materialize `x` for the output
+/// norm, and a one-layer model therefore has no legal deferred boundary.
+fn deferred_ffn_boundaries(enabled: bool, layers: usize) -> u64 {
+    if enabled {
+        layers.saturating_sub(1) as u64
+    } else {
+        0
+    }
+}
+
 /// Accumulated per-stage prefill cost: what glbench turns into the bucket
 /// roofline. `ms` is `None` for a stage nothing timed -- absence must never
 /// read as zero.
@@ -366,48 +377,6 @@ fn gemm_rows(
                         let tiled_qs = tiled.qs.dptr + qs_offset;
                         let tiled_scales = tiled.scales.dptr + scale_offset;
                         if k.gemm_n16_enabled() && n16_bstage_shape(rows, inb) {
-                            if k.gemm_n16_m32_prefetch_remat_enabled(rows, inb, n) {
-                                static N16_M32_PREFETCH_REMAT_ANNOUNCED: std::sync::Once =
-                                    std::sync::Once::new();
-                                N16_M32_PREFETCH_REMAT_ANNOUNCED.call_once(|| {
-                                    eprintln!(
-                                        "[glcuda-gemm] {{\"path\":\"bstage-n16-m32-prefetch-remat\",\"out_dim\":{},\"in_dim\":{},\"ntok\":{}}}",
-                                        rows, inb, n
-                                    );
-                                });
-                                return k.gemm_mma_q8_bstage_n16_m32_prefetch_remat(
-                                    cuda,
-                                    tiled_qs,
-                                    tiled_scales,
-                                    x_qs,
-                                    x_scales,
-                                    y,
-                                    rows,
-                                    inb,
-                                    n,
-                                );
-                            }
-                            if k.gemm_n16_m32_prefetch_enabled(rows, inb, n) {
-                                static N16_M32_PREFETCH_ANNOUNCED: std::sync::Once =
-                                    std::sync::Once::new();
-                                N16_M32_PREFETCH_ANNOUNCED.call_once(|| {
-                                    eprintln!(
-                                        "[glcuda-gemm] {{\"path\":\"bstage-n16-m32-prefetch\",\"out_dim\":{},\"in_dim\":{},\"ntok\":{}}}",
-                                        rows, inb, n
-                                    );
-                                });
-                                return k.gemm_mma_q8_bstage_n16_m32_prefetch(
-                                    cuda,
-                                    tiled_qs,
-                                    tiled_scales,
-                                    x_qs,
-                                    x_scales,
-                                    y,
-                                    rows,
-                                    inb,
-                                    n,
-                                );
-                            }
                             if k.gemm_n16_prefetch_enabled(rows, inb, n) {
                                 static N16_PREFETCH_ANNOUNCED: std::sync::Once =
                                     std::sync::Once::new();
@@ -1104,6 +1073,7 @@ impl GpuModel {
 
             for l in 0..self.layers.len() {
                 let layer = &self.layers[l];
+                let defer_ffn_residual = k.defer_ffn_residual_enabled();
 
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
@@ -1112,7 +1082,7 @@ impl GpuModel {
                         k.rms_quantize_q8_rows(
                             cuda,
                             pf_x,
-                            None,
+                            (defer_ffn_residual && l > 0).then_some(pf_proj),
                             layer.attn_norm.dptr,
                             pf_xn,
                             pf_qs,
@@ -1403,7 +1373,14 @@ impl GpuModel {
                     )?;
                 });
                 phase!(t_elt, ST_ELT, {
-                    k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+                    // Wave 111: `pf_proj` is not touched before the next
+                    // layer's attention RMS+Q8 pass, whose optional residual
+                    // arm performs this identical f32 add while `x` is
+                    // already being read. The final layer stays materialized
+                    // for the output norm and logits path below.
+                    if !defer_ffn_residual || l + 1 == self.layers.len() {
+                        k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
+                    }
                 });
             }
 
@@ -1461,6 +1438,14 @@ impl GpuModel {
                     hidden as u64,
                     k.fuse_q8_glue_enabled(),
                 ) * layers;
+                let deferred =
+                    deferred_ffn_boundaries(k.defer_ffn_residual_enabled(), self.layers.len());
+                let residual_bytes = 4 * n as u64 * dim as u64;
+                // Each boundary drops the standalone add's two input reads;
+                // the next attention RMS pass gains one residual read. Keep
+                // the bytes attributed to the phases that actually issue it.
+                stage_bytes[ST_ELT] -= 2 * residual_bytes * deferred;
+                stage_bytes[ST_QKV] += residual_bytes * deferred;
                 let mut add = |st: usize, m: &GpuMat| {
                     stage_bytes[st] += weight_bytes(&m.w) * weight_reads(&m.w, nn, slab_rows);
                     stage_macs[st] += nn as u64 * m.out_dim as u64 * m.in_dim as u64;
@@ -1750,7 +1735,8 @@ impl GpuModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        bstage_tile_offsets, consumes_q8_act, elementwise_read_bytes, n16_bstage_shape, r256_pays,
+        bstage_tile_offsets, consumes_q8_act, deferred_ffn_boundaries, elementwise_read_bytes,
+        n16_bstage_shape, r256_pays,
     };
     use crate::buffer::DevSlice;
     use crate::model::GpuWeight;
@@ -1800,6 +1786,14 @@ mod tests {
         // The unfused arm does the same work in more passes, so it must read
         // strictly more. That ordering is the point of the fusion.
         assert!(elementwise_read_bytes(244, 896, 896, 4864, false) > per_layer);
+    }
+
+    #[test]
+    fn deferred_ffn_residual_never_crosses_the_final_layer() {
+        assert_eq!(deferred_ffn_boundaries(false, 24), 0);
+        assert_eq!(deferred_ffn_boundaries(true, 0), 0);
+        assert_eq!(deferred_ffn_boundaries(true, 1), 0);
+        assert_eq!(deferred_ffn_boundaries(true, 24), 23);
     }
 
     #[test]
