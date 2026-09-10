@@ -1,0 +1,24 @@
+{
+  "wave": 113,
+  "status": "failed_before_measurement",
+  "kernel": "jinxsuperdev/glcuda-t4-wave113-q8-head-to-head",
+  "kernel_version": 1,
+  "source_revision": "a9ca6070acabd4d6ff677532716b1e4bf92a7c98",
+  "notebook_commit": "07b89c37e7d438b9b44e2fe4c2a4a4540dffc1bd",
+  "passed_gates": {
+    "tesla_t4_sm75": true,
+    "host_tests": "66 passed; 0 failed",
+    "cuda_parity": "33 passed; 0 failed",
+    "glbench_release_build": true,
+    "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "llama_cpp_build": "4d9176092d00586775af140581bb0b558ddc4389",
+    "llama_cuda_smoke": true,
+    "gwen_dispatch_probe": true
+  },
+  "failed_phase": "h2h-probe",
+  "primary_error": "NameError: name 'save_log' is not defined",
+  "production_sessions_completed": 0,
+  "production_metrics_valid": false,
+  "raw_log_sha256": "33e91a66341cfe54a5184e3b6df3301ba3e9cef4aebad19bb84a1dbd62a59364",
+  "failure_archive_sha256": "115897f07c2ae620a1f4dcaa992e757581113f674850e330dfd9125b34f1af1f"
+}
