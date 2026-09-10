@@ -1,0 +1,23 @@
+{
+  "wave": 114,
+  "status": "failed_before_measurement",
+  "kernel": "jinxsuperdev/glcuda-t4-wave114-q8-head-to-head",
+  "kernel_version": 1,
+  "source_revision": "07b89c37e7d438b9b44e2fe4c2a4a4540dffc1bd",
+  "passed_gates": {
+    "tesla_t4_sm75": true,
+    "host_tests": "66 passed; 0 failed",
+    "cuda_parity": "33 passed; 0 failed",
+    "glbench_release_build": true,
+    "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "llama_cpp_build": "4d9176092d00586775af140581bb0b558ddc4389",
+    "llama_cuda_smoke": true,
+    "gwen_dispatch_probe": true
+  },
+  "failed_phase": "h2h-probe",
+  "primary_error": "NameError: name 're' is not defined",
+  "production_sessions_completed": 0,
+  "production_metrics_valid": false,
+  "raw_log_sha256": "77bcecfeae3a932f2155c18e8bd20d6f04f9c8e841b6c590f649f05256b78e4",
+  "failure_archive_sha256": "48348f4db6fe05395a03ecc8f500d1e0c45f733487786ad262df578b90e6341b"
+}
