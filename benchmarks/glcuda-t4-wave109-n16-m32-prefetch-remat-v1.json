@@ -1,0 +1,52 @@
+{
+  "wave": 109,
+  "classification": "direct_gate_rejection",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave-109-n16-m32-prefetch-remat",
+  "version": 1,
+  "status": "KernelWorkerStatus.ERROR",
+  "failure_phase": "direct-run-1",
+  "device": "Tesla T4",
+  "compute_capability": "7.5",
+  "shape": {
+    "out_dim": 896,
+    "in_dim": 4864,
+    "ntok": 244,
+    "k32_blocks": 152
+  },
+  "timing": {
+    "warmup": 10,
+    "iters": 100,
+    "repeats": 5,
+    "retained_us": 220.805,
+    "candidate_us": 202.166,
+    "speedup": 1.0922,
+    "required_speedup": 1.10,
+    "pass": false
+  },
+  "parity": {
+    "bit_exact": true,
+    "first_mismatch": -1
+  },
+  "resources": {
+    "retained": {
+      "registers": 64,
+      "static_shared_bytes": 9728,
+      "active_blocks_per_sm": 4,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    "candidate": {
+      "registers": 64,
+      "static_shared_bytes": 9728,
+      "active_blocks_per_sm": 4,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    }
+  },
+  "archive": "glcuda-t4-wave109-n16-m32-prefetch-remat-v1.zip",
+  "archive_sha256": "2dc46f06a16aa39c6f1dbb8d97adf847475c987b7a8c04cd404ea1b4ed0242bc",
+  "notebook_sha256": "f6903fb37d9613d3a3405d5ee462ece32e3e9457ac697b4512d7b5c0f1478295",
+  "patch_sha256": "d6c121b6564a01dcf0542053ef109c6e86f40ff31fc540ac5c50f27f8e0a5cea",
+  "production_metric": null
+}
+
