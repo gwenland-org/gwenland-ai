@@ -67,5 +67,19 @@ if text.count(needle) != 1:
     raise RuntimeError("Wave 109 epilogue insertion point is not unique")
 text = text.replace(needle, replacement, 1)
 
+# Wave 110: the host gate admits only in_dim=4864, exactly 152 K32 blocks.
+# Compare the current block directly with the final index instead of forming
+# k+1 on every iteration. The prologue remains dynamic and unchanged.
+text = text.replace("    .reg .b32 %rP_next;\n", "", 1)
+tail_guard = """    add.s32 %rP_next, %r20, 1;
+    setp.ge.u32 %pP_more, %rP_next, %r14;
+"""
+fixed_tail_guard = """    // Wave 110 exact-shape tail: 4864 / 32 - 1 = 151.
+    setp.ge.u32 %pP_more, %r20, 151;
+"""
+if text.count(tail_guard) != 1:
+    raise RuntimeError("Wave 110 dynamic tail guard is not unique")
+text = text.replace(tail_guard, fixed_tail_guard, 1)
+
 with TARGET.open("w", newline="\n") as target:
     target.write(text.rstrip() + "\n")

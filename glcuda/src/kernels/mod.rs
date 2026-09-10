@@ -3542,6 +3542,8 @@ mod tests {
         assert!(PTX_SM75_WAVE109.contains("%rdP_a0"));
         assert!(PTX_SM75_WAVE109.contains("%rdP_a1"));
         assert!(PTX_SM75_WAVE109.contains("%rdP_b0"));
+        assert!(!PTX_SM75_WAVE109.contains("%rP_next"));
+        assert!(PTX_SM75_WAVE109.contains("setp.ge.u32 %pP_more, %r20, 151;"));
         assert!(!PTX_SM75_WAVE109.contains("wmma."));
         assert!(!PTX_SM75_WAVE109.contains('\0'));
         assert!(!PTX_SM75_WAVE109.contains('\r'));

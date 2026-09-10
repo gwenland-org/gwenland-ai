@@ -40,7 +40,6 @@
     .reg .b64 %rdP_a0, %rdP_a1, %rdP_b0;
     .reg .f32 %fP_xs;
     .reg .b16 %hP_bs;
-    .reg .b32 %rP_next;
     .reg .pred %pP_more;
     .reg .pred %p_bscale;
     .shared .align 16 .b8 sm_a[3072];    // 64 token rows x 48 B padded pitch
@@ -289,8 +288,8 @@ MMA_STAGE_BAR:
     add.s64 %rd20, %rd20, 32;
     add.s64 %rd_n16_astage_ptr1, %rd_n16_astage_ptr1, 32;
     add.s64 %rd22, %rd22, 4;
-    add.s32 %rP_next, %r20, 1;
-    setp.ge.u32 %pP_more, %rP_next, %r14;
+    // Wave 110 exact-shape tail: 4864 / 32 - 1 = 151.
+    setp.ge.u32 %pP_more, %r20, 151;
     @%pP_more bra MMA_PF_F_DONE;
     @!%p13 bra MMA_PF_F_A1;
     ld.global.u64 %rdP_a0, [%rd20];
