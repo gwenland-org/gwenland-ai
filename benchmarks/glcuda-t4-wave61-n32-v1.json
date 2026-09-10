@@ -1,0 +1,49 @@
+{
+  "schema": "gwenland.glcuda.wave-gate.v1",
+  "wave": 61,
+  "candidate": "gl_gemm_mma_q8_bstage_n32_m32",
+  "status": "no_gpu_verdict",
+  "decision": "export_ptxas_path_in_wave62",
+  "submitted_kernel": "jinxsuperdev/glcuda-t4-wave61-n32-production",
+  "submitted_version": 1,
+  "environment": {
+    "gpu": "Tesla T4",
+    "compute_capability": "7.5",
+    "driver": "580.159.04"
+  },
+  "remote_gates": {
+    "snapshot_hashes_verified": true,
+    "git_diff_check_passed": true,
+    "glcuda_lib": {
+      "passed": 64,
+      "failed": 0
+    },
+    "retained_ptxas_passed": true,
+    "retained_driver_init_passed": true,
+    "full_cuda_parity": {
+      "passed": 33,
+      "failed": 0
+    },
+    "glbench_release_build_passed": true
+  },
+  "failure": {
+    "phase": "wave61-n32-screen",
+    "exception": "NameError: name 'PTXAS' is not defined",
+    "failed_before_candidate_ptxas": true,
+    "failed_before_candidate_device_parity": true,
+    "failed_before_direct_timing": true,
+    "failed_before_production_ab": true,
+    "root_cause": "The retained compile phase discovered ptxas into a function-local PTXAS variable. The later candidate-screen code runs outside that function and referenced PTXAS without the value being exported to notebook-global scope."
+  },
+  "candidate_identity": {
+    "ptx_sha256": "0f3a390c1bc9509836aed1ccd450dd341b5f6d91cf5c5c18916f0b7913ca86f6",
+    "changed_since_wave59": false
+  },
+  "artifacts": {
+    "evidence_zip": "benchmarks/glcuda-t4-wave61-n32-v1-failed.zip",
+    "evidence_zip_sha256": "ca6f4c8c9cbf6988488d7694ee027106dfdba295512285a1584a49aea73d3dda",
+    "submitted_notebook_sha256": "5f8ee99b6ca009cd6fb9e081d9f93173f63adddc99db41e59e0bd0173caf82f1"
+  },
+  "performance": null,
+  "ptxas_resources": null
+}

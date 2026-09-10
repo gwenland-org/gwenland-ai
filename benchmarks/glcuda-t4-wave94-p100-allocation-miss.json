@@ -1,0 +1,28 @@
+{
+  "wave": 94,
+  "kernel": "jinxsuperdev/glcuda-wave-94-n16-prefetch-t4-gate",
+  "version": 1,
+  "status": "allocation_miss",
+  "requested": {
+    "enable_gpu": true,
+    "machine_shape": null
+  },
+  "observed_gpu": {
+    "name": "Tesla P100-PCIE-16GB",
+    "compute_capability": "6.0",
+    "memory_mib": 16384,
+    "driver": "580.159.04"
+  },
+  "required_gpu": {
+    "name": "Tesla T4",
+    "compute_capability": "7.5",
+    "machine_shape": "NvidiaTeslaT4"
+  },
+  "failed_phase": "bootstrap",
+  "implementation_reached": false,
+  "source_revision": "604acd0b20f20aa40a9d0e15814dd30675914e5f",
+  "source_patch_sha256": "272ae9add1a8b1b9f56ff4bee97d95aad2fdb461c29f2224388257896cae0279",
+  "archive": "glcuda-t4-wave94-p100-allocation-miss.zip",
+  "archive_sha256": "674622f9d971dc9885ff8215d17d7eb8b900244698ad5dc5cb42946eca720b97",
+  "next_action": "push a new version with --accelerator NvidiaTeslaT4"
+}

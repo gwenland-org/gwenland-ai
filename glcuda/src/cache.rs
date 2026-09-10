@@ -32,15 +32,9 @@ fn cache_path(gguf_path: &str) -> PathBuf {
     let mut p = PathBuf::from(gguf_path);
     let name = p.file_name().map(|n| n.to_owned()).unwrap_or_default();
     // The suffix carries the weight-format policy the stage ran under, so a
-    // GLCUDA_W8PC/GLCUDA_FORCE_Q8 runs can never be handed a cache produced
-    // under a different scale contract. See load_host_cached.
-    let policy = if std::env::var_os("GLCUDA_W8PC").is_some() {
-        ".w8pc"
-    } else if std::env::var_os("GLCUDA_FORCE_Q8").is_some() {
-        ".q8"
-    } else {
-        ""
-    };
+    // GLCUDA_FORCE_Q8 run can never be handed the native-SoA weights it exists
+    // to avoid. See load_host_cached.
+    let policy = if std::env::var_os("GLCUDA_FORCE_Q8").is_some() { ".q8" } else { "" };
     p.set_file_name(format!("{}{policy}.glcache", name.to_string_lossy()));
     p
 }
@@ -162,31 +156,17 @@ fn rd_weight<R: Read>(r: &mut R) -> io::Result<HostWeight> {
     Ok(match tag[0] {
         0 => HostWeight::F32(rd_vecf32(r)?),
         1 => HostWeight::Q8_0(rd_bytes(r)?),
-        2 => HostWeight::Q8_0Soa {
-            qs: rd_bytes(r)?,
-            scales: rd_bytes(r)?,
-        },
+        2 => HostWeight::Q8_0Soa { qs: rd_bytes(r)?, scales: rd_bytes(r)? },
         3 => HostWeight::Q4_0(rd_bytes(r)?),
         4 => HostWeight::Q4K(rd_bytes(r)?),
-        5 => HostWeight::Q4KSoa {
-            qs: rd_bytes(r)?,
-            scales: rd_bytes(r)?,
-            mins: rd_bytes(r)?,
-        },
-        6 => HostWeight::Q4_0Soa {
-            qs: rd_bytes(r)?,
-            scales: rd_bytes(r)?,
-        },
+        5 => HostWeight::Q4KSoa { qs: rd_bytes(r)?, scales: rd_bytes(r)?, mins: rd_bytes(r)? },
+        6 => HostWeight::Q4_0Soa { qs: rd_bytes(r)?, scales: rd_bytes(r)? },
         7 => HostWeight::Q6K(rd_bytes(r)?),
         8 => HostWeight::Q6KSoa {
             ql: rd_bytes(r)?,
             qh: rd_bytes(r)?,
             scales: rd_bytes(r)?,
             d: rd_bytes(r)?,
-        },
-        9 => HostWeight::W8PcSoa {
-            qs: rd_bytes(r)?,
-            scales: rd_vecf32(r)?,
         },
         _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "bad weight tag")),
     })
@@ -195,11 +175,7 @@ fn rd_weight<R: Read>(r: &mut R) -> io::Result<HostWeight> {
 fn rd_mat<R: Read>(r: &mut R) -> io::Result<HostMat> {
     let out_dim = rd_u64(r)? as usize;
     let in_dim = rd_u64(r)? as usize;
-    Ok(HostMat {
-        w: rd_weight(r)?,
-        out_dim,
-        in_dim,
-    })
+    Ok(HostMat { w: rd_weight(r)?, out_dim, in_dim })
 }
 
 fn read_model<R: Read>(r: &mut R) -> io::Result<HostModel> {
@@ -215,11 +191,7 @@ fn read_model<R: Read>(r: &mut R) -> io::Result<HostModel> {
         max_seq: rd_u64(r)? as usize,
         rms_eps: rd_f32(r)?,
         rope_freq_base: rd_f32(r)?,
-        rope_style: if rd_u64(r)? == 0 {
-            RopeStyle::Neox
-        } else {
-            RopeStyle::Norm
-        },
+        rope_style: if rd_u64(r)? == 0 { RopeStyle::Neox } else { RopeStyle::Norm },
     };
     let token_embd = rd_weight(r)?;
     let n = rd_u64(r)? as usize;
@@ -243,13 +215,7 @@ fn read_model<R: Read>(r: &mut R) -> io::Result<HostModel> {
     }
     let output_norm = rd_vecf32(r)?;
     let output = rd_mat(r)?;
-    Ok(HostModel {
-        config,
-        token_embd,
-        layers,
-        output_norm,
-        output,
-    })
+    Ok(HostModel { config, token_embd, layers, output_norm, output })
 }
 
 // --- write side ---
@@ -345,11 +311,6 @@ fn wr_weight<W: Write>(w: &mut W, weight: &HostWeight) -> io::Result<()> {
             wr_bytes(w, scales)?;
             wr_bytes(w, d)
         }
-        HostWeight::W8PcSoa { qs, scales } => {
-            w.write_all(&[9u8])?;
-            wr_bytes(w, qs)?;
-            wr_vecf32(w, scales)
-        }
     }
 }
 
@@ -363,28 +324,12 @@ fn write_model<W: Write>(w: &mut W, model: &HostModel) -> io::Result<()> {
     let c = &model.config;
     wr_u64(w, c.arch.len() as u64)?;
     w.write_all(c.arch.as_bytes())?;
-    for v in [
-        c.dim,
-        c.n_layers,
-        c.n_heads,
-        c.n_kv_heads,
-        c.head_dim,
-        c.hidden_dim,
-        c.vocab_size,
-        c.max_seq,
-    ] {
+    for v in [c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.head_dim, c.hidden_dim, c.vocab_size, c.max_seq] {
         wr_u64(w, v as u64)?;
     }
     wr_f32(w, c.rms_eps)?;
     wr_f32(w, c.rope_freq_base)?;
-    wr_u64(
-        w,
-        if c.rope_style == RopeStyle::Neox {
-            0
-        } else {
-            1
-        },
-    )?;
+    wr_u64(w, if c.rope_style == RopeStyle::Neox { 0 } else { 1 })?;
 
     wr_weight(w, &model.token_embd)?;
     wr_u64(w, model.layers.len() as u64)?;
@@ -432,63 +377,26 @@ mod tests {
         };
         let layer = HostLayer {
             attn_norm: vec![1.0, 2.0, 3.0, 4.0],
-            wq: mat(
-                4,
-                4,
-                HostWeight::Q8_0Soa {
-                    qs: vec![1, 2, 3, 4],
-                    scales: vec![9, 8],
-                },
-            ),
+            wq: mat(4, 4, HostWeight::Q8_0Soa { qs: vec![1, 2, 3, 4], scales: vec![9, 8] }),
             wk: mat(
                 2,
                 4,
-                HostWeight::Q6KSoa {
-                    ql: vec![1; 4],
-                    qh: vec![2; 2],
-                    scales: vec![3, 4],
-                    d: vec![5, 6],
-                },
+                HostWeight::Q6KSoa { ql: vec![1; 4], qh: vec![2; 2], scales: vec![3, 4], d: vec![5, 6] },
             ),
             wv: mat(
                 2,
                 4,
-                HostWeight::Q4KSoa {
-                    qs: vec![7; 8],
-                    scales: vec![1, 2, 3, 4],
-                    mins: vec![5, 6, 7, 8],
-                },
+                HostWeight::Q4KSoa { qs: vec![7; 8], scales: vec![1, 2, 3, 4], mins: vec![5, 6, 7, 8] },
             ),
-            wo: mat(
-                4,
-                4,
-                HostWeight::Q4_0Soa {
-                    qs: vec![9; 8],
-                    scales: vec![2, 4],
-                },
-            ),
+            wo: mat(4, 4, HostWeight::Q4_0Soa { qs: vec![9; 8], scales: vec![2, 4] }),
             bq: Some(vec![0.1, 0.2, 0.3, 0.4]),
             bk: None,
             bv: Some(vec![9.9]),
             q_norm: None,
             k_norm: Some(vec![1.5, 2.5]),
             ffn_norm: vec![5.0, 6.0, 7.0, 8.0],
-            w_gate_up: mat(
-                16,
-                4,
-                HostWeight::Q8_0Soa {
-                    qs: vec![5; 64],
-                    scales: vec![1; 4],
-                },
-            ),
-            w_down: mat(
-                4,
-                8,
-                HostWeight::W8PcSoa {
-                    qs: (0..32).map(|i| i as i8 as u8).collect(),
-                    scales: vec![0.25, 0.5, 0.75, 1.0],
-                },
-            ),
+            w_gate_up: mat(16, 4, HostWeight::Q8_0Soa { qs: vec![5; 64], scales: vec![1; 4] }),
+            w_down: mat(4, 8, HostWeight::F32(vec![0.25; 32])),
         };
         HostModel {
             config: cfg,
@@ -510,38 +418,16 @@ mod tests {
                 HostWeight::Q8_0Soa { qs: yq, scales: ys },
             ) => xq == yq && xs == ys,
             (
-                HostWeight::W8PcSoa { qs: xq, scales: xs },
-                HostWeight::W8PcSoa { qs: yq, scales: ys },
-            ) => xq == yq && xs == ys,
-            (
-                HostWeight::Q4KSoa {
-                    qs: xq,
-                    scales: xs,
-                    mins: xm,
-                },
-                HostWeight::Q4KSoa {
-                    qs: yq,
-                    scales: ys,
-                    mins: ym,
-                },
+                HostWeight::Q4KSoa { qs: xq, scales: xs, mins: xm },
+                HostWeight::Q4KSoa { qs: yq, scales: ys, mins: ym },
             ) => xq == yq && xs == ys && xm == ym,
             (
                 HostWeight::Q4_0Soa { qs: xq, scales: xs },
                 HostWeight::Q4_0Soa { qs: yq, scales: ys },
             ) => xq == yq && xs == ys,
             (
-                HostWeight::Q6KSoa {
-                    ql: xl,
-                    qh: xh,
-                    scales: xs,
-                    d: xd,
-                },
-                HostWeight::Q6KSoa {
-                    ql: yl,
-                    qh: yh,
-                    scales: ys,
-                    d: yd,
-                },
+                HostWeight::Q6KSoa { ql: xl, qh: xh, scales: xs, d: xd },
+                HostWeight::Q6KSoa { ql: yl, qh: yh, scales: ys, d: yd },
             ) => xl == yl && xh == yh && xs == ys && xd == yd,
             _ => false,
         }
@@ -581,14 +467,8 @@ mod tests {
         let dir = std::env::temp_dir();
         let path = dir.join(format!("glcuda_cache_test_{}.glcache", std::process::id()));
         write_cache(&path, &tiny_model(), 1234, 5678).unwrap();
-        assert!(
-            read_cache(&path, 1234, 5678).is_some(),
-            "matching identity hits"
-        );
-        assert!(
-            read_cache(&path, 9999, 5678).is_none(),
-            "changed size misses"
-        );
+        assert!(read_cache(&path, 1234, 5678).is_some(), "matching identity hits");
+        assert!(read_cache(&path, 9999, 5678).is_none(), "changed size misses");
         assert!(read_cache(&path, 1234, 1).is_none(), "changed mtime misses");
         let _ = std::fs::remove_file(&path);
     }

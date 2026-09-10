@@ -1,0 +1,48 @@
+{
+  "wave": 111,
+  "classification": "direct_gate_acceptance",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave111-residual-fusion-t4-gate",
+  "version": 1,
+  "status": "KernelWorkerStatus.COMPLETE",
+  "device": "Tesla T4",
+  "compute_capability": "7.5",
+  "shape": {
+    "rows": 244,
+    "dim": 896,
+    "layers": 24,
+    "eliminated_launches_per_chunk": 23
+  },
+  "timing": {
+    "warmup": 10,
+    "iters": 100,
+    "repeats": 5,
+    "required_speedup": 1.05,
+    "runs": [
+      {
+        "retained_us": 24.776,
+        "candidate_us": 18.338,
+        "speedup": 1.3511
+      },
+      {
+        "retained_us": 20.204,
+        "candidate_us": 14.760,
+        "speedup": 1.3688
+      }
+    ],
+    "minimum_speedup": 1.3511,
+    "pass": true
+  },
+  "parity": {
+    "x_bit_exact": true,
+    "out_bit_exact": true,
+    "q8_bit_exact": true,
+    "scales_bit_exact": true
+  },
+  "archive": "glcuda-t4-wave111-residual-fusion-v1.zip",
+  "archive_sha256": "a248549b59ebce3300efdad6ef81b0760c90f2f0f6d4d57ad951794a0ef72a99",
+  "notebook_sha256": "5d7fbc1b2836881249df665ecd0c35812c0066204e9f743fa7c4b9251dd0fcba",
+  "patch_sha256": "e8019acc8810445c9e29ad32eb60e7bd76c8607c6d2d0df8e9f1fea68911f8d3",
+  "source_rev": "755bcd5d5c7d2813ad3c6958e687dfc055548948",
+  "production_metric": null
+}
+

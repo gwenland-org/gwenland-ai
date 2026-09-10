@@ -1,0 +1,59 @@
+{
+  "wave": 77,
+  "status": "reproduced_direct_feasibility_pass",
+  "route": "kaggle_cli_hard_selected_t4",
+  "hard_selector": "NvidiaTeslaT4",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave77-hard-t4-mma-av-row",
+  "notebook": "notebooks/glcuda_t4_wave75_mma_av_row.ipynb",
+  "notebook_sha256": "eeedcaae19fb450ea03fd73436bfb3ea50a5a27320cdc2dcc2b8e37f7c3726a2",
+  "base_revision": "3bce8dd7b8aaa2765855ab927c611b54981f9241",
+  "gpu": "Tesla T4",
+  "compute_capability": "7.5",
+  "driver": "580.159.04",
+  "protocol": {
+    "warmup": 10,
+    "iterations": 100,
+    "repeats": 5,
+    "capacities": [1, 17, 241, 244],
+    "max_abs_gate": 1e-5,
+    "capacity_244_speedup_gate": 1.5
+  },
+  "resources": {
+    "registers": 42,
+    "stack_bytes": 0,
+    "spill_store_bytes": 0,
+    "spill_load_bytes": 0,
+    "barriers": 0
+  },
+  "runs": [
+    {
+      "version": 1,
+      "capacity_244": {
+        "scalar_us": 239.703,
+        "mma_us": 58.038,
+        "speedup": 4.1301,
+        "max_abs": 3.799796104e-7,
+        "rms": 5.854676156e-8
+      },
+      "archive_sha256": "6d2bccc6ecbb266a3e4a65eb16f4ce5bb9e4182b13bee124f428a3b4dd227a64"
+    },
+    {
+      "version": 2,
+      "capacity_244": {
+        "scalar_us": 243.730,
+        "mma_us": 59.101,
+        "speedup": 4.1239,
+        "max_abs": 3.799796104e-7,
+        "rms": 5.854676156e-8
+      },
+      "archive_sha256": "dff0f647153e157c3aa5e7e568e310ea1394230708f9381f744d4e53326dfd9c"
+    }
+  ],
+  "midpoint_capacity_244": {
+    "scalar_us": 241.7165,
+    "mma_us": 58.5695,
+    "speedup": 4.1272
+  },
+  "production_measured": false,
+  "target_15000_tps_achieved": false
+}

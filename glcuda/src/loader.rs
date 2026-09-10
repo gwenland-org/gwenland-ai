@@ -13,18 +13,16 @@ use glcore::GlError;
 
 use crate::dequant::dequant_any;
 use crate::model::{GpuModelConfig, HostLayer, HostMat, HostModel, HostWeight, RopeStyle};
-use crate::repack::{f32_to_q8_0_soa, f32_to_w8pc_soa, q4_0_to_soa, q4_k_to_soa, q6_k_to_soa};
+use crate::repack::{f32_to_q8_0_soa, q4_0_to_soa, q4_k_to_soa, q6_k_to_soa};
 
 /// Read `{arch}.{suffix}` from metadata as u64.
 fn meta_u64(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<u64> {
-    gguf.get_meta(&format!("{arch}.{suffix}"))
-        .and_then(GgufValue::as_u64)
+    gguf.get_meta(&format!("{arch}.{suffix}")).and_then(GgufValue::as_u64)
 }
 
 /// Read `{arch}.{suffix}` from metadata as f32.
 fn meta_f32(gguf: &GgufFile, arch: &str, suffix: &str) -> Option<f32> {
-    gguf.get_meta(&format!("{arch}.{suffix}"))
-        .and_then(GgufValue::as_f32)
+    gguf.get_meta(&format!("{arch}.{suffix}")).and_then(GgufValue::as_f32)
 }
 
 /// Dequantize a required tensor by name to f32.
@@ -83,20 +81,7 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
     // save DRAM traffic (6.5625 bpw against 8.5), which is real and matters to
     // decode. The trade has never been measured, and glbench reports both
     // phases from one run.
-    // Wave 7 research arm. This replaces (never duplicates) the normal
-    // representation with one signed-INT8 stream plus one f32 scale per
-    // output row. It is opt-in until real-model accuracy and T4 production
-    // throughput both pass the notebook gate.
-    let w8pc = std::env::var_os("GLCUDA_W8PC").is_some();
-    let force_q8 = !w8pc && std::env::var_os("GLCUDA_FORCE_Q8").is_some();
-    if w8pc {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            eprintln!(
-                "[glcuda] GLCUDA_W8PC: per-output weight scales + per-token activation scales enabled"
-            )
-        });
-    }
+    let force_q8 = std::env::var_os("GLCUDA_FORCE_Q8").is_some();
     if force_q8 {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
@@ -105,62 +90,58 @@ fn weight(gguf: &GgufFile, name: &str) -> Result<HostMat, GlError> {
             )
         });
     }
-    let w = if w8pc {
-        let dense = dequant_any(gguf, info)?;
-        let (qs, scales) = f32_to_w8pc_soa(&dense, out_dim, in_dim)?;
-        HostWeight::W8PcSoa { qs, scales }
-    } else {
-        match info.dtype {
-            GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
-                let data = gguf.tensor_data(info)?;
-                // Structure-of-Arrays: split the 34-byte blocks into a contiguous
-                // int8 qs stream + a contiguous f16 scale stream (both row-major),
-                // so the GEMV reads qs as one coalesced transaction with no padding.
-                let n_blocks = data.len() / 34;
-                let mut qs = Vec::with_capacity(n_blocks * 32);
-                let mut scales = Vec::with_capacity(n_blocks * 2);
-                for block in data.chunks_exact(34) {
-                    scales.extend_from_slice(&block[0..2]); // f16 scale
-                    qs.extend_from_slice(&block[2..34]); // 32 quantized weights
-                }
-                HostWeight::Q8_0Soa { qs, scales }
+    let w = match info.dtype {
+        GgufDType::Q8_0 if in_dim.is_multiple_of(32) => {
+            let data = gguf.tensor_data(info)?;
+            // Structure-of-Arrays: split the 34-byte blocks into a contiguous
+            // int8 qs stream + a contiguous f16 scale stream (both row-major),
+            // so the GEMV reads qs as one coalesced transaction with no padding.
+            let n_blocks = data.len() / 34;
+            let mut qs = Vec::with_capacity(n_blocks * 32);
+            let mut scales = Vec::with_capacity(n_blocks * 2);
+            for block in data.chunks_exact(34) {
+                scales.extend_from_slice(&block[0..2]);  // f16 scale
+                qs.extend_from_slice(&block[2..34]);     // 32 quantized weights
             }
-            // Native Q4_K path (M2.1 Task A): repack the 144-byte super-blocks
-            // into the SoA triple gl_gemv_q4_k_soa streams at 5.0 bpw. The
-            // in_dim % 256 guard is belt-and-braces — ggml cannot emit a Q4_K
-            // tensor with a ragged row (QK_K divisibility is a format invariant).
-            GgufDType::Q4_K if !force_q8 && in_dim.is_multiple_of(256) => {
-                let (qs, scales, mins) = q4_k_to_soa(gguf.tensor_data(info)?)?;
-                HostWeight::Q4KSoa { qs, scales, mins }
-            }
-            // Native Q4_0 path (M2.2 Task C-2): SoA nibbles + verbatim f16
-            // scales for gl_gemv_q4_0_soa. The kernel has a block tail, so
-            // in % 32 (the format's own invariant) is the only requirement.
-            GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
-                let (qs, scales) = q4_0_to_soa(gguf.tensor_data(info)?)?;
-                HostWeight::Q4_0Soa { qs, scales }
-            }
-            // Native Q6_K path (M2.2 Task C-1): four SoA streams at the exact
-            // native 6.5625 bpw — replaces the M2.1 requant-to-Q8_0 detour that
-            // streamed these tensors (half of Q4_K_M's ffn_down/attn_v, plus
-            // output.weight) at 8.5 bpw. Zero added quantization error: every
-            // stream is verbatim or losslessly relocated.
-            GgufDType::Q6_K if !force_q8 && in_dim.is_multiple_of(256) => {
-                let (ql, qh, scales, d) = q6_k_to_soa(gguf.tensor_data(info)?)?;
-                HostWeight::Q6KSoa { ql, qh, scales, d }
-            }
-            // Quantized dtypes with no native kernel (Q5_0, plus ragged-row
-            // k-quants, which the format itself cannot normally produce):
-            // requantize to Q8_0 SoA instead of dense f32. Same policy glproc
-            // documents for its repack: Q8_0 adds ~2^-8 relative error on top
-            // of an already-lossy format, where dense f32 would multiply the
-            // tensor's VRAM and per-token DRAM traffic by 4-6x.
-            GgufDType::Q5_0 | GgufDType::Q6_K | GgufDType::Q4_K if in_dim.is_multiple_of(32) => {
-                let (qs, scales) = f32_to_q8_0_soa(&dequant_any(gguf, info)?);
-                HostWeight::Q8_0Soa { qs, scales }
-            }
-            _ => HostWeight::F32(dequant_any(gguf, info)?),
+            HostWeight::Q8_0Soa { qs, scales }
         }
+        // Native Q4_K path (M2.1 Task A): repack the 144-byte super-blocks
+        // into the SoA triple gl_gemv_q4_k_soa streams at 5.0 bpw. The
+        // in_dim % 256 guard is belt-and-braces — ggml cannot emit a Q4_K
+        // tensor with a ragged row (QK_K divisibility is a format invariant).
+        GgufDType::Q4_K if !force_q8 && in_dim.is_multiple_of(256) => {
+            let (qs, scales, mins) = q4_k_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q4KSoa { qs, scales, mins }
+        }
+        // Native Q4_0 path (M2.2 Task C-2): SoA nibbles + verbatim f16
+        // scales for gl_gemv_q4_0_soa. The kernel has a block tail, so
+        // in % 32 (the format's own invariant) is the only requirement.
+        GgufDType::Q4_0 if in_dim.is_multiple_of(32) => {
+            let (qs, scales) = q4_0_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q4_0Soa { qs, scales }
+        }
+        // Native Q6_K path (M2.2 Task C-1): four SoA streams at the exact
+        // native 6.5625 bpw — replaces the M2.1 requant-to-Q8_0 detour that
+        // streamed these tensors (half of Q4_K_M's ffn_down/attn_v, plus
+        // output.weight) at 8.5 bpw. Zero added quantization error: every
+        // stream is verbatim or losslessly relocated.
+        GgufDType::Q6_K if !force_q8 && in_dim.is_multiple_of(256) => {
+            let (ql, qh, scales, d) = q6_k_to_soa(gguf.tensor_data(info)?)?;
+            HostWeight::Q6KSoa { ql, qh, scales, d }
+        }
+        // Quantized dtypes with no native kernel (Q5_0, plus ragged-row
+        // k-quants, which the format itself cannot normally produce):
+        // requantize to Q8_0 SoA instead of dense f32. Same policy glproc
+        // documents for its repack: Q8_0 adds ~2^-8 relative error on top
+        // of an already-lossy format, where dense f32 would multiply the
+        // tensor's VRAM and per-token DRAM traffic by 4-6x.
+        GgufDType::Q5_0 | GgufDType::Q6_K | GgufDType::Q4_K
+            if in_dim.is_multiple_of(32) =>
+        {
+            let (qs, scales) = f32_to_q8_0_soa(&dequant_any(gguf, info)?);
+            HostWeight::Q8_0Soa { qs, scales }
+        }
+        _ => HostWeight::F32(dequant_any(gguf, info)?),
     };
     Ok(HostMat { w, out_dim, in_dim })
 }
@@ -191,16 +172,8 @@ fn fuse_gate_up(
         gguf.find_tensor(&format!("blk.{layer}.ffn_up.weight"))
             .ok_or_else(|| GlError::Parse(format!("GGUF: missing blk.{layer}.ffn_up.weight")))?,
     )?;
-    let gm = HostMat {
-        w: HostWeight::F32(g),
-        out_dim: gate.out_dim,
-        in_dim: gate.in_dim,
-    };
-    let um = HostMat {
-        w: HostWeight::F32(u),
-        out_dim: up.out_dim,
-        in_dim: up.in_dim,
-    };
+    let gm = HostMat { w: HostWeight::F32(g), out_dim: gate.out_dim, in_dim: gate.in_dim };
+    let um = HostMat { w: HostWeight::F32(u), out_dim: up.out_dim, in_dim: up.in_dim };
     Ok(gm.stack_rows(um))
 }
 
@@ -248,9 +221,7 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         .ok_or_else(|| GlError::Parse(format!("GGUF: missing {arch}.attention.head_count")))?
         as usize;
     if dim == 0 || n_layers == 0 || n_heads == 0 {
-        return Err(GlError::Parse(
-            "GGUF: model dimensions must be non-zero".into(),
-        ));
+        return Err(GlError::Parse("GGUF: model dimensions must be non-zero".into()));
     }
     let n_kv_heads =
         meta_u64(gguf, &arch, "attention.head_count_kv").unwrap_or(n_heads as u64) as usize;
@@ -277,9 +248,7 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         .ok_or_else(|| GlError::Parse("GGUF: missing tensor 'token_embd.weight'".into()))?;
     let vocab_size = embd_info.dimensions.get(1).copied().unwrap_or(0) as usize;
     if vocab_size == 0 {
-        return Err(GlError::Parse(
-            "GGUF: token_embd.weight has no vocab dimension".into(),
-        ));
+        return Err(GlError::Parse("GGUF: token_embd.weight has no vocab dimension".into()));
     }
     let token_embd = match embd_info.dtype {
         GgufDType::Q8_0 if dim.is_multiple_of(32) => {
@@ -339,10 +308,7 @@ pub fn load_host(gguf: &GgufFile) -> Result<HostModel, GlError> {
         }
         Ok(())
     })?;
-    let layers: Vec<HostLayer> = built
-        .into_iter()
-        .map(|o| o.expect("every layer built"))
-        .collect();
+    let layers: Vec<HostLayer> = built.into_iter().map(|o| o.expect("every layer built")).collect();
 
     let output_norm = tensor(gguf, "output_norm.weight")?;
     // Tied embeddings: reuse the embedding tensor as LM head — staged

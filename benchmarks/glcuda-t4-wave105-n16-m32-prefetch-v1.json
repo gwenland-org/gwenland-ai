@@ -1,0 +1,22 @@
+{
+  "wave": 105,
+  "classification": "infrastructure_miss",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave-105-n16-m32-prefetch",
+  "version": 1,
+  "status": "KernelWorkerStatus.ERROR",
+  "phase": "bootstrap",
+  "required_device": "Tesla T4",
+  "required_compute_capability": "7.5",
+  "allocated_device": "Tesla P100-PCIE-16GB",
+  "allocated_compute_capability": "6.0",
+  "driver_version": "580.159.04",
+  "archive": "glcuda-t4-wave105-n16-m32-prefetch-v1.zip",
+  "archive_sha256": "ab885641b132da174b6cd0538f33f0f257b35b2dadc144c81734997ecb2a04e2",
+  "notebook_sha256": "b73415c02b5965df68b8ca5ba6bcd7c5ce98cb15556d00027227a1c0d3e6b71d",
+  "patch_sha256": "b5a11b0202b40cf9fe6ca9b68f19dff6b53e1eef39f6da60d32ac71b2bd6d9e5",
+  "ptxas_ran": false,
+  "parity_ran": false,
+  "timing_ran": false,
+  "production_metric": null
+}
+

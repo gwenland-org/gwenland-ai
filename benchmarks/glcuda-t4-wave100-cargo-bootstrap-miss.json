@@ -1,0 +1,44 @@
+{
+  "wave": 100,
+  "kernel": "jinxsuperdev/glcuda-wave-94-n16-prefetch-t4-gate",
+  "version": 2,
+  "status": "cargo_bootstrap_miss",
+  "requested_gpu": {
+    "name": "Tesla T4",
+    "compute_capability": "7.5",
+    "machine_shape": "NvidiaTeslaT4"
+  },
+  "observed_gpu": {
+    "count": 2,
+    "name": "Tesla T4",
+    "compute_capability": "7.5",
+    "memory_mib": 15360,
+    "driver": "580.159.04"
+  },
+  "resources": {
+    "retained": {
+      "registers": 72,
+      "static_shared_bytes": 9728,
+      "stack_frame_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    "candidate": {
+      "registers": 80,
+      "static_shared_bytes": 9728,
+      "stack_frame_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    }
+  },
+  "failed_phase": "build-test",
+  "failure": "cargo unavailable: /root/.cargo/bin/cargo",
+  "host_tests_reached": false,
+  "direct_gate_reached": false,
+  "production_benchmark_reached": false,
+  "source_revision": "604acd0b20f20aa40a9d0e15814dd30675914e5f",
+  "source_patch_sha256": "272ae9add1a8b1b9f56ff4bee97d95aad2fdb461c29f2224388257896cae0279",
+  "archive": "glcuda-t4-wave100-cargo-bootstrap-miss.zip",
+  "archive_sha256": "cf84e63e1ae25e1434350d86cd78309e3ddf1be5d821836d19dfd8688fb7e367",
+  "next_action": "resolve cargo from PATH with installation-path fallbacks and rerun unchanged source"
+}

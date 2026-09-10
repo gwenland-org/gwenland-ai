@@ -1,0 +1,33 @@
+{
+  "wave": 76,
+  "route": "kaggle_cli_cross_assemble_before_device_gate",
+  "status": "compiler_pass_device_not_run",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave76-sm75-compiler-gate",
+  "version": 1,
+  "ptx_target": "sm_75",
+  "allocated_gpu": "Tesla P100-PCIE-16GB",
+  "allocated_compute_capability": "6.0",
+  "driver": "580.159.04",
+  "entries": {
+    "gl_wave64_av_scalar_f32": {
+      "registers": 25,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0,
+      "barriers": 0
+    },
+    "gl_wave75_av_mma4_row_f32": {
+      "registers": 42,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0,
+      "barriers": 0
+    }
+  },
+  "device_gate": "Wave 76 device gate requires Tesla T4 sm_75, got Tesla P100-PCIE-16GB, 6.0, 580.159.04",
+  "notebook_sha256": "4bea60fe943b525a1acbe2a5b0e567cc61a61cae1bc2b538cbb8459635f38608",
+  "archive_sha256": "935b8c88e8af537190571133410e26b4c16af9edeb231ff344a5e7b18f4ed0fd",
+  "device_numeric_ran": false,
+  "device_timing_ran": false,
+  "target_15000_tps_achieved": false
+}

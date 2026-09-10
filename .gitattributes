@@ -1,4 +1,31 @@
 # Hand-authored PTX is fed verbatim to ptxas, which is ASCII-only and
 # line-oriented. Pin it to LF so checkout on any platform delivers exactly
 # what was committed, regardless of core.autocrlf.
+.gitattributes text eol=lf
 *.ptx text eol=lf
+
+# Wave 20's notebook is byte-for-byte benchmark evidence from Kaggle v2/v3.
+notebooks/glcuda_t4_wave20_production.ipynb binary
+
+# Wave 21 records the compile-rejected fused-SwiGLU experiment byte-for-byte.
+notebooks/glcuda_t4_wave21_fused_swiglu.ipynb binary
+
+# Wave 22 records the repaired fused-SwiGLU production experiment byte-for-byte.
+notebooks/glcuda_t4_wave22_fused_swiglu.ipynb binary
+
+# Wave 23 records the rejected K128 B-stage GEMM experiment byte-for-byte.
+notebooks/glcuda_t4_wave23_k128_gemm.ipynb binary
+
+# Wave 24 records the rejected independent-MMA-chain experiment byte-for-byte.
+notebooks/glcuda_t4_wave24_mma2_gemm.ipynb binary
+
+# Wave 25 records the 16-byte cooperative-stage GEMM experiment byte-for-byte.
+notebooks/glcuda_t4_wave25_v16_stage.ipynb binary
+
+# Wave 50 is the retained N16 + register-Q production gate; Wave 55 is the
+# successful pinned same-T4 llama.cpp comparison; Wave 56 is the ten-repeat
+# reproducibility confirmation.
+notebooks/glcuda_t4_wave50_regq_attention.ipynb binary
+notebooks/glcuda_t4_wave55_h2h_llamacpp.ipynb binary
+notebooks/glcuda_t4_wave56_repro10.ipynb binary
+notebooks/glcuda_t4_wave57_h2h_q8.ipynb binary

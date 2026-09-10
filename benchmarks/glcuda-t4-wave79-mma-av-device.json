@@ -1,0 +1,78 @@
+{
+  "wave": 79,
+  "status": "reproduced_device_pass",
+  "route": "kaggle_cli_hard_selected_t4",
+  "hard_selector": "NvidiaTeslaT4",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave79-hard-t4-mma-av-device-gate",
+  "versions": [1, 2],
+  "notebook": "notebooks/glcuda_t4_wave79_mma_av_device.ipynb",
+  "submitted_notebook_sha256": "c36ce71b931b08fd554ffc3f506f92b01a2315cd1de52e72cf8b32e0e677dd03",
+  "repository_notebook_sha256": "d0bcfce2655f8477be37885ca79c7e3a539ec5717eec0f98ad9b0420239d2f19",
+  "notebook_difference": "line-endings-only: submitted CRLF, repository LF",
+  "base_revision": "bd5c956bafb3bb6738c3f1de348a4ebb55d9c29f",
+  "source_revision": "48ae7c7ea53e299efca02afb8c996f938dec16bf",
+  "patch_sha256": "da156a5ebc4b9e6b4c89181120f27511092ac1650d4eadffe022a316b34e367c",
+  "gpu": "Tesla T4",
+  "compute_capability": "7.5",
+  "driver": "580.159.04",
+  "protocol": {
+    "warmup": 20,
+    "iterations": 200,
+    "rounds": 7,
+    "shape": {
+      "tokens": 244,
+      "heads": 14,
+      "kv_heads": 2,
+      "head_dim": 64
+    },
+    "max_abs_gate": 1e-5,
+    "direct_speedup_gate": 1.10,
+    "device_parity_tests": 33
+  },
+  "resources": {
+    "retained": {
+      "registers": 64,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0,
+      "resident_blocks_per_sm": 4
+    },
+    "candidate": {
+      "registers": 64,
+      "stack_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0,
+      "resident_blocks_per_sm": 4
+    }
+  },
+  "runs": [
+    {
+      "version": 1,
+      "device_parity": "33/33 pass",
+      "retained_us": 149.321,
+      "candidate_us": 110.767,
+      "speedup": 1.3481,
+      "max_abs": 6.556510925e-7,
+      "rms": 1.168130365e-7,
+      "archive_sha256": "9971293eb3dfe9916fb910c26793ac29d82c3c6b3136599514acc7098c95d495"
+    },
+    {
+      "version": 2,
+      "device_parity": "33/33 pass",
+      "retained_us": 146.328,
+      "candidate_us": 107.401,
+      "speedup": 1.3625,
+      "max_abs": 6.556510925e-7,
+      "rms": 1.168130365e-7,
+      "archive_sha256": "151565087b6d507abde99391be8bbc237bbe6e7d42c9bf0b4544a1bd63c6583b"
+    }
+  ],
+  "midpoint": {
+    "retained_us": 147.8245,
+    "candidate_us": 109.084,
+    "speedup": 1.3551437424,
+    "latency_reduction_percent": 26.2070901644
+  },
+  "production_measured": false,
+  "target_15000_tps_achieved": false
+}

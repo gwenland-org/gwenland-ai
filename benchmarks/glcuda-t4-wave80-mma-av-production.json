@@ -1,0 +1,87 @@
+{
+  "wave": 80,
+  "status": "production_reproduced_retention_reject",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave-80-hard-t4-mma-av-production",
+  "valid_versions": [3, 4],
+  "hard_selector": "NvidiaTeslaT4",
+  "source_revision": "48ae7c7ea53e299efca02afb8c996f938dec16bf",
+  "patch_sha256": "da156a5ebc4b9e6b4c89181120f27511092ac1650d4eadffe022a316b34e367c",
+  "notebook_sha256": "6608d9f7d009a7f3071427a5720ab052ea8c5004e7462ee329d2bf141434545f",
+  "gpu": "Tesla T4",
+  "compute_capability": "7.5",
+  "driver": "580.159.04",
+  "model": {
+    "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "filename": "qwen2.5-0.5b-instruct-q8_0.gguf",
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "protocol": {
+    "quant": "Q8_0",
+    "prompt_tokens": 244,
+    "repeats_per_version": 10,
+    "sessions_per_version": 20,
+    "positions_per_arm": [5, 5],
+    "cold_iters": 1,
+    "warmup_iters": 5,
+    "measure_iters": 10,
+    "seed": 42,
+    "temperature": 0.0,
+    "oracle": "glproc first-token exact; contiguous 50-token prefix recorded"
+  },
+  "runs": [
+    {
+      "version": 3,
+      "archive_sha256": "2bc1cc7424dba44d8f5c7968152104d81c079f5ecdcb01f30ed1596f96eafbe9",
+      "retained_p50_tps": 10492.769212807858,
+      "candidate_p50_tps": 11198.901009084697,
+      "absolute_gain_tps": 706.1317962768389,
+      "median_ratio": 0.06729699109505893,
+      "median_paired_delta": 0.05359788219478312,
+      "positive_pairs": 9,
+      "worst_pair_delta": -0.10357735291157566,
+      "tail_session_max_delta": -0.015119157139607431,
+      "decode_gate": false,
+      "retention_gate": false
+    },
+    {
+      "version": 4,
+      "archive_sha256": "ac60daea208efebf35aa6d005db3d8e38f92873803b5cca98cd82a3658443241",
+      "retained_p50_tps": 11187.402756537827,
+      "candidate_p50_tps": 11556.930134979018,
+      "absolute_gain_tps": 369.5273784411911,
+      "median_ratio": 0.033030667303475925,
+      "median_paired_delta": 0.04703924567120432,
+      "positive_pairs": 9,
+      "worst_pair_delta": -0.006502493928289388,
+      "tail_session_max_delta": 0.14267905887846788,
+      "decode_gate": true,
+      "retention_gate": false
+    }
+  ],
+  "midpoint": {
+    "retained_p50_tps": 10840.085984672842,
+    "candidate_p50_tps": 11377.915572031858,
+    "absolute_gain_tps": 537.8295873590159,
+    "ratio": 0.04961488203317499,
+    "retained_latency_p50_ms": 22.533616000000002,
+    "candidate_latency_p50_ms": 21.45139675,
+    "latency_reduction": 0.04802687904151737,
+    "gap_to_15000_tps": 3622.0844279681423,
+    "additional_ratio_needed": 0.31834340877617473
+  },
+  "oracle_prefixes": {
+    "version_3": {
+      "retained_regq": [29, 29, 29, 29, 29, 29, 29, 29, 29, 29],
+      "candidate_avmma": [50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
+    },
+    "version_4": {
+      "retained_regq": [29, 29, 29, 29, 29, 29, 29, 29, 29, 29],
+      "candidate_avmma": [50, 50, 50, 50, 50, 50, 50, 50, 50, 50]
+    }
+  },
+  "decision": "REJECT_RETENTION",
+  "production_measured": true,
+  "target_15000_tps_achieved": false
+}

@@ -1,0 +1,57 @@
+{
+  "wave": 102,
+  "kernel": "jinxsuperdev/glcuda-wave-102-n16-prefetch-production",
+  "version": 1,
+  "status": "production_dispatch_gate_miss",
+  "failed_phase": "stabilization_dispatch_check",
+  "production_sessions_reached": 0,
+  "expected_candidate_paths": [
+    "bstage-n16-m32",
+    "bstage-n16",
+    "bstage-n16-prefetch"
+  ],
+  "observed_candidate_paths": [
+    "bstage-n16-m32",
+    "bstage-n16-prefetch"
+  ],
+  "correct_candidate_paths": [
+    "bstage-n16-m32",
+    "bstage-n16-prefetch"
+  ],
+  "direct_records": [
+    {
+      "run": 1,
+      "retained_us": 172.339,
+      "candidate_us": 140.127,
+      "speedup": 1.2299,
+      "bit_exact": true
+    },
+    {
+      "run": 2,
+      "retained_us": 165.884,
+      "candidate_us": 131.701,
+      "speedup": 1.2595,
+      "bit_exact": true
+    }
+  ],
+  "host_tests": {
+    "passed": 65,
+    "failed": 0
+  },
+  "model": {
+    "quant": "Q8_0",
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "stabilization": {
+    "retained_tps_excluded": 6058.0,
+    "candidate_tps_excluded": 6363.6,
+    "reason_excluded": "one cold iteration with zero warmup and no variance estimate",
+    "oracle_matches": "50/50 both arms"
+  },
+  "source_revision": "ec4a6332558070cb6b3c6371d3bdacb8f18b6d78",
+  "source_patch_sha256": "272ae9add1a8b1b9f56ff4bee97d95aad2fdb461c29f2224388257896cae0279",
+  "archive": "glcuda-t4-wave102-production-dispatch-gate-miss.zip",
+  "archive_sha256": "963b47007196a18683d052b5a286396fb59c5e0da8a64db58dff427ec5941049",
+  "decision": "repair_harness_and_rerun_unchanged_candidate"
+}

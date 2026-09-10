@@ -501,7 +501,7 @@ impl Cuda {
             values.extend_from_slice(&[
                 info_log.as_mut_ptr().cast(),
                 info_cap as *mut std::ffi::c_void,
-                1_usize as *mut std::ffi::c_void, // verbose = true
+                std::ptr::dangling_mut::<std::ffi::c_void>(), // verbose = true
             ]);
         }
 
@@ -548,6 +548,30 @@ impl Cuda {
     /// stream while a graph is being recorded). `params` holds one pointer
     /// per kernel parameter, in declaration order, each pointing at a live
     /// host value (the driver reads them at launch/record time).
+    /// Resident blocks per SM for `func`, as the DRIVER computes it.
+    ///
+    /// Wave 15C derived this from bytes and got every point on its sweep axis
+    /// wrong: shared memory is allocated on a granule, so 8944 B occupies 8960
+    /// and a 418-byte pad silently costs a whole tier. Arithmetic cannot see
+    /// that; `cuOccupancyMaxActiveBlocksPerMultiprocessor` can. Returns `None`
+    /// when the driver does not export it, which costs a diagnostic and
+    /// nothing else.
+    pub fn max_active_blocks_per_sm(
+        &self,
+        func: Kernel,
+        block_threads: i32,
+        dynamic_smem: usize,
+    ) -> Option<i32> {
+        let query = self.api.cu_occupancy_max_active_blocks?;
+        let mut blocks: i32 = 0;
+        // SAFETY: a `Kernel` can only be produced by this module's loader, so
+        // the handle is live for this context; `blocks` is a local the driver
+        // only writes. Taking `Kernel` rather than a raw `CUfunction` is what
+        // keeps this callable safely, exactly as `launch` does.
+        let rc = unsafe { query(&mut blocks, func.0, block_threads, dynamic_smem) };
+        (rc == 0).then_some(blocks)
+    }
+
     pub fn launch(
         &self,
         f: Kernel,
@@ -785,12 +809,11 @@ impl Cuda {
                 )
             }
             // Streams already created are freed by the partial pool's Drop.
-            .map_err(|e| {
+            .inspect_err(|_| {
                 drop(StreamPool {
                     api: self.api.clone(),
                     streams: std::mem::take(&mut streams),
                 });
-                e
             })?;
             streams.push(s);
         }

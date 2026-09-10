@@ -29,10 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let cuda = Cuda::probe()?;
     let k = KernelSet::load(&cuda)?;
-    println!(
-        "device: {} sm_{}{}\n",
-        cuda.info.name, cuda.info.sm_major, cuda.info.sm_minor
-    );
+    println!("device: {} sm_{}{}\n", cuda.info.name, cuda.info.sm_major, cuda.info.sm_minor);
 
     // --- Qwen2.5-0.5B decode dimensions ---
     let dim = 896usize;
@@ -74,12 +71,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    (a) N launches then ONE sync  -> pure GPU throughput (best case)
     //    (b) N launches each with a sync -> per-call latency exposed
     // ============================================================
-    for (label, out_dim, in_dim) in [
-        ("qkv   ", dim + 2 * 128, dim),
-        ("gate  ", hidden, dim),
-        ("down  ", dim, hidden),
-        ("lmhead", vocab, dim),
-    ] {
+    for (label, out_dim, in_dim) in
+        [("qkv   ", dim + 2 * 128, dim), ("gate  ", hidden, dim), ("down  ", dim, hidden), ("lmhead", vocab, dim)]
+    {
         let mark = buf.mark();
         let w = buf.alloc_f32(out_dim * in_dim)?.dptr;
         let x = buf.alloc_f32(in_dim)?.dptr;
@@ -125,11 +119,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //     stride is n_blocks * 36); compare GB/s to the ~265 achievable to see
     //     if the quantized kernel is bandwidth-bound.
     // ============================================================
-    for (label, out_dim, in_dim) in [
-        ("gate  ", 2 * hidden, dim),
-        ("down  ", dim, hidden),
-        ("lmhead", vocab, dim),
-    ] {
+    for (label, out_dim, in_dim) in
+        [("gate  ", 2 * hidden, dim), ("down  ", dim, hidden), ("lmhead", vocab, dim)]
+    {
         let mark = buf.mark();
         let row_blocks = in_dim / 32;
         let wbytes = out_dim * row_blocks * 36;
@@ -171,11 +163,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scale_vals: [f32; 4] = [1.0, 0.5, 1.5, 0.25];
         let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
 
-        for (label, out_dim, in_dim) in [
-            ("gate  ", 2 * hidden, dim),
-            ("down  ", dim, hidden),
-            ("lmhead", vocab, dim),
-        ] {
+        for (label, out_dim, in_dim) in
+            [("gate  ", 2 * hidden, dim), ("down  ", dim, hidden), ("lmhead", vocab, dim)]
+        {
             let mark = buf.mark();
             let nb = in_dim / 32;
             // host weights: qs (int8) + per-block f16 scales.
@@ -190,26 +180,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d_xqs = buf.alloc(in_dim as u64)?.dptr;
             let d_xsc = buf.alloc_f32(nb)?.dptr;
             let d_y = buf.alloc_f32(out_dim)?.dptr;
-            let as_u8 =
-                |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-            let wsc_u8 = unsafe {
-                std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2)
-            };
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let wsc_u8 =
+                unsafe { std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2) };
             cuda.htod(d_wqs, as_u8(&wqs))?;
             cuda.htod(d_wsc, wsc_u8)?;
             cuda.htod(d_xqs, as_u8(&xqs))?;
             cuda.htod_f32(d_xsc, &xsc)?;
 
-            k.gemv_q8_0_soa(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-            )?;
+            k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             cuda.synchronize()?;
 
             // CPU reference: y[r] = sum_b (wsc*xsc) * sum_j wqs*xqs.
@@ -232,16 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iters = 200;
             let t = Instant::now();
             for _ in 0..iters {
-                k.gemv_q8_0_soa(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                )?;
+                k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             }
             cuda.synchronize()?;
             let soa = t.elapsed().as_secs_f64() / iters as f64;
@@ -283,9 +253,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let wqs: Vec<u8> = (0..out_dim * in_dim / 2).map(qb).collect();
             let wsc_bits: Vec<u16> = (0..out_dim * nsub).map(|i| sc_bits[i % 4]).collect();
             let wmn_bits: Vec<u16> = (0..out_dim * nsub).map(|i| mn_bits[(i / 3) % 4]).collect();
-            let xqs: Vec<i8> = (0..in_dim)
-                .map(|i| (qb(i * 7 + 3) as i32 - 125) as i8)
-                .collect();
+            let xqs: Vec<i8> = (0..in_dim).map(|i| (qb(i * 7 + 3) as i32 - 125) as i8).collect();
             let xsc: Vec<f32> = (0..nsub).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
 
             let d_wqs = buf.alloc(wqs.len() as u64)?.dptr;
@@ -305,17 +273,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             cuda.htod_f32(d_xsc, &xsc)?;
 
-            k.gemv_q4_k_soa(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_wmn,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-            )?;
+            k.gemv_q4_k_soa(&cuda, d_wqs, d_wsc, d_wmn, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             cuda.synchronize()?;
             let mut y_host = vec![0f32; out_dim];
             cuda.dtoh_f32(&mut y_host, d_y)?;
@@ -351,17 +309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iters = 100;
             let t = Instant::now();
             for _ in 0..iters {
-                k.gemv_q4_k_soa(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    d_wmn,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                )?;
+                k.gemv_q4_k_soa(&cuda, d_wqs, d_wsc, d_wmn, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             }
             cuda.synchronize()?;
             let each = t.elapsed().as_secs_f64() / iters as f64;
@@ -394,9 +342,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let wqs: Vec<u8> = (0..out_dim * in_dim / 2).map(qb).collect();
             let wsc_bits: Vec<u16> = (0..out_dim * nb).map(|i| sc_bits[i % 4]).collect();
-            let xqs: Vec<i8> = (0..in_dim)
-                .map(|i| (qb(i * 7 + 3) as i32 - 125) as i8)
-                .collect();
+            let xqs: Vec<i8> = (0..in_dim).map(|i| (qb(i * 7 + 3) as i32 - 125) as i8).collect();
             let xsc: Vec<f32> = (0..nb).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
 
             let d_wqs = buf.alloc(wqs.len() as u64)?.dptr;
@@ -414,16 +360,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             })?;
             cuda.htod_f32(d_xsc, &xsc)?;
 
-            k.gemv_q4_0_soa(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-            )?;
+            k.gemv_q4_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             cuda.synchronize()?;
             let mut y_host = vec![0f32; out_dim];
             cuda.dtoh_f32(&mut y_host, d_y)?;
@@ -455,16 +392,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iters = 100;
             let t = Instant::now();
             for _ in 0..iters {
-                k.gemv_q4_0_soa(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                )?;
+                k.gemv_q4_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             }
             cuda.synchronize()?;
             let each = t.elapsed().as_secs_f64() / iters as f64;
@@ -498,19 +426,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let wql: Vec<u8> = (0..out_dim * in_dim / 2).map(qb).collect();
             // qh: widened nibble layout, each nibble a 2-bit field (0..3).
-            let wqh: Vec<u8> = (0..out_dim * in_dim / 2)
-                .map(|i| qb(i * 3 + 1) & 0x33)
-                .collect();
-            let wsc: Vec<i8> = (0..out_dim * nsub)
-                .map(|i| ((i * 5) % 23) as i8 - 11)
-                .collect();
+            let wqh: Vec<u8> = (0..out_dim * in_dim / 2).map(|i| qb(i * 3 + 1) & 0x33).collect();
+            let wsc: Vec<i8> = (0..out_dim * nsub).map(|i| ((i * 5) % 23) as i8 - 11).collect();
             let wd_bits: Vec<u16> = (0..out_dim * nsb).map(|i| d_bits[i % 4]).collect();
-            let xqs: Vec<i8> = (0..in_dim)
-                .map(|i| (qb(i * 7 + 3) as i32 - 125) as i8)
-                .collect();
-            let xsc: Vec<f32> = (0..in_dim / 32)
-                .map(|b| 0.5 + (b % 3) as f32 * 0.25)
-                .collect();
+            let xqs: Vec<i8> = (0..in_dim).map(|i| (qb(i * 7 + 3) as i32 - 125) as i8).collect();
+            let xsc: Vec<f32> = (0..in_dim / 32).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
 
             let d_wql = buf.alloc(wql.len() as u64)?.dptr;
             let d_wqh = buf.alloc(wqh.len() as u64)?.dptr;
@@ -519,8 +439,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d_xqs = buf.alloc(in_dim as u64)?.dptr;
             let d_xsc = buf.alloc_f32(in_dim / 32)?.dptr;
             let d_y = buf.alloc_f32(out_dim)?.dptr;
-            let as_u8 =
-                |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
             let u16_u8 = |v: &[u16]| unsafe {
                 std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
             };
@@ -531,18 +450,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             cuda.htod(d_xqs, as_u8(&xqs))?;
             cuda.htod_f32(d_xsc, &xsc)?;
 
-            k.gemv_q6_k_soa(
-                &cuda,
-                d_wql,
-                d_wqh,
-                d_wsc,
-                d_wd,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-            )?;
+            k.gemv_q6_k_soa(&cuda, d_wql, d_wqh, d_wsc, d_wd, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             cuda.synchronize()?;
             let mut y_host = vec![0f32; out_dim];
             cuda.dtoh_f32(&mut y_host, d_y)?;
@@ -579,18 +487,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let iters = 100;
             let t = Instant::now();
             for _ in 0..iters {
-                k.gemv_q6_k_soa(
-                    &cuda,
-                    d_wql,
-                    d_wqh,
-                    d_wsc,
-                    d_wd,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                )?;
+                k.gemv_q6_k_soa(&cuda, d_wql, d_wqh, d_wsc, d_wd, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32)?;
             }
             cuda.synchronize()?;
             let each = t.elapsed().as_secs_f64() / iters as f64;
@@ -623,36 +520,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
         let wsc_bits: Vec<u16> = (0..out_dim * nb).map(|i| scale_bits[i % 4]).collect();
         let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
-        let xsc: Vec<f32> = (0..ntok * nb)
-            .map(|i| 0.5 + (i % 3) as f32 * 0.25)
-            .collect();
+        let xsc: Vec<f32> = (0..ntok * nb).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
 
         let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
         let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
         let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
         let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
         let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
-        let as_u8 =
-            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-        let wsc_u8 = unsafe {
-            std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2)
-        };
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let wsc_u8 =
+            unsafe { std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2) };
         cuda.htod(d_wqs, as_u8(&wqs))?;
         cuda.htod(d_wsc, wsc_u8)?;
         cuda.htod(d_xqs, as_u8(&xqs))?;
         cuda.htod_f32(d_xsc, &xsc)?;
 
-        k.gemm_q8_0_soa(
-            &cuda,
-            d_wqs,
-            d_wsc,
-            d_xqs,
-            d_xsc,
-            d_y,
-            out_dim as u32,
-            in_dim as u32,
-            ntok as u32,
-        )?;
+        k.gemm_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
         cuda.synchronize()?;
         let mut y_host = vec![0f32; ntok * out_dim];
         cuda.dtoh_f32(&mut y_host, d_y)?;
@@ -664,8 +547,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for b in 0..nb {
                     let mut dot = 0i32;
                     for j in 0..32 {
-                        dot += wqs[r * in_dim + b * 32 + j] as i32
-                            * xqs[t * in_dim + b * 32 + j] as i32;
+                        dot += wqs[r * in_dim + b * 32 + j] as i32 * xqs[t * in_dim + b * 32 + j] as i32;
                     }
                     acc += dot as f32 * (scale_vals[(r * nb + b) % 4] * xsc[t * nb + b]);
                 }
@@ -677,17 +559,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let iters = 50;
         let t = Instant::now();
         for _ in 0..iters {
-            k.gemm_q8_0_soa(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-                ntok as u32,
-            )?;
+            k.gemm_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
         }
         cuda.synchronize()?;
         let gemm = t.elapsed().as_secs_f64() / iters as f64;
@@ -698,16 +570,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let xq = d_xqs + (tk * in_dim) as u64;
                 let xs = d_xsc + (tk * nb * 4) as u64;
                 let yy = d_y + (tk * out_dim * 4) as u64;
-                k.gemv_q8_0_soa(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    xq,
-                    xs,
-                    yy,
-                    out_dim as u32,
-                    in_dim as u32,
-                )?;
+                k.gemv_q8_0_soa(&cuda, d_wqs, d_wsc, xq, xs, yy, out_dim as u32, in_dim as u32)?;
             }
         }
         cuda.synchronize()?;
@@ -740,36 +603,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
         let wsc_bits: Vec<u16> = (0..out_dim * nb).map(|i| scale_bits[i % 4]).collect();
         let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
-        let xsc: Vec<f32> = (0..ntok * nb)
-            .map(|i| 0.5 + (i % 3) as f32 * 0.25)
-            .collect();
+        let xsc: Vec<f32> = (0..ntok * nb).map(|i| 0.5 + (i % 3) as f32 * 0.25).collect();
 
         let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
         let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
         let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
         let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
         let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
-        let as_u8 =
-            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-        let wsc_u8 = unsafe {
-            std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2)
-        };
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let wsc_u8 =
+            unsafe { std::slice::from_raw_parts(wsc_bits.as_ptr() as *const u8, wsc_bits.len() * 2) };
         cuda.htod(d_wqs, as_u8(&wqs))?;
         cuda.htod(d_wsc, wsc_u8)?;
         cuda.htod(d_xqs, as_u8(&xqs))?;
         cuda.htod_f32(d_xsc, &xsc)?;
 
-        k.gemm_mma_q8(
-            &cuda,
-            d_wqs,
-            d_wsc,
-            d_xqs,
-            d_xsc,
-            d_y,
-            out_dim as u32,
-            in_dim as u32,
-            ntok as u32,
-        )?;
+        k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
         cuda.synchronize()?;
         let mut y_host = vec![0f32; ntok * out_dim];
         cuda.dtoh_f32(&mut y_host, d_y)?;
@@ -781,8 +630,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for b in 0..nb {
                     let mut dot = 0i32;
                     for j in 0..32 {
-                        dot += wqs[r * in_dim + b * 32 + j] as i32
-                            * xqs[t * in_dim + b * 32 + j] as i32;
+                        dot += wqs[r * in_dim + b * 32 + j] as i32 * xqs[t * in_dim + b * 32 + j] as i32;
                     }
                     acc += dot as f32 * (scale_vals[(r * nb + b) % 4] * xsc[t * nb + b]);
                 }
@@ -794,33 +642,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let iters = 50;
         let t = Instant::now();
         for _ in 0..iters {
-            k.gemm_mma_q8(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-                ntok as u32,
-            )?;
+            k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
         }
         cuda.synchronize()?;
         let mma = t.elapsed().as_secs_f64() / iters as f64;
         let t = Instant::now();
         for _ in 0..iters {
-            k.gemm_q8_0_soa(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-                ntok as u32,
-            )?;
+            k.gemm_q8_0_soa(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32)?;
         }
         cuda.synchronize()?;
         let dp4a = t.elapsed().as_secs_f64() / iters as f64;
@@ -836,99 +664,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         buf.reset_to(mark);
     } else {
         println!("\n[mma] skipped (device below sm_75 or GLCUDA_NO_MMA set)");
-    }
-
-    // Wave 9 diagnostic: identical grid64 arithmetic with two CTA rasters.
-    // ntok=244 produces four slabs, matching the production prompt geometry.
-    if k.has_mma() {
-        let ntok = 244usize;
-        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
-        let as_u8 =
-            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
-        for (label, out_dim, in_dim) in [("gate_up", 4864usize, 896usize), ("down", 896, 4864)] {
-            let mark = buf.mark();
-            let nb = in_dim / 32;
-            let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
-            let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
-            let d_wqs = buf.alloc(wqs.len() as u64)?.dptr;
-            let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
-            let d_xqs = buf.alloc(xqs.len() as u64)?.dptr;
-            let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
-            let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
-            cuda.htod(d_wqs, as_u8(&wqs))?;
-            cuda.htod(d_wsc, &vec![0x3cu8; out_dim * nb * 2])?;
-            cuda.htod(d_xqs, as_u8(&xqs))?;
-            cuda.htod_f32(d_xsc, &vec![0.5f32; ntok * nb])?;
-
-            let iters = 50;
-            let time = |l2: bool| -> Result<f64, Box<dyn std::error::Error>> {
-                for _ in 0..3 {
-                    if l2 {
-                        k.gemm_mma_q8_l2(
-                            &cuda,
-                            d_wqs,
-                            d_wsc,
-                            d_xqs,
-                            d_xsc,
-                            d_y,
-                            out_dim as u32,
-                            in_dim as u32,
-                            ntok as u32,
-                        )?;
-                    } else {
-                        k.gemm_mma_q8(
-                            &cuda,
-                            d_wqs,
-                            d_wsc,
-                            d_xqs,
-                            d_xsc,
-                            d_y,
-                            out_dim as u32,
-                            in_dim as u32,
-                            ntok as u32,
-                        )?;
-                    }
-                }
-                cuda.synchronize()?;
-                let started = Instant::now();
-                for _ in 0..iters {
-                    if l2 {
-                        k.gemm_mma_q8_l2(
-                            &cuda,
-                            d_wqs,
-                            d_wsc,
-                            d_xqs,
-                            d_xsc,
-                            d_y,
-                            out_dim as u32,
-                            in_dim as u32,
-                            ntok as u32,
-                        )?;
-                    } else {
-                        k.gemm_mma_q8(
-                            &cuda,
-                            d_wqs,
-                            d_wsc,
-                            d_xqs,
-                            d_xsc,
-                            d_y,
-                            out_dim as u32,
-                            in_dim as u32,
-                            ntok as u32,
-                        )?;
-                    }
-                }
-                cuda.synchronize()?;
-                Ok(started.elapsed().as_secs_f64() * 1e6 / iters as f64)
-            };
-            let grid_us = time(false)?;
-            let l2_us = time(true)?;
-            println!(
-                "[gemm-l2-raster {label}] ntok={ntok} grid {grid_us:.1} us | grouped {l2_us:.1} us | delta {:+.2}%",
-                100.0 * (l2_us - grid_us) / grid_us
-            );
-            buf.reset_to(mark);
-        }
     }
 
     // ============================================================
@@ -988,30 +723,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
             // Fill weights once (values irrelevant to timing; just not NaN).
             let wqs: Vec<i8> = (0..out_dim * in_dim).map(qb).collect();
-            let as_u8 =
-                |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
             cuda.htod(d_wqs, as_u8(&wqs))?;
-            cuda.htod(
-                d_wsc,
-                &vec![0x3C00u16; out_dim * nb]
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
+            cuda.htod(d_wsc, &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
             // Activation + output sized for the largest ntok (64); extra rows
             // are read-safe per the kernel's round8 contract.
             let max_ntok = 64usize;
             let d_xqs = buf.alloc((max_ntok * in_dim) as u64)?.dptr;
             let d_xsc = buf.alloc_f32(max_ntok * nb)?.dptr;
             let d_y = buf.alloc_f32(max_ntok * out_dim)?.dptr;
-            cuda.htod(
-                d_xqs,
-                as_u8(
-                    &(0..max_ntok * in_dim)
-                        .map(|i| qb(i * 7 + 3))
-                        .collect::<Vec<i8>>(),
-                ),
-            )?;
+            cuda.htod(d_xqs, as_u8(&(0..max_ntok * in_dim).map(|i| qb(i * 7 + 3)).collect::<Vec<i8>>()))?;
             cuda.htod_f32(d_xsc, &vec![0.5f32; max_ntok * nb])?;
 
             // The RIGHT question (v2 metric): does per-call time grow
@@ -1024,56 +745,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             //     Phase B pays.
             // (The old weight-bytes/time metric divided a constant by a growing
             // time, so it fell monotonically no matter what — uninformative.)
-            print!(
-                "[gemm-reuse {label}] in={in_dim:<5} wt={:.0}MB | ",
-                wbytes / 1e6
-            );
+            print!("[gemm-reuse {label}] in={in_dim:<5} wt={:.0}MB | ", wbytes / 1e6);
             let mut tpt_prev = 0.0f64;
             for (idx, &ntok) in [8u32, 16, 32, 64].iter().enumerate() {
-                k.gemm_mma_q8(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                    ntok,
-                )?;
+                k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok)?;
                 cuda.synchronize()?;
                 let iters = 50;
                 let t = Instant::now();
                 for _ in 0..iters {
-                    k.gemm_mma_q8(
-                        &cuda,
-                        d_wqs,
-                        d_wsc,
-                        d_xqs,
-                        d_xsc,
-                        d_y,
-                        out_dim as u32,
-                        in_dim as u32,
-                        ntok,
-                    )?;
+                    k.gemm_mma_q8(&cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok)?;
                 }
                 cuda.synchronize()?;
                 let each = t.elapsed().as_secs_f64() / iters as f64;
                 let tpt = each * 1e6 / ntok as f64; // us per token
-                                                    // total bytes moved: weights (once) + act (int8+f32/32) + out f32.
+                // total bytes moved: weights (once) + act (int8+f32/32) + out f32.
                 let abytes = (ntok as usize * in_dim + ntok as usize * (in_dim / 32) * 4) as f64;
                 let obytes = (ntok as usize * out_dim * 4) as f64;
                 let eff_gbs = (wbytes + abytes + obytes) / each / 1e9;
-                let trend = if idx == 0 {
-                    "".to_string()
-                } else {
-                    format!(" ({:+.0}%)", 100.0 * (tpt - tpt_prev) / tpt_prev)
-                };
+                let trend = if idx == 0 { "".to_string() } else { format!(" ({:+.0}%)", 100.0 * (tpt - tpt_prev) / tpt_prev) };
                 tpt_prev = tpt;
-                print!(
-                    "n{ntok}: {:.1}us/tok{}  [{:.0} GB/s eff]  ",
-                    tpt, trend, eff_gbs
-                );
+                print!("n{ntok}: {:.1}us/tok{}  [{:.0} GB/s eff]  ", tpt, trend, eff_gbs);
             }
             println!();
             buf.reset_to(mark);
@@ -1170,15 +861,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Warm once so the first timed call is not paying for JIT or
                 // first-touch page mapping.
                 k.gemm_mma_q8(
-                    &cuda,
-                    wqs_ptrs[0],
-                    wsc_ptrs[0],
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
-                    ntok as u32,
+                    &cuda, wqs_ptrs[0], wsc_ptrs[0], d_xqs, d_xsc, d_y, out_dim as u32,
+                    in_dim as u32, ntok as u32,
                 )?;
                 cuda.synchronize()?;
 
@@ -1192,15 +876,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let l = if step >= 2 { i % layers } else { 0 };
                     k.gemm_mma_q8(
-                        &cuda,
-                        wqs_ptrs[l],
-                        wsc_ptrs[l],
-                        d_xqs,
-                        d_xsc,
-                        d_y,
-                        out_dim as u32,
-                        in_dim as u32,
-                        ntok as u32,
+                        &cuda, wqs_ptrs[l], wsc_ptrs[l], d_xqs, d_xsc, d_y, out_dim as u32,
+                        in_dim as u32, ntok as u32,
                     )?;
                 }
                 cuda.synchronize()?;
@@ -1281,17 +958,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mark = buf.mark();
             let nb = in_dim / 32;
             let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
-            cuda.htod(
-                d_wqs,
-                as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()),
-            )?;
+            cuda.htod(d_wqs, as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()))?;
             let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
             cuda.htod(
                 d_wsc,
-                &vec![0x3C00u16; out_dim * nb]
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect::<Vec<u8>>(),
+                &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>(),
             )?;
             let d_x = buf.alloc_f32(ntok * in_dim)?.dptr;
             cuda.htod_f32(d_x, &vec![0.25f32; ntok * in_dim])?;
@@ -1304,28 +975,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // One GEMM call covering all ntok rows.
             k.gemm_mma_q8(
-                &cuda,
-                d_wqs,
-                d_wsc,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
+                &cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32,
                 ntok as u32,
             )?;
             cuda.synchronize()?;
             let t = Instant::now();
             for _ in 0..iters {
                 k.gemm_mma_q8(
-                    &cuda,
-                    d_wqs,
-                    d_wsc,
-                    d_xqs,
-                    d_xsc,
-                    d_y,
-                    out_dim as u32,
-                    in_dim as u32,
+                    &cuda, d_wqs, d_wsc, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32,
                     ntok as u32,
                 )?;
             }
@@ -1398,21 +1055,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
     if k.has_mma() {
         let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
-        let as_u8 =
-            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
         let scale_bits = 0x3C00u16;
         println!("[r256-ladder] (out=8) sweeping shapes; first MISMATCH localizes the bug:");
         for &(in_dim, ntok) in &[
-            (32usize, 8usize),
-            (64, 8),
-            (32, 16),
-            (32, 64),
-            (32, 72),
-            (32, 256),
-            (128, 8),
-            (128, 256),
-            (3584, 8),
-            (3584, 256),
+            (32usize, 8usize), (64, 8), (32, 16), (32, 64), (32, 72), (32, 256),
+            (128, 8), (128, 256), (3584, 8), (3584, 256),
         ] {
             let out_dim = 8usize;
             let nb = in_dim / 32;
@@ -1426,41 +1074,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d_yr = buf.alloc_f32(ntok * out_dim)?.dptr;
             let d_yc = buf.alloc_f32(ntok * out_dim)?.dptr;
             cuda.htod(d_w, as_u8(&wqs))?;
-            cuda.htod(
-                d_s,
-                &vec![scale_bits; out_dim * nb]
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
+            cuda.htod(d_s, &vec![scale_bits; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
             cuda.htod(d_x, as_u8(&xqs))?;
             cuda.htod_f32(d_xs, &vec![1.0f32; ntok * nb])?;
             // reference: 8-tile kernel in 64-row sub-slabs
             for t0 in (0..ntok).step_by(64) {
                 let nn = (ntok - t0).min(64) as u32;
-                k.gemm_mma_q8(
-                    &cuda,
-                    d_w,
-                    d_s,
-                    d_x + (t0 * in_dim) as u64,
-                    d_xs + (t0 * nb) as u64 * 4,
-                    d_yr + (t0 * out_dim) as u64 * 4,
-                    out_dim as u32,
-                    in_dim as u32,
-                    nn,
-                )?;
+                k.gemm_mma_q8(&cuda, d_w, d_s, d_x + (t0 * in_dim) as u64, d_xs + (t0 * nb) as u64 * 4, d_yr + (t0 * out_dim) as u64 * 4, out_dim as u32, in_dim as u32, nn)?;
             }
-            let launched = k.gemm_mma_q8_r256(
-                &cuda,
-                d_w,
-                d_s,
-                d_x,
-                d_xs,
-                d_yc,
-                out_dim as u32,
-                in_dim as u32,
-                ntok as u32,
-            );
+            let launched = k.gemm_mma_q8_r256(&cuda, d_w, d_s, d_x, d_xs, d_yc, out_dim as u32, in_dim as u32, ntok as u32);
             let synced = cuda.synchronize();
             let verdict = match (launched, synced) {
                 (Ok(()), Ok(())) => {
@@ -1471,13 +1093,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let bad = (0..ntok * out_dim).find(|&i| (yr[i] - yc[i]).abs() > 1.0);
                     match bad {
                         None => "MATCH".to_string(),
-                        Some(i) => format!(
-                            "MISMATCH @ (t={},r={}) ref={:.0} r256={:.0}",
-                            i / out_dim,
-                            i % out_dim,
-                            yr[i],
-                            yc[i]
-                        ),
+                        Some(i) => format!("MISMATCH @ (t={},r={}) ref={:.0} r256={:.0}", i / out_dim, i % out_dim, yr[i], yc[i]),
                     }
                 }
                 (l, s) => format!("FAULT {l:?}/{s:?}"),
@@ -1492,16 +1108,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Real 7B in-dims (3584 gate_up, 18944 down); out_dim trimmed to 256
         // so the CPU reference stays cheap. ntok=256 = the r256 cap and the
         // engine's second sub-slab size. This mirrors the engine call shape.
-        for (label, out_dim, in_dim, ntok) in [
-            ("gate_up", 256usize, 3584usize, 256usize),
-            ("down", 256, 18944, 256),
-        ] {
+        for (label, out_dim, in_dim, ntok) in
+            [("gate_up", 256usize, 3584usize, 256usize), ("down", 256, 18944, 256)]
+        {
             let mark = buf.mark();
             let nb = in_dim / 32;
             let scale_bits = 0x3C00u16; // 1.0 in f16, so scales are exactly 1.
             let xqs: Vec<i8> = (0..ntok * in_dim).map(|i| qb(i * 7 + 3)).collect();
-            let as_u8 =
-                |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+            let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
             let d_xqs = buf.alloc((ntok * in_dim) as u64)?.dptr;
             let d_xsc = buf.alloc_f32(ntok * nb)?.dptr;
             let d_y = buf.alloc_f32(ntok * out_dim)?.dptr;
@@ -1519,42 +1133,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let d_w2 = buf.alloc((need_rows * in_dim) as u64)?.dptr;
             let d_s2 = buf.alloc((need_rows * nb * 2) as u64)?.dptr;
             cuda.htod(d_w2, as_u8(&wqs))?;
-            cuda.htod(
-                d_s2,
-                &vec![scale_bits; need_rows * nb]
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
+            cuda.htod(d_s2, &vec![scale_bits; need_rows * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
             let d_y_ref = buf.alloc_f32(ntok * out_dim)?.dptr;
 
             // Reference: 8-tile kernel in 64-row sub-slabs.
             for t0 in (0..ntok).step_by(64) {
                 let nn = (ntok - t0).min(64) as u32;
-                k.gemm_mma_q8(
-                    &cuda,
-                    d_w2,
-                    d_s2,
+                k.gemm_mma_q8(&cuda, d_w2, d_s2,
                     d_xqs + (t0 * in_dim) as u64,
                     d_xsc + (t0 * nb) as u64 * 4,
                     d_y_ref + (t0 * out_dim) as u64 * 4,
-                    out_dim as u32,
-                    in_dim as u32,
-                    nn,
-                )?;
+                    out_dim as u32, in_dim as u32, nn)?;
             }
             // Candidate: r256 in one 256-row call.
-            let launched = k.gemm_mma_q8_r256(
-                &cuda,
-                d_w2,
-                d_s2,
-                d_xqs,
-                d_xsc,
-                d_y,
-                out_dim as u32,
-                in_dim as u32,
-                ntok as u32,
-            );
+            let launched = k.gemm_mma_q8_r256(&cuda, d_w2, d_s2, d_xqs, d_xsc, d_y, out_dim as u32, in_dim as u32, ntok as u32);
             let synced = cuda.synchronize();
             match (launched, synced) {
                 (Ok(()), Ok(())) => {
@@ -1566,9 +1158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut first_bad = None;
                     for i in 0..ntok * out_dim {
                         let d = (y_r256[i] - y_ref[i]).abs();
-                        if d > max_abs {
-                            max_abs = d;
-                        }
+                        if d > max_abs { max_abs = d; }
                         if d > 1.0 && first_bad.is_none() {
                             first_bad = Some((i / out_dim, i % out_dim, y_ref[i], y_r256[i]));
                         }
@@ -1601,35 +1191,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let h7 = 18944usize;
         let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
         let chunk = 512usize; // one layer-first ubatch
-        let as_u8 =
-            |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
         for (label, out_dim, in_dim) in [("gate_up", 2 * h7, d7), ("down   ", d7, h7)] {
             let mark = buf.mark();
             let nb = in_dim / 32;
             let d_wqs = buf.alloc((out_dim * in_dim) as u64)?.dptr;
             let d_wsc = buf.alloc((out_dim * nb * 2) as u64)?.dptr;
-            cuda.htod(
-                d_wqs,
-                as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()),
-            )?;
-            cuda.htod(
-                d_wsc,
-                &vec![0x3C00u16; out_dim * nb]
-                    .iter()
-                    .flat_map(|b| b.to_le_bytes())
-                    .collect::<Vec<u8>>(),
-            )?;
+            cuda.htod(d_wqs, as_u8(&(0..out_dim * in_dim).map(qb).collect::<Vec<i8>>()))?;
+            cuda.htod(d_wsc, &vec![0x3C00u16; out_dim * nb].iter().flat_map(|b| b.to_le_bytes()).collect::<Vec<u8>>())?;
             let d_xqs = buf.alloc((chunk * in_dim) as u64)?.dptr;
             let d_xsc = buf.alloc_f32(chunk * nb)?.dptr;
             let d_y = buf.alloc_f32(chunk * out_dim)?.dptr;
-            cuda.htod(
-                d_xqs,
-                as_u8(
-                    &(0..chunk * in_dim)
-                        .map(|i| qb(i * 7 + 3))
-                        .collect::<Vec<i8>>(),
-                ),
-            )?;
+            cuda.htod(d_xqs, as_u8(&(0..chunk * in_dim).map(|i| qb(i * 7 + 3)).collect::<Vec<i8>>()))?;
             cuda.htod_f32(d_xsc, &vec![0.5f32; chunk * nb])?;
 
             // Process the full `chunk` rows as ceil(chunk/tile) calls of `tile`
@@ -1645,41 +1218,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let xsc = d_xsc + (base * nb) as u64 * 4;
                         let y = d_y + (base * out_dim) as u64 * 4;
                         if tile <= 64 {
-                            k.gemm_mma_q8(
-                                &cuda,
-                                d_wqs,
-                                d_wsc,
-                                xqs,
-                                xsc,
-                                y,
-                                out_dim as u32,
-                                in_dim as u32,
-                                n,
-                            )?;
-                        } else if tile <= 128 {
-                            k.gemm_mma_q8_r128(
-                                &cuda,
-                                d_wqs,
-                                d_wsc,
-                                xqs,
-                                xsc,
-                                y,
-                                out_dim as u32,
-                                in_dim as u32,
-                                n,
-                            )?;
+                            k.gemm_mma_q8(&cuda, d_wqs, d_wsc, xqs, xsc, y, out_dim as u32, in_dim as u32, n)?;
                         } else {
-                            k.gemm_mma_q8_r256(
-                                &cuda,
-                                d_wqs,
-                                d_wsc,
-                                xqs,
-                                xsc,
-                                y,
-                                out_dim as u32,
-                                in_dim as u32,
-                                n,
-                            )?;
+                            k.gemm_mma_q8_r256(&cuda, d_wqs, d_wsc, xqs, xsc, y, out_dim as u32, in_dim as u32, n)?;
                         }
                         base += tile;
                     }
@@ -1688,17 +1229,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(t.elapsed().as_secs_f64() * 1e6 / iters as f64) // us per full chunk
             };
             // Warm all three.
-            for &tile in &[64usize, 128, 256] {
-                run_chunk(tile)?;
-            }
+            for &tile in &[64usize, 128, 256] { run_chunk(tile)?; }
             let (t64, t128, t256) = (run_chunk(64)?, run_chunk(128)?, run_chunk(256)?);
-            let best = if t256 <= t128 && t256 <= t64 {
-                "256"
-            } else if t128 <= t64 {
-                "128"
-            } else {
-                "64"
-            };
+            let best = if t256 <= t128 && t256 <= t64 { "256" } else if t128 <= t64 { "128" } else { "64" };
             println!(
                 "[gemm-phaseb {label}] 512-row chunk: 8x64 {:.0}us | 4x128 {:.0}us ({:+.0}%) | 2x256 {:.0}us ({:+.0}%) => best tile {best}",
                 t64,
@@ -1722,7 +1255,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ============================================================
     {
         let n_layers = 24usize; // Qwen2.5-0.5B
-                                // (input_dim, count/token) for each quantize the runner issues.
+        // (input_dim, count/token) for each quantize the runner issues.
         let quants = [
             (dim, n_layers),    // attn-norm -> qkv
             (dim, n_layers),    // attn-out  -> o_proj
@@ -1754,43 +1287,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             total_us,
             total_us / 4400.0 * 100.0,
         );
-    }
-
-    // Wave 8 diagnostic: isolate launch-geometry cost without changing the
-    // Q8_0 scale contract. Both arms quantize the same 244x896 activation;
-    // the candidate maps eight independent K32 blocks onto each row CTA.
-    {
-        let (rows, cols) = (244usize, 896usize);
-        let elements = rows * cols;
-        let mark = buf.mark();
-        let x = buf.alloc_f32(elements)?.dptr;
-        cuda.htod_f32(x, &vec![0.25f32; elements])?;
-        let qs = buf.alloc(elements as u64)?.dptr;
-        let scales = buf.alloc_f32(elements / 32)?.dptr;
-        let iters = 200;
-
-        k.quantize_q8(&cuda, x, qs, scales, elements as u32)?;
-        cuda.synchronize()?;
-        let t = Instant::now();
-        for _ in 0..iters {
-            k.quantize_q8(&cuda, x, qs, scales, elements as u32)?;
-        }
-        cuda.synchronize()?;
-        let warp_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-
-        k.quantize_q8_rowcta(&cuda, x, qs, scales, rows as u32, cols as u32)?;
-        cuda.synchronize()?;
-        let t = Instant::now();
-        for _ in 0..iters {
-            k.quantize_q8_rowcta(&cuda, x, qs, scales, rows as u32, cols as u32)?;
-        }
-        cuda.synchronize()?;
-        let rowcta_us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
-        println!(
-            "[q8-rowcta] 244x896: warp-grid {warp_us:.1} us | row-CTA {rowcta_us:.1} us ({:+.1}%)",
-            100.0 * (rowcta_us - warp_us) / warp_us
-        );
-        buf.reset_to(mark);
     }
 
     // ============================================================
@@ -1868,40 +1364,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let probe = |stop: u32| {
             k.attn_rows_probe(
-                &cuda,
-                q,
-                kc,
-                vc,
-                out,
-                n_heads,
-                head_dim as u32,
-                pos,
-                heads_per_kv,
-                head_stride,
-                scale,
-                ntok as u32,
-                max_seq as u32,
-                stop,
+                &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+                head_stride, scale, ntok as u32, max_seq as u32, stop,
+                n_heads * head_dim as u32,
             )
         };
-        // Warm every variant (JIT + caches), plus the real kernel.
+        // Warm every variant (JIT + caches), plus the real kernel. The
+        // explicit retained entry, not the dispatcher: attn_rows_probe is
+        // a copy of THIS kernel, so comparing it against a GQA7 launch
+        // would be comparing two different kernels.
         for stop in [1u32, 2, 0] {
             probe(stop)?;
         }
-        k.attn_decode_rows(
-            &cuda,
-            q,
-            kc,
-            vc,
-            out,
-            n_heads,
-            head_dim as u32,
-            pos,
-            heads_per_kv,
-            head_stride,
-            scale,
-            ntok as u32,
-            max_seq as u32,
+        k.attn_decode_rows_legacy(
+            &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+            head_stride, scale, ntok as u32, max_seq as u32, n_heads * head_dim as u32,
         )?;
         cuda.synchronize()?;
 
@@ -1917,23 +1394,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t1 = time_probe(1)?; // score pass only
         let t12 = time_probe(2)?; // + softmax
         let tful = time_probe(0)?; // + V-accum (everything)
-                                   // Cross-check that the probe copy costs the same as the real kernel.
+        // Cross-check that the probe copy costs the same as the real kernel.
         let t = Instant::now();
         for _ in 0..iters {
-            k.attn_decode_rows(
-                &cuda,
-                q,
-                kc,
-                vc,
-                out,
-                n_heads,
-                head_dim as u32,
-                pos,
-                heads_per_kv,
-                head_stride,
-                scale,
-                ntok as u32,
-                max_seq as u32,
+            k.attn_decode_rows_legacy(
+                &cuda, q, kc, vc, out, n_heads, head_dim as u32, pos, heads_per_kv,
+                head_stride, scale, ntok as u32, max_seq as u32, n_heads * head_dim as u32,
             )?;
         }
         cuda.synchronize()?;
@@ -1984,20 +1450,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let single_capacity = (base + ntok / 2 + 1) as u32;
         for stop in [1u32, 2, 0] {
             k.attn_rows_probe(
-                &cuda,
-                q,
-                kc,
-                vc,
-                out,
-                1,
-                head_dim as u32,
-                pos_mid,
-                heads_per_kv,
-                head_stride,
-                scale,
-                1,
-                single_capacity,
-                stop,
+                &cuda, q, kc, vc, out, 1, head_dim as u32, pos_mid, heads_per_kv,
+                head_stride, scale, 1, single_capacity, stop, head_dim as u32,
             )?;
         }
         cuda.synchronize()?;
@@ -2006,20 +1460,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = Instant::now();
             for _ in 0..single_iters {
                 k.attn_rows_probe(
-                    &cuda,
-                    q,
-                    kc,
-                    vc,
-                    out,
-                    1,
-                    head_dim as u32,
-                    pos_mid,
-                    heads_per_kv,
-                    head_stride,
-                    scale,
-                    1,
-                    single_capacity,
-                    stop,
+                    &cuda, q, kc, vc, out, 1, head_dim as u32, pos_mid, heads_per_kv,
+                    head_stride, scale, 1, single_capacity, stop, head_dim as u32,
                 )?;
             }
             cuda.synchronize()?;

@@ -1,0 +1,23 @@
+{
+  "wave": 115,
+  "status": "failed_before_measurement",
+  "kernel": "jinxsuperdev/glcuda-t4-wave115-q8-head-to-head",
+  "kernel_version": 1,
+  "source_revision": "7100bb555e3238ac438dc858e5e06ae6c7f57d1f",
+  "passed_gates": {
+    "tesla_t4_sm75": true,
+    "host_tests": "66 passed; 0 failed",
+    "cuda_parity": "33 passed; 0 failed",
+    "glbench_release_build": true,
+    "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+    "llama_cpp_build": "4d9176092d00586775af140581bb0b558ddc4389",
+    "llama_cuda_smoke": true,
+    "gwen_dispatch_probe": true
+  },
+  "failed_phase": "glcore-tokenizer-exact",
+  "primary_error": "rustup could not choose a version of cargo to run; no default toolchain configured",
+  "production_sessions_completed": 0,
+  "production_metrics_valid": false,
+  "partial_archive_sha256": "c089491c295a7e4fcfe01ae17544d6a1fa20f76af5018094aa0ed85d2ac848ee",
+  "raw_log_sha256": "5c4dd7fa530cb2a745134115f6135e91fe00a745ad094fe45f3992c66e0a8bef"
+}

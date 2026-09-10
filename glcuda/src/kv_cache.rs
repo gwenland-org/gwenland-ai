@@ -50,14 +50,7 @@ impl KvCacheDev {
             data.len_f32(),
             Self::numel(n_layers, n_heads, head_dim, max_context)
         );
-        KvCacheDev {
-            data,
-            current_pos: 0,
-            n_layers,
-            n_heads,
-            head_dim,
-            max_context,
-        }
+        KvCacheDev { data, current_pos: 0, n_layers, n_heads, head_dim, max_context }
     }
 
     /// Element offset of the `[seq][dim]` region for one layer+kv+head —

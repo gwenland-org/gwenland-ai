@@ -1,0 +1,52 @@
+{
+  "schema": "gwenland.glcuda.wave-gate.v1",
+  "wave": 60,
+  "candidate": "gl_gemm_mma_q8_bstage_n32_m32",
+  "status": "no_gpu_verdict",
+  "decision": "repair_snapshot_closure_in_wave61",
+  "submitted_kernel": "jinxsuperdev/glcuda-t4-wave60-n32-production",
+  "submitted_version": 1,
+  "environment": {
+    "gpu": "Tesla T4",
+    "compute_capability": "7.5",
+    "driver": "580.159.04"
+  },
+  "local_gates": {
+    "glcuda_lib": {
+      "passed": 64,
+      "failed": 0
+    },
+    "device_execution_local": "skipped_no_cuda"
+  },
+  "remote_gate": {
+    "phase": "compile-resource-correctness",
+    "host_tests": {
+      "passed": 62,
+      "failed": 2,
+      "failures": [
+        "kernels::tests::sm75_ptx_is_structurally_sound",
+        "tests::capabilities_match_hardware_reality"
+      ]
+    },
+    "failure": "unexpected Wave 50 host-test result: test result: FAILED. 62 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s",
+    "failed_before_candidate_ptxas": true,
+    "failed_before_device_parity": true,
+    "failed_before_direct_timing": true,
+    "failed_before_production_ab": true,
+    "root_cause": "The hash-pinned Wave60 snapshot repaired the Wave59 overlay drift, but its five-file closure was incomplete. Current glcuda/src/kernels/mod.rs resolves and structurally asserts gl_gemm_mma_q8_bstage_pipe, while the historical reconstruction retained an older glcuda_sm75.ptx without that production entry. The complete current glcuda_sm75.ptx was not included in the snapshot."
+  },
+  "snapshot_verification": {
+    "candidate_files_written": 5,
+    "all_hashes_verified": true,
+    "git_diff_check_passed": true,
+    "missing_dependency_file": "glcuda/src/kernels/glcuda_sm75.ptx",
+    "missing_dependency_sha256": "2a87248b17bbd3aef50209295e1a4c2f71d9fa559f14cb84564a99fd7f583e55"
+  },
+  "artifacts": {
+    "evidence_zip": "benchmarks/glcuda-t4-wave60-n32-v1-failed.zip",
+    "evidence_zip_sha256": "ee0a2d8fe758813e975dba1125d861ca77d29ab938496aa3a203c9c4864bea15",
+    "submitted_notebook_sha256": "a9afcf1935e1f20ac69726f0210985ae7e17458522fb092764f8c7bc0fa20361"
+  },
+  "performance": null,
+  "ptxas_resources": null
+}

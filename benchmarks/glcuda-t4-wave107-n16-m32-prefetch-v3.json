@@ -1,0 +1,25 @@
+{
+  "wave": 107,
+  "classification": "patch_whitespace_failure",
+  "kaggle_kernel": "jinxsuperdev/glcuda-wave-107-n16-m32-prefetch",
+  "version": 3,
+  "status": "KernelWorkerStatus.ERROR",
+  "phase": "reconstruct",
+  "accelerator_request": "NvidiaTeslaT4",
+  "allocated_device": "Tesla T4",
+  "allocated_compute_capability": "7.5",
+  "allocated_device_count": 2,
+  "driver_version": "580.159.04",
+  "base_revision": "bd5c956bafb3bb6738c3f1de348a4ebb55d9c29f",
+  "source_revision": "285950b891a7fcf9e3252e23b53c90c72a7de327",
+  "patch_sha256": "084377b77369f99dbf9c503d3b59602a4227293c9e6f0382e4d0af57822bd82c",
+  "whitespace_error": "glcuda/src/kernels/glcuda_sm75_wave105.ptx:515: new blank line at EOF.",
+  "archive": "glcuda-t4-wave107-n16-m32-prefetch-v3.zip",
+  "archive_sha256": "08a942e5394115e963145c8b6e5874da844179aa1229c08da163dca921aaff31",
+  "notebook_sha256": "046b819198099f671dd053c1ec02cad3cede159c83e4711e1660e5c5761c523e",
+  "ptxas_ran": false,
+  "parity_ran": false,
+  "timing_ran": false,
+  "production_metric": null
+}
+

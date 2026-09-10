@@ -1,0 +1,96 @@
+{
+  "schema": "gwenland.glcuda.wave-gate.v1",
+  "wave": 62,
+  "candidate": "gl_gemm_mma_q8_bstage_n32_m32",
+  "status": "rejected",
+  "decision": "reject_before_production_ab",
+  "submitted_kernel": "jinxsuperdev/glcuda-t4-wave62-n32-production",
+  "submitted_version": 1,
+  "environment": {
+    "gpu": "Tesla T4",
+    "compute_capability": "7.5",
+    "driver": "580.159.04"
+  },
+  "candidate_identity": {
+    "ptx_sha256": "0f3a390c1bc9509836aed1ccd450dd341b5f6d91cf5c5c18916f0b7913ca86f6",
+    "changed_since_wave59": false
+  },
+  "gates": {
+    "snapshot_hashes_verified": true,
+    "git_diff_check_passed": true,
+    "glcuda_lib": {
+      "passed": 64,
+      "failed": 0
+    },
+    "full_cuda_parity": {
+      "passed": 33,
+      "failed": 0
+    },
+    "candidate_ptxas": {
+      "registers": 80,
+      "static_shared_bytes": 8064,
+      "barriers": 1,
+      "stack_frame_bytes": 0,
+      "spill_store_bytes": 0,
+      "spill_load_bytes": 0
+    },
+    "driver_occupancy": {
+      "retained_threads": 256,
+      "retained_active_blocks_per_sm": 4,
+      "candidate_threads": 128,
+      "candidate_active_blocks_per_sm": 6
+    },
+    "candidate_device_parity": {
+      "passed": 1,
+      "failed": 0,
+      "bit_exact": true
+    },
+    "direct_hard_stop_speedup": 1.1,
+    "direct_screen_passed": false,
+    "production_ab_executed": false
+  },
+  "direct_screen": {
+    "warmup": 10,
+    "iters": 100,
+    "repeats": 5,
+    "all_bit_exact": true,
+    "records": [
+      {
+        "shape": "qkv",
+        "out_dim": 1152,
+        "in_dim": 896,
+        "ntok": 244,
+        "retained_n16_m32_us": 55.87,
+        "candidate_n32_m32_us": 63.865,
+        "speedup": 0.8748
+      },
+      {
+        "shape": "ffn_down",
+        "out_dim": 896,
+        "in_dim": 4864,
+        "ntok": 244,
+        "retained_n16_m32_us": 178.834,
+        "candidate_n32_m32_us": 216.932,
+        "speedup": 0.8244
+      },
+      {
+        "shape": "ragged",
+        "out_dim": 136,
+        "in_dim": 160,
+        "ntok": 17,
+        "retained_n16_m32_us": 5.136,
+        "candidate_n32_m32_us": 6.989,
+        "speedup": 0.7349
+      }
+    ]
+  },
+  "artifacts": {
+    "evidence_zip": "benchmarks/glcuda-t4-wave62-n32-v1-failed.zip",
+    "evidence_zip_sha256": "eea3bcc5195550595378713259e9d0420e4ae44fb8bfb23bae2071e431c1837f",
+    "notebook": "notebooks/glcuda_t4_wave62_n32_production.ipynb",
+    "notebook_sha256": "1570aaa9619683e9a9a5e0d0ed1795ad1f90b675a3d09b783a7dcff7a3eb8ee9"
+  },
+  "production_performance": null,
+  "target_prefill_tps": 15000,
+  "target_reached": false
+}

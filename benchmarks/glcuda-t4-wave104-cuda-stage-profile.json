@@ -1,0 +1,93 @@
+{
+  "wave": 104,
+  "kernel": "jinxsuperdev/glcuda-wave-104-cuda-stage-profile",
+  "version": 1,
+  "status": "cuda_profile_complete",
+  "diagnostic_only": true,
+  "method": {
+    "quant": "Q8_0",
+    "prompt_tokens": 244,
+    "arms": 2,
+    "sessions_per_arm": 5,
+    "warmup_iters": 2,
+    "measure_iters": 3,
+    "telemetry": "GLCUDA_TELEMETRY event timing",
+    "alternating_order": true,
+    "equal_position_counts": false
+  },
+  "retained_profile": {
+    "profile_total_median_ms": 25.7486080378294,
+    "wall_p50_median_ms": 29.57427,
+    "stages": {
+      "ffn_gate_up": {
+        "median_ms": 8.653472006320953,
+        "share": 0.3362232524440787,
+        "share_min": 0.3347,
+        "share_max": 0.3379
+      },
+      "ffn_down": {
+        "median_ms": 6.119168013334274,
+        "share": 0.23775503869339182,
+        "share_min": 0.2358,
+        "share_max": 0.2391
+      },
+      "attention": {
+        "median_ms": 4.218304023146629,
+        "share": 0.16389859439359214,
+        "share_min": 0.1617,
+        "share_max": 0.1644
+      },
+      "ffn_elementwise": {
+        "median_ms": 2.847007976844907,
+        "share": 0.11061805954994934,
+        "share_min": 0.1077,
+        "share_max": 0.1168
+      },
+      "qkv": {
+        "median_ms": 1.7720960304141045,
+        "share": 0.06885327537361337,
+        "share_min": 0.0686,
+        "share_max": 0.0701
+      },
+      "attn_out": {
+        "median_ms": 1.219967994838953,
+        "share": 0.04740081285324728,
+        "share_min": 0.0472,
+        "share_max": 0.0477
+      },
+      "attn_norm": {
+        "median_ms": 0.6756800021976233,
+        "share": 0.026252968494537607,
+        "share_min": 0.0249,
+        "share_max": 0.0264
+      },
+      "attn_kv_write": {
+        "median_ms": 0.2315839994698763,
+        "share": 0.008997998197589785,
+        "share_min": 0.0083,
+        "share_max": 0.0093
+      }
+    }
+  },
+  "candidate_profile": {
+    "profile_total_median_ms": 27.262655943632126,
+    "wall_p50_median_ms": 30.402728,
+    "ffn_gate_up_median_ms": 8.158591985702515,
+    "cross_arm_retention_authority": false
+  },
+  "direct_gate": {
+    "minimum_speedup": 1.2607,
+    "all_bit_exact": true
+  },
+  "decision": "test_existing_n16_prefetch_kernel_on_ffn_down",
+  "next_shape": {
+    "out_dim": 896,
+    "in_dim": 4864,
+    "ntok": 244
+  },
+  "archive": "glcuda-t4-wave104-cuda-stage-profile-v1.zip",
+  "archive_sha256": "e896e3f24d796b4d7e74644748331ecdd136613e24c2ca42464d17fc6971b2b5",
+  "production_record_tps": 12232.744196796972,
+  "target_tps": 15000.0,
+  "target_achieved": false
+}

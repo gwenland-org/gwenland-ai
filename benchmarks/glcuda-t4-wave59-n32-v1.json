@@ -1,0 +1,39 @@
+{
+  "schema": "gwenland.glcuda.wave-gate.v1",
+  "wave": 59,
+  "candidate": "gl_gemm_mma_q8_bstage_n32_m32",
+  "status": "no_gpu_verdict",
+  "decision": "repair_harness_in_wave60",
+  "submitted_kernel": "jinxsuperdev/glcuda-t4-wave59-n32-gemm",
+  "submitted_version": 1,
+  "environment": {
+    "gpu": "Tesla T4",
+    "compute_capability": "7.5",
+    "driver": "580.159.04"
+  },
+  "local_gates": {
+    "glcuda_lib": {
+      "passed": 64,
+      "failed": 0
+    },
+    "device_parity_harness_compiles": true,
+    "direct_benchmark_compiles": true,
+    "device_execution_local": "skipped_no_cuda"
+  },
+  "remote_gate": {
+    "phase": "compile-resource-correctness",
+    "failure": "Wave 59 overlay apply failed",
+    "failed_before_ptxas": true,
+    "failed_before_device_parity": true,
+    "failed_before_timing": true,
+    "root_cause": "The archived Wave50 reconstruction retains experimental Wave21-Wave24 source in glcuda/src/kernels/mod.rs, while the Wave59 overlay was generated against the cleaned production snapshot. The first mod.rs hunk therefore did not apply."
+  },
+  "artifacts": {
+    "evidence_zip": "benchmarks/glcuda-t4-wave59-n32-v1-failed.zip",
+    "evidence_zip_sha256": "5ab48adf9c742c32d270480b6143bb056b0954ffaff87cf9c9931af1a704214d",
+    "notebook_sha256": "fc7252c504f0c7db54a8c3ac80f7682c10fc8aa33102b262a06fa860e7bf6225",
+    "overlay_sha256": "fff07d724142a8456a8912bed092593f4e0b2b8197baed19b8aed865710db45c"
+  },
+  "performance": null,
+  "ptxas_resources": null
+}

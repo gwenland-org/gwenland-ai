@@ -1,0 +1,22 @@
+{
+  "wave": 112,
+  "status": "failed_before_measurement",
+  "kernel": "jinxsuperdev/glcuda-t4-wave112-q8-head-to-head",
+  "kernel_version": 1,
+  "source_revision": "6ba97d98549330e76e3961227d53759389e4cfd3",
+  "notebook_commit": "8f7a32ff212952d336f3180d5d29090508eaac40",
+  "patch_sha256": "e8019acc8810445c9e29ad32eb60e7bd76c8607c6d2d0df8e9f1fea68911f8d3",
+  "passed_gates": {
+    "tesla_t4_sm75": true,
+    "host_tests": "66 passed; 0 failed",
+    "cuda_parity": "33 passed; 0 failed",
+    "glbench_release_build": true
+  },
+  "failed_phase": "model-fetch",
+  "primary_error": "NameError: name 'sha256_file' is not defined",
+  "secondary_error": "HTTP 416 after the complete partial file was left in place",
+  "production_sessions_completed": 0,
+  "production_metrics_valid": false,
+  "raw_log_sha256": "302ab35ef9cbef106fd0fc46d4c28d9f269c4597693dda48645da9466615d629",
+  "failure_archive_sha256": "ae3c555e4dc3bb15a1db6dc293bd59b44139ead3ec0fdf98407542c28786c013"
+}
