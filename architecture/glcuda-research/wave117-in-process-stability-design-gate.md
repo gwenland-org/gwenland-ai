@@ -41,13 +41,14 @@ is the missing optimization.
 Add a dedicated `glcuda` example, not a `glbench` behavior change. It will:
 
 1. load the pinned Q8_0 model once and create one CUDA context;
-2. construct retained and Wave 111 runners through an explicit benchmark-only
-   configuration value, never by mutating process-global environment variables
+2. select retained and Wave 111 execution through an explicit benchmark-only
+   runner switch, never by mutating process-global environment variables
    between iterations;
 3. pre-JIT and warm both arms before collecting samples;
-4. alternate `ABBA` per measured quartet for 25 quartets (100 prefill samples
+4. alternate `ABBA` per measured quartet for 50 quartets (100 prefill samples
    per arm), reversing the first arm in a second independent invocation;
-5. synchronize with CUDA events around the complete production prefill call;
+5. use the production runner's synchronized end-to-end prefill timer (the
+   same timing boundary as `glbench`, not a kernel-only probe);
 6. require the exact 244-token ChatML IDs and compare every measured output to
    the unchanged `glproc` oracle;
 7. archive every raw latency, order position, dispatch contract, GPU identity,

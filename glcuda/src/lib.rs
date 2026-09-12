@@ -51,6 +51,13 @@ use sampler::{Sampler, SamplerConfig};
 pub struct GlcudaConfig {
     /// Fixed RNG seed for reproducible sampling; `None` = time-seeded.
     pub seed: Option<u64>,
+    /// Benchmark-only override for Wave 111's deferred FFN residual path.
+    ///
+    /// `None` preserves the production environment contract. The dedicated
+    /// Wave 118 harness uses `Some` so both arms can coexist in one process
+    /// without mutating process-global environment variables.
+    #[doc(hidden)]
+    pub benchmark_defer_ffn_residual: Option<bool>,
 }
 
 /// Optional per-token callback threaded through [`GlcudaEngine::run`].
@@ -97,6 +104,18 @@ impl GlcudaEngine {
     /// The loaded kernel suite, once initialized.
     pub fn kernels(&self) -> Option<&KernelSet> {
         self.kernels.as_ref()
+    }
+
+    /// Select the retained or Wave 111 path between synchronized iterations
+    /// in the dedicated Wave 118 benchmark harness.
+    #[doc(hidden)]
+    pub fn set_benchmark_defer_ffn_residual(&self, enabled: bool) -> Result<(), GlError> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
+        kernels.set_benchmark_defer_ffn_residual(enabled);
+        Ok(())
     }
 
     /// Encode `text` to token ids with the loaded model's tokenizer, adding
@@ -249,7 +268,10 @@ impl GlEngine for GlcudaEngine {
 
     fn init(&mut self) -> Result<(), GlError> {
         let cuda = Cuda::probe()?;
-        let kernels = KernelSet::load(&cuda)?;
+        let kernels = KernelSet::load_with_defer_override(
+            &cuda,
+            self.config.benchmark_defer_ffn_residual,
+        )?;
         let i = &cuda.info;
         // One startup line, like glproc's [simd] line: name the hardware
         // path so a silent mis-selection is visible.

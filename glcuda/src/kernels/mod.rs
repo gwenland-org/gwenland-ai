@@ -6,6 +6,7 @@
 //! once per forward pass (or per test).
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use glcore::GlError;
 
@@ -225,7 +226,7 @@ pub struct KernelSet {
     gemm_n16_prefetch: bool,
     /// Wave 111: defer each non-final FFN residual into the next layer's
     /// already-fused attention RMS+Q8 pass. Opt-in until production A/B.
-    defer_ffn_residual: bool,
+    defer_ffn_residual: AtomicBool,
     /// Wave 15A is retained and default; this forces the row kernel back,
     /// which is what an A/B against it needs.
     rows_forced: bool,
@@ -293,11 +294,29 @@ pub struct KernelSet {
     f_attn_rows_qk4_probe: Kernel,
 }
 
+fn resolve_defer_ffn_residual(
+    fuse_q8_glue: bool,
+    environment_enabled: bool,
+    benchmark_override: Option<bool>,
+) -> bool {
+    fuse_q8_glue && benchmark_override.unwrap_or(environment_enabled)
+}
+
 impl KernelSet {
     /// JIT the embedded PTX and resolve every entry point. On sm_75+ the
     /// tensor-core module is loaded too (`GLCUDA_NO_MMA=1` opts out, for
     /// A/B benchmarking against the sm_70 dp4a GEMM).
     pub fn load(cuda: &Cuda) -> Result<KernelSet, GlError> {
+        Self::load_with_defer_override(cuda, None)
+    }
+
+    /// Load the kernel suite with a narrow benchmark-only override for Wave
+    /// 111. `None` is byte-for-byte the production environment policy.
+    #[doc(hidden)]
+    pub fn load_with_defer_override(
+        cuda: &Cuda,
+        defer_ffn_residual_override: Option<bool>,
+    ) -> Result<KernelSet, GlError> {
         let module = cuda.load_module(PTX)?;
         let sm = (cuda.info.sm_major, cuda.info.sm_minor);
         let mma = if sm >= (7, 5) && std::env::var_os("GLCUDA_NO_MMA").is_none() {
@@ -388,8 +407,11 @@ impl KernelSet {
         } else {
             None
         };
-        let defer_ffn_residual =
-            fuse_q8_glue && std::env::var_os("GLCUDA_DEFER_FFN_RESIDUAL").is_some();
+        let defer_ffn_residual = resolve_defer_ffn_residual(
+            fuse_q8_glue,
+            std::env::var_os("GLCUDA_DEFER_FFN_RESIDUAL").is_some(),
+            defer_ffn_residual_override,
+        );
         let rows_forced = std::env::var_os("GLCUDA_ATTN_ROWS").is_some();
         let mma4_attention = mma.is_some() && std::env::var_os("GLCUDA_ATTN_MMA4").is_some();
         let mma4_regq_attention =
@@ -419,7 +441,7 @@ impl KernelSet {
             gemm_n16,
             gemm_n32,
             gemm_n16_prefetch,
-            defer_ffn_residual,
+            defer_ffn_residual: AtomicBool::new(defer_ffn_residual),
             rows_forced,
             gqa7_chains,
             mma4_attention,
@@ -1714,7 +1736,18 @@ impl KernelSet {
     /// Whether non-final prefill layers may defer their FFN residual add into
     /// the next attention RMS+Q8 pass.
     pub fn defer_ffn_residual_enabled(&self) -> bool {
+        self.defer_ffn_residual.load(Ordering::Relaxed)
+    }
+
+    /// Switch Wave 111 between synchronized benchmark iterations.
+    ///
+    /// Production construction never calls this. The Wave 118 harness owns a
+    /// single runner/model/context and uses this instead of process-global
+    /// environment mutation.
+    #[doc(hidden)]
+    pub fn set_benchmark_defer_ffn_residual(&self, enabled: bool) {
         self.defer_ffn_residual
+            .store(self.fuse_q8_glue && enabled, Ordering::Relaxed);
     }
 
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
@@ -2736,6 +2769,15 @@ pub fn rope_tables(pos: usize, head_dim: usize, freq_base: f32) -> (Vec<f32>, Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wave118_deferred_residual_override_is_explicit_and_fusion_gated() {
+        assert!(!resolve_defer_ffn_residual(true, false, None));
+        assert!(resolve_defer_ffn_residual(true, true, None));
+        assert!(resolve_defer_ffn_residual(true, false, Some(true)));
+        assert!(!resolve_defer_ffn_residual(true, true, Some(false)));
+        assert!(!resolve_defer_ffn_residual(false, true, Some(true)));
+    }
 
     /// The PTX image must declare exactly the entry points KernelSet
     /// resolves — catches drift between the .ptx file and this module
