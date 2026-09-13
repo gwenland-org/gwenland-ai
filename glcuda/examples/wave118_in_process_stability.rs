@@ -93,13 +93,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // its production kernels without replaying the 200-sample stability run.
     if profile_once {
         let prefill_ms = run_arm(&gpu, &ids, true, oracle)?;
+        let telemetry = gpu
+            .telemetry()
+            .and_then(|t| t.prefill)
+            .ok_or("Wave 120 prefill telemetry unavailable")?;
         println!(
-            "[wave119-profile] {{\"prompt_tokens\":{},\"prefill_ms\":{:.9},\"prefill_tps\":{:.6},\"oracle_token\":{}}}",
+            "[wave120-profile] {{\"prompt_tokens\":{},\"host_prefill_ms\":{:.9},\"gpu_prefill_ms\":{:.9},\"gpu_prefill_tps\":{:.6},\"oracle_token\":{}}}",
             ids.len(),
             prefill_ms,
-            ids.len() as f64 * 1000.0 / prefill_ms,
+            telemetry.total_ms,
+            ids.len() as f64 * 1000.0 / telemetry.total_ms,
             oracle,
         );
+        for stage in telemetry.stages {
+            println!(
+                "[wave120-stage] {{\"name\":\"{}\",\"total_ms\":{:.9},\"calls\":{},\"bytes_read\":{},\"macs\":{}}}",
+                stage.name,
+                stage.total_ms,
+                stage.calls,
+                stage.bytes_read.unwrap_or(0),
+                stage.macs.unwrap_or(0),
+            );
+        }
         gpu.shutdown();
         return Ok(());
     }

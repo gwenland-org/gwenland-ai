@@ -174,6 +174,10 @@ pub struct PrefillProfile {
     /// drains the pipeline at every boundary and therefore reports an
     /// execution order that never runs in production. glbench must say which.
     pub on_stream: bool,
+    /// Whole-prefill GPU elapsed time from one enclosing event pair. Unlike
+    /// `GenTiming::prefill`, this excludes the host cost of reading the
+    /// detailed event pairs after the workload has completed.
+    pub total_gpu_ms: Option<f64>,
 }
 
 /// Does this weight's GEMV read the int8 activation scratch
@@ -966,8 +970,13 @@ impl GpuModel {
         // wall clock, because nothing overlaps. `PrefillProfile::on_stream`
         // carries which one produced the numbers so a reader is never left
         // guessing.
+        let chunks = p.div_ceil(PREFILL_BATCH);
         let ring = if want_profile {
-            cuda.event_ring(2 * 12 * c.n_layers)
+            // Two enclosing marks plus one pair for every phase in every
+            // layer/chunk. Keep the detailed marks live until all prefill
+            // work has been submitted; draining per chunk put profiler host
+            // overhead inside the production wall-clock interval.
+            cuda.event_ring(2 + 2 * STAGE_NAMES.len() * c.n_layers * chunks)
         } else {
             None
         };
@@ -998,8 +1007,11 @@ impl GpuModel {
                 );
             });
         }
-        let mut mark = 0usize;
+        let mut mark = 2usize;
         let mut pending: Vec<(usize, usize, usize)> = Vec::new();
+        if let Some(r) = ring.as_ref() {
+            r.record(cuda, 0);
+        }
         macro_rules! phase {
             ($bucket:expr, $stage:expr, $body:block) => {{
                 if let Some(r) = ring.as_ref() {
@@ -1460,20 +1472,20 @@ impl GpuModel {
                 }
             }
 
-            // Drain this chunk's event marks. One sync for the whole chunk,
-            // not one per stage -- the marks were enqueued, the work is done,
-            // and reading them now costs a single wait.
-            if let Some(r) = ring.as_ref() {
-                for &(st, a, b) in &pending {
-                    if let Some(ms) = r.elapsed_ms(a, b) {
-                        stage_ms[st] = Some(stage_ms[st].unwrap_or(0.0) + ms);
-                    }
-                }
-                pending.clear();
-                mark = 0;
-            }
-
             base += n;
+        }
+        let mut total_gpu_ms = None;
+        if let Some(r) = ring.as_ref() {
+            r.record(cuda, 1);
+            // Synchronizing the enclosing end mark closes the measured GPU
+            // interval once. Every detailed mark is complete after this, so
+            // their reads cannot serialize or extend the workload itself.
+            total_gpu_ms = r.elapsed_ms(0, 1);
+            for &(st, a, b) in &pending {
+                if let Some(ms) = r.elapsed_ms(a, b) {
+                    stage_ms[st] = Some(stage_ms[st].unwrap_or(0.0) + ms);
+                }
+            }
         }
         if want_profile {
             self.prefill_profile = Some(PrefillProfile {
@@ -1483,6 +1495,7 @@ impl GpuModel {
                 macs: stage_macs,
                 tokens: p,
                 on_stream,
+                total_gpu_ms,
             });
         }
         if prof {

@@ -251,7 +251,13 @@ impl GlEngine for GlcudaEngine {
             // overstates a pipelined wall clock -- which is why `on_stream`
             // is reported and why this total is not compared against
             // end-to-end throughput.
-            let total_ms = stages.iter().map(|s| s.total_ms).sum();
+            // Prefer the enclosing GPU event. Summing adjacent stages is a
+            // useful attribution check, but it cannot represent gaps and it
+            // previously encouraged consumers to compare profiler-inflated
+            // host wall time with production throughput.
+            let total_ms = p
+                .total_gpu_ms
+                .unwrap_or_else(|| stages.iter().map(|s| s.total_ms).sum());
             PhaseProfile { stages, total_ms }
         });
 
