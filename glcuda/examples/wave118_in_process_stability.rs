@@ -51,7 +51,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = args
         .next()
         .ok_or("usage: wave118_in_process_stability MODEL [a|b]")?;
-    let reverse = matches!(args.next().as_deref(), Some("b"));
+    let mode = args.next();
+    let reverse = matches!(mode.as_deref(), Some("b"));
+    let profile_once = matches!(mode.as_deref(), Some("profile"));
 
     let prompt = PROMPT_UNIT.repeat(8);
     let mut gpu = GlcudaEngine::with_config(GlcudaConfig {
@@ -84,6 +86,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for _ in 0..WARMUPS_PER_ARM {
             run_arm(&gpu, &ids, candidate, oracle)?;
         }
+    }
+
+    // Observation-only entry point for Wave 119. Keep one representative
+    // candidate inference in the process so an external profiler can select
+    // its production kernels without replaying the 200-sample stability run.
+    if profile_once {
+        let prefill_ms = run_arm(&gpu, &ids, true, oracle)?;
+        println!(
+            "[wave119-profile] {{\"prompt_tokens\":{},\"prefill_ms\":{:.9},\"prefill_tps\":{:.6},\"oracle_token\":{}}}",
+            ids.len(),
+            prefill_ms,
+            ids.len() as f64 * 1000.0 / prefill_ms,
+            oracle,
+        );
+        gpu.shutdown();
+        return Ok(());
     }
 
     let normal = [false, true, true, false];
