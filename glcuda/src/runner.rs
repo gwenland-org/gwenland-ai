@@ -1420,7 +1420,34 @@ impl GpuModel {
                         dim as u32,
                         rms_eps,
                     )?;
-                    gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
+                    if self.output.bstage.is_some() {
+                        // Wave 121 candidate: the vocabulary projection is
+                        // wide enough to expose thousands of output tiles even
+                        // for one token. Reuse the padded prefill activation
+                        // scratch and the exact Q8 tensor-core GEMM; decode
+                        // still uses the latency-oriented GEMV path.
+                        k.quantize_q8(
+                            cuda,
+                            single_xn,
+                            pf_qs,
+                            pf_scales,
+                            dim as u32,
+                        )?;
+                        gemm_rows(
+                            cuda,
+                            k,
+                            &self.output,
+                            0,
+                            self.output.out_dim,
+                            single_xn,
+                            pf_qs,
+                            pf_scales,
+                            logits,
+                            1,
+                        )?;
+                    } else {
+                        gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
+                    }
                 });
                 if want_profile {
                     stage_bytes[ST_LM] += weight_bytes(&self.output.w);

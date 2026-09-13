@@ -530,6 +530,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
     let f32s = |n: usize| align_up((n * 4) as u64);
     // vram_reserved already rounds every upload stream to ALIGN individually.
     let want_bstage = std::env::var_os("GLCUDA_BSTAGE").is_some();
+    let want_lmhead_bstage = std::env::var_os("GLCUDA_LMHEAD_GEMM").is_some();
     let mat = |m: &HostMat, prefill_bstage: bool| {
         let mut bytes = m.w.vram_reserved();
         if want_bstage && prefill_bstage && matches!(m.w, HostWeight::Q8_0Soa { .. }) {
@@ -550,7 +551,7 @@ fn vram_total(host: &HostModel, kv_capacity: usize) -> u64 {
             total += f32s(v.len());
         }
     }
-    total += f32s(host.output_norm.len()) + mat(&host.output, false);
+    total += f32s(host.output_norm.len()) + mat(&host.output, want_lmhead_bstage);
     total += f32s(KvCacheDev::numel(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity));
     // Workspace.
     total += f32s(c.dim) * 3; // x, xn, proj
@@ -821,8 +822,9 @@ impl GpuModel {
             });
         }
         let output_norm = up_f32(cuda, &mut buf, &host.output_norm)?;
-        // The vocabulary projection is GEMV-only (last prefill row + decode),
-        // so a prefill B-stage duplicate would consume VRAM without a launch.
+        // Wave 121 optionally gives the one-row prefill vocabulary projection
+        // the same B-stage image as the batched projections. Decode remains on
+        // GEMV; the duplicate is created only for the explicit experiment.
         // One machine-readable line so a benchmark arm can prove which QKV
         // path it ran instead of inferring it from a timing. Emitted once per
         // upload, never on the hot path.
@@ -838,7 +840,11 @@ impl GpuModel {
             layers.len(),
             stacked_rows
         );
-        let output = up_mat(cuda, &mut buf, &host.output, false)?;
+        let lmhead_gemm = std::env::var_os("GLCUDA_LMHEAD_GEMM").is_some();
+        let output = up_mat(cuda, &mut buf, &host.output, lmhead_gemm)?;
+        if lmhead_gemm {
+            eprintln!("[glcuda-lmhead] {{\"path\":\"bstage-gemm-n1\"}}");
+        }
 
         let kv_slice =
             buf.alloc_f32(KvCacheDev::numel(c.n_layers, c.n_kv_heads, c.head_dim, kv_capacity))?;
