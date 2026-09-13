@@ -147,9 +147,27 @@ try:
     cargo_candidates = [shutil.which("cargo"), Path.home() / ".cargo/bin/cargo",
                         "/usr/local/cargo/bin/cargo", "/opt/conda/bin/cargo"]
     cargo = next((str(x) for x in cargo_candidates if x and Path(x).is_file()), None)
+    cargo_env = {}
+    bootstrapped = False
     if cargo is None:
-        raise RuntimeError("cargo unavailable")
-    common = {"CARGO_TARGET_DIR": TARGET, "CUDA_VISIBLE_DEVICES": "0"}
+        bootstrapped = True
+        rustup_script = ROOT / "rustup-init.sh"
+        urllib.request.urlretrieve("https://sh.rustup.rs", rustup_script)
+        cargo_home = ROOT / "cargo-home"
+        rustup_home = ROOT / "rustup-home"
+        cargo_env = {"CARGO_HOME": cargo_home, "RUSTUP_HOME": rustup_home}
+        install = run(["bash", rustup_script, "-y", "--profile", "minimal",
+                       "--default-toolchain", "stable", "--no-modify-path"],
+                      env=cargo_env, timeout=1800)
+        save("rustup-install.log", install)
+        cargo = str(cargo_home / "bin/cargo")
+    if not Path(cargo).is_file():
+        raise RuntimeError(f"cargo unavailable after bootstrap: {cargo}")
+    (RESULTS / "cargo-discovery.json").write_text(json.dumps({
+        "selected": cargo, "bootstrapped": bootstrapped,
+        "candidates": [str(x) for x in cargo_candidates if x],
+    }, indent=2), encoding="utf-8")
+    common = {**cargo_env, "CARGO_TARGET_DIR": TARGET, "CUDA_VISIBLE_DEVICES": "0"}
 
     phase = "host-tests"
     tests = run([cargo, "test", "-p", "glcuda", "--lib", "--locked"], cwd=TREE, env=common)
