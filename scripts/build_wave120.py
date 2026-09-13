@@ -59,7 +59,7 @@ replacement = r'''    phase = "build"
 
     profile = json.loads(re.search(r"\[wave120-profile\]\s*(\{[^\n]+\})", measured.stdout).group(1))
     stages = [json.loads(x) for x in re.findall(r"\[wave120-stage\]\s*(\{[^\n]+\})", measured.stdout)]
-    if len(stages) != 8 or profile["gpu_prefill_ms"] <= 0:
+    if len(stages) != 9 or profile["gpu_prefill_ms"] <= 0:
         raise RuntimeError(f"event profile contract failed: {profile}, {len(stages)} stages")
     stage_sum = sum(x["total_ms"] for x in stages)
     summary = {"wave": 120, "gpu": fields, "model": model_meta,

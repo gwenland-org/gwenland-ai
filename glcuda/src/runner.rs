@@ -48,7 +48,7 @@ pub struct GenTiming {
 /// names glproc already reports. A name outside the convention lands in
 /// `Other` and the bucket roofline goes quiet about it -- which is how this
 /// engine has been invisible to the roofline until now.
-pub const STAGE_NAMES: [&str; 8] = [
+pub const STAGE_NAMES: [&str; 9] = [
     "qkv",             // 0 - norm + activation quantize + Q/K/V GEMMs
     "attn_norm",       // 1 - bias, qk-norm, RoPE
     "attn_kv_write",   // 2 - KV cache write
@@ -57,6 +57,7 @@ pub const STAGE_NAMES: [&str; 8] = [
     "ffn_down",        // 5 - the down projection
     "ffn_gate_up",     // 6 - the fused gate+up projection
     "attn_out",        // 7 - the attention output projection
+    "lm_head",         // 8 - final norm + vocabulary projection
 ];
 pub(crate) const ST_QKV: usize = 0;
 pub(crate) const ST_AN: usize = 1;
@@ -73,6 +74,7 @@ pub(crate) const ST_GU: usize = 6;
 /// also belong to different roofline buckets -- `wo` is Attention, `w_down`
 /// is FFN -- so merging them mis-attributes the roofline too.
 pub(crate) const ST_AO: usize = 7;
+pub(crate) const ST_LM: usize = 8;
 
 /// Total device bytes a weight occupies, across all of its streams.
 ///
@@ -158,15 +160,15 @@ fn deferred_ffn_boundaries(enabled: bool, layers: usize) -> u64 {
 #[derive(Debug, Clone, Default)]
 pub struct PrefillProfile {
     /// Wall-clock per stage, milliseconds.
-    pub ms: [Option<f64>; 8],
+    pub ms: [Option<f64>; 9],
     /// Device bytes read per stage, summed over every re-read.
-    pub bytes: [u64; 8],
+    pub bytes: [u64; 9],
     /// Times each stage ran (layers x chunks).
-    pub calls: [u64; 8],
+    pub calls: [u64; 9],
     /// Multiply-accumulates per stage. Format-independent, so it compares
     /// kernels that GB/s cannot -- a kernel reading fewer bytes can look
     /// efficient while doing the same arithmetic slower.
-    pub macs: [u64; 8],
+    pub macs: [u64; 9],
     /// Prompt tokens this profile covers.
     pub tokens: usize,
     /// True when stage times came from CUDA events (pipelined, production
@@ -924,7 +926,8 @@ impl GpuModel {
         // Fine-grained FFN sub-buckets (only meaningful with the profiler on):
         // gate+up GEMMs, down GEMM, and the elementwise glue (quant/silu/
         // norm/add) — to localize the 51-67% FFN cost the coarse split shows.
-        let (mut t_gu, mut t_dn, mut t_elt) = (
+        let (mut t_gu, mut t_dn, mut t_elt, mut t_lm) = (
+            std::time::Duration::ZERO,
             std::time::Duration::ZERO,
             std::time::Duration::ZERO,
             std::time::Duration::ZERO,
@@ -953,10 +956,10 @@ impl GpuModel {
         // runs; `GLCUDA_TELEMETRY=1` asks for the first.
         let want_profile = prof || std::env::var_os("GLCUDA_TELEMETRY").is_some();
         let want_profile = want_profile && cuda.events_available() || prof;
-        let mut stage_ms: [Option<f64>; 8] = [None; 8];
-        let mut stage_bytes = [0u64; 8];
-        let mut stage_calls = [0u64; 8];
-        let mut stage_macs = [0u64; 8];
+        let mut stage_ms: [Option<f64>; 9] = [None; 9];
+        let mut stage_bytes = [0u64; 9];
+        let mut stage_calls = [0u64; 9];
+        let mut stage_macs = [0u64; 9];
 
         // Stage timing has two paths, and they are not equivalent.
         //
@@ -1407,16 +1410,22 @@ impl GpuModel {
 
             // Logits only for the final prompt token (last row of the last chunk).
             if base + n == p {
-                let last = fq(pf_x, (n - 1) * dim);
-                k.rms_norm(
-                    cuda,
-                    last,
-                    self.output_norm.dptr,
-                    single_xn,
-                    dim as u32,
-                    rms_eps,
-                )?;
-                gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
+                phase!(t_lm, ST_LM, {
+                    let last = fq(pf_x, (n - 1) * dim);
+                    k.rms_norm(
+                        cuda,
+                        last,
+                        self.output_norm.dptr,
+                        single_xn,
+                        dim as u32,
+                        rms_eps,
+                    )?;
+                    gemv_w(cuda, k, &self.ws, &self.output, single_xn, logits)?;
+                });
+                if want_profile {
+                    stage_bytes[ST_LM] += weight_bytes(&self.output.w);
+                    stage_macs[ST_LM] += self.output.out_dim as u64 * self.output.in_dim as u64;
+                }
             }
             // Per-chunk weight traffic, per stage. This is the number that
             // turns "down is 66% of prefill" into "down reads its weights n
@@ -1499,6 +1508,7 @@ impl GpuModel {
             });
         }
         if prof {
+            let _ = t_lm;
             let _ = t_attn; // superseded by the t_an/t_kv/t_ac sub-buckets
             let _ = t_ffn; // superseded by the t_gu/t_dn/t_elt sub-buckets
             let t_attn = t_an + t_kv + t_ac;
