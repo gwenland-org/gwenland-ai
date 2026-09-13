@@ -1,0 +1,38 @@
+{
+  "schema": "gwenland.glcuda.wave-gate.v1",
+  "wave": 119,
+  "status": "diagnostic_blocked",
+  "gpu": "Tesla T4",
+  "compute_capability": "7.5",
+  "driver": "580.159.04",
+  "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+  "oracle_token": 3323,
+  "dispatch": {
+    "gemm_gate_up": "bstage-n16-prefetch",
+    "gemm_m32": "bstage-n16-m32",
+    "attention": "mma4-regq-avmma"
+  },
+  "ncu": {
+    "available": true,
+    "counter_status": "ERR_NVGPUCTRPERM",
+    "metrics_collected": false
+  },
+  "event_telemetry": {
+    "on_stream": true,
+    "reported_prefill_ms": 102.309957,
+    "authoritative_throughput": false,
+    "limitation": "event-drain host overhead is inside GenTiming prefill wall time"
+  },
+  "static_audit": {
+    "sass_available": true,
+    "production_main_module_zero_spills": true,
+    "attention_registers": 64,
+    "attention_static_shared_bytes": 0,
+    "attention_barriers": 1
+  },
+  "decision": "repair telemetry before selecting Wave120 optimization",
+  "target_prefill_tps": 15000,
+  "target_reached": false,
+  "archive": "benchmarks/glcuda-t4-wave119-kernel-profile-results.zip",
+  "archive_sha256": "e60b0991979e164bd7c212e6b0e7b2cbc3328db9a161872264363fe3eb703409"
+}
