@@ -1,0 +1,31 @@
+{
+  "wave": 118,
+  "gpu": [
+    "0",
+    "Tesla T4",
+    "7.5",
+    "15360",
+    "580.159.04"
+  ],
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "samples_per_arm_per_invocation": 100,
+  "total_samples": 400,
+  "oracle_matches": "400/400",
+  "median_speedup": 1.0043174574569755,
+  "p10_speedup": 0.9810131955569537,
+  "p90_speedup": 1.024771356542645,
+  "bootstrap_ci95_speedup": [
+    0.9990845548004031,
+    1.008138002261881
+  ],
+  "invocation_median_speedup": {
+    "a": 1.0014208546226526,
+    "b": 1.0068815021153616
+  },
+  "diagnostic_pass": true,
+  "retention_authority": false,
+  "target_15000_tps_achieved": false
+}
