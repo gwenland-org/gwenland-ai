@@ -79,8 +79,10 @@ replacement = r'''    phase = "build"
                "median_lm_head_ms": {arm: med(arm, "lm_head_ms") for arm in by_arm}}
     summary["speedup"] = (summary["median_gpu_prefill_ms"]["retained"] /
                           summary["median_gpu_prefill_ms"]["candidate"])
-    summary["lm_head_speedup"] = (summary["median_lm_head_ms"]["retained"] /
-                                  summary["median_lm_head_ms"]["candidate"])
+    candidate_lm = summary["median_lm_head_ms"]["candidate"]
+    if candidate_lm <= 0:
+        raise RuntimeError(f"LM-head event was not recorded: {summary['median_lm_head_ms']}")
+    summary["lm_head_speedup"] = summary["median_lm_head_ms"]["retained"] / candidate_lm
     summary["target_15000_tps_achieved"] = summary["median_prefill_tps"]["candidate"] >= 15000
     (RESULTS / "wave121-summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print("WAVE121_RESULT", json.dumps(summary, indent=2), flush=True)

@@ -75,6 +75,9 @@ pub(crate) const ST_GU: usize = 6;
 /// is FFN -- so merging them mis-attributes the roofline too.
 pub(crate) const ST_AO: usize = 7;
 pub(crate) const ST_LM: usize = 8;
+/// Event pairs emitted by one layer. Several elementwise launches share one
+/// reporting bucket, so this is deliberately not `STAGE_NAMES.len()`.
+const PROFILE_PHASES_PER_LAYER: usize = 12;
 
 /// Total device bytes a weight occupies, across all of its streams.
 ///
@@ -979,7 +982,8 @@ impl GpuModel {
             // layer/chunk. Keep the detailed marks live until all prefill
             // work has been submitted; draining per chunk put profiler host
             // overhead inside the production wall-clock interval.
-            cuda.event_ring(2 + 2 * STAGE_NAMES.len() * c.n_layers * chunks)
+            // Add the one final LM-head pair outside the layer loop.
+            cuda.event_ring(2 + 2 * (PROFILE_PHASES_PER_LAYER * c.n_layers * chunks + 1))
         } else {
             None
         };
