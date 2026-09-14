@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = GlcudaEngine::with_config(GlcudaConfig {
         seed: Some(42),
         benchmark_defer_ffn_residual: Some(false),
+        ..GlcudaConfig::default()
     });
     gpu.init()?;
     gpu.load_model(&model)?;
