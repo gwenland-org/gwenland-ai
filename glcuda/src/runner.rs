@@ -48,16 +48,19 @@ pub struct GenTiming {
 /// names glproc already reports. A name outside the convention lands in
 /// `Other` and the bucket roofline goes quiet about it -- which is how this
 /// engine has been invisible to the roofline until now.
-pub const STAGE_NAMES: [&str; 9] = [
-    "qkv",             // 0 - norm + activation quantize + Q/K/V GEMMs
-    "attn_norm",       // 1 - bias, qk-norm, RoPE
-    "attn_kv_write",   // 2 - KV cache write
-    "attention",       // 3 - the attention core
-    "ffn_elementwise", // 4 - norm/quantize/silu/residual glue
-    "ffn_down",        // 5 - the down projection
-    "ffn_gate_up",     // 6 - the fused gate+up projection
-    "attn_out",        // 7 - the attention output projection
-    "lm_head",         // 8 - final norm + vocabulary projection
+pub const STAGE_NAMES: [&str; 12] = [
+    "qkv",                     // 0 - norm + activation quantize + Q/K/V GEMMs
+    "attn_norm",               // 1 - bias, qk-norm, RoPE
+    "attn_kv_write",           // 2 - KV cache write
+    "attention",               // 3 - the attention core
+    "attn_out_quant",          // 4 - quantize attention output for o-projection
+    "ffn_down",                // 5 - the down projection
+    "ffn_gate_up",             // 6 - the fused gate+up projection
+    "attn_out",                // 7 - the attention output projection
+    "lm_head",                 // 8 - final norm + vocabulary projection
+    "ffn_residual_norm_quant", // 9 - residual + RMSNorm + Q8
+    "ffn_silu_quant",          // 10 - SiLU multiply + Q8
+    "ffn_residual_add",        // 11 - materialized FFN residual
 ];
 pub(crate) const ST_QKV: usize = 0;
 pub(crate) const ST_AN: usize = 1;
@@ -75,6 +78,9 @@ pub(crate) const ST_GU: usize = 6;
 /// is FFN -- so merging them mis-attributes the roofline too.
 pub(crate) const ST_AO: usize = 7;
 pub(crate) const ST_LM: usize = 8;
+pub(crate) const ST_RNQ: usize = 9;
+pub(crate) const ST_SILU: usize = 10;
+pub(crate) const ST_RADD: usize = 11;
 /// Event pairs emitted by one layer. Several elementwise launches share one
 /// reporting bucket, so this is deliberately not `STAGE_NAMES.len()`.
 const PROFILE_PHASES_PER_LAYER: usize = 12;
@@ -116,10 +122,44 @@ pub(crate) fn weight_reads(w: &GpuWeight, n: u32, slab_rows: u32) -> u64 {
 /// could never see it: through Wave 12 it reported 7.9% of prefill and zero
 /// bytes, which is a bandwidth-bound stage invisible to a bandwidth roofline.
 ///
-/// This mirrors the four `ST_ELT` phases the layer loop runs, in their order,
-/// and has to be kept in step with them. Reads only, matching how the GEMM
-/// stages report traffic: the quantizers write too, and those bytes are not
-/// counted here.
+/// This mirrors the four glue phases the layer loop runs, in their order, and
+/// has to be kept in step with them. Reads only, matching how the GEMM stages
+/// report traffic: the quantizers write too, and those bytes are not counted
+/// here.
+pub(crate) fn elementwise_read_bytes_split(
+    n: u64,
+    dim: u64,
+    q_dim: u64,
+    hidden: u64,
+    fused: bool,
+) -> [u64; 4] {
+    let f32s = |elems: u64| elems * 4;
+    let attn_out_quant = f32s(n * q_dim);
+    let (residual_norm_quant, silu_quant) = if fused {
+        // 2. Residual add and RMSNorm and quantize, in one pass over x and the
+        //    projection, plus the norm weights.
+        let residual_norm_quant = f32s(2 * n * dim + dim);
+        // 3. SiLU(gate) * up and quantize, reading both halves once.
+        let silu_quant = f32s(2 * n * hidden);
+        (residual_norm_quant, silu_quant)
+    } else {
+        // 2. The same work as three passes: add, norm (plus weights), quantize.
+        let residual_norm_quant = f32s(4 * n * dim + dim);
+        // 3. silu_mul writes the product, then a second pass quantizes it.
+        let silu_quant = f32s(3 * n * hidden);
+        (residual_norm_quant, silu_quant)
+    };
+    // 4. Residual add of the FFN output back into the layer input.
+    let residual_add = f32s(2 * n * dim);
+    [
+        attn_out_quant,
+        residual_norm_quant,
+        silu_quant,
+        residual_add,
+    ]
+}
+
+#[cfg(test)]
 pub(crate) fn elementwise_read_bytes(
     n: u64,
     dim: u64,
@@ -127,23 +167,9 @@ pub(crate) fn elementwise_read_bytes(
     hidden: u64,
     fused: bool,
 ) -> u64 {
-    let f32s = |elems: u64| elems * 4;
-    // 1. Quantize the attention output for the o-projection.
-    let mut bytes = f32s(n * q_dim);
-    if fused {
-        // 2. Residual add and RMSNorm and quantize, in one pass over x and the
-        //    projection, plus the norm weights.
-        bytes += f32s(2 * n * dim + dim);
-        // 3. SiLU(gate) * up and quantize, reading both halves once.
-        bytes += f32s(2 * n * hidden);
-    } else {
-        // 2. The same work as three passes: add, norm (plus weights), quantize.
-        bytes += f32s(2 * n * dim) + f32s(n * dim + dim) + f32s(n * dim);
-        // 3. silu_mul writes the product, then a second pass quantizes it.
-        bytes += f32s(2 * n * hidden) + f32s(n * hidden);
-    }
-    // 4. Residual add of the FFN output back into the layer input.
-    bytes + f32s(2 * n * dim)
+    elementwise_read_bytes_split(n, dim, q_dim, hidden, fused)
+        .into_iter()
+        .sum()
 }
 
 /// Number of FFN residual adds that move into the following layer's
@@ -163,15 +189,15 @@ fn deferred_ffn_boundaries(enabled: bool, layers: usize) -> u64 {
 #[derive(Debug, Clone, Default)]
 pub struct PrefillProfile {
     /// Wall-clock per stage, milliseconds.
-    pub ms: [Option<f64>; 9],
+    pub ms: [Option<f64>; 12],
     /// Device bytes read per stage, summed over every re-read.
-    pub bytes: [u64; 9],
+    pub bytes: [u64; 12],
     /// Times each stage ran (layers x chunks).
-    pub calls: [u64; 9],
+    pub calls: [u64; 12],
     /// Multiply-accumulates per stage. Format-independent, so it compares
     /// kernels that GB/s cannot -- a kernel reading fewer bytes can look
     /// efficient while doing the same arithmetic slower.
-    pub macs: [u64; 9],
+    pub macs: [u64; 12],
     /// Prompt tokens this profile covers.
     pub tokens: usize,
     /// True when stage times came from CUDA events (pipelined, production
@@ -202,6 +228,10 @@ fn consumes_q8_act(w: &GpuWeight) -> bool {
         | GpuWeight::Q4KSoa { .. }
         | GpuWeight::Q6KSoa { .. } => true,
     }
+}
+
+fn q8_soa_weight(w: &GpuWeight) -> bool {
+    matches!(w, GpuWeight::Q8_0Soa { .. })
 }
 
 /// Quantize `x` if this weight needs it, then run the GEMV.
@@ -897,6 +927,7 @@ impl GpuModel {
         };
         let (pf_attn, pf_proj) = (ws.pf_attn.dptr, ws.pf_proj.dptr);
         let (pf_gate, pf_up) = (ws.pf_gate.dptr, ws.pf_up.dptr);
+        let pf_gate_up_contiguous = ws.pf_up.dptr == ws.pf_gate.dptr + ws.pf_gate.bytes;
         let (pf_qs, pf_scales) = (ws.pf_qs.dptr, ws.pf_scales.dptr);
         let pos_seq = ws.pos_seq.dptr;
         let (rope_cos, rope_sin) = (ws.rope_cos.dptr, ws.rope_sin.dptr);
@@ -959,10 +990,10 @@ impl GpuModel {
         // runs; `GLCUDA_TELEMETRY=1` asks for the first.
         let want_profile = prof || std::env::var_os("GLCUDA_TELEMETRY").is_some();
         let want_profile = want_profile && cuda.events_available() || prof;
-        let mut stage_ms: [Option<f64>; 9] = [None; 9];
-        let mut stage_bytes = [0u64; 9];
-        let mut stage_calls = [0u64; 9];
-        let mut stage_macs = [0u64; 9];
+        let mut stage_ms: [Option<f64>; 12] = [None; 12];
+        let mut stage_bytes = [0u64; 12];
+        let mut stage_calls = [0u64; 12];
+        let mut stage_macs = [0u64; 12];
 
         // Stage timing has two paths, and they are not equivalent.
         //
@@ -1093,23 +1124,55 @@ impl GpuModel {
             for l in 0..self.layers.len() {
                 let layer = &self.layers[l];
                 let defer_ffn_residual = k.defer_ffn_residual_enabled();
+                let qkv_q8_only = match layer.w_qkv.as_ref().filter(|_| qkv_stacked) {
+                    Some(w_qkv) => consumes_q8_act(&w_qkv.w),
+                    None => {
+                        consumes_q8_act(&layer.wq.w)
+                            && consumes_q8_act(&layer.wk.w)
+                            && consumes_q8_act(&layer.wv.w)
+                    }
+                };
+                let gate_up_q8_only = consumes_q8_act(&layer.w_gate_up.w);
+                let down_q8_only = consumes_q8_act(&layer.w_down.w);
+                let stacked_gate_up = k.ffn_gate_up_stacked_enabled()
+                    && pf_gate_up_contiguous
+                    && q8_soa_weight(&layer.w_gate_up.w)
+                    && down_q8_only
+                    && layer.w_gate_up.out_dim == (2 * hidden) as u32
+                    && layer.w_gate_up.in_dim == dim as u32;
 
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
                 phase!(t_qkv, ST_QKV, {
                     if k.fuse_q8_glue_enabled() {
-                        k.rms_quantize_q8_rows(
-                            cuda,
-                            pf_x,
-                            (defer_ffn_residual && l > 0).then_some(pf_proj),
-                            layer.attn_norm.dptr,
-                            pf_xn,
-                            pf_qs,
-                            pf_scales,
-                            dim as u32,
-                            rms_eps,
-                            n as u32,
-                        )?;
+                        let residual = (defer_ffn_residual && l > 0).then_some(pf_proj);
+                        if k.q8_nostore_enabled() && qkv_q8_only {
+                            k.rms_quantize_q8_rows_nostore(
+                                cuda,
+                                pf_x,
+                                residual,
+                                layer.attn_norm.dptr,
+                                pf_xn,
+                                pf_qs,
+                                pf_scales,
+                                dim as u32,
+                                rms_eps,
+                                n as u32,
+                            )?;
+                        } else {
+                            k.rms_quantize_q8_rows(
+                                cuda,
+                                pf_x,
+                                residual,
+                                layer.attn_norm.dptr,
+                                pf_xn,
+                                pf_qs,
+                                pf_scales,
+                                dim as u32,
+                                rms_eps,
+                                n as u32,
+                            )?;
+                        }
                     } else {
                         k.rms_norm_rows(
                             cuda,
@@ -1308,20 +1371,35 @@ impl GpuModel {
                         n as u32,
                     )?;
                 });
-                phase!(t_elt, ST_ELT, {
+                phase!(t_elt, ST_RNQ, {
                     if k.fuse_q8_glue_enabled() {
-                        k.rms_quantize_q8_rows(
-                            cuda,
-                            pf_x,
-                            Some(pf_proj),
-                            layer.ffn_norm.dptr,
-                            pf_xn,
-                            pf_qs,
-                            pf_scales,
-                            dim as u32,
-                            rms_eps,
-                            n as u32,
-                        )?;
+                        if k.q8_nostore_enabled() && gate_up_q8_only {
+                            k.rms_quantize_q8_rows_nostore(
+                                cuda,
+                                pf_x,
+                                Some(pf_proj),
+                                layer.ffn_norm.dptr,
+                                pf_xn,
+                                pf_qs,
+                                pf_scales,
+                                dim as u32,
+                                rms_eps,
+                                n as u32,
+                            )?;
+                        } else {
+                            k.rms_quantize_q8_rows(
+                                cuda,
+                                pf_x,
+                                Some(pf_proj),
+                                layer.ffn_norm.dptr,
+                                pf_xn,
+                                pf_qs,
+                                pf_scales,
+                                dim as u32,
+                                rms_eps,
+                                n as u32,
+                            )?;
+                        }
                     } else {
                         k.add(cuda, pf_x, pf_proj, (n * dim) as u32)?;
                         k.rms_norm_rows(
@@ -1337,41 +1415,76 @@ impl GpuModel {
                     }
                 });
                 phase!(t_gu, ST_GU, {
-                    gemm_rows(
-                        cuda,
-                        k,
-                        &layer.w_gate_up,
-                        0,
-                        hidden as u32,
-                        pf_xn,
-                        pf_qs,
-                        pf_scales,
-                        pf_gate,
-                        n as u32,
-                    )?;
-                    gemm_rows(
-                        cuda,
-                        k,
-                        &layer.w_gate_up,
-                        hidden as u32,
-                        hidden as u32,
-                        pf_xn,
-                        pf_qs,
-                        pf_scales,
-                        pf_up,
-                        n as u32,
-                    )?;
-                });
-                phase!(t_elt, ST_ELT, {
-                    if k.fuse_q8_glue_enabled() {
-                        k.silu_mul_quantize_q8(
+                    if stacked_gate_up {
+                        gemm_rows(
                             cuda,
-                            pf_gate,
-                            pf_up,
+                            k,
+                            &layer.w_gate_up,
+                            0,
+                            (2 * hidden) as u32,
+                            pf_xn,
                             pf_qs,
                             pf_scales,
-                            (n * hidden) as u32,
+                            pf_gate,
+                            n as u32,
                         )?;
+                    } else {
+                        gemm_rows(
+                            cuda,
+                            k,
+                            &layer.w_gate_up,
+                            0,
+                            hidden as u32,
+                            pf_xn,
+                            pf_qs,
+                            pf_scales,
+                            pf_gate,
+                            n as u32,
+                        )?;
+                        gemm_rows(
+                            cuda,
+                            k,
+                            &layer.w_gate_up,
+                            hidden as u32,
+                            hidden as u32,
+                            pf_xn,
+                            pf_qs,
+                            pf_scales,
+                            pf_up,
+                            n as u32,
+                        )?;
+                    }
+                });
+                phase!(t_elt, ST_SILU, {
+                    if k.fuse_q8_glue_enabled() {
+                        if stacked_gate_up {
+                            k.silu_mul_quantize_q8_stacked_nostore(
+                                cuda,
+                                pf_gate,
+                                pf_qs,
+                                pf_scales,
+                                hidden as u32,
+                                n as u32,
+                            )?;
+                        } else if k.q8_nostore_enabled() && down_q8_only {
+                            k.silu_mul_quantize_q8_nostore(
+                                cuda,
+                                pf_gate,
+                                pf_up,
+                                pf_qs,
+                                pf_scales,
+                                (n * hidden) as u32,
+                            )?;
+                        } else {
+                            k.silu_mul_quantize_q8(
+                                cuda,
+                                pf_gate,
+                                pf_up,
+                                pf_qs,
+                                pf_scales,
+                                (n * hidden) as u32,
+                            )?;
+                        }
                     } else {
                         k.silu_mul(cuda, pf_gate, pf_up, (n * hidden) as u32)?;
                         k.quantize_q8(cuda, pf_gate, pf_qs, pf_scales, (n * hidden) as u32)?;
@@ -1391,7 +1504,7 @@ impl GpuModel {
                         n as u32,
                     )?;
                 });
-                phase!(t_elt, ST_ELT, {
+                phase!(t_elt, ST_RADD, {
                     // Wave 111: `pf_proj` is not touched before the next
                     // layer's attention RMS+Q8 pass, whose optional residual
                     // arm performs this identical f32 add while `x` is
@@ -1456,20 +1569,25 @@ impl GpuModel {
                     attention::VLAttentionCost::of(&attn_call, attention::select(k, &attn_call));
                 stage_macs[ST_AC] += attn_cost.macs() * layers;
                 stage_bytes[ST_AC] += attn_cost.read_bytes() * layers;
-                stage_bytes[ST_ELT] += elementwise_read_bytes(
-                    n as u64,
-                    dim as u64,
-                    q_dim as u64,
-                    hidden as u64,
-                    k.fuse_q8_glue_enabled(),
-                ) * layers;
+                let [attn_out_quant, residual_norm_quant, silu_quant, residual_add] =
+                    elementwise_read_bytes_split(
+                        n as u64,
+                        dim as u64,
+                        q_dim as u64,
+                        hidden as u64,
+                        k.fuse_q8_glue_enabled(),
+                    );
+                stage_bytes[ST_ELT] += attn_out_quant * layers;
+                stage_bytes[ST_RNQ] += residual_norm_quant * layers;
+                stage_bytes[ST_SILU] += silu_quant * layers;
+                stage_bytes[ST_RADD] += residual_add * layers;
                 let deferred =
                     deferred_ffn_boundaries(k.defer_ffn_residual_enabled(), self.layers.len());
                 let residual_bytes = 4 * n as u64 * dim as u64;
                 // Each boundary drops the standalone add's two input reads;
                 // the next attention RMS pass gains one residual read. Keep
                 // the bytes attributed to the phases that actually issue it.
-                stage_bytes[ST_ELT] -= 2 * residual_bytes * deferred;
+                stage_bytes[ST_RADD] -= 2 * residual_bytes * deferred;
                 stage_bytes[ST_QKV] += residual_bytes * deferred;
                 let mut add = |st: usize, m: &GpuMat| {
                     stage_bytes[st] += weight_bytes(&m.w) * weight_reads(&m.w, nn, slab_rows);
@@ -1763,7 +1881,7 @@ impl GpuModel {
 mod tests {
     use super::{
         bstage_tile_offsets, consumes_q8_act, deferred_ffn_boundaries, elementwise_read_bytes,
-        n16_bstage_shape, r256_pays,
+        elementwise_read_bytes_split, n16_bstage_shape, r256_pays,
     };
     use crate::buffer::DevSlice;
     use crate::model::GpuWeight;
@@ -1799,16 +1917,19 @@ mod tests {
     /// format whose scales live in a separate allocation reads both, and
     /// charging it only for `qs` would flatter exactly the SoA formats this
     /// engine prefers.
-    /// The Wave 13A notebook gates on these exact byte counts, so the model
-    /// and the gate cannot drift apart silently. If a fifth `ST_ELT` call
-    /// appears, this test fails first and the notebook constant is the next
-    /// thing to update.
+    /// The Wave 122 notebook gates on these exact byte counts, so the model
+    /// and the gate cannot drift apart silently. If the layer loop gains
+    /// another named glue phase, this test fails first and the notebook
+    /// contract is the next thing to update.
     #[test]
     fn elementwise_bytes_are_the_qwen_glue_traffic_the_gate_expects() {
         // Qwen2.5-0.5B, the pinned 244-token prompt, one chunk (PREFILL_BATCH
         // is 512, so the prompt never splits).
+        let split = elementwise_read_bytes_split(244, 896, 896, 4864, true);
+        assert_eq!(split, [874_496, 1_752_576, 9_494_528, 1_748_992]);
         let per_layer = elementwise_read_bytes(244, 896, 896, 4864, true);
         assert_eq!(per_layer, 13_870_592);
+        assert_eq!(per_layer, split.into_iter().sum::<u64>());
         assert_eq!(per_layer * 24, 332_894_208);
         // The unfused arm does the same work in more passes, so it must read
         // strictly more. That ordering is the point of the fusion.

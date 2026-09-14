@@ -375,6 +375,7 @@ QUANT_DONE:
 //
 // add_residual == 0: out = rms(x,w), then quantize(out)
 // add_residual != 0: x += residual; out = rms(x,w), then quantize(out)
+// store_out == 0: skip the f32 out write when the next GEMM reads only Q8.
 // Launch: grid (rows) x 256 threads. dim must be a multiple of 32.
 // ---------------------------------------------------------------------------
 .visible .entry gl_rms_quantize_q8_rows(
@@ -386,7 +387,8 @@ QUANT_DONE:
     .param .u64 p_scales,
     .param .u32 p_dim,
     .param .f32 p_eps,
-    .param .u32 p_add_residual
+    .param .u32 p_add_residual,
+    .param .u32 p_store_out
 )
 {
     .reg .pred %p<10>;
@@ -404,6 +406,7 @@ QUANT_DONE:
     ld.param.u32 %r1, [p_dim];
     ld.param.f32 %f1, [p_eps];
     ld.param.u32 %r20, [p_add_residual];
+    ld.param.u32 %r28, [p_store_out];
 
     cvta.to.global.u64 %rd7, %rd1;
     cvta.to.global.u64 %rd8, %rd2;
@@ -522,7 +525,8 @@ W11_RMSQ_BLOCK:
     ld.global.f32 %f14, [%rd22];
     mul.rn.f32 %f15, %f13, %f12;
     mul.rn.f32 %f16, %f15, %f14;
-    st.global.f32 [%rd23], %f16;
+    setp.ne.u32 %p9, %r28, 0;
+    @%p9 st.global.f32 [%rd23], %f16;
 
     abs.f32 %f17, %f16;
     shfl.sync.down.b32 %f18, %f17, 16, 31, 0xffffffff;
@@ -574,11 +578,12 @@ W11_RMSQ_DONE:
     .param .u64 p_up,
     .param .u64 p_qs,
     .param .u64 p_scales,
-    .param .u32 p_n
+    .param .u32 p_n,
+    .param .u32 p_store_gate
 )
 {
-    .reg .pred %p<4>;
-    .reg .b32 %r<16>;
+    .reg .pred %p<5>;
+    .reg .b32 %r<18>;
     .reg .f32 %f<20>;
     .reg .b64 %rd<20>;
 
@@ -587,6 +592,7 @@ W11_RMSQ_DONE:
     ld.param.u64 %rd3, [p_qs];
     ld.param.u64 %rd4, [p_scales];
     ld.param.u32 %r1, [p_n];
+    ld.param.u32 %r10, [p_store_gate];
     mov.u32 %r2, %ctaid.x;
     mov.u32 %r3, %tid.x;
     and.b32 %r8, %r3, 31;               // lane
@@ -612,7 +618,8 @@ W11_RMSQ_DONE:
     add.f32 %f5, %f4, 0f3F800000;
     div.rn.f32 %f6, %f1, %f5;
     mul.f32 %f7, %f6, %f2;
-    st.global.f32 [%rd10], %f7;
+    setp.ne.u32 %p4, %r10, 0;
+    @%p4 st.global.f32 [%rd10], %f7;
 
     abs.f32 %f8, %f7;
     shfl.sync.down.b32 %f9, %f8, 16, 31, 0xffffffff;
@@ -646,6 +653,104 @@ W11_SQ_STORE:
     add.s64 %rd15, %rd8, %rd14;
     st.global.f32 [%rd15], %f11;
 W11_SQ_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
+// Wave 123 stacked gate/up SwiGLU+Q8. The producer GEMM writes one row-major
+// slab per token: [gate(hidden), up(hidden)]. One warp owns one 32-value Q8
+// block inside one token row and stores only Q8 bytes/scales; the f32 product
+// is intentionally not materialized because the following Q8 down GEMM reads
+// qs/scales only.
+// Launch: grid (ceil((hidden/32)/8), ntok) x 256 threads. hidden % 32 == 0.
+// ---------------------------------------------------------------------------
+.visible .entry gl_silu_mul_quantize_q8_stacked_nostore(
+    .param .u64 p_gate_up,
+    .param .u64 p_qs,
+    .param .u64 p_scales,
+    .param .u32 p_hidden,
+    .param .u32 p_ntok
+)
+{
+    .reg .pred %p<5>;
+    .reg .b32 %r<28>;
+    .reg .f32 %f<20>;
+    .reg .b64 %rd<24>;
+
+    ld.param.u64 %rd1, [p_gate_up];
+    ld.param.u64 %rd3, [p_qs];
+    ld.param.u64 %rd4, [p_scales];
+    ld.param.u32 %r1, [p_hidden];
+    ld.param.u32 %r20, [p_ntok];
+    mov.u32 %r2, %ctaid.x;              // group of eight Q8 blocks in hidden
+    mov.u32 %r3, %ctaid.y;              // token row
+    mov.u32 %r4, %tid.x;
+    and.b32 %r5, %r4, 31;               // lane
+    shr.u32 %r6, %r4, 5;                // warp
+    shl.b32 %r7, %r2, 3;
+    add.s32 %r7, %r7, %r6;              // Q8 block within the hidden row
+    shr.u32 %r8, %r1, 5;                // Q8 blocks per hidden row
+    setp.ge.u32 %p1, %r7, %r8;
+    @%p1 bra W123_STK_DONE;
+    setp.ge.u32 %p2, %r3, %r20;
+    @%p2 bra W123_STK_DONE;
+
+    cvta.to.global.u64 %rd5, %rd1;
+    cvta.to.global.u64 %rd7, %rd3;
+    cvta.to.global.u64 %rd8, %rd4;
+    mul.lo.u32 %r9, %r3, %r1;           // token * hidden
+    shl.b32 %r10, %r7, 5;
+    add.s32 %r11, %r10, %r5;            // h within hidden
+    add.s32 %r12, %r9, %r11;            // output q8 element
+    shl.b32 %r13, %r9, 1;               // token * (2 * hidden)
+    add.s32 %r14, %r13, %r11;           // stacked gate element
+    add.s32 %r15, %r14, %r1;            // stacked up element
+    mad.lo.s32 %r16, %r3, %r8, %r7;     // scale block index
+
+    mul.wide.u32 %rd9, %r14, 4;
+    add.s64 %rd10, %rd5, %rd9;
+    mul.wide.u32 %rd11, %r15, 4;
+    add.s64 %rd12, %rd5, %rd11;
+    ld.global.f32 %f1, [%rd10];
+    ld.global.f32 %f2, [%rd12];
+    mul.f32 %f3, %f1, 0fBFB8AA3B;
+    ex2.approx.f32 %f4, %f3;
+    add.f32 %f5, %f4, 0f3F800000;
+    div.rn.f32 %f6, %f1, %f5;
+    mul.f32 %f7, %f6, %f2;
+
+    abs.f32 %f8, %f7;
+    shfl.sync.down.b32 %f9, %f8, 16, 31, 0xffffffff;
+    max.f32 %f8, %f8, %f9;
+    shfl.sync.down.b32 %f9, %f8, 8, 31, 0xffffffff;
+    max.f32 %f8, %f8, %f9;
+    shfl.sync.down.b32 %f9, %f8, 4, 31, 0xffffffff;
+    max.f32 %f8, %f8, %f9;
+    shfl.sync.down.b32 %f9, %f8, 2, 31, 0xffffffff;
+    max.f32 %f8, %f8, %f9;
+    shfl.sync.down.b32 %f9, %f8, 1, 31, 0xffffffff;
+    max.f32 %f8, %f8, %f9;
+    shfl.sync.idx.b32 %f10, %f8, 0, 31, 0xffffffff;
+    div.rn.f32 %f11, %f10, 127.0;
+    mov.f32 %f12, 0f00000000;
+    setp.eq.f32 %p3, %f11, %f12;
+    @%p3 bra W123_STK_STORE;
+    rcp.rn.f32 %f12, %f11;
+W123_STK_STORE:
+    mul.rn.f32 %f13, %f7, %f12;
+    cvt.rni.s32.f32 %r17, %f13;
+    min.s32 %r17, %r17, 127;
+    max.s32 %r17, %r17, -128;
+    cvt.s8.s32 %r18, %r17;
+    cvt.u64.u32 %rd13, %r12;
+    add.s64 %rd14, %rd7, %rd13;
+    st.global.u8 [%rd14], %r18;
+    setp.ne.u32 %p4, %r5, 0;
+    @%p4 bra W123_STK_DONE;
+    mul.wide.u32 %rd15, %r16, 4;
+    add.s64 %rd16, %rd8, %rd15;
+    st.global.f32 [%rd16], %f11;
+W123_STK_DONE:
     ret;
 }
 

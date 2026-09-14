@@ -58,6 +58,12 @@ pub struct GlcudaConfig {
     /// without mutating process-global environment variables.
     #[doc(hidden)]
     pub benchmark_defer_ffn_residual: Option<bool>,
+    /// Benchmark-only override for Wave 123's Q8 no-store path.
+    #[doc(hidden)]
+    pub benchmark_q8_nostore: Option<bool>,
+    /// Benchmark-only override for Wave 123's stacked FFN gate/up path.
+    #[doc(hidden)]
+    pub benchmark_ffn_gate_up_stacked: Option<bool>,
 }
 
 /// Optional per-token callback threaded through [`GlcudaEngine::run`].
@@ -115,6 +121,22 @@ impl GlcudaEngine {
             .as_ref()
             .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
         kernels.set_benchmark_defer_ffn_residual(enabled);
+        Ok(())
+    }
+
+    /// Select the retained or Wave 123 Q8 no-store/stacked-gate-up path between
+    /// synchronized iterations in the dedicated benchmark harness.
+    #[doc(hidden)]
+    pub fn set_benchmark_q8_nostore(
+        &self,
+        no_store: bool,
+        stacked_gate_up: bool,
+    ) -> Result<(), GlError> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
+        kernels.set_benchmark_q8_nostore(no_store, stacked_gate_up);
         Ok(())
     }
 
@@ -274,9 +296,11 @@ impl GlEngine for GlcudaEngine {
 
     fn init(&mut self) -> Result<(), GlError> {
         let cuda = Cuda::probe()?;
-        let kernels = KernelSet::load_with_defer_override(
+        let kernels = KernelSet::load_with_benchmark_overrides(
             &cuda,
             self.config.benchmark_defer_ffn_residual,
+            self.config.benchmark_q8_nostore,
+            self.config.benchmark_ffn_gate_up_stacked,
         )?;
         let i = &cuda.info;
         // One startup line, like glproc's [simd] line: name the hardware

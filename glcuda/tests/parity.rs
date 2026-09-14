@@ -1856,6 +1856,207 @@ fn wave11_fused_silu_q8_is_bit_exact_to_unfused_chain() {
 }
 
 #[test]
+fn wave123_rms_q8_nostore_keeps_quantizer_outputs() {
+    let Some((cuda, k)) = gpu() else { return };
+    let rows = 3usize;
+    let dim = 896usize;
+    let n = rows * dim;
+    let mut x = randv(n, 0x1230, 3.0);
+    let mut residual = randv(n, 0x1231, 1.0);
+    let w = randv(dim, 0x1232, 0.5)
+        .into_iter()
+        .map(|v| v.abs() + 0.5)
+        .collect::<Vec<_>>();
+    x[0] = 4.0;
+    x[1] = -4.0;
+    x[32..64].fill(0.0);
+    residual[32..64].fill(0.0);
+
+    for add_residual in [false, true] {
+        let sentinel = vec![12345.0f32; n];
+        let bytes = (n * 7 * 4 + n * 2 + (n / 32) * 2 * 4 + 16_384) as u64;
+        let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+        let dx_store = upload(&cuda, &mut buf, &x);
+        let dx_no_store = upload(&cuda, &mut buf, &x);
+        let dres = upload(&cuda, &mut buf, &residual);
+        let dw = upload(&cuda, &mut buf, &w);
+        let dout_store = buf.alloc_f32(n).unwrap().dptr;
+        let dout_no_store = upload(&cuda, &mut buf, &sentinel);
+        let dqs_store = buf.alloc(n as u64).unwrap().dptr;
+        let dqs_no_store = buf.alloc(n as u64).unwrap().dptr;
+        let dsc_store = buf.alloc_f32(n / 32).unwrap().dptr;
+        let dsc_no_store = buf.alloc_f32(n / 32).unwrap().dptr;
+
+        k.rms_quantize_q8_rows(
+            &cuda,
+            dx_store,
+            add_residual.then_some(dres),
+            dw,
+            dout_store,
+            dqs_store,
+            dsc_store,
+            dim as u32,
+            1e-5,
+            rows as u32,
+        )
+        .unwrap();
+        k.rms_quantize_q8_rows_nostore(
+            &cuda,
+            dx_no_store,
+            add_residual.then_some(dres),
+            dw,
+            dout_no_store,
+            dqs_no_store,
+            dsc_no_store,
+            dim as u32,
+            1e-5,
+            rows as u32,
+        )
+        .unwrap();
+        cuda.synchronize().unwrap();
+
+        let mut sc_store = vec![0f32; n / 32];
+        let mut sc_no_store = vec![0f32; n / 32];
+        let mut out_no_store = vec![0f32; n];
+        cuda.dtoh_f32(&mut sc_store, dsc_store).unwrap();
+        cuda.dtoh_f32(&mut sc_no_store, dsc_no_store).unwrap();
+        cuda.dtoh_f32(&mut out_no_store, dout_no_store).unwrap();
+        assert_bits_eq(&sc_no_store, &sc_store, "Wave123 RMS no-store Q8 scales");
+        assert_eq!(
+            download_bytes(&cuda, dqs_no_store, n),
+            download_bytes(&cuda, dqs_store, n),
+            "Wave123 RMS no-store Q8 bytes"
+        );
+        assert_bits_eq(
+            &out_no_store,
+            &sentinel,
+            "Wave123 RMS no-store out untouched",
+        );
+        if add_residual {
+            let mut x_store = vec![0f32; n];
+            let mut x_no_store = vec![0f32; n];
+            cuda.dtoh_f32(&mut x_store, dx_store).unwrap();
+            cuda.dtoh_f32(&mut x_no_store, dx_no_store).unwrap();
+            assert_bits_eq(&x_no_store, &x_store, "Wave123 RMS no-store residual add");
+        }
+        buf.free(&cuda).unwrap();
+    }
+}
+
+#[test]
+fn wave123_silu_q8_nostore_keeps_quantizer_outputs() {
+    let Some((cuda, k)) = gpu() else { return };
+    let n = 3usize * 4864;
+    let mut gate = randv(n, 0x1240, 4.0);
+    let up = randv(n, 0x1241, 4.0);
+    gate[0] = 5.0;
+    gate[1] = -5.0;
+    gate[32..64].fill(0.0);
+    let bytes = (n * 5 * 4 + n * 2 + (n / 32) * 2 * 4 + 16_384) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dgate_store = upload(&cuda, &mut buf, &gate);
+    let dgate_no_store = upload(&cuda, &mut buf, &gate);
+    let dup = upload(&cuda, &mut buf, &up);
+    let dqs_store = buf.alloc(n as u64).unwrap().dptr;
+    let dqs_no_store = buf.alloc(n as u64).unwrap().dptr;
+    let dsc_store = buf.alloc_f32(n / 32).unwrap().dptr;
+    let dsc_no_store = buf.alloc_f32(n / 32).unwrap().dptr;
+
+    k.silu_mul_quantize_q8(&cuda, dgate_store, dup, dqs_store, dsc_store, n as u32)
+        .unwrap();
+    k.silu_mul_quantize_q8_nostore(
+        &cuda,
+        dgate_no_store,
+        dup,
+        dqs_no_store,
+        dsc_no_store,
+        n as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+
+    let mut gate_no_store = vec![0f32; n];
+    let mut sc_store = vec![0f32; n / 32];
+    let mut sc_no_store = vec![0f32; n / 32];
+    cuda.dtoh_f32(&mut gate_no_store, dgate_no_store).unwrap();
+    cuda.dtoh_f32(&mut sc_store, dsc_store).unwrap();
+    cuda.dtoh_f32(&mut sc_no_store, dsc_no_store).unwrap();
+    assert_bits_eq(
+        &gate_no_store,
+        &gate,
+        "Wave123 SwiGLU no-store gate untouched",
+    );
+    assert_bits_eq(&sc_no_store, &sc_store, "Wave123 SwiGLU no-store Q8 scales");
+    assert_eq!(
+        download_bytes(&cuda, dqs_no_store, n),
+        download_bytes(&cuda, dqs_store, n),
+        "Wave123 SwiGLU no-store Q8 bytes"
+    );
+    buf.free(&cuda).unwrap();
+}
+
+#[test]
+fn wave123_stacked_silu_q8_matches_separate_layout() {
+    let Some((cuda, k)) = gpu() else { return };
+    let ntok = 3usize;
+    let hidden = 4864usize;
+    let n = ntok * hidden;
+    let mut gate = randv(n, 0x1250, 4.0);
+    let up = randv(n, 0x1251, 4.0);
+    gate[0] = 5.0;
+    gate[1] = -5.0;
+    gate[32..64].fill(0.0);
+    let mut stacked = vec![0f32; ntok * hidden * 2];
+    for t in 0..ntok {
+        let separate = t * hidden;
+        let fused = t * hidden * 2;
+        stacked[fused..fused + hidden].copy_from_slice(&gate[separate..separate + hidden]);
+        stacked[fused + hidden..fused + 2 * hidden]
+            .copy_from_slice(&up[separate..separate + hidden]);
+    }
+
+    let bytes =
+        ((gate.len() + up.len() + stacked.len()) * 4 + n * 2 + (n / 32) * 2 * 4 + 16_384) as u64;
+    let mut buf = BackendBuffer::new(&cuda, bytes).unwrap();
+    let dgate = upload(&cuda, &mut buf, &gate);
+    let dup = upload(&cuda, &mut buf, &up);
+    let dstacked = upload(&cuda, &mut buf, &stacked);
+    let dqs_separate = buf.alloc(n as u64).unwrap().dptr;
+    let dqs_stacked = buf.alloc(n as u64).unwrap().dptr;
+    let dsc_separate = buf.alloc_f32(n / 32).unwrap().dptr;
+    let dsc_stacked = buf.alloc_f32(n / 32).unwrap().dptr;
+
+    k.silu_mul_quantize_q8(&cuda, dgate, dup, dqs_separate, dsc_separate, n as u32)
+        .unwrap();
+    k.silu_mul_quantize_q8_stacked_nostore(
+        &cuda,
+        dstacked,
+        dqs_stacked,
+        dsc_stacked,
+        hidden as u32,
+        ntok as u32,
+    )
+    .unwrap();
+    cuda.synchronize().unwrap();
+
+    let mut sc_separate = vec![0f32; n / 32];
+    let mut sc_stacked = vec![0f32; n / 32];
+    cuda.dtoh_f32(&mut sc_separate, dsc_separate).unwrap();
+    cuda.dtoh_f32(&mut sc_stacked, dsc_stacked).unwrap();
+    assert_bits_eq(
+        &sc_stacked,
+        &sc_separate,
+        "Wave123 stacked SwiGLU Q8 scales",
+    );
+    assert_eq!(
+        download_bytes(&cuda, dqs_stacked, n),
+        download_bytes(&cuda, dqs_separate, n),
+        "Wave123 stacked SwiGLU Q8 bytes"
+    );
+    buf.free(&cuda).unwrap();
+}
+
+#[test]
 fn add_is_exact() {
     let Some((cuda, k)) = gpu() else { return };
     let n = 1000usize;

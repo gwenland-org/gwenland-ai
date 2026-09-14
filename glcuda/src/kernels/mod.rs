@@ -79,10 +79,12 @@ fn n16_uses_m32(ntile128: bool, out_dim: u32, ntok: u32, sm_count: u32) -> bool 
     ntile128 && !ntile128_covers(out_dim, ntok, sm_count)
 }
 
-/// Wave 88 deliberately covers only the pinned FFN gate/up projection. The
-/// exact shape guard prevents the experiment from leaking into QKV or down.
+/// Wave 88 deliberately covers only the pinned FFN gate/up projection. Wave
+/// 123 may launch the two stacked halves at once, so both the split half and
+/// the full stacked output are in scope. The exact shape guard prevents the
+/// experiment from leaking into QKV or down.
 fn n16_prefetch_shape(out_dim: u32, in_dim: u32, ntok: u32) -> bool {
-    out_dim == 4_864 && in_dim == 896 && ntok == 244
+    matches!(out_dim, 4_864 | 9_728) && in_dim == 896 && ntok == 244
 }
 
 /// Dynamic shared memory for prefill attention: one f32 score per causal row
@@ -212,6 +214,12 @@ pub struct KernelSet {
     grid2d: bool,
     /// Wave 11 exact adjacent-chain fusion; prefill-only and opt-in.
     fuse_q8_glue: bool,
+    /// Wave 123: skip f32 scratch writes when the downstream prefill GEMM reads
+    /// only the Q8 activation copy.
+    q8_nostore: AtomicBool,
+    /// Wave 123: compute the stacked FFN gate+up projection in one GEMM and
+    /// consume its row-major [gate, up] layout directly.
+    ffn_gate_up_stacked: AtomicBool,
     /// Wave 11 Qwen GQA7 K/V-reuse attention; prefill-only and opt-in.
     gqa_group: bool,
     /// Wave 12: 512-thread N128 CTA when coverage remains >= one CTA/SM.
@@ -248,6 +256,7 @@ pub struct KernelSet {
     f_add: Kernel,
     f_silu_mul: Kernel,
     f_silu_mul_quantize_q8: Kernel,
+    f_silu_mul_quantize_q8_stacked_nostore: Kernel,
     f_rope: Kernel,
     f_gemv: Kernel,
     f_quantize_q8: Kernel,
@@ -317,6 +326,19 @@ impl KernelSet {
         cuda: &Cuda,
         defer_ffn_residual_override: Option<bool>,
     ) -> Result<KernelSet, GlError> {
+        Self::load_with_benchmark_overrides(cuda, defer_ffn_residual_override, None, None)
+    }
+
+    /// Load the kernel suite with benchmark-only overrides for paths that must
+    /// be A/B'd inside one process. `None` keeps the production environment
+    /// contract for that switch.
+    #[doc(hidden)]
+    pub fn load_with_benchmark_overrides(
+        cuda: &Cuda,
+        defer_ffn_residual_override: Option<bool>,
+        q8_nostore_override: Option<bool>,
+        ffn_gate_up_stacked_override: Option<bool>,
+    ) -> Result<KernelSet, GlError> {
         let module = cuda.load_module(PTX)?;
         let sm = (cuda.info.sm_major, cuda.info.sm_minor);
         let mma = if sm >= (7, 5) && std::env::var_os("GLCUDA_NO_MMA").is_none() {
@@ -378,6 +400,12 @@ impl KernelSet {
             eprintln!("[glcuda] 2-D token-grid prefill GEMM enabled");
         }
         let fuse_q8_glue = std::env::var_os("GLCUDA_FUSE_Q8_GLUE").is_some();
+        let q8_nostore = fuse_q8_glue
+            && q8_nostore_override
+                .unwrap_or_else(|| std::env::var_os("GLCUDA_Q8_NOSTORE").is_some());
+        let ffn_gate_up_stacked = fuse_q8_glue
+            && ffn_gate_up_stacked_override
+                .unwrap_or_else(|| std::env::var_os("GLCUDA_FFN_GATE_UP_STACKED").is_some());
         let gqa_group = std::env::var_os("GLCUDA_GQA_GROUP").is_some();
         let ntile128 = mma.is_some() && std::env::var_os("GLCUDA_NTILE128").is_some();
         let bstage = mma.is_some() && std::env::var_os("GLCUDA_BSTAGE").is_some();
@@ -424,8 +452,8 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -435,6 +463,8 @@ impl KernelSet {
             r256,
             grid2d,
             fuse_q8_glue,
+            q8_nostore: AtomicBool::new(q8_nostore),
+            ffn_gate_up_stacked: AtomicBool::new(ffn_gate_up_stacked),
             gqa_group,
             ntile128,
             bstage,
@@ -451,6 +481,8 @@ impl KernelSet {
             f_add: module.get_function("gl_add_f32")?,
             f_silu_mul: module.get_function("gl_silu_mul_f32")?,
             f_silu_mul_quantize_q8: module.get_function("gl_silu_mul_quantize_q8")?,
+            f_silu_mul_quantize_q8_stacked_nostore: module
+                .get_function("gl_silu_mul_quantize_q8_stacked_nostore")?,
             f_rope: module.get_function("gl_rope_f32")?,
             f_gemv: module.get_function("gl_gemv_f32")?,
             f_quantize_q8: module.get_function("gl_quantize_q8")?,
@@ -638,6 +670,16 @@ impl KernelSet {
         self.fuse_q8_glue
     }
 
+    /// Whether Wave 123 may skip f32 scratch writes for Q8-only prefill consumers.
+    pub fn q8_nostore_enabled(&self) -> bool {
+        self.q8_nostore.load(Ordering::Relaxed)
+    }
+
+    /// Whether Wave 123 may consume the stacked gate/up prefill GEMM layout.
+    pub fn ffn_gate_up_stacked_enabled(&self) -> bool {
+        self.ffn_gate_up_stacked.load(Ordering::Relaxed)
+    }
+
     /// RMSNorm followed by the byte-compatible Q8 activation quantizer, with
     /// an optional in-place residual add before the unchanged RMS reduction.
     /// This is prefill-only: decode graph geometry and entry points stay fixed.
@@ -655,10 +697,53 @@ impl KernelSet {
         eps: f32,
         rows: u32,
     ) -> Result<(), GlError> {
+        self.rms_quantize_q8_rows_impl(cuda, x, residual, w, out, qs, scales, dim, eps, rows, true)
+    }
+
+    /// Wave 123 no-store variant of [`Self::rms_quantize_q8_rows`]. Use only
+    /// when the following prefill GEMM consumes `qs`/`scales` and never the f32
+    /// `out` scratch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rms_quantize_q8_rows_nostore(
+        &self,
+        cuda: &Cuda,
+        x: CUdeviceptr,
+        residual: Option<CUdeviceptr>,
+        w: CUdeviceptr,
+        out: CUdeviceptr,
+        qs: CUdeviceptr,
+        scales: CUdeviceptr,
+        dim: u32,
+        eps: f32,
+        rows: u32,
+    ) -> Result<(), GlError> {
+        self.rms_quantize_q8_rows_impl(cuda, x, residual, w, out, qs, scales, dim, eps, rows, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn rms_quantize_q8_rows_impl(
+        &self,
+        cuda: &Cuda,
+        x: CUdeviceptr,
+        residual: Option<CUdeviceptr>,
+        w: CUdeviceptr,
+        out: CUdeviceptr,
+        qs: CUdeviceptr,
+        scales: CUdeviceptr,
+        dim: u32,
+        eps: f32,
+        rows: u32,
+        store_out: bool,
+    ) -> Result<(), GlError> {
         debug_assert_eq!(dim % 32, 0, "fused RMS+Q8 dim must be a multiple of 32");
         let (mut x, mut residual_ptr, mut w, mut out, mut qs, mut scales) =
             (x, residual.unwrap_or(x), w, out, qs, scales);
-        let (mut d, mut e, mut add) = (dim, eps, u32::from(residual.is_some()));
+        let (mut d, mut e, mut add, mut store) = (
+            dim,
+            eps,
+            u32::from(residual.is_some()),
+            u32::from(store_out),
+        );
         let mut params = [
             &mut x as *mut _ as *mut c_void,
             &mut residual_ptr as *mut _ as *mut c_void,
@@ -669,6 +754,7 @@ impl KernelSet {
             &mut d as *mut _ as *mut c_void,
             &mut e as *mut _ as *mut c_void,
             &mut add as *mut _ as *mut c_void,
+            &mut store as *mut _ as *mut c_void,
         ];
         cuda.launch(
             self.f_rms_quantize_q8_rows,
@@ -689,18 +775,83 @@ impl KernelSet {
         scales: CUdeviceptr,
         n: u32,
     ) -> Result<(), GlError> {
+        self.silu_mul_quantize_q8_impl(cuda, gate, up, qs, scales, n, true)
+    }
+
+    /// Wave 123 no-store variant of [`Self::silu_mul_quantize_q8`]. Use only
+    /// when the following prefill down projection consumes the Q8 activation.
+    pub fn silu_mul_quantize_q8_nostore(
+        &self,
+        cuda: &Cuda,
+        gate: CUdeviceptr,
+        up: CUdeviceptr,
+        qs: CUdeviceptr,
+        scales: CUdeviceptr,
+        n: u32,
+    ) -> Result<(), GlError> {
+        self.silu_mul_quantize_q8_impl(cuda, gate, up, qs, scales, n, false)
+    }
+
+    fn silu_mul_quantize_q8_impl(
+        &self,
+        cuda: &Cuda,
+        gate: CUdeviceptr,
+        up: CUdeviceptr,
+        qs: CUdeviceptr,
+        scales: CUdeviceptr,
+        n: u32,
+        store_gate: bool,
+    ) -> Result<(), GlError> {
         debug_assert_eq!(n % 32, 0, "fused SwiGLU+Q8 n must be a multiple of 32");
-        let (mut gate, mut up, mut qs, mut scales, mut n_) = (gate, up, qs, scales, n);
+        let (mut gate, mut up, mut qs, mut scales, mut n_, mut store) =
+            (gate, up, qs, scales, n, u32::from(store_gate));
         let mut params = [
             &mut gate as *mut _ as *mut c_void,
             &mut up as *mut _ as *mut c_void,
             &mut qs as *mut _ as *mut c_void,
             &mut scales as *mut _ as *mut c_void,
             &mut n_ as *mut _ as *mut c_void,
+            &mut store as *mut _ as *mut c_void,
         ];
         cuda.launch(
             self.f_silu_mul_quantize_q8,
             (ceil_div(n, BLOCK), 1, 1),
+            (BLOCK, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 123 stacked gate/up SwiGLU followed by the byte-compatible Q8
+    /// activation quantizer. The input is `[ntok, 2*hidden]`, laid out as
+    /// gate columns then up columns for each token row. It does not write a f32
+    /// product scratch; the following down GEMM must consume Q8.
+    pub fn silu_mul_quantize_q8_stacked_nostore(
+        &self,
+        cuda: &Cuda,
+        gate_up: CUdeviceptr,
+        qs: CUdeviceptr,
+        scales: CUdeviceptr,
+        hidden: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(
+            hidden % 32,
+            0,
+            "stacked fused SwiGLU+Q8 hidden must be a multiple of 32"
+        );
+        let (mut gate_up, mut qs, mut scales, mut h, mut n) = (gate_up, qs, scales, hidden, ntok);
+        let hidden_blocks = hidden / 32;
+        let mut params = [
+            &mut gate_up as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+            &mut scales as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            self.f_silu_mul_quantize_q8_stacked_nostore,
+            (ceil_div(hidden_blocks, BLOCK / WARP), ntok, 1),
             (BLOCK, 1, 1),
             0,
             &mut params,
@@ -1750,6 +1901,16 @@ impl KernelSet {
             .store(self.fuse_q8_glue && enabled, Ordering::Relaxed);
     }
 
+    /// Switch Wave 123 no-store and stacked gate/up paths between synchronized
+    /// benchmark iterations.
+    #[doc(hidden)]
+    pub fn set_benchmark_q8_nostore(&self, no_store: bool, stacked_gate_up: bool) {
+        self.q8_nostore
+            .store(self.fuse_q8_glue && no_store, Ordering::Relaxed);
+        self.ffn_gate_up_stacked
+            .store(self.fuse_q8_glue && stacked_gate_up, Ordering::Relaxed);
+    }
+
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
     pub fn wave27_n16_resource_kernel(&self) -> Option<Kernel> {
         self.mma.as_ref().map(|module| module.bstage_n16)
@@ -2788,6 +2949,7 @@ mod tests {
             "gl_add_f32",
             "gl_silu_mul_f32",
             "gl_silu_mul_quantize_q8",
+            "gl_silu_mul_quantize_q8_stacked_nostore",
             "gl_rope_f32",
             "gl_gemv_f32",
             "gl_quantize_q8",

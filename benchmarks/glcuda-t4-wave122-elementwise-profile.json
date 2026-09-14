@@ -1,0 +1,263 @@
+{
+  "wave": 122,
+  "gpu": [
+    "0",
+    "Tesla T4",
+    "7.5",
+    "15360",
+    "580.159.04"
+  ],
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "profile": {
+    "prompt_tokens": 244,
+    "host_prefill_ms": 19.699937,
+    "gpu_prefill_ms": 19.259328842,
+    "gpu_prefill_tps": 12669.184996,
+    "oracle_token": 3323
+  },
+  "stages": [
+    {
+      "name": "qkv",
+      "total_ms": 1.328032006,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 0.487071995,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.163040002,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attention",
+      "total_ms": 2.894112021,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.347968002,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.297023982,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264
+    },
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 4.952800006,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.848320007,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.595615983,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.421184001,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 1.546463996,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.053504,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0
+    }
+  ],
+  "ranked_stages": [
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 4.952800006,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528,
+      "share_of_gpu_total": 0.2571636865766125,
+      "share_of_stage_sum": 0.2761506801913211
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.297023982,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264,
+      "share_of_gpu_total": 0.22311390065832493,
+      "share_of_stage_sum": 0.23958691931638618
+    },
+    {
+      "name": "attention",
+      "total_ms": 2.894112021,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120,
+      "share_of_gpu_total": 0.1502706581700102,
+      "share_of_stage_sum": 0.16136549066807382
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 1.546463996,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0,
+      "share_of_gpu_total": 0.08029687891446825,
+      "share_of_stage_sum": 0.08622538440264822
+    },
+    {
+      "name": "qkv",
+      "total_ms": 1.328032006,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352,
+      "share_of_gpu_total": 0.06895525887194362,
+      "share_of_stage_sum": 0.0740463861509583
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.848320007,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496,
+      "share_of_gpu_total": 0.044047225838421564,
+      "share_of_stage_sum": 0.047299335056767935
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.595615983,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656,
+      "share_of_gpu_total": 0.030926102767460082,
+      "share_of_stage_sum": 0.03320944892566137
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 0.487071995,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.025290185291286592,
+      "share_of_stage_sum": 0.027157418542733246
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.421184001,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0,
+      "share_of_gpu_total": 0.021869090270762614,
+      "share_of_stage_sum": 0.023483736113097568
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.347968002,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0,
+      "share_of_gpu_total": 0.0180675040576266,
+      "share_of_stage_sum": 0.0194014699403784
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.163040002,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.00846550797992756,
+      "share_of_stage_sum": 0.00909053614039556
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.053504,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0,
+      "share_of_gpu_total": 0.0027780822706199686,
+      "share_of_stage_sum": 0.002983194551578355
+    }
+  ],
+  "stage_sum_ms": 17.935136001,
+  "stage_sum_over_gpu_total": 0.9312440816674644,
+  "attention_ms": 6.068544033,
+  "ffn_ms": 11.270975985,
+  "glue_ms": 2.369119999,
+  "glue_ranked": [
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 1.546463996,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0,
+      "share_of_gpu_total": 0.08029687891446825,
+      "share_of_stage_sum": 0.08622538440264822
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.421184001,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0,
+      "share_of_gpu_total": 0.021869090270762614,
+      "share_of_stage_sum": 0.023483736113097568
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.347968002,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0,
+      "share_of_gpu_total": 0.0180675040576266,
+      "share_of_stage_sum": 0.0194014699403784
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.053504,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0,
+      "share_of_gpu_total": 0.0027780822706199686,
+      "share_of_stage_sum": 0.002983194551578355
+    }
+  ],
+  "next_fusion_candidate": "ffn_silu_quant",
+  "retention_authority": false,
+  "target_15000_tps_achieved": false
+}

@@ -155,12 +155,24 @@ impl RooflineReport {
         t: &glcore::telemetry::EngineTelemetry,
         ceiling_gbs: Option<f64>,
     ) -> Option<RooflineReport> {
-        let decode = t.decode.as_ref().map(|p| bucketize(p, ceiling_gbs)).unwrap_or_default();
-        let prefill = t.prefill.as_ref().map(|p| bucketize(p, ceiling_gbs)).unwrap_or_default();
+        let decode = t
+            .decode
+            .as_ref()
+            .map(|p| bucketize(p, ceiling_gbs))
+            .unwrap_or_default();
+        let prefill = t
+            .prefill
+            .as_ref()
+            .map(|p| bucketize(p, ceiling_gbs))
+            .unwrap_or_default();
         if decode.is_empty() && prefill.is_empty() {
             return None;
         }
-        Some(RooflineReport { ceiling_gbs, decode, prefill })
+        Some(RooflineReport {
+            ceiling_gbs,
+            decode,
+            prefill,
+        })
     }
 }
 
@@ -197,10 +209,42 @@ fn bucketize(phase: &PhaseProfile, ceiling_gbs: Option<f64>) -> Vec<BucketRoofli
         seen: bool,
     }
     let mut accs: [(Bucket, Acc); 4] = [
-        (Bucket::Attention, Acc { total_ms: 0.0, bytes: None, macs: None, seen: false }),
-        (Bucket::Ffn, Acc { total_ms: 0.0, bytes: None, macs: None, seen: false }),
-        (Bucket::LmHead, Acc { total_ms: 0.0, bytes: None, macs: None, seen: false }),
-        (Bucket::Other, Acc { total_ms: 0.0, bytes: None, macs: None, seen: false }),
+        (
+            Bucket::Attention,
+            Acc {
+                total_ms: 0.0,
+                bytes: None,
+                macs: None,
+                seen: false,
+            },
+        ),
+        (
+            Bucket::Ffn,
+            Acc {
+                total_ms: 0.0,
+                bytes: None,
+                macs: None,
+                seen: false,
+            },
+        ),
+        (
+            Bucket::LmHead,
+            Acc {
+                total_ms: 0.0,
+                bytes: None,
+                macs: None,
+                seen: false,
+            },
+        ),
+        (
+            Bucket::Other,
+            Acc {
+                total_ms: 0.0,
+                bytes: None,
+                macs: None,
+                seen: false,
+            },
+        ),
     ];
 
     for st in &phase.stages {
@@ -265,12 +309,21 @@ mod tests {
     }
 
     fn stage(name: &str, ms: f64, bytes: Option<u64>, macs: Option<u64>) -> StageTiming {
-        StageTiming { name: name.into(), total_ms: ms, calls: 10, bytes_read: bytes, macs }
+        StageTiming {
+            name: name.into(),
+            total_ms: ms,
+            calls: 10,
+            bytes_read: bytes,
+            macs,
+        }
     }
 
     fn phase(stages: Vec<StageTiming>) -> PhaseProfile {
         let total = stages.iter().map(|s| s.total_ms).sum::<f64>() + 5.0;
-        PhaseProfile { stages, total_ms: total }
+        PhaseProfile {
+            stages,
+            total_ms: total,
+        }
     }
 
     #[test]
@@ -278,10 +331,14 @@ mod tests {
         assert_eq!(bucket_of("qkv"), Bucket::Attention);
         assert_eq!(bucket_of("attention"), Bucket::Attention);
         assert_eq!(bucket_of("attn_out"), Bucket::Attention);
+        assert_eq!(bucket_of("attn_out_quant"), Bucket::Attention);
         assert_eq!(bucket_of("fixup"), Bucket::Attention);
         assert_eq!(bucket_of("ffn_gate_up"), Bucket::Ffn);
         assert_eq!(bucket_of("ffn_down"), Bucket::Ffn);
         assert_eq!(bucket_of("ffn_downq"), Bucket::Ffn);
+        assert_eq!(bucket_of("ffn_residual_norm_quant"), Bucket::Ffn);
+        assert_eq!(bucket_of("ffn_silu_quant"), Bucket::Ffn);
+        assert_eq!(bucket_of("ffn_residual_add"), Bucket::Ffn);
         assert_eq!(bucket_of("lm_head"), Bucket::LmHead);
         assert_eq!(bucket_of("sampler"), Bucket::Other);
         assert_eq!(bucket_of("serial"), Bucket::Other);
@@ -293,13 +350,21 @@ mod tests {
         // Attention: 6 GB/s (20%) -> NOT bandwidth-bound. The v2 headline case.
         let p = phase(vec![
             // 100 ms at 27 GB/s = 2.7 GB read.
-            stage("ffn_gate_up", 100.0, Some(2_700_000_000), Some(1_000_000_000)),
+            stage(
+                "ffn_gate_up",
+                100.0,
+                Some(2_700_000_000),
+                Some(1_000_000_000),
+            ),
             // 100 ms at 6 GB/s = 0.6 GB read.
             stage("attention", 100.0, Some(600_000_000), Some(500_000_000)),
         ]);
         let buckets = bucketize(&p, Some(30.0));
         let ffn = buckets.iter().find(|b| b.bucket == Bucket::Ffn).unwrap();
-        let attn = buckets.iter().find(|b| b.bucket == Bucket::Attention).unwrap();
+        let attn = buckets
+            .iter()
+            .find(|b| b.bucket == Bucket::Attention)
+            .unwrap();
         assert_eq!(ffn.verdict, BucketVerdict::BandwidthBound);
         assert_eq!(attn.verdict, BucketVerdict::NotBandwidthBound);
         assert!((ffn.ceiling_frac.unwrap() - 0.9).abs() < 1e-6);
@@ -314,7 +379,10 @@ mod tests {
             stage("attn_out", 5.0, Some(500_000), None),
         ]);
         let buckets = bucketize(&p, None);
-        let attn = buckets.iter().find(|b| b.bucket == Bucket::Attention).unwrap();
+        let attn = buckets
+            .iter()
+            .find(|b| b.bucket == Bucket::Attention)
+            .unwrap();
         assert!((attn.total_ms - 35.0).abs() < 1e-9);
         // Bytes sum across all three; macs across the two that reported them.
         assert!((attn.gb_per_s.unwrap() - 3_500_000.0 / 0.035 / 1e9).abs() < 1e-9);
@@ -329,7 +397,6 @@ mod tests {
         assert!((b.intensity_flop_per_byte.unwrap() - 4.0).abs() < 1e-9);
     }
 
-    #[test]
     /// Every stage `glcuda` reports must land in a real bucket.
     ///
     /// This is the failure mode that kept glcuda invisible: `bucket_of` sends
@@ -345,10 +412,14 @@ mod tests {
             ("attn_norm", Bucket::Attention),
             ("attn_kv_write", Bucket::Attention),
             ("attention", Bucket::Attention),
-            ("attn_out", Bucket::Attention),
-            ("ffn_elementwise", Bucket::Ffn),
+            ("attn_out_quant", Bucket::Attention),
             ("ffn_down", Bucket::Ffn),
             ("ffn_gate_up", Bucket::Ffn),
+            ("attn_out", Bucket::Attention),
+            ("lm_head", Bucket::LmHead),
+            ("ffn_residual_norm_quant", Bucket::Ffn),
+            ("ffn_silu_quant", Bucket::Ffn),
+            ("ffn_residual_add", Bucket::Ffn),
         ];
         for name in glcuda::runner::STAGE_NAMES {
             let (_, expect) = want
@@ -369,6 +440,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn no_telemetry_yields_no_report() {
         let t = glcore::telemetry::EngineTelemetry::default();
         assert!(RooflineReport::compute(&t, Some(30.0)).is_none());

@@ -1,0 +1,256 @@
+{
+  "wave": 123,
+  "candidate": "q8_nostore_plus_stacked_gate_up",
+  "gpu": [
+    "0",
+    "Tesla T4",
+    "7.5",
+    "15360",
+    "580.159.04"
+  ],
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "production_ab": {
+    "samples_per_arm": 40,
+    "retained_median_ms": 19.103201,
+    "candidate_median_ms": 18.333203,
+    "retained_tps": 12772.728507646441,
+    "candidate_tps": 13309.185525300734,
+    "speedup": 1.0420001894922561,
+    "all_candidate_deltas_positive": true,
+    "invocation_summaries": [
+      {
+        "invocation": "a",
+        "quartets": 10,
+        "samples_per_arm": 20,
+        "retained_median_ms": 19.101019,
+        "candidate_median_ms": 18.253556,
+        "retained_tps": 12774.187597,
+        "candidate_tps": 13367.258413,
+        "speedup": 1.046427,
+        "oracle_token": 3323
+      },
+      {
+        "invocation": "b",
+        "quartets": 10,
+        "samples_per_arm": 20,
+        "retained_median_ms": 19.156975,
+        "candidate_median_ms": 18.485438,
+        "retained_tps": 12736.875211,
+        "candidate_tps": 13199.579042,
+        "speedup": 1.036328,
+        "oracle_token": 3323
+      }
+    ]
+  },
+  "candidate_profile": {
+    "prompt_tokens": 244,
+    "host_prefill_ms": 19.654184,
+    "gpu_prefill_ms": 19.097312927,
+    "gpu_prefill_tps": 12776.666588,
+    "oracle_token": 3323
+  },
+  "candidate_stages": [
+    {
+      "name": "qkv",
+      "total_ms": 1.308447994,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 0.504575998,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.169568,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attention",
+      "total_ms": 2.923424006,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.356704,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.287039995,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264
+    },
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 4.864063963,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.853824001,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.593919992,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.40752,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 1.238367978,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.056928,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0
+    }
+  ],
+  "candidate_ranked_stages": [
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 4.864063963,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528,
+      "share_of_gpu_total": 0.2546988668821115,
+      "share_of_stage_sum": 0.2769276726821573
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.287039995,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264,
+      "share_of_gpu_total": 0.22448393715845402,
+      "share_of_stage_sum": 0.24407573945192318
+    },
+    {
+      "name": "attention",
+      "total_ms": 2.923424006,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120,
+      "share_of_gpu_total": 0.15308038451141623,
+      "share_of_stage_sum": 0.16644045234664379
+    },
+    {
+      "name": "qkv",
+      "total_ms": 1.308447994,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352,
+      "share_of_gpu_total": 0.06851476953860358,
+      "share_of_stage_sum": 0.07449438587986291
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 1.238367978,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0,
+      "share_of_gpu_total": 0.0648451424937998,
+      "share_of_stage_sum": 0.07050449267943742
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.853824001,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496,
+      "share_of_gpu_total": 0.04470911715505556,
+      "share_of_stage_sum": 0.04861109871821352
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.593919992,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656,
+      "share_of_gpu_total": 0.031099662778228298,
+      "share_of_stage_sum": 0.033813881230814205
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 0.504575998,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.026421308585598165,
+      "share_of_stage_sum": 0.028727224370469658
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.40752,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0,
+      "share_of_gpu_total": 0.021339127737905132,
+      "share_of_stage_sum": 0.023201496943684972
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.356704,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0,
+      "share_of_gpu_total": 0.01867822983073644,
+      "share_of_stage_sum": 0.020308369566647538
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.169568,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.008879154918190758,
+      "share_of_stage_sum": 0.009654081845668369
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.056928,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0,
+      "share_of_gpu_total": 0.0029809429325271483,
+      "share_of_stage_sum": 0.0032411042844770763
+    }
+  ],
+  "candidate_stage_sum_ms": 17.564383927,
+  "candidate_attention_ms": 6.116543999,
+  "candidate_ffn_ms": 10.853919936,
+  "retention_authority": true,
+  "target_15000_tps_achieved": false
+}
