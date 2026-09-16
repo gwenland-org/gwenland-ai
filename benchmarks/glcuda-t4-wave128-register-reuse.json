@@ -1,0 +1,52 @@
+{
+  "wave": 128,
+  "candidate": "n16_prefetch_fused_swiglu_register_reuse",
+  "verdict": "rejected_at_compiler_resource_gate",
+  "retention_authority": false,
+  "production_ab_run": false,
+  "target_15000_tps_achieved": false,
+  "gpu": {
+    "name": "Tesla T4",
+    "selected_device": 0,
+    "visible_devices_before_cuda_mask": 2,
+    "compute_capability": "7.5",
+    "memory_mib": 15360,
+    "driver": "580.159.04",
+    "cuda": "13.0"
+  },
+  "host_tests": {
+    "passed": 67,
+    "failed": 0
+  },
+  "compiler_resource": {
+    "kernel": "gl_gemm_mma_q8_bstage_n16_prefetch",
+    "registers_per_thread": 80,
+    "static_shared_bytes": 16384,
+    "barriers": 1,
+    "stack_frame_bytes": 8,
+    "spill_store_bytes": 4,
+    "spill_load_bytes": 4,
+    "passed": false
+  },
+  "stopped_phase": "compiler-resource",
+  "not_run": [
+    "driver_occupancy",
+    "cuda_parity",
+    "direct_q8_byte_and_scale_parity",
+    "production_ab",
+    "candidate_profile"
+  ],
+  "artifacts": {
+    "results_zip": "benchmarks/glcuda-t4-wave128-register-reuse-results.zip",
+    "results_zip_sha256": "e60c2856399ad040e50759c01fc0d21abb1f7a8da0d3936653560963898e9c41",
+    "notebook": "notebooks/glcuda_t4_wave128_register_reuse.ipynb",
+    "notebook_sha256": "8bc57b5ca86a328ffa35aba8b5416122b5948f62e57bed43257c6f838d9bdb73",
+    "source_patch_sha256": "7b74dddf036616613bf5d0e2968f8acecbf6845ce9e4182de71b4db7b0f5558b"
+  },
+  "glbench_missing_counters": [
+    "eligible warps per cycle",
+    "issue-active percentage",
+    "stall-reason breakdown",
+    "per-kernel L1 and L2 hit rates"
+  ]
+}
