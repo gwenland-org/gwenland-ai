@@ -31,6 +31,10 @@ pub const PTX_SM75_WAVE59: &str = include_str!("glcuda_sm75_wave59.ptx");
 /// the explicit experiment so the retained sm_75 module and JIT stay fixed.
 pub const PTX_SM75_WAVE88: &str = include_str!("glcuda_sm75_wave88.ptx");
 
+/// Wave 129's compiler-only fused specialization. It is not loaded by the
+/// production dispatch until the T4 resource and device gates pass.
+pub const PTX_SM75_WAVE129: &str = include_str!("glcuda_sm75_wave129.ptx");
+
 /// Threads per block for element-wise and one-block-reduction kernels.
 const BLOCK: u32 = 256;
 /// Warp size — grid geometry for the one-warp-per-row GEMV.
@@ -3508,6 +3512,30 @@ mod tests {
         assert!(n16_prefetch_shape(4_864, 896, 244));
         assert!(!n16_prefetch_shape(896, 4_864, 244));
         assert!(!n16_prefetch_shape(4_864, 896, 243));
+    }
+
+    #[test]
+    fn wave129_fused_specialization_removes_the_dual_mode_live_range() {
+        assert!(PTX_SM75_WAVE129.starts_with(".version 6.5\n.target sm_75\n"));
+        assert!(PTX_SM75_WAVE129
+            .contains(".visible .entry gl_gemm_mma_q8_bstage_n16_fused_swiglu_specialized("));
+        assert_eq!(
+            PTX_SM75_WAVE129.matches('{').count(),
+            PTX_SM75_WAVE129.matches('}').count()
+        );
+        assert_eq!(PTX_SM75_WAVE129.matches("mma.sync.aligned").count(), 32);
+        assert_eq!(PTX_SM75_WAVE129.matches("bar.sync 0;").count(), 3);
+        assert!(PTX_SM75_WAVE129.contains("sm_fgu[16384]"));
+        assert!(PTX_SM75_WAVE129.contains(".maxnreg 80"));
+        assert!(PTX_SM75_WAVE129.contains("MMA_WRITE:\n    bra FGU_PAIR;\n\nFGU_PAIR:"));
+        assert!(!PTX_SM75_WAVE129.contains("p_fused_swiglu"));
+        assert!(!PTX_SM75_WAVE129.contains("@%p_fgu "));
+        assert!(!PTX_SM75_WAVE129.contains("@!%p_fgu "));
+        assert!(!PTX_SM75_WAVE129.contains("MMA_M1:"));
+        assert!(!PTX_SM75_WAVE129.contains("MMA_M7:"));
+        assert!(!PTX_SM75_WAVE129.contains("wmma."));
+        assert!(!PTX_SM75_WAVE129.contains('\0'));
+        assert!(!PTX_SM75_WAVE129.contains('\r'));
     }
 
     #[test]
