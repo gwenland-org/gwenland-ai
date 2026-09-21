@@ -91,6 +91,12 @@ fn n16_prefetch_shape(out_dim: u32, in_dim: u32, ntok: u32) -> bool {
     matches!(out_dim, 4_864 | 9_728) && in_dim == 896 && ntok == 244
 }
 
+/// Wave 129 is narrower than the retained Wave 88 entry: one complete stacked
+/// gate/up call for the pinned Qwen2.5-0.5B production shape.
+fn n16_fused_swiglu_shape(hidden_dim: u32, in_dim: u32, ntok: u32) -> bool {
+    hidden_dim == 4_864 && in_dim == 896 && ntok == 244
+}
+
 /// Dynamic shared memory for prefill attention: one f32 score per causal row
 /// plus the fixed block-reduction scratch. Returning `None` makes an invalid
 /// zero/overflow capacity a launch error rather than an undersized buffer.
@@ -191,6 +197,12 @@ struct Wave88Module {
     n16_prefetch: Kernel,
 }
 
+/// Wave 129 is isolated until its device-parity and production gates pass.
+struct Wave129Module {
+    _module: Module,
+    fused_swiglu: Kernel,
+}
+
 /// One loaded module plus resolved handles for every kernel. Handles stay
 /// valid while `_module` lives — the struct owns it for exactly that.
 pub struct KernelSet {
@@ -208,6 +220,9 @@ pub struct KernelSet {
     wave59: Option<Wave59Module>,
     /// Opt-in Wave 88 wide-grid N16 register-prefetch candidate.
     wave88: Option<Wave88Module>,
+    /// Opt-in Wave 129 fused-only specialization, never selected by the
+    /// production runner in Wave 130.
+    wave129: Option<Wave129Module>,
     /// Whether prefill should drive the r256 (256-row) GEMM instead of the
     /// 64-row one. Read once at load from `GLCUDA_R256`; see
     /// [`KernelSet::r256_enabled`].
@@ -439,6 +454,23 @@ impl KernelSet {
         } else {
             None
         };
+        let n16_fused_swiglu = gemm_n16_prefetch
+            && fuse_q8_glue
+            && q8_nostore
+            && ffn_gate_up_stacked
+            && std::env::var_os("GLCUDA_N16_FUSED_SWIGLU").is_some();
+        let wave129 = if n16_fused_swiglu {
+            let module = cuda.load_module(PTX_SM75_WAVE129)?;
+            let fused_swiglu =
+                module.get_function("gl_gemm_mma_q8_bstage_n16_fused_swiglu_specialized")?;
+            eprintln!("[glcuda] Wave 129 fused-only N16 SwiGLU device gate enabled");
+            Some(Wave129Module {
+                _module: module,
+                fused_swiglu,
+            })
+        } else {
+            None
+        };
         let defer_ffn_residual = resolve_defer_ffn_residual(
             fuse_q8_glue,
             std::env::var_os("GLCUDA_DEFER_FFN_RESIDUAL").is_some(),
@@ -456,14 +488,15 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
             mma,
             wave59,
             wave88,
+            wave129,
             r256,
             grid2d,
             fuse_q8_glue,
@@ -1888,6 +1921,11 @@ impl KernelSet {
         self.gemm_n16_prefetch && n16_prefetch_shape(out_dim, in_dim, ntok)
     }
 
+    /// Whether the isolated Wave 129 module covers this direct gate shape.
+    pub fn n16_fused_swiglu_enabled(&self, hidden_dim: u32, in_dim: u32, ntok: u32) -> bool {
+        self.wave129.is_some() && n16_fused_swiglu_shape(hidden_dim, in_dim, ntok)
+    }
+
     /// Whether non-final prefill layers may defer their FFN residual add into
     /// the next attention RMS+Q8 pass.
     pub fn defer_ffn_residual_enabled(&self) -> bool {
@@ -1933,6 +1971,11 @@ impl KernelSet {
     /// Wave 88 entry used by the direct resource and occupancy gate.
     pub fn wave88_n16_prefetch_resource_kernel(&self) -> Option<Kernel> {
         self.wave88.as_ref().map(|module| module.n16_prefetch)
+    }
+
+    /// Wave 129 entry used by the real driver's occupancy query.
+    pub fn wave129_fused_swiglu_resource_kernel(&self) -> Option<Kernel> {
+        self.wave129.as_ref().map(|module| module.fused_swiglu)
     }
 
     /// Whether this launch uses the narrow-grid M32 entry.
@@ -2317,6 +2360,58 @@ impl KernelSet {
             f,
             (ceil_div(out_dim, n_tile), ceil_div(ntok, 64), 1),
             (threads, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 129 fused-only specialization. The output pointers are distinct
+    /// from the input activation image because peer CTAs may finish at
+    /// different times while others still read the shared input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mma_q8_bstage_n16_fused_swiglu(
+        &self,
+        cuda: &Cuda,
+        gate_w_qs: CUdeviceptr,
+        gate_w_scales: CUdeviceptr,
+        up_w_qs: CUdeviceptr,
+        up_w_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        y_qs: CUdeviceptr,
+        y_scales: CUdeviceptr,
+        hidden_dim: u32,
+        in_dim: u32,
+        ntok: u32,
+    ) -> Result<(), GlError> {
+        debug_assert!(self.n16_fused_swiglu_enabled(hidden_dim, in_dim, ntok));
+        debug_assert_eq!(n16_threads(self.ntile128), 256);
+        let f = self
+            .wave129
+            .as_ref()
+            .map(|module| module.fused_swiglu)
+            .ok_or_else(|| GlError::Engine("Wave 129 called without its module".into()))?;
+        let (mut wqs, mut wsc, mut xqs, mut xsc, mut y) =
+            (gate_w_qs, gate_w_scales, x_qs, x_scales, y_qs);
+        let (mut o, mut i, mut n) = (hidden_dim, in_dim, ntok);
+        let (mut up_wqs, mut up_wsc, mut ysc) = (up_w_qs, up_w_scales, y_scales);
+        let mut params = [
+            &mut wqs as *mut _ as *mut c_void,
+            &mut wsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut y as *mut _ as *mut c_void,
+            &mut o as *mut _ as *mut c_void,
+            &mut i as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut up_wqs as *mut _ as *mut c_void,
+            &mut up_wsc as *mut _ as *mut c_void,
+            &mut ysc as *mut _ as *mut c_void,
+        ];
+        cuda.launch(
+            f,
+            (ceil_div(hidden_dim, 64), ceil_div(ntok, 64), 1),
+            (256, 1, 1),
             0,
             &mut params,
         )
@@ -3536,6 +3631,9 @@ mod tests {
         assert!(!PTX_SM75_WAVE129.contains("wmma."));
         assert!(!PTX_SM75_WAVE129.contains('\0'));
         assert!(!PTX_SM75_WAVE129.contains('\r'));
+        assert!(n16_fused_swiglu_shape(4_864, 896, 244));
+        assert!(!n16_fused_swiglu_shape(4_864, 896, 243));
+        assert!(!n16_fused_swiglu_shape(4_800, 896, 244));
     }
 
     #[test]
