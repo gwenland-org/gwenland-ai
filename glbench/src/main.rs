@@ -36,6 +36,18 @@ use glbench::tensor_stats::{self, TensorStatsArgs};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Engine profiling switches are process-startup contracts. Re-exec with a
+    // child environment rather than mutating this process's environment after
+    // Rust or a backend may already have started threads.
+    if let Some(result) = reexec_for_stage_profile(&args) {
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("glbench: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     let result = match args.first().map(String::as_str) {
         Some("run") => cmd_run(&args[1..]),
         Some("ab") => cmd_ab(&args[1..]),
@@ -82,11 +94,65 @@ fn main() -> ExitCode {
     }
 }
 
+/// Re-run `run`/`ab` with the engine's profiling variable present before any
+/// runtime state exists. Returns `None` when no re-exec is needed.
+fn reexec_for_stage_profile(args: &[String]) -> Option<Result<(), String>> {
+    let key = stage_profile_env_key(args)?;
+    let active = match key {
+        "GLPROC_PROFILE" => {
+            std::env::var("GLPROC_PROFILE")
+                .ok()
+                .is_some_and(|value| !value.is_empty() && value != "0")
+        }
+        "GLCUDA_TELEMETRY" => std::env::var_os("GLCUDA_TELEMETRY").is_some(),
+        _ => false,
+    };
+    if active {
+        return None;
+    }
+
+    Some((|| {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("locating glbench for instrumented re-exec: {error}"))?;
+        let status = std::process::Command::new(executable)
+            .args(args)
+            .env(key, "1")
+            .status()
+            .map_err(|error| format!("starting instrumented glbench child: {error}"))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "instrumented glbench child exited with {}",
+                status.code().map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+            ))
+        }
+    })())
+}
+
+fn stage_profile_env_key(args: &[String]) -> Option<&'static str> {
+    if !matches!(args.first().map(String::as_str), Some("run" | "ab"))
+        || !args.windows(2).any(|pair| pair == ["--profile", "stages"])
+    {
+        return None;
+    }
+    match args
+        .windows(2)
+        .find(|pair| pair[0] == "--engine")
+        .map(|pair| pair[1].as_str())
+    {
+        Some("glproc") => Some("GLPROC_PROFILE"),
+        Some("glcuda") => Some("GLCUDA_TELEMETRY"),
+        _ => None,
+    }
+}
+
 const USAGE: &str = "\
 usage:
   glbench run     --engine <name> --model <path> [--prompt <text>] [--tokens N]
                   [--cold-iters N] [--warmup N] [--iters N] [--temperature F]
                   [--seed N] [--kind prefill|decode|end_to_end|stress]
+                  [--profile stages]
                   [--cot on|off] [--verify-against <oracle>] [--out <file.json>]
                   (--verify-against loads a second engine and cross-checks the
                    first 50 generated tokens against it, folding the result into
@@ -168,6 +234,9 @@ training observation (needs --features train-bench):
                   as absent rather than guessed.
 
 bit profiling (run):
+  --profile stages            collect engine stage telemetry. This is an
+                              instrumented diagnostic run: its headline tok/s
+                              is archived and printed as non-authoritative.
   --profile bits              profile the model's weight tensors at the bit
                               level after the benchmark (GLBitProf). Static —
                               it reads the model file, not the run, so it
@@ -305,7 +374,8 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = value(&mut i)?;
                 match v.as_str() {
                     "bits" => profile_bits = true,
-                    other => return Err(format!("--profile takes 'bits', got '{other}'")),
+                    "stages" => spec.instrument_engine = true,
+                    other => return Err(format!("--profile takes bits|stages, got '{other}'")),
                 }
             }
             "--bit-scope" => {
@@ -1254,4 +1324,51 @@ fn parse_f32(s: &str, flag: &str) -> Result<f32, String> {
 
 fn parse_f64(s: &str, flag: &str) -> Result<f64, String> {
     s.parse::<f64>().map_err(|_| format!("flag '{flag}': '{s}' is not a valid number"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn stage_profile_selects_the_engine_startup_contract() {
+        assert_eq!(
+            stage_profile_env_key(&args(&[
+                "run",
+                "--profile",
+                "stages",
+                "--engine",
+                "glcuda",
+            ])),
+            Some("GLCUDA_TELEMETRY")
+        );
+        assert_eq!(
+            stage_profile_env_key(&args(&[
+                "ab",
+                "--engine",
+                "glproc",
+                "--profile",
+                "stages",
+            ])),
+            Some("GLPROC_PROFILE")
+        );
+    }
+
+    #[test]
+    fn static_bit_profile_does_not_reexec_the_benchmark() {
+        assert_eq!(
+            stage_profile_env_key(&args(&[
+                "run",
+                "--engine",
+                "glproc",
+                "--profile",
+                "bits",
+            ])),
+            None
+        );
+    }
 }

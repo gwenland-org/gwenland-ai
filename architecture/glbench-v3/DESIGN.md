@@ -1162,7 +1162,10 @@ is a CLI error. There is no default "good loss".
 
 **Added at the top level:** `inference`, `training`, `availability`,
 `integrity`. **Added to `metadata`:** `session_mode`, `host_identifier`,
-`collection_profile`. **Removed:** nothing. **Changed in meaning:** nothing.
+`collection_profile`. The later observability Wave 1 writer adds
+`measurement_mode` and `dispatch` to metadata plus `instrument_engine` to the
+workload. These are additive v2 fields with explicit missing-field readings.
+**Removed:** nothing. **Changed in meaning:** nothing.
 
 Reading a v1 archive with a v3 build: `session_mode` absent → `InferenceOnly`;
 `availability` absent → empty map; `integrity` absent → `DoesNotExist`, not a
@@ -1170,8 +1173,10 @@ verification failure. Reading a v2 archive with a v1 build: refused by the
 existing check in `storage::archive::read`, which is correct behaviour and needs
 no change.
 
-`from_json` continues not to reconstruct `telemetry` and `behavior`, for the
-reason its existing comment gives. v3 adds no round-trip requirement for them.
+The original v3 implementation did not reconstruct `telemetry` or `behavior`.
+Observability Wave 1 supersedes the telemetry half of that decision: raw engine
+telemetry is now load-bearing bottleneck evidence and round-trips so archived
+inspect/export/comparison sees it. Behavior remains a live-run view.
 
 ---
 

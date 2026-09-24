@@ -67,6 +67,18 @@ glbench run --engine glproc --model model.gguf \
     --out benchmarks/qwen-glproc-001.json
 ```
 
+Collect an engine stage breakdown in a separate diagnostic run:
+
+```sh
+glbench run --engine glcuda --model model.gguf --profile stages \
+    --out benchmarks/qwen-glcuda-profile.json
+```
+
+The default run is `production`. `--profile stages` is `instrumented`: its
+stage timings are useful for locating cost, but its tok/s is clearly marked
+non-authoritative because instrumentation can perturb wall time. Run both when
+making an optimization decision; only the production run decides retention.
+
 A/B two (or more) models under one identical workload, in one command — each
 candidate is diffed against the first. Sequential on purpose: parallel decodes
 would contend for the memory bus and corrupt every number:
@@ -146,6 +158,7 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--kind`        | end_to_end | `prefill`, `decode`, `end_to_end`, `stress`   |
 | `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--verify-against` | unset | oracle engine to auto cross-check the first 50 tokens against, folded into the validation report; skipped (not just trivial) when equal to `--engine` |
+| `--profile stages` | off | collect engine stage telemetry in a diagnostic-only run; headline tok/s is non-authoritative |
 | `--out`         | —       | archive the session as JSON                      |
 
 `validate` additionally takes `--against <oracle>` (default `glproc`); `scale`
@@ -162,6 +175,9 @@ inputs were actually measured, absent otherwise:
   runs before warmup, every iteration individually timed and reported as
   median + range, never mixed into the warm statistics (see
   [Interpreting Results](#interpreting-results)).
+- **measurement authority and dispatch provenance** — every new run says
+  `production` or `instrumented`, records a fingerprint of whitelisted engine
+  overrides, and preserves those facts through archive inspect/export.
 - **roofline** — engine stage telemetry bucketed into attention / ffn /
   lm_head, each classified against the *measured* bandwidth ceiling
   (bandwidth-bound / not-bandwidth-bound / indeterminate).

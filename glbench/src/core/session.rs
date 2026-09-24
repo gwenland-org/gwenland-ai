@@ -14,7 +14,7 @@ use crate::core::inference::VLInferenceSession;
 use crate::core::metrics::MeasurementSet;
 use crate::core::mode::{ENInferenceRole, ENSessionMode};
 use crate::core::result::SessionMetadata;
-use crate::core::schema::{field, ToJson};
+use crate::core::schema::{field, field_f64, field_str, ToJson};
 use crate::core::workload::WorkloadSpec;
 use crate::storage::digest::VLIntegrity;
 use crate::engine::metadata::EngineMetadata;
@@ -161,12 +161,16 @@ impl BenchmarkSession {
             engine,
             workload,
             measurements,
-            // Telemetry and behavior are not read back from the archive:
-            // reconstructing them adds a parser that can only ever agree with
-            // the writer. `inspect` re-renders the measured facts; the profile
-            // and behavior sections are live-run views. Revisit if archives
-            // need diffing (drift analysis will want exactly that).
-            telemetry: None,
+            // Telemetry is measured evidence, not a derived report. It must
+            // survive archive reads so inspect, export, and cross-run drift
+            // analysis see the same bottleneck facts as the live run.
+            telemetry: match v.get("telemetry") {
+                Some(t) if !matches!(t, Json::Null) => Some(telemetry_from_json(t)?),
+                _ => None,
+            },
+            // Behavior remains a live-run view for now. Its archive reader is
+            // separate scope because it has a much wider derived schema than
+            // the raw engine telemetry fixed in this wave.
             behavior: None,
             analysis: None,
             comparison: None,
@@ -703,6 +707,144 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
     ])
 }
 
+/// Reconstruct the raw telemetry fields written by [`telemetry_json`].
+/// Derived convenience values such as `share` and `gb_per_s` are deliberately
+/// ignored and recomputed from the raw counters by consumers.
+fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, String> {
+    use glcore::telemetry::{
+        BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile,
+        StageTiming,
+    };
+
+    fn required_u64(v: &Json, key: &str, path: &str) -> Result<u64, String> {
+        let value = field_f64(v, key).map_err(|error| format!("{path}: {error}"))?;
+        if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > u64::MAX as f64 {
+            return Err(format!("{path}.{key} is not a non-negative integer"));
+        }
+        Ok(value as u64)
+    }
+
+    fn optional_u64(v: &Json, key: &str, path: &str) -> Result<Option<u64>, String> {
+        match v.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(value) => {
+                let number = value
+                    .as_f64()
+                    .ok_or_else(|| format!("{path}.{key} is not a number or null"))?;
+                if !number.is_finite()
+                    || number < 0.0
+                    || number.fract() != 0.0
+                    || number > u64::MAX as f64
+                {
+                    return Err(format!("{path}.{key} is not a non-negative integer"));
+                }
+                Ok(Some(number as u64))
+            }
+        }
+    }
+
+    fn phase(v: &Json, path: &str) -> Result<PhaseProfile, String> {
+        let stages = field(v, "stages")
+            .map_err(|error| format!("{path}: {error}"))?
+            .as_arr()
+            .ok_or_else(|| format!("{path}.stages is not an array"))?;
+        let mut parsed = Vec::with_capacity(stages.len());
+        for (index, stage) in stages.iter().enumerate() {
+            let stage_path = format!("{path}.stages[{index}]");
+            parsed.push(StageTiming {
+                name: field_str(stage, "name")
+                    .map_err(|error| format!("{stage_path}: {error}"))?,
+                total_ms: field_f64(stage, "total_ms")
+                    .map_err(|error| format!("{stage_path}: {error}"))?,
+                calls: required_u64(stage, "calls", &stage_path)?,
+                bytes_read: optional_u64(stage, "bytes_read", &stage_path)?,
+                macs: optional_u64(stage, "macs", &stage_path)?,
+            });
+        }
+        Ok(PhaseProfile {
+            stages: parsed,
+            total_ms: field_f64(v, "total_ms").map_err(|error| format!("{path}: {error}"))?,
+        })
+    }
+
+    fn optional_phase(root: &Json, key: &str) -> Result<Option<PhaseProfile>, String> {
+        match root.get(key) {
+            None | Some(Json::Null) => Ok(None),
+            Some(value) => phase(value, &format!("telemetry.{key}")).map(Some),
+        }
+    }
+
+    let backend = match v.get("backend") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            let kernels = field(value, "kernels")?
+                .as_arr()
+                .ok_or_else(|| "telemetry.backend.kernels is not an array".to_string())?;
+            let mut parsed = Vec::with_capacity(kernels.len());
+            for (index, kernel) in kernels.iter().enumerate() {
+                let role = field_str(kernel, "role")
+                    .map_err(|error| format!("telemetry.backend.kernels[{index}]: {error}"))?;
+                let name = field_str(kernel, "kernel")
+                    .map_err(|error| format!("telemetry.backend.kernels[{index}]: {error}"))?;
+                parsed.push((role, name));
+            }
+            Some(BackendTelemetry {
+                simd_path: field_str(value, "simd_path")?,
+                threads: required_u64(value, "threads", "telemetry.backend")? as usize,
+                kernels: parsed,
+            })
+        }
+    };
+
+    let memory = match v.get("memory") {
+        None | Some(Json::Null) => None,
+        Some(value) => Some(MemoryTelemetry {
+            model_bytes: required_u64(value, "model_bytes", "telemetry.memory")?,
+            kv_cache_bytes: required_u64(value, "kv_cache_bytes", "telemetry.memory")?,
+            scratch_bytes: required_u64(value, "scratch_bytes", "telemetry.memory")?,
+        }),
+    };
+
+    let moe = match v.get("moe") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            let load = field(value, "expert_load")?
+                .as_arr()
+                .ok_or_else(|| "telemetry.moe.expert_load is not an array".to_string())?;
+            let mut expert_load = Vec::with_capacity(load.len());
+            for (index, count) in load.iter().enumerate() {
+                let number = count.as_f64().ok_or_else(|| {
+                    format!("telemetry.moe.expert_load[{index}] is not a number")
+                })?;
+                if !number.is_finite()
+                    || number < 0.0
+                    || number.fract() != 0.0
+                    || number > u64::MAX as f64
+                {
+                    return Err(format!(
+                        "telemetry.moe.expert_load[{index}] is not a non-negative integer"
+                    ));
+                }
+                expert_load.push(number as u64);
+            }
+            Some(MoeTelemetry {
+                num_experts: required_u64(value, "num_experts", "telemetry.moe")? as usize,
+                num_experts_per_tok: required_u64(value, "top_k", "telemetry.moe")? as usize,
+                expert_load,
+                moe_layers: required_u64(value, "moe_layers", "telemetry.moe")? as usize,
+            })
+        }
+    };
+
+    Ok(EngineTelemetry {
+        prefill: optional_phase(v, "prefill")?,
+        decode: optional_phase(v, "decode")?,
+        backend,
+        memory,
+        moe,
+    })
+}
+
 /// Reconstruct engine metadata from JSON (the fields comparison needs).
 fn engine_from_json(v: &Json) -> Result<EngineMetadata, String> {
     Ok(EngineMetadata {
@@ -887,5 +1029,58 @@ mod tests {
             assert!(analysis.contains_key(derived_field), "analysis missing {derived_field}");
             assert!(!measurements.contains_key(derived_field), "measurements leaked derived field {derived_field}");
         }
+    }
+
+    #[test]
+    fn telemetry_survives_a_full_session_json_round_trip() {
+        use glcore::telemetry::{
+            BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile,
+            StageTiming,
+        };
+
+        let mut session = BenchmarkSession::new(
+            SessionMetadata::new("telemetry-round-trip"),
+            EnvironmentSnapshot::probe(""),
+            EngineMetadata {
+                name: "glcuda".into(),
+                backend: "cuda".into(),
+                available: true,
+                model_arch: Some("qwen2".into()),
+                quantization: Some("Q8_0".into()),
+                thinking_capable: Some(false),
+            },
+            WorkloadSpec::default(),
+            MeasurementSet::default(),
+        );
+        let stage = StageTiming {
+            name: "attention_core".into(),
+            total_ms: 12.5,
+            calls: 24,
+            bytes_read: Some(4096),
+            macs: Some(8192),
+        };
+        session.telemetry = Some(EngineTelemetry {
+            prefill: Some(PhaseProfile { stages: vec![stage.clone()], total_ms: 13.0 }),
+            decode: Some(PhaseProfile { stages: vec![stage], total_ms: 14.0 }),
+            backend: Some(BackendTelemetry {
+                simd_path: "sm_75".into(),
+                threads: 128,
+                kernels: vec![("attention".into(), "gl_attn_rows_qk4_f32".into())],
+            }),
+            memory: Some(MemoryTelemetry {
+                model_bytes: 1_000,
+                kv_cache_bytes: 2_000,
+                scratch_bytes: 3_000,
+            }),
+            moe: Some(MoeTelemetry {
+                num_experts: 4,
+                num_experts_per_tok: 2,
+                expert_load: vec![10, 20, 30, 40],
+                moe_layers: 8,
+            }),
+        });
+
+        let back = BenchmarkSession::from_json(&session.to_json()).unwrap();
+        assert_eq!(back.telemetry, session.telemetry);
     }
 }

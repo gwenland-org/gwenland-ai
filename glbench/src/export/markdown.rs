@@ -3,6 +3,7 @@
 //! short prose summary.
 
 use crate::comparison::statistics::Stats;
+use crate::core::result::ENMeasurementMode;
 use crate::core::session::BenchmarkSession;
 use crate::measurement::memory::bytes_to_gib;
 
@@ -65,6 +66,31 @@ pub fn render(session: &BenchmarkSession) -> String {
         session.environment.runtime.glbench_version,
     ));
     s.push_str(&format!("- **Run at:** unix {}\n", session.metadata.created_unix));
+    let measurement = match session.metadata.measurement_mode {
+        ENMeasurementMode::Production => "production (throughput is eligible as production evidence)",
+        ENMeasurementMode::Instrumented => {
+            "INSTRUMENTED (diagnostic only; throughput is non-authoritative)"
+        }
+        ENMeasurementMode::Unknown => {
+            "UNKNOWN (legacy archive; throughput authority was not recorded)"
+        }
+    };
+    s.push_str(&format!("- **Measurement mode:** {measurement}\n"));
+    if let Some(dispatch) = &session.metadata.dispatch {
+        s.push_str(&format!(
+            "- **Dispatch config:** `{}`",
+            dispatch.config_fingerprint
+        ));
+        if !dispatch.engine_overrides.is_empty() {
+            let names: Vec<&str> = dispatch
+                .engine_overrides
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            s.push_str(&format!(" (overrides: `{}`)", names.join("`, `")));
+        }
+        s.push('\n');
+    }
     s.push_str(&format!(
         "- **Iterations:** {} warmup + {} measured\n\n",
         session.workload.warmup_iters, dec.count
@@ -636,6 +662,15 @@ mod tests {
         // RAM is either a real figure or the explicit not-available line —
         // never silently absent.
         assert!(s.contains("**RAM:**"), "{s}");
+    }
+
+    #[test]
+    fn instrumented_markdown_marks_throughput_non_authoritative() {
+        let mut sess = sample();
+        sess.metadata.measurement_mode = ENMeasurementMode::Instrumented;
+        let report = render(&sess);
+        assert!(report.contains("**Measurement mode:** INSTRUMENTED"), "{report}");
+        assert!(report.contains("throughput is non-authoritative"), "{report}");
     }
 
     #[test]

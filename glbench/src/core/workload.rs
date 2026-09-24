@@ -88,6 +88,10 @@ pub struct WorkloadSpec {
     /// when equal to `engine`: comparing an engine's output to itself always
     /// matches and would report a check that verified nothing.
     pub verify_against: Option<String>,
+    /// Ask the engine to collect stage-level profiling. This deliberately
+    /// changes the measurement mode to diagnostic-only because instrumentation
+    /// can perturb wall time.
+    pub instrument_engine: bool,
 }
 
 impl Default for WorkloadSpec {
@@ -105,6 +109,7 @@ impl Default for WorkloadSpec {
             kind: WorkloadKind::EndToEnd,
             cot_mode: None,
             verify_against: None,
+            instrument_engine: false,
         }
     }
 }
@@ -136,6 +141,7 @@ impl ToJson for WorkloadSpec {
                     None => Json::Null,
                 },
             ),
+            ("instrument_engine", Json::Bool(self.instrument_engine)),
         ])
     }
 }
@@ -164,6 +170,13 @@ impl FromJson for WorkloadSpec {
             // means "no cross-check was requested", not "was requested and
             // is now missing".
             verify_against: v.get("verify_against").and_then(|s| s.as_str()).map(String::from),
+            // Optional for archives written before production and instrumented
+            // runs were separated. The metadata carries `Unknown` for those;
+            // the workload merely records that no explicit request survives.
+            instrument_engine: v
+                .get("instrument_engine")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
         })
     }
 }
@@ -217,5 +230,14 @@ mod tests {
         map.remove("verify_against");
         let back = WorkloadSpec::from_json(&Json::Obj(map)).unwrap();
         assert_eq!(back.verify_against, None);
+    }
+
+    #[test]
+    fn instrument_engine_round_trips_and_defaults_off() {
+        let mut spec = WorkloadSpec::default();
+        assert!(!spec.instrument_engine);
+        spec.instrument_engine = true;
+        let back = WorkloadSpec::from_json(&spec.to_json()).unwrap();
+        assert!(back.instrument_engine);
     }
 }

@@ -130,8 +130,11 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
 
     // 6. Assemble the session, then run the derived passes.
     let label = default_label(spec);
+    let mut metadata = SessionMetadata::new(label);
+    metadata.measurement_mode = adapter.observation().measurement_mode;
+    metadata.dispatch = Some(adapter.observation().dispatch.clone());
     let mut session = BenchmarkSession::new(
-        SessionMetadata::new(label),
+        metadata,
         environment,
         engine_meta,
         spec.clone(),

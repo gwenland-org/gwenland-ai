@@ -6,6 +6,7 @@
 
 use crate::comparison::runs::ComparisonReport;
 use crate::comparison::statistics::Stats;
+use crate::core::result::ENMeasurementMode;
 use crate::core::session::BenchmarkSession;
 use crate::measurement::memory::bytes_to_gib;
 use crate::environment::bandwidth::CEILING_TOLERANCE;
@@ -32,6 +33,29 @@ pub fn session(session: &BenchmarkSession) -> String {
         session.environment.runtime.arch,
         session.environment.runtime.glbench_version,
     ));
+    match session.metadata.measurement_mode {
+        ENMeasurementMode::Production => {
+            s.push_str("measurement production | throughput is eligible as production evidence\n")
+        }
+        ENMeasurementMode::Instrumented => s.push_str(
+            "measurement INSTRUMENTED | diagnostic only; throughput is non-authoritative\n",
+        ),
+        ENMeasurementMode::Unknown => s.push_str(
+            "measurement UNKNOWN | legacy archive; throughput authority was not recorded\n",
+        ),
+    }
+    if let Some(dispatch) = &session.metadata.dispatch {
+        s.push_str(&format!("dispatch config {}", dispatch.config_fingerprint));
+        if !dispatch.engine_overrides.is_empty() {
+            let names: Vec<&str> = dispatch
+                .engine_overrides
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            s.push_str(&format!(" | overrides {}", names.join(",")));
+        }
+        s.push('\n');
+    }
     let hw = &session.environment.hardware;
     if let Some(name) = &hw.gpu.name {
         s.push_str(&format!(
@@ -706,6 +730,15 @@ mod tests {
         assert!(s.contains(std::env::consts::OS));
         assert!(s.contains(std::env::consts::ARCH));
         assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn instrumented_report_marks_throughput_non_authoritative() {
+        let mut sess = sample();
+        sess.metadata.measurement_mode = ENMeasurementMode::Instrumented;
+        let report = session(&sess);
+        assert!(report.contains("measurement INSTRUMENTED"), "{report}");
+        assert!(report.contains("throughput is non-authoritative"), "{report}");
     }
 
     #[test]

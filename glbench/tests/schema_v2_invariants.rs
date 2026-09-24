@@ -19,7 +19,7 @@ use glbench::core::availability::{self, ENAvailability, VLAvailabilityMap};
 use glbench::core::inference::VLInferenceSession;
 use glbench::core::metrics::{IterationMetrics, MeasurementSet};
 use glbench::core::mode::{ENInferenceRole, ENSessionMode};
-use glbench::core::result::SessionMetadata;
+use glbench::core::result::{ENMeasurementMode, SessionMetadata, VLDispatchProvenance};
 use glbench::core::session::BenchmarkSession;
 use glbench::core::workload::WorkloadSpec;
 use glbench::engine::metadata::EngineMetadata;
@@ -411,6 +411,9 @@ fn test6_a_v1_archive_reads_as_inference_only_with_an_empty_map_and_no_digest() 
 
     // The three D-20 defaults.
     assert_eq!(session.metadata.session_mode, ENSessionMode::InferenceOnly);
+    assert_eq!(session.metadata.measurement_mode, ENMeasurementMode::Unknown);
+    assert!(session.metadata.dispatch.is_none());
+    assert!(!session.workload.instrument_engine);
     assert!(
         session.availability.is_empty(),
         "a v1 archive has no availability block: {:?}",
@@ -446,7 +449,13 @@ fn test6_the_fixture_really_is_v1_shaped_not_a_v2_archive_in_disguise() {
         );
     }
     let metadata = value.get("metadata").unwrap().as_obj().unwrap();
-    for added_in_v2 in ["session_mode", "host_identifier", "collection_profile"] {
+    for added_in_v2 in [
+        "session_mode",
+        "host_identifier",
+        "collection_profile",
+        "measurement_mode",
+        "dispatch",
+    ] {
         assert!(
             !metadata.contains_key(added_in_v2),
             "fixture metadata carries the v2 key '{added_in_v2}'"
@@ -502,6 +511,12 @@ fn the_v2_envelope_survives_a_full_write_read_cycle() {
     let mut s = session("envelope");
     s.metadata.host_identifier = Some("ci-runner-3".to_string());
     s.metadata.collection_profile = Some("bits+weights".to_string());
+    s.metadata.measurement_mode = ENMeasurementMode::Instrumented;
+    s.metadata.dispatch = Some(VLDispatchProvenance {
+        config_fingerprint: "sha256-128:test".to_string(),
+        engine_overrides: vec![("GLPROC_PROFILE".to_string(), "1".to_string())],
+    });
+    s.workload.instrument_engine = true;
     availability::set_with_note(
         &mut s.availability,
         "analysis.roofline.ceiling_gbs",
@@ -515,6 +530,9 @@ fn the_v2_envelope_survives_a_full_write_read_cycle() {
 
     assert_eq!(back.metadata.host_identifier.as_deref(), Some("ci-runner-3"));
     assert_eq!(back.metadata.collection_profile.as_deref(), Some("bits+weights"));
+    assert_eq!(back.metadata.measurement_mode, ENMeasurementMode::Instrumented);
+    assert_eq!(back.metadata.dispatch, s.metadata.dispatch);
+    assert!(back.workload.instrument_engine);
     assert_eq!(back.metadata.session_mode, ENSessionMode::InferenceOnly);
     let entry = back
         .availability
