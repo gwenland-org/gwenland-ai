@@ -240,6 +240,54 @@ pub struct BackendTelemetry {
     pub kernels: Vec<(String, String)>,
 }
 
+/// GPU time accumulated for one submitted device entry.
+///
+/// `kind` distinguishes a kernel launch from a replayed device graph. A graph
+/// replay is deliberately not presented as one giant kernel: its internal
+/// kernels are opaque to the launch seam that timed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchTiming {
+    /// Device entry name, e.g. `"gl_attn_rows_qk4_f32"`.
+    pub name: String,
+    /// Submission kind, currently `"kernel"` or `"graph_replay"`.
+    pub kind: String,
+    /// Sum of device duration across every timed launch, milliseconds.
+    /// Concurrent streams can overlap, so this is work attribution rather
+    /// than an end-to-end wall clock.
+    pub total_ms: f64,
+    /// Number of successfully timed launches aggregated into `total_ms`.
+    pub launches: u64,
+}
+
+/// Per-dispatch GPU timing collected by an engine-native launch observer.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchProfile {
+    /// Entries in hotspot order (largest accumulated device time first).
+    pub entries: Vec<LaunchTiming>,
+    /// Timing mechanism, e.g. `"cuda_events_on_launch_stream"`.
+    pub timing_source: String,
+    /// Exact observer boundary, including known blind spots.
+    pub coverage: String,
+    /// Successful dispatches seen by the observer.
+    pub observed_launches: u64,
+    /// Dispatches whose event pair produced a valid duration.
+    pub timed_launches: u64,
+}
+
+impl LaunchProfile {
+    /// Sum of attributed device work. This is not wall time when streams
+    /// overlap; [`LaunchTiming::total_ms`] documents that distinction.
+    pub fn total_ms(&self) -> f64 {
+        self.entries.iter().map(|entry| entry.total_ms).sum()
+    }
+
+    /// Dispatches observed but not timed because the event API refused a
+    /// record or query.
+    pub fn untimed_launches(&self) -> u64 {
+        self.observed_launches.saturating_sub(self.timed_launches)
+    }
+}
+
 /// Everything an engine chooses to report about a completed run.
 ///
 /// All fields optional: an engine that collects nothing returns
@@ -253,6 +301,8 @@ pub struct EngineTelemetry {
     pub decode: Option<PhaseProfile>,
     /// Which kernels and SIMD path the engine selected.
     pub backend: Option<BackendTelemetry>,
+    /// Per-kernel or per-graph-replay GPU time from the native launch seam.
+    pub launches: Option<LaunchProfile>,
     /// Memory breakdown.
     pub memory: Option<MemoryTelemetry>,
     /// MoE routing stats. `None` on a dense model — which is itself the signal
@@ -369,6 +419,26 @@ mod tests {
     fn empty_telemetry_is_all_none() {
         // An engine that collects nothing must cost nothing and report nothing.
         let t = EngineTelemetry::default();
-        assert!(t.prefill.is_none() && t.decode.is_none() && t.moe.is_none());
+        assert!(t.prefill.is_none() && t.decode.is_none() && t.launches.is_none() && t.moe.is_none());
+    }
+
+    #[test]
+    fn launch_profile_distinguishes_work_sum_from_missing_timings() {
+        let profile = LaunchProfile {
+            entries: vec![
+                LaunchTiming {
+                    name: "attention".into(), kind: "kernel".into(), total_ms: 4.5, launches: 3,
+                },
+                LaunchTiming {
+                    name: "decode".into(), kind: "graph_replay".into(), total_ms: 2.0, launches: 2,
+                },
+            ],
+            timing_source: "cuda_events_on_launch_stream".into(),
+            coverage: "driver launch seam".into(),
+            observed_launches: 7,
+            timed_launches: 5,
+        };
+        assert_eq!(profile.total_ms(), 6.5);
+        assert_eq!(profile.untimed_launches(), 2);
     }
 }

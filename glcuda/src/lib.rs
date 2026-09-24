@@ -286,12 +286,15 @@ impl GlEngine for GlcudaEngine {
         let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
             MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
         });
+        let launches = self.cuda.as_ref().and_then(Cuda::kernel_profile);
 
         // Absence must read as "not measured", never as a zeroed report.
-        if prefill.is_none() && memory.is_none() {
+        if prefill.is_none() && launches.is_none() && memory.is_none() {
             return None;
         }
-        Some(EngineTelemetry { prefill, decode: None, backend: None, memory, moe: None })
+        Some(EngineTelemetry {
+            prefill, decode: None, backend: None, launches, memory, moe: None,
+        })
     }
 
     fn init(&mut self) -> Result<(), GlError> {

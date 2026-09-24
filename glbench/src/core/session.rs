@@ -661,6 +661,23 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
         }
     };
 
+    let launches = match &t.launches {
+        Some(profile) => Json::obj([
+            ("timing_source", Json::Str(profile.timing_source.clone())),
+            ("coverage", Json::Str(profile.coverage.clone())),
+            ("observed_launches", Json::Num(profile.observed_launches as f64)),
+            ("timed_launches", Json::Num(profile.timed_launches as f64)),
+            ("total_ms", Json::Num(profile.total_ms())),
+            ("entries", Json::Arr(profile.entries.iter().map(|entry| Json::obj([
+                ("name", Json::Str(entry.name.clone())),
+                ("kind", Json::Str(entry.kind.clone())),
+                ("total_ms", Json::Num(entry.total_ms)),
+                ("launches", Json::Num(entry.launches as f64)),
+            ])).collect())),
+        ]),
+        None => Json::Null,
+    };
+
     let memory = match &t.memory {
         Some(m) => Json::obj([
             ("model_bytes", Json::Num(m.model_bytes as f64)),
@@ -702,6 +719,7 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
         ("prefill", t.prefill.as_ref().map(phase).unwrap_or(Json::Null)),
         ("decode", t.decode.as_ref().map(phase).unwrap_or(Json::Null)),
         ("backend", backend),
+        ("launches", launches),
         ("memory", memory),
         ("moe", moe),
     ])
@@ -712,8 +730,8 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
 /// ignored and recomputed from the raw counters by consumers.
 fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, String> {
     use glcore::telemetry::{
-        BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile,
-        StageTiming,
+        BackendTelemetry, EngineTelemetry, LaunchProfile, LaunchTiming, MemoryTelemetry,
+        MoeTelemetry, PhaseProfile, StageTiming,
     };
 
     fn required_u64(v: &Json, key: &str, path: &str) -> Result<u64, String> {
@@ -805,6 +823,36 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
         }),
     };
 
+    let launches = match v.get("launches") {
+        None | Some(Json::Null) => None,
+        Some(value) => {
+            let raw_entries = field(value, "entries")?.as_arr()
+                .ok_or_else(|| "telemetry.launches.entries is not an array".to_string())?;
+            let mut entries = Vec::with_capacity(raw_entries.len());
+            for (index, entry) in raw_entries.iter().enumerate() {
+                let path = format!("telemetry.launches.entries[{index}]");
+                entries.push(LaunchTiming {
+                    name: field_str(entry, "name").map_err(|error| format!("{path}: {error}"))?,
+                    kind: field_str(entry, "kind").map_err(|error| format!("{path}: {error}"))?,
+                    total_ms: field_f64(entry, "total_ms").map_err(|error| format!("{path}: {error}"))?,
+                    launches: required_u64(entry, "launches", &path)?,
+                });
+            }
+            let observed_launches = required_u64(value, "observed_launches", "telemetry.launches")?;
+            let timed_launches = required_u64(value, "timed_launches", "telemetry.launches")?;
+            if timed_launches > observed_launches {
+                return Err("telemetry.launches.timed_launches exceeds observed_launches".to_string());
+            }
+            Some(LaunchProfile {
+                entries,
+                timing_source: field_str(value, "timing_source")?,
+                coverage: field_str(value, "coverage")?,
+                observed_launches,
+                timed_launches,
+            })
+        }
+    };
+
     let moe = match v.get("moe") {
         None | Some(Json::Null) => None,
         Some(value) => {
@@ -840,6 +888,7 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
         prefill: optional_phase(v, "prefill")?,
         decode: optional_phase(v, "decode")?,
         backend,
+        launches,
         memory,
         moe,
     })
@@ -1034,8 +1083,8 @@ mod tests {
     #[test]
     fn telemetry_survives_a_full_session_json_round_trip() {
         use glcore::telemetry::{
-            BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile,
-            StageTiming,
+            BackendTelemetry, EngineTelemetry, LaunchProfile, LaunchTiming, MemoryTelemetry,
+            MoeTelemetry, PhaseProfile, StageTiming,
         };
 
         let mut session = BenchmarkSession::new(
@@ -1066,6 +1115,22 @@ mod tests {
                 simd_path: "sm_75".into(),
                 threads: 128,
                 kernels: vec![("attention".into(), "gl_attn_rows_qk4_f32".into())],
+            }),
+            launches: Some(LaunchProfile {
+                entries: vec![
+                    LaunchTiming {
+                        name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
+                        total_ms: 8.25, launches: 24,
+                    },
+                    LaunchTiming {
+                        name: "cuda_graph_replay".into(), kind: "graph_replay".into(),
+                        total_ms: 3.5, launches: 8,
+                    },
+                ],
+                timing_source: "cuda_events_on_launch_stream".into(),
+                coverage: "direct launches and graph replays".into(),
+                observed_launches: 33,
+                timed_launches: 32,
             }),
             memory: Some(MemoryTelemetry {
                 model_bytes: 1_000,

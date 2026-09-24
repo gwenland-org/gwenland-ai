@@ -575,6 +575,7 @@ impl Prof {
             prefill,
             decode,
             backend: None, // filled by the engine, which knows the strategy
+            launches: None,
             memory: None,  // filled by the engine, which knows the model size
             moe,
         }

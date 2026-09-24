@@ -269,6 +269,31 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
         }
     }
 
+    if let Some(profile) = &t.launches {
+        let total_ms = profile.total_ms();
+        s.push_str(&format!("\nCUDA dispatch profile ({total_ms:.2} ms summed GPU work)\n"));
+        s.push_str(&format!(
+            "  source: {} | observed {} | timed {} | untimed {}\n",
+            profile.timing_source, profile.observed_launches, profile.timed_launches,
+            profile.untimed_launches(),
+        ));
+        s.push_str(&format!("  coverage: {}\n", profile.coverage));
+        s.push_str("  note: summed event durations are work attribution, not wall time when streams overlap\n");
+        if !profile.entries.is_empty() {
+            let mut tab = Table::new(&["kind", "entry", "launches", "total ms", "ms/launch", "share"])
+                .right_align(2).right_align(3).right_align(4).right_align(5);
+            for entry in &profile.entries {
+                tab.row(&[
+                    entry.kind.clone(), entry.name.clone(), entry.launches.to_string(),
+                    format!("{:.3}", entry.total_ms),
+                    if entry.launches > 0 { format!("{:.4}", entry.total_ms / entry.launches as f64) } else { "-".into() },
+                    if total_ms > 0.0 { format!("{:.1}%", entry.total_ms / total_ms * 100.0) } else { "-".into() },
+                ]);
+            }
+            s.push_str(&tab.render());
+        }
+    }
+
     // Timeline. Decode first: it is the phase that dominates a real session,
     // and the one whose hotspot decides what to optimize next.
     for (label, phase) in [("decode", &t.decode), ("prefill", &t.prefill)] {
@@ -739,6 +764,33 @@ mod tests {
         let report = session(&sess);
         assert!(report.contains("measurement INSTRUMENTED"), "{report}");
         assert!(report.contains("throughput is non-authoritative"), "{report}");
+    }
+
+    #[test]
+    fn launch_profile_names_provenance_and_graph_replays() {
+        let report = telemetry(
+            &glcore::telemetry::EngineTelemetry {
+                launches: Some(glcore::telemetry::LaunchProfile {
+                    entries: vec![glcore::telemetry::LaunchTiming {
+                        name: "cuda_graph_replay".into(),
+                        kind: "graph_replay".into(),
+                        total_ms: 2.5,
+                        launches: 5,
+                    }],
+                    timing_source: "cuda_events_on_launch_stream".into(),
+                    coverage: "graph internals excluded".into(),
+                    observed_launches: 6,
+                    timed_launches: 5,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(report.contains("CUDA dispatch profile"), "{report}");
+        assert!(report.contains("cuda_events_on_launch_stream"), "{report}");
+        assert!(report.contains("graph_replay"), "{report}");
+        assert!(report.contains("untimed 1"), "{report}");
+        assert!(report.contains("not wall time"), "{report}");
     }
 
     #[test]

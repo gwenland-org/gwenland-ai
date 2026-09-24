@@ -445,6 +445,29 @@ fn telemetry_section(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option
         s.push('\n');
     }
 
+    if let Some(profile) = &t.launches {
+        s.push_str("### CUDA dispatch profile\n\n");
+        s.push_str(&format!(
+            "- **Timing source:** `{}`\n- **Coverage:** {}\n- **Dispatches:** {} observed · {} timed · {} untimed\n- **Summed GPU work:** {:.3} ms (not wall time when streams overlap)\n\n",
+            profile.timing_source, profile.coverage, profile.observed_launches,
+            profile.timed_launches, profile.untimed_launches(), profile.total_ms(),
+        ));
+        if !profile.entries.is_empty() {
+            s.push_str("| Kind | Entry | Launches | Total ms | ms/launch | Work share |\n");
+            s.push_str("|------|-------|---------:|---------:|----------:|-----------:|\n");
+            let total_ms = profile.total_ms();
+            for entry in &profile.entries {
+                let per_launch = if entry.launches > 0 { format!("{:.4}", entry.total_ms / entry.launches as f64) } else { "-".into() };
+                let share = if total_ms > 0.0 { format!("{:.1}%", entry.total_ms / total_ms * 100.0) } else { "-".into() };
+                s.push_str(&format!(
+                    "| {} | `{}` | {} | {:.3} | {} | {} |\n",
+                    entry.kind, entry.name, entry.launches, entry.total_ms, per_launch, share,
+                ));
+            }
+            s.push('\n');
+        }
+    }
+
     for (label, phase) in [("Decode", &t.decode), ("Prefill", &t.prefill)] {
         let Some(p) = phase else { continue };
         if p.total_ms <= 0.0 {
@@ -671,6 +694,32 @@ mod tests {
         let report = render(&sess);
         assert!(report.contains("**Measurement mode:** INSTRUMENTED"), "{report}");
         assert!(report.contains("throughput is non-authoritative"), "{report}");
+    }
+
+    #[test]
+    fn launch_profile_markdown_preserves_observer_limits() {
+        let report = telemetry_section(
+            &glcore::telemetry::EngineTelemetry {
+                launches: Some(glcore::telemetry::LaunchProfile {
+                    entries: vec![glcore::telemetry::LaunchTiming {
+                        name: "gl_attn_rows_qk4_f32".into(),
+                        kind: "kernel".into(),
+                        total_ms: 7.5,
+                        launches: 3,
+                    }],
+                    timing_source: "cuda_events_on_launch_stream".into(),
+                    coverage: "graph internals excluded".into(),
+                    observed_launches: 4,
+                    timed_launches: 3,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(report.contains("CUDA dispatch profile"), "{report}");
+        assert!(report.contains("graph internals excluded"), "{report}");
+        assert!(report.contains("1 untimed"), "{report}");
+        assert!(report.contains("not wall time"), "{report}");
     }
 
     #[test]

@@ -32,7 +32,8 @@ pub mod trace;
 pub use engine_trait::{EngineSpec, GlEngine, InferInput, InferOutput};
 pub use stopping::StoppingCriteria;
 pub use telemetry::{
-    BackendTelemetry, EngineTelemetry, MemoryTelemetry, MoeTelemetry, PhaseProfile, StageTiming,
+    BackendTelemetry, EngineTelemetry, LaunchProfile, LaunchTiming, MemoryTelemetry, MoeTelemetry,
+    PhaseProfile, StageTiming,
 };
 pub use trace::{TokenTrace, TraceConfig};
 pub use error::GlError;

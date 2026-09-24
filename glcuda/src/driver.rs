@@ -5,7 +5,8 @@
 //! and kernel launch. Everything numeric happens in the PTX kernels.
 
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use glcore::GlError;
 
@@ -105,6 +106,113 @@ impl Drop for EventRing {
 unsafe impl Send for EventRing {}
 unsafe impl Sync for EventRing {}
 
+const KERNEL_TIMING_SOURCE: &str = "cuda_events_on_launch_stream";
+const MAX_KERNEL_EVENT_PAIRS: usize = 16_384;
+const KERNEL_TIMING_COVERAGE: &str =
+    "successful direct kernel launches and CUDA graph replays since engine init, including warmup; graph internals excluded; at most 16384 event pairs";
+
+/// Keep entry names beside copyable CUDA handles without changing the public
+/// `get_function(&str)` contract. Names are resolved only at module load, and
+/// equal names share one process-lifetime allocation.
+fn intern_kernel_name(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<std::collections::BTreeMap<String, &'static str>>> =
+        OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let Ok(mut names) = names.lock() else {
+        return Box::leak(name.to_string().into_boxed_str());
+    };
+    if let Some(&name) = names.get(name) {
+        return name;
+    }
+    let interned = Box::leak(name.to_string().into_boxed_str());
+    names.insert(interned.to_string(), interned);
+    interned
+}
+
+struct KernelLaunchRecord {
+    name: &'static str,
+    kind: &'static str,
+    events: EventRing,
+}
+
+#[derive(Default)]
+struct KernelProfilerState {
+    records: Vec<KernelLaunchRecord>,
+    observed_launches: u64,
+    cached: Option<glcore::telemetry::LaunchProfile>,
+}
+
+/// Opt-in native launch observer. It exists only when `GLCUDA_TELEMETRY` was
+/// present before CUDA initialization, so production allocates no events and
+/// acquires no profiler lock.
+struct KernelProfiler {
+    state: Mutex<KernelProfilerState>,
+    reserved_event_pairs: AtomicUsize,
+}
+
+impl KernelProfiler {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(KernelProfilerState::default()),
+            reserved_event_pairs: AtomicUsize::new(0),
+        }
+    }
+
+    fn reserve_event_pair(&self) -> bool {
+        self.reserved_event_pairs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                (reserved < MAX_KERNEL_EVENT_PAIRS).then_some(reserved + 1)
+            })
+            .is_ok()
+    }
+
+    fn record(&self, name: &'static str, kind: &'static str, events: Option<EventRing>) {
+        let Ok(mut state) = self.state.lock() else { return };
+        state.observed_launches += 1;
+        state.cached = None;
+        if let Some(events) = events {
+            state.records.push(KernelLaunchRecord { name, kind, events });
+        }
+    }
+
+    fn snapshot(&self) -> Option<glcore::telemetry::LaunchProfile> {
+        let mut state = self.state.lock().ok()?;
+        if let Some(snapshot) = &state.cached {
+            return Some(snapshot.clone());
+        }
+        let mut grouped = std::collections::BTreeMap::<
+            (&'static str, &'static str), (f64, u64),
+        >::new();
+        let mut timed_launches = 0u64;
+        for record in &state.records {
+            let Some(ms) = record.events.elapsed_ms(0, 1) else { continue };
+            let entry = grouped.entry((record.kind, record.name)).or_default();
+            entry.0 += ms;
+            entry.1 += 1;
+            timed_launches += 1;
+        }
+        let mut entries: Vec<glcore::telemetry::LaunchTiming> = grouped
+            .into_iter()
+            .map(|((kind, name), (total_ms, launches))| glcore::telemetry::LaunchTiming {
+                name: name.to_string(), kind: kind.to_string(), total_ms, launches,
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.total_ms.partial_cmp(&a.total_ms).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.name.cmp(&b.name))
+        });
+        let snapshot = glcore::telemetry::LaunchProfile {
+            entries,
+            timing_source: KERNEL_TIMING_SOURCE.to_string(),
+            coverage: KERNEL_TIMING_COVERAGE.to_string(),
+            observed_launches: state.observed_launches,
+            timed_launches,
+        };
+        state.cached = Some(snapshot.clone());
+        Some(snapshot)
+    }
+}
+
 /// Returned when graph capture or replay is asked of a driver that does not
 /// export the CUDA Graph API. Not a failure state: the caller is expected to
 /// fall back to issuing kernels individually.
@@ -179,6 +287,11 @@ pub struct Cuda {
     /// graph instead of executing. `AtomicPtr` so `Cuda` stays `Sync`;
     /// only ever flipped between launches by the single owning thread.
     launch_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// Capture-time kernel nodes are excluded; each future graph replay is
+    /// timed as one dispatch because its internal launches are opaque here.
+    capture_active: AtomicBool,
+    /// Native launch timing, allocated only for an instrumented run.
+    kernel_profiler: Option<KernelProfiler>,
     /// Streams for issuing independent prefill sub-slabs concurrently.
     ///
     /// `None` unless `GLCUDA_MULTI_STREAM_PREFILL` is set, and never created
@@ -335,6 +448,9 @@ impl Cuda {
                 device,
                 ctx,
                 launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                capture_active: AtomicBool::new(false),
+                kernel_profiler: std::env::var_os("GLCUDA_TELEMETRY")
+                    .is_some().then(KernelProfiler::new),
                 prefill_streams: std::sync::OnceLock::new(),
                 info: DeviceInfo {
                     name,
@@ -568,7 +684,7 @@ impl Cuda {
         // the handle is live for this context; `blocks` is a local the driver
         // only writes. Taking `Kernel` rather than a raw `CUfunction` is what
         // keeps this callable safely, exactly as `launch` does.
-        let rc = unsafe { query(&mut blocks, func.0, block_threads, dynamic_smem) };
+        let rc = unsafe { query(&mut blocks, func.raw, block_threads, dynamic_smem) };
         (rc == 0).then_some(blocks)
     }
 
@@ -580,9 +696,23 @@ impl Cuda {
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<(), GlError> {
-        let stream = self
-            .launch_stream
-            .load(std::sync::atomic::Ordering::Relaxed);
+        if self.kernel_profiler.is_some() && !self.capture_active.load(Ordering::Relaxed) {
+            return self.observe_dispatch(f.name, "kernel", || {
+                self.launch_raw(f, grid, block, shared_bytes, params)
+            });
+        }
+        self.launch_raw(f, grid, block, shared_bytes, params)
+    }
+
+    fn launch_raw(
+        &self,
+        f: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<(), GlError> {
+        let stream = self.launch_stream.load(Ordering::Relaxed);
         // SAFETY: f belongs to a live module on this context; params
         // pointers are valid for the duration of the call; stream is NULL
         // or a live stream owned for the length of a capture.
@@ -590,7 +720,7 @@ impl Cuda {
             check(
                 &self.api,
                 (self.api.cu_launch_kernel)(
-                    f.0,
+                    f.raw,
                     grid.0,
                     grid.1,
                     grid.2,
@@ -605,6 +735,33 @@ impl Cuda {
                 "cuLaunchKernel",
             )
         }
+    }
+
+    /// Submit one profiled device entry with an event pair on its real stream.
+    fn observe_dispatch<T>(
+        &self,
+        name: &'static str,
+        kind: &'static str,
+        submit: impl FnOnce() -> Result<T, GlError>,
+    ) -> Result<T, GlError> {
+        let events = self.kernel_profiler.as_ref()
+            .filter(|profiler| profiler.reserve_event_pair())
+            .and_then(|_| self.event_ring(2));
+        if let Some(events) = events.as_ref() { events.record(self, 0); }
+        let result = submit();
+        if result.is_ok() {
+            if let Some(events) = events.as_ref() { events.record(self, 1); }
+            if let Some(profiler) = &self.kernel_profiler {
+                profiler.record(name, kind, events);
+            }
+        }
+        result
+    }
+
+    /// Snapshot the native launch observer. `None` means it was disabled
+    /// before CUDA initialization.
+    pub fn kernel_profile(&self) -> Option<glcore::telemetry::LaunchProfile> {
+        self.kernel_profiler.as_ref()?.snapshot()
     }
 
     /// True when this driver exports the CUDA event entry points, i.e.
@@ -702,6 +859,7 @@ impl Cuda {
 
         // Point launches at the capture stream; guarantee restore + destroy.
         self.launch_stream.store(stream, Ordering::Relaxed);
+        self.capture_active.store(true, Ordering::Relaxed);
         let result = (|| -> Result<GraphExec, GlError> {
             // SAFETY: stream is live and idle.
             unsafe {
@@ -734,6 +892,7 @@ impl Cuda {
         // stream regardless of outcome.
         self.launch_stream
             .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.capture_active.store(false, Ordering::Relaxed);
         // SAFETY: stream is live and no longer referenced.
         unsafe {
             let _ = (self.api.cu_stream_destroy)(stream);
@@ -869,14 +1028,15 @@ impl Cuda {
         let launch = self
             .cu_graph_launch_fn()
             .ok_or_else(|| GlError::Engine(GRAPHS_UNSUPPORTED.into()))?;
-        // SAFETY: exec is a live instantiated graph; NULL = default stream.
-        unsafe {
-            check(
-                &self.api,
-                launch(exec.exec, std::ptr::null_mut()),
-                "cuGraphLaunch",
-            )?
+        let submit = || {
+            // SAFETY: exec is a live instantiated graph; NULL = default stream.
+            unsafe { check(&self.api, launch(exec.exec, std::ptr::null_mut()), "cuGraphLaunch") }
         };
+        if self.kernel_profiler.is_some() {
+            self.observe_dispatch("cuda_graph_replay", "graph_replay", submit)?;
+        } else {
+            submit()?;
+        }
         self.synchronize()
     }
 }
@@ -897,6 +1057,7 @@ impl Drop for Cuda {
         // was already written, so the measurements survived and only the
         // process died. A crash that arrives after the useful work is the
         // easiest kind to dismiss and still means undefined behaviour ran.
+        drop(self.kernel_profiler.take());
         drop(self.prefill_streams.take());
         // SAFETY: releasing a context we retained; errors on teardown are
         // unreportable, so they are intentionally ignored.
@@ -909,7 +1070,10 @@ impl Drop for Cuda {
 /// A resolved kernel handle, owned by its module — valid only while that
 /// `Module` is alive. Plain data; copying does not duplicate GPU state.
 #[derive(Clone, Copy)]
-pub struct Kernel(CUfunction);
+pub struct Kernel {
+    raw: CUfunction,
+    name: &'static str,
+}
 
 // SAFETY: function handles are context-level objects; the driver API is
 // thread-safe.
@@ -942,7 +1106,7 @@ impl Module {
                 "cuModuleGetFunction",
             )?
         };
-        Ok(Kernel(f))
+        Ok(Kernel { raw: f, name: intern_kernel_name(name) })
     }
 }
 
@@ -979,5 +1143,27 @@ impl Drop for GraphExec {
                 let _ = destroy(self.exec);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_profiler_bounds_event_pair_retention() {
+        let profiler = KernelProfiler::new();
+        for _ in 0..MAX_KERNEL_EVENT_PAIRS {
+            assert!(profiler.reserve_event_pair());
+        }
+        assert!(!profiler.reserve_event_pair());
+    }
+
+    #[test]
+    fn kernel_names_are_interned_without_requiring_static_input() {
+        let dynamic = String::from("gl_test_entry");
+        let first = intern_kernel_name(&dynamic);
+        let second = intern_kernel_name("gl_test_entry");
+        assert!(std::ptr::eq(first, second));
     }
 }
