@@ -44,6 +44,12 @@ pub const ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
 pub const ATTR_COMPUTE_CAPABILITY_MAJOR: i32 = 75;
 pub const ATTR_COMPUTE_CAPABILITY_MINOR: i32 = 76;
 
+// cuFuncGetAttribute selectors (CUfunction_attribute). These stable selectors
+// expose compiler/JIT resource decisions without requiring a CUDA toolkit.
+pub const FUNC_ATTR_SHARED_SIZE_BYTES: i32 = 1;
+pub const FUNC_ATTR_LOCAL_SIZE_BYTES: i32 = 3;
+pub const FUNC_ATTR_NUM_REGS: i32 = 4;
+
 // CUjit_option selectors (for cuModuleLoadDataEx JIT log capture).
 pub const JIT_INFO_LOG_BUFFER: i32 = 3;
 pub const JIT_INFO_LOG_BUFFER_SIZE_BYTES: i32 = 4;
@@ -161,6 +167,11 @@ pub struct DriverApi {
         *mut *mut c_void, // kernelParams
         *mut *mut c_void, // extra
     ) -> CUresult,
+
+    /// Optional because this is diagnostic metadata. A driver that cannot
+    /// expose compiled function resources must still be able to run kernels.
+    pub cu_func_get_attribute:
+        Option<unsafe extern "system" fn(*mut i32, i32, CUfunction) -> CUresult>,
 
     // --- Streams + CUDA Graphs (M2.2) ---
     pub cu_stream_create: unsafe extern "system" fn(*mut CUstream, u32) -> CUresult,
@@ -307,6 +318,7 @@ impl DriverApi {
             cu_memcpy_dtod: sym_v2(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0")?,
             cu_mem_get_info: sym_v2(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0")?,
             cu_launch_kernel: sym(lib, b"cuLaunchKernel\0")?,
+            cu_func_get_attribute: sym_opt(lib, &[b"cuFuncGetAttribute\0"]),
 
             cu_stream_create: sym(lib, b"cuStreamCreate\0")?,
             cu_stream_destroy: sym_v2(lib, b"cuStreamDestroy_v2\0", b"cuStreamDestroy\0")?,

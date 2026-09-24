@@ -13,7 +13,8 @@ use glcore::GlError;
 use crate::ffi::{
     CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule,
     CUresult, CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
-    ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
+    ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS, FUNC_ATTR_LOCAL_SIZE_BYTES, FUNC_ATTR_NUM_REGS,
+    FUNC_ATTR_SHARED_SIZE_BYTES,
 };
 
 /// The process-wide driver API table, loaded on first use. `None` when the
@@ -116,7 +117,7 @@ const MAX_KERNEL_EVENT_PAIRS: usize = 16_384;
 /// Human-readable scope stored with every profile so a result cannot be read
 /// as more complete than the observer really is.
 const KERNEL_TIMING_COVERAGE: &str =
-    "successful direct kernel launches and CUDA graph replays since engine init, including warmup; graph internals excluded; at most 16384 event pairs";
+    "successful direct kernel launches and CUDA graph replays since engine init, including warmup; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
 
 /// Give a kernel name process lifetime so the copyable [`Kernel`] handle can
 /// carry it without owning or cloning a `String` on every launch.
@@ -150,8 +151,22 @@ struct KernelLaunchRecord {
     /// `kernel` and `graph_replay` must stay distinct: a graph contains many
     /// kernels, but this launch seam can only time the replay as one unit.
     kind: &'static str,
+    /// Exact launch shape and the driver's resource projection. `None` for a
+    /// graph replay because its internal nodes are hidden behind one handle.
+    config: Option<glcore::telemetry::LaunchConfig>,
     /// Start/end events remain alive until `snapshot` reads their timestamps.
     events: EventRing,
+}
+
+/// Cache key for resource queries whose answers stay fixed for a launch shape.
+/// The raw handle distinguishes equal entry names loaded from different PTX
+/// modules; the geometry distinguishes one entry launched in several ways.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KernelResourceKey {
+    function: usize,
+    grid: [u32; 3],
+    block: [u32; 3],
+    dynamic_shared_bytes: u32,
 }
 
 /// Mutable evidence accumulated across the lifetime of one CUDA engine.
@@ -160,6 +175,10 @@ struct KernelProfilerState {
     /// Dispatches with an event pair. Missing pairs are represented by the
     /// gap between `observed_launches` and the snapshot's `timed_launches`.
     records: Vec<KernelLaunchRecord>,
+    /// CUDA function attributes are immutable after module load, while the
+    /// occupancy answer is fixed by function, block shape, and dynamic shared
+    /// memory. Cache both so an instrumented run queries each variant once.
+    configs: std::collections::BTreeMap<KernelResourceKey, glcore::telemetry::LaunchConfig>,
     /// Successful submissions seen since CUDA initialization, including
     /// warmup. Failed CUDA submissions are errors, not performance samples.
     observed_launches: u64,
@@ -210,15 +229,41 @@ impl KernelProfiler {
     /// failed, or the bounded event budget is exhausted. The launch remains
     /// observable through `observed_launches` instead of being reported as a
     /// zero-duration sample.
-    fn record(&self, name: &'static str, kind: &'static str, events: Option<EventRing>) {
+    fn record(
+        &self,
+        name: &'static str,
+        kind: &'static str,
+        config: Option<glcore::telemetry::LaunchConfig>,
+        events: Option<EventRing>,
+    ) {
         // Profiling is diagnostic. If another profiler thread panicked while
         // holding this lock, drop this sample instead of failing inference.
         let Ok(mut state) = self.state.lock() else { return };
         state.observed_launches += 1;
         state.cached = None;
         if let Some(events) = events {
-            state.records.push(KernelLaunchRecord { name, kind, events });
+            state.records.push(KernelLaunchRecord { name, kind, config, events });
         }
+    }
+
+    /// Return cached resource metadata, computing it once for a new launch
+    /// shape. A poisoned diagnostic lock skips caching; the launch itself is
+    /// still allowed to proceed.
+    fn config_for(
+        &self,
+        key: KernelResourceKey,
+        build: impl FnOnce() -> glcore::telemetry::LaunchConfig,
+    ) -> glcore::telemetry::LaunchConfig {
+        if let Ok(state) = self.state.lock() {
+            if let Some(config) = state.configs.get(&key) {
+                return *config;
+            }
+        }
+        let config = build();
+        if let Ok(mut state) = self.state.lock() {
+            state.configs.entry(key).or_insert(config);
+        }
+        config
     }
 
     /// Wait for recorded end events, aggregate them by `(kind, name)`, and
@@ -239,20 +284,20 @@ impl KernelProfiler {
         // explicit tie-breakers below then keep archives stable when two
         // entries have equal measured time.
         let mut grouped = std::collections::BTreeMap::<
-            (&'static str, &'static str), (f64, u64),
+            (&'static str, &'static str, Option<glcore::telemetry::LaunchConfig>), (f64, u64),
         >::new();
         let mut timed_launches = 0u64;
         for record in &state.records {
             let Some(ms) = record.events.elapsed_ms(0, 1) else { continue };
-            let entry = grouped.entry((record.kind, record.name)).or_default();
+            let entry = grouped.entry((record.kind, record.name, record.config)).or_default();
             entry.0 += ms;
             entry.1 += 1;
             timed_launches += 1;
         }
         let mut entries: Vec<glcore::telemetry::LaunchTiming> = grouped
             .into_iter()
-            .map(|((kind, name), (total_ms, launches))| glcore::telemetry::LaunchTiming {
-                name: name.to_string(), kind: kind.to_string(), total_ms, launches,
+            .map(|((kind, name, config), (total_ms, launches))| glcore::telemetry::LaunchTiming {
+                name: name.to_string(), kind: kind.to_string(), total_ms, launches, config,
             })
             .collect();
         entries.sort_by(|a, b| {
@@ -744,6 +789,69 @@ impl Cuda {
         (rc == 0).then_some(blocks)
     }
 
+    /// Read one immutable compiler/JIT resource attribute for a kernel.
+    /// Missing symbols, unsupported selectors, and invalid negative values are
+    /// reported as unavailable metadata rather than inference failures.
+    fn function_attribute(&self, func: Kernel, attribute: i32) -> Option<u32> {
+        let query = self.api.cu_func_get_attribute?;
+        let mut value = 0i32;
+        // SAFETY: `func` came from a live Module on this context; `value` is a
+        // valid output pointer for the duration of the driver call. The safe
+        // wrapper accepts only the integer selectors declared in `ffi.rs`.
+        let result = unsafe { query(&mut value, attribute, func.raw) };
+        if result != CUDA_SUCCESS {
+            return None;
+        }
+        u32::try_from(value).ok()
+    }
+
+    /// Build the archived launch shape and resource projection for one direct
+    /// kernel launch. The profiler caches this by handle and geometry, so the
+    /// driver queries run once per variant rather than once per launch.
+    fn launch_config(
+        &self,
+        profiler: &KernelProfiler,
+        func: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        dynamic_shared_bytes: u32,
+    ) -> glcore::telemetry::LaunchConfig {
+        let key = KernelResourceKey {
+            function: func.raw as usize,
+            grid: [grid.0, grid.1, grid.2],
+            block: [block.0, block.1, block.2],
+            dynamic_shared_bytes,
+        };
+        profiler.config_for(key, || {
+            let block_threads = block.0.checked_mul(block.1)
+                .and_then(|threads| threads.checked_mul(block.2));
+            let active_blocks_per_sm = block_threads
+                .and_then(|threads| i32::try_from(threads).ok())
+                .and_then(|threads| {
+                    self.max_active_blocks_per_sm(func, threads, dynamic_shared_bytes as usize)
+                })
+                .and_then(|blocks| u32::try_from(blocks).ok());
+            let active_warps_per_sm = active_blocks_per_sm
+                .zip(block_threads)
+                .and_then(|(blocks, threads)| blocks.checked_mul(threads.saturating_add(31) / 32));
+
+            glcore::telemetry::LaunchConfig {
+                grid: key.grid,
+                block: key.block,
+                dynamic_shared_bytes: dynamic_shared_bytes as u64,
+                registers_per_thread: self.function_attribute(func, FUNC_ATTR_NUM_REGS),
+                static_shared_bytes: self
+                    .function_attribute(func, FUNC_ATTR_SHARED_SIZE_BYTES)
+                    .map(u64::from),
+                local_bytes_per_thread: self
+                    .function_attribute(func, FUNC_ATTR_LOCAL_SIZE_BYTES)
+                    .map(u64::from),
+                active_blocks_per_sm,
+                active_warps_per_sm,
+            }
+        })
+    }
+
     /// Launch `f` on the current stream.
     ///
     /// `params` contains one pointer per PTX parameter, in declaration order;
@@ -765,8 +873,11 @@ impl Cuda {
         // Capture records future work, not elapsed work. Timing these calls
         // would attach timestamps to graph construction and mislabel them as
         // kernel execution.
-        if self.kernel_profiler.is_some() && !self.capture_active.load(Ordering::Relaxed) {
-            return self.observe_dispatch(f.name, "kernel", || {
+        if let Some(profiler) = self.kernel_profiler.as_ref()
+            .filter(|_| !self.capture_active.load(Ordering::Relaxed))
+        {
+            let config = self.launch_config(profiler, f, grid, block, shared_bytes);
+            return self.observe_dispatch(f.name, "kernel", Some(config), || {
                 self.launch_raw(f, grid, block, shared_bytes, params)
             });
         }
@@ -818,6 +929,7 @@ impl Cuda {
         &self,
         name: &'static str,
         kind: &'static str,
+        config: Option<glcore::telemetry::LaunchConfig>,
         submit: impl FnOnce() -> Result<T, GlError>,
     ) -> Result<T, GlError> {
         let events = self.kernel_profiler.as_ref()
@@ -828,7 +940,7 @@ impl Cuda {
         if result.is_ok() {
             if let Some(events) = events.as_ref() { events.record(self, 1); }
             if let Some(profiler) = &self.kernel_profiler {
-                profiler.record(name, kind, events);
+                profiler.record(name, kind, config, events);
             }
         }
         result
@@ -1117,7 +1229,7 @@ impl Cuda {
             unsafe { check(&self.api, launch(exec.exec, std::ptr::null_mut()), "cuGraphLaunch") }
         };
         if self.kernel_profiler.is_some() {
-            self.observe_dispatch("cuda_graph_replay", "graph_replay", submit)?;
+            self.observe_dispatch("cuda_graph_replay", "graph_replay", None, submit)?;
         } else {
             submit()?;
         }
@@ -1255,5 +1367,34 @@ mod tests {
         let first = intern_kernel_name(&dynamic);
         let second = intern_kernel_name("gl_test_entry");
         assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn kernel_resource_queries_are_cached_per_launch_shape() {
+        let profiler = KernelProfiler::new();
+        let key = KernelResourceKey {
+            function: 7,
+            grid: [28, 4, 1],
+            block: [128, 1, 1],
+            dynamic_shared_bytes: 9_728,
+        };
+        let builds = AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            glcore::telemetry::LaunchConfig {
+                grid: key.grid,
+                block: key.block,
+                dynamic_shared_bytes: key.dynamic_shared_bytes as u64,
+                registers_per_thread: Some(64),
+                static_shared_bytes: Some(0),
+                local_bytes_per_thread: Some(0),
+                active_blocks_per_sm: Some(2),
+                active_warps_per_sm: Some(8),
+            }
+        };
+
+        assert_eq!(profiler.config_for(key, build).registers_per_thread, Some(64));
+        assert_eq!(profiler.config_for(key, build).active_warps_per_sm, Some(8));
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
     }
 }

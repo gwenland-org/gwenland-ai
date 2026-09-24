@@ -246,6 +246,34 @@ pub struct BackendTelemetry {
 /// one replay of a previously captured graph containing many kernels. Keeping
 /// those kinds separate prevents a graph replay from being mistaken for one
 /// giant kernel.
+/// Resource shape for one directly launched GPU kernel variant.
+///
+/// Every value is descriptive. In particular, resident blocks and warps are
+/// the driver's capacity projection, not a measurement of scheduler activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LaunchConfig {
+    /// Number of thread blocks submitted along the X, Y, and Z axes.
+    pub grid: [u32; 3],
+    /// Threads per block along the X, Y, and Z axes.
+    pub block: [u32; 3],
+    /// Shared memory requested by the launch in addition to the kernel's
+    /// statically declared shared memory.
+    pub dynamic_shared_bytes: u64,
+    /// Registers assigned to each thread by the CUDA compiler/JIT.
+    pub registers_per_thread: Option<u32>,
+    /// Shared memory declared by the compiled kernel itself.
+    pub static_shared_bytes: Option<u64>,
+    /// Per-thread local memory reported by the driver. A non-zero value can
+    /// indicate stack use or register spilling and deserves inspection.
+    pub local_bytes_per_thread: Option<u64>,
+    /// Resident blocks per SM projected by the CUDA occupancy calculator for
+    /// this exact block shape and dynamic shared-memory request.
+    pub active_blocks_per_sm: Option<u32>,
+    /// Resident warps per SM derived from `active_blocks_per_sm` and the block
+    /// shape. This is projected capacity, not measured achieved occupancy.
+    pub active_warps_per_sm: Option<u32>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchTiming {
     /// Device entry name, e.g. `"gl_attn_rows_qk4_f32"`.
@@ -260,6 +288,10 @@ pub struct LaunchTiming {
     pub total_ms: f64,
     /// Number of successfully timed launches aggregated into `total_ms`.
     pub launches: u64,
+    /// Launch geometry and compiler/occupancy resources for this kernel
+    /// variant. Graph replays and legacy archives have no config because their
+    /// internal kernel nodes are not visible at the driver launch seam.
+    pub config: Option<LaunchConfig>,
 }
 
 /// GPU timing collected at the backend's device-submission boundary.
@@ -434,9 +466,16 @@ mod tests {
             entries: vec![
                 LaunchTiming {
                     name: "attention".into(), kind: "kernel".into(), total_ms: 4.5, launches: 3,
+                    config: Some(LaunchConfig {
+                        grid: [28, 4, 1], block: [128, 1, 1], dynamic_shared_bytes: 9_728,
+                        registers_per_thread: Some(64), static_shared_bytes: Some(0),
+                        local_bytes_per_thread: Some(0), active_blocks_per_sm: Some(2),
+                        active_warps_per_sm: Some(8),
+                    }),
                 },
                 LaunchTiming {
                     name: "decode".into(), kind: "graph_replay".into(), total_ms: 2.0, launches: 2,
+                    config: None,
                 },
             ],
             timing_source: "cuda_events_on_launch_stream".into(),
@@ -446,5 +485,7 @@ mod tests {
         };
         assert_eq!(profile.total_ms(), 6.5);
         assert_eq!(profile.untimed_launches(), 2);
+        assert_eq!(profile.entries[0].config.unwrap().active_warps_per_sm, Some(8));
+        assert!(profile.entries[1].config.is_none());
     }
 }

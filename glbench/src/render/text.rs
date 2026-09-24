@@ -291,6 +291,32 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
                 ]);
             }
             s.push_str(&tab.render());
+
+            let configured: Vec<_> = profile.entries.iter()
+                .filter_map(|entry| entry.config.map(|config| (entry, config)))
+                .collect();
+            if !configured.is_empty() {
+                s.push_str("  resource projection (driver-reported; projected capacity, not achieved occupancy)\n");
+                let mut resources = Table::new(&[
+                    "entry", "grid", "block", "regs/t", "static smem", "dynamic smem",
+                    "local/t", "blocks/SM", "warps/SM",
+                ])
+                .right_align(3).right_align(4).right_align(5).right_align(6)
+                .right_align(7).right_align(8);
+                for (entry, config) in configured {
+                    let dim = |v: [u32; 3]| format!("{}x{}x{}", v[0], v[1], v[2]);
+                    resources.row(&[
+                        entry.name.clone(), dim(config.grid), dim(config.block),
+                        config.registers_per_thread.map_or("-".into(), |v| v.to_string()),
+                        config.static_shared_bytes.map_or("-".into(), |v| v.to_string()),
+                        config.dynamic_shared_bytes.to_string(),
+                        config.local_bytes_per_thread.map_or("-".into(), |v| v.to_string()),
+                        config.active_blocks_per_sm.map_or("-".into(), |v| v.to_string()),
+                        config.active_warps_per_sm.map_or("-".into(), |v| v.to_string()),
+                    ]);
+                }
+                s.push_str(&resources.render());
+            }
         }
     }
 
@@ -776,6 +802,7 @@ mod tests {
                         kind: "graph_replay".into(),
                         total_ms: 2.5,
                         launches: 5,
+                        config: None,
                     }],
                     timing_source: "cuda_events_on_launch_stream".into(),
                     coverage: "graph internals excluded".into(),
@@ -791,6 +818,35 @@ mod tests {
         assert!(report.contains("graph_replay"), "{report}");
         assert!(report.contains("untimed 1"), "{report}");
         assert!(report.contains("not wall time"), "{report}");
+    }
+
+    #[test]
+    fn launch_profile_renders_kernel_resources_without_claiming_achieved_occupancy() {
+        let report = telemetry(
+            &glcore::telemetry::EngineTelemetry {
+                launches: Some(glcore::telemetry::LaunchProfile {
+                    entries: vec![glcore::telemetry::LaunchTiming {
+                        name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
+                        total_ms: 7.5, launches: 3,
+                        config: Some(glcore::telemetry::LaunchConfig {
+                            grid: [28, 4, 1], block: [128, 1, 1],
+                            dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
+                            static_shared_bytes: Some(0), local_bytes_per_thread: Some(0),
+                            active_blocks_per_sm: Some(2), active_warps_per_sm: Some(8),
+                        }),
+                    }],
+                    timing_source: "cuda_events_on_launch_stream".into(),
+                    coverage: "graph internals excluded".into(),
+                    observed_launches: 3, timed_launches: 3,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(report.contains("resource projection"), "{report}");
+        assert!(report.contains("28x4x1"), "{report}");
+        assert!(report.contains("128x1x1"), "{report}");
+        assert!(report.contains("projected capacity, not achieved occupancy"), "{report}");
     }
 
     #[test]

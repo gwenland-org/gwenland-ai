@@ -465,6 +465,29 @@ fn telemetry_section(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option
                 ));
             }
             s.push('\n');
+
+            let configured: Vec<_> = profile.entries.iter()
+                .filter_map(|entry| entry.config.map(|config| (entry, config)))
+                .collect();
+            if !configured.is_empty() {
+                s.push_str("#### CUDA launch resources\n\n");
+                s.push_str("Driver-reported resources and projected residency; these are not measured achieved occupancy.\n\n");
+                s.push_str("| Entry | Grid | Block | Regs/thread | Static shared B | Dynamic shared B | Local B/thread | Blocks/SM | Warps/SM |\n");
+                s.push_str("|-------|------|-------|------------:|----------------:|-----------------:|---------------:|----------:|---------:|\n");
+                for (entry, config) in configured {
+                    let dim = |v: [u32; 3]| format!("{}x{}x{}", v[0], v[1], v[2]);
+                    let cell = |value: Option<u32>| value.map_or("-".into(), |v| v.to_string());
+                    let bytes = |value: Option<u64>| value.map_or("-".into(), |v| v.to_string());
+                    s.push_str(&format!(
+                        "| `{}` | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                        entry.name, dim(config.grid), dim(config.block),
+                        cell(config.registers_per_thread), bytes(config.static_shared_bytes),
+                        config.dynamic_shared_bytes, bytes(config.local_bytes_per_thread),
+                        cell(config.active_blocks_per_sm), cell(config.active_warps_per_sm),
+                    ));
+                }
+                s.push('\n');
+            }
         }
     }
 
@@ -706,6 +729,12 @@ mod tests {
                         kind: "kernel".into(),
                         total_ms: 7.5,
                         launches: 3,
+                        config: Some(glcore::telemetry::LaunchConfig {
+                            grid: [28, 4, 1], block: [128, 1, 1],
+                            dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
+                            static_shared_bytes: Some(0), local_bytes_per_thread: Some(0),
+                            active_blocks_per_sm: Some(2), active_warps_per_sm: Some(8),
+                        }),
                     }],
                     timing_source: "cuda_events_on_launch_stream".into(),
                     coverage: "graph internals excluded".into(),
@@ -720,6 +749,9 @@ mod tests {
         assert!(report.contains("graph internals excluded"), "{report}");
         assert!(report.contains("1 untimed"), "{report}");
         assert!(report.contains("not wall time"), "{report}");
+        assert!(report.contains("CUDA launch resources"), "{report}");
+        assert!(report.contains("projected residency"), "{report}");
+        assert!(report.contains("28x4x1"), "{report}");
     }
 
     #[test]

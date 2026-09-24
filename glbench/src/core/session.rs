@@ -668,12 +668,25 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
             ("observed_launches", Json::Num(profile.observed_launches as f64)),
             ("timed_launches", Json::Num(profile.timed_launches as f64)),
             ("total_ms", Json::Num(profile.total_ms())),
-            ("entries", Json::Arr(profile.entries.iter().map(|entry| Json::obj([
-                ("name", Json::Str(entry.name.clone())),
-                ("kind", Json::Str(entry.kind.clone())),
-                ("total_ms", Json::Num(entry.total_ms)),
-                ("launches", Json::Num(entry.launches as f64)),
-            ])).collect())),
+            ("entries", Json::Arr(profile.entries.iter().map(|entry| {
+                let config = entry.config.map(|config| Json::obj([
+                    ("grid", Json::Arr(config.grid.into_iter().map(|v| Json::Num(v as f64)).collect())),
+                    ("block", Json::Arr(config.block.into_iter().map(|v| Json::Num(v as f64)).collect())),
+                    ("dynamic_shared_bytes", Json::Num(config.dynamic_shared_bytes as f64)),
+                    ("registers_per_thread", config.registers_per_thread.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)),
+                    ("static_shared_bytes", config.static_shared_bytes.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)),
+                    ("local_bytes_per_thread", config.local_bytes_per_thread.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)),
+                    ("active_blocks_per_sm", config.active_blocks_per_sm.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)),
+                    ("active_warps_per_sm", config.active_warps_per_sm.map(|v| Json::Num(v as f64)).unwrap_or(Json::Null)),
+                ])).unwrap_or(Json::Null);
+                Json::obj([
+                    ("name", Json::Str(entry.name.clone())),
+                    ("kind", Json::Str(entry.kind.clone())),
+                    ("total_ms", Json::Num(entry.total_ms)),
+                    ("launches", Json::Num(entry.launches as f64)),
+                    ("config", config),
+                ])
+            }).collect())),
         ]),
         None => Json::Null,
     };
@@ -730,8 +743,8 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
 /// ignored and recomputed from the raw counters by consumers.
 fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, String> {
     use glcore::telemetry::{
-        BackendTelemetry, EngineTelemetry, LaunchProfile, LaunchTiming, MemoryTelemetry,
-        MoeTelemetry, PhaseProfile, StageTiming,
+        BackendTelemetry, EngineTelemetry, LaunchConfig, LaunchProfile, LaunchTiming,
+        MemoryTelemetry, MoeTelemetry, PhaseProfile, StageTiming,
     };
 
     fn required_u64(v: &Json, key: &str, path: &str) -> Result<u64, String> {
@@ -759,6 +772,34 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
                 Ok(Some(number as u64))
             }
         }
+    }
+
+    fn optional_u32(v: &Json, key: &str, path: &str) -> Result<Option<u32>, String> {
+        optional_u64(v, key, path)?
+            .map(|value| u32::try_from(value).map_err(|_| format!("{path}.{key} exceeds u32")))
+            .transpose()
+    }
+
+    fn dim3(v: &Json, key: &str, path: &str) -> Result<[u32; 3], String> {
+        let values = field(v, key)
+            .map_err(|error| format!("{path}: {error}"))?
+            .as_arr()
+            .ok_or_else(|| format!("{path}.{key} is not an array"))?;
+        if values.len() != 3 {
+            return Err(format!("{path}.{key} must contain exactly 3 dimensions"));
+        }
+        let mut out = [0u32; 3];
+        for (index, value) in values.iter().enumerate() {
+            let number = value.as_f64()
+                .ok_or_else(|| format!("{path}.{key}[{index}] is not a number"))?;
+            if !number.is_finite() || number < 0.0 || number.fract() != 0.0
+                || number > u32::MAX as f64
+            {
+                return Err(format!("{path}.{key}[{index}] is not a u32 integer"));
+            }
+            out[index] = number as u32;
+        }
+        Ok(out)
     }
 
     fn phase(v: &Json, path: &str) -> Result<PhaseProfile, String> {
@@ -831,11 +872,28 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
             let mut entries = Vec::with_capacity(raw_entries.len());
             for (index, entry) in raw_entries.iter().enumerate() {
                 let path = format!("telemetry.launches.entries[{index}]");
+                let config = match entry.get("config") {
+                    None | Some(Json::Null) => None,
+                    Some(config) => {
+                        let config_path = format!("{path}.config");
+                        Some(LaunchConfig {
+                            grid: dim3(config, "grid", &config_path)?,
+                            block: dim3(config, "block", &config_path)?,
+                            dynamic_shared_bytes: required_u64(config, "dynamic_shared_bytes", &config_path)?,
+                            registers_per_thread: optional_u32(config, "registers_per_thread", &config_path)?,
+                            static_shared_bytes: optional_u64(config, "static_shared_bytes", &config_path)?,
+                            local_bytes_per_thread: optional_u64(config, "local_bytes_per_thread", &config_path)?,
+                            active_blocks_per_sm: optional_u32(config, "active_blocks_per_sm", &config_path)?,
+                            active_warps_per_sm: optional_u32(config, "active_warps_per_sm", &config_path)?,
+                        })
+                    }
+                };
                 entries.push(LaunchTiming {
                     name: field_str(entry, "name").map_err(|error| format!("{path}: {error}"))?,
                     kind: field_str(entry, "kind").map_err(|error| format!("{path}: {error}"))?,
                     total_ms: field_f64(entry, "total_ms").map_err(|error| format!("{path}: {error}"))?,
                     launches: required_u64(entry, "launches", &path)?,
+                    config,
                 });
             }
             let observed_launches = required_u64(value, "observed_launches", "telemetry.launches")?;
@@ -1083,8 +1141,8 @@ mod tests {
     #[test]
     fn telemetry_survives_a_full_session_json_round_trip() {
         use glcore::telemetry::{
-            BackendTelemetry, EngineTelemetry, LaunchProfile, LaunchTiming, MemoryTelemetry,
-            MoeTelemetry, PhaseProfile, StageTiming,
+            BackendTelemetry, EngineTelemetry, LaunchConfig, LaunchProfile, LaunchTiming,
+            MemoryTelemetry, MoeTelemetry, PhaseProfile, StageTiming,
         };
 
         let mut session = BenchmarkSession::new(
@@ -1121,10 +1179,17 @@ mod tests {
                     LaunchTiming {
                         name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
                         total_ms: 8.25, launches: 24,
+                        config: Some(LaunchConfig {
+                            grid: [28, 4, 1], block: [128, 1, 1],
+                            dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
+                            static_shared_bytes: Some(0), local_bytes_per_thread: Some(0),
+                            active_blocks_per_sm: Some(2), active_warps_per_sm: Some(8),
+                        }),
                     },
                     LaunchTiming {
                         name: "cuda_graph_replay".into(), kind: "graph_replay".into(),
                         total_ms: 3.5, launches: 8,
+                        config: None,
                     },
                 ],
                 timing_source: "cuda_events_on_launch_stream".into(),
@@ -1147,5 +1212,33 @@ mod tests {
 
         let back = BenchmarkSession::from_json(&session.to_json()).unwrap();
         assert_eq!(back.telemetry, session.telemetry);
+    }
+
+    #[test]
+    fn legacy_launch_entry_without_resources_remains_readable() {
+        let legacy = Json::obj([
+            ("prefill", Json::Null),
+            ("decode", Json::Null),
+            ("backend", Json::Null),
+            ("memory", Json::Null),
+            ("moe", Json::Null),
+            ("launches", Json::obj([
+                ("timing_source", Json::s("cuda_events_on_launch_stream")),
+                ("coverage", Json::s("legacy driver launch seam")),
+                ("observed_launches", Json::Num(1.0)),
+                ("timed_launches", Json::Num(1.0)),
+                ("entries", Json::Arr(vec![Json::obj([
+                    ("name", Json::s("gl_legacy_kernel")),
+                    ("kind", Json::s("kernel")),
+                    ("total_ms", Json::Num(1.25)),
+                    ("launches", Json::Num(1.0)),
+                ])])),
+            ])),
+        ]);
+
+        let parsed = telemetry_from_json(&legacy).unwrap();
+        let entry = &parsed.launches.unwrap().entries[0];
+        assert_eq!(entry.name, "gl_legacy_kernel");
+        assert!(entry.config.is_none());
     }
 }
