@@ -284,20 +284,23 @@ impl KernelProfiler {
         // explicit tie-breakers below then keep archives stable when two
         // entries have equal measured time.
         let mut grouped = std::collections::BTreeMap::<
-            (&'static str, &'static str, Option<glcore::telemetry::LaunchConfig>), (f64, u64),
+            (&'static str, &'static str, Option<glcore::telemetry::LaunchConfig>), Vec<f64>,
         >::new();
         let mut timed_launches = 0u64;
         for record in &state.records {
             let Some(ms) = record.events.elapsed_ms(0, 1) else { continue };
-            let entry = grouped.entry((record.kind, record.name, record.config)).or_default();
-            entry.0 += ms;
-            entry.1 += 1;
+            grouped.entry((record.kind, record.name, record.config)).or_default().push(ms);
             timed_launches += 1;
         }
         let mut entries: Vec<glcore::telemetry::LaunchTiming> = grouped
             .into_iter()
-            .map(|((kind, name, config), (total_ms, launches))| glcore::telemetry::LaunchTiming {
-                name: name.to_string(), kind: kind.to_string(), total_ms, launches, config,
+            .map(|((kind, name, config), samples_ms)| glcore::telemetry::LaunchTiming {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                total_ms: samples_ms.iter().sum(),
+                launches: samples_ms.len() as u64,
+                samples_ms,
+                config,
             })
             .collect();
         entries.sort_by(|a, b| {

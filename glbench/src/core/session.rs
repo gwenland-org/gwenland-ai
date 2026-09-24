@@ -684,6 +684,7 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
                     ("kind", Json::Str(entry.kind.clone())),
                     ("total_ms", Json::Num(entry.total_ms)),
                     ("launches", Json::Num(entry.launches as f64)),
+                    ("samples_ms", Json::Arr(entry.samples_ms.iter().copied().map(Json::Num).collect())),
                     ("config", config),
                 ])
             }).collect())),
@@ -802,6 +803,23 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
         Ok(out)
     }
 
+    fn launch_samples(v: &Json, path: &str) -> Result<Vec<f64>, String> {
+        let Some(value) = v.get("samples_ms") else { return Ok(Vec::new()) };
+        if matches!(value, Json::Null) {
+            return Ok(Vec::new());
+        }
+        let values = value.as_arr()
+            .ok_or_else(|| format!("{path}.samples_ms is not an array"))?;
+        values.iter().enumerate().map(|(index, value)| {
+            let sample = value.as_f64()
+                .ok_or_else(|| format!("{path}.samples_ms[{index}] is not a number"))?;
+            if !sample.is_finite() || sample < 0.0 {
+                return Err(format!("{path}.samples_ms[{index}] is not a finite non-negative duration"));
+            }
+            Ok(sample)
+        }).collect()
+    }
+
     fn phase(v: &Json, path: &str) -> Result<PhaseProfile, String> {
         let stages = field(v, "stages")
             .map_err(|error| format!("{path}: {error}"))?
@@ -888,11 +906,21 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
                         })
                     }
                 };
+                let samples_ms = launch_samples(entry, &path)?;
+                let archived_total_ms = field_f64(entry, "total_ms")
+                    .map_err(|error| format!("{path}: {error}"))?;
+                let archived_launches = required_u64(entry, "launches", &path)?;
+                let (total_ms, launches) = if samples_ms.is_empty() {
+                    (archived_total_ms, archived_launches)
+                } else {
+                    (samples_ms.iter().sum(), samples_ms.len() as u64)
+                };
                 entries.push(LaunchTiming {
                     name: field_str(entry, "name").map_err(|error| format!("{path}: {error}"))?,
                     kind: field_str(entry, "kind").map_err(|error| format!("{path}: {error}"))?,
-                    total_ms: field_f64(entry, "total_ms").map_err(|error| format!("{path}: {error}"))?,
-                    launches: required_u64(entry, "launches", &path)?,
+                    total_ms,
+                    launches,
+                    samples_ms,
                     config,
                 });
             }
@@ -1178,7 +1206,8 @@ mod tests {
                 entries: vec![
                     LaunchTiming {
                         name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
-                        total_ms: 8.25, launches: 24,
+                        total_ms: 6.0, launches: 24,
+                        samples_ms: vec![0.25; 24],
                         config: Some(LaunchConfig {
                             grid: [28, 4, 1], block: [128, 1, 1],
                             dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
@@ -1188,7 +1217,8 @@ mod tests {
                     },
                     LaunchTiming {
                         name: "cuda_graph_replay".into(), kind: "graph_replay".into(),
-                        total_ms: 3.5, launches: 8,
+                        total_ms: 2.0, launches: 8,
+                        samples_ms: vec![0.25; 8],
                         config: None,
                     },
                 ],
@@ -1240,5 +1270,30 @@ mod tests {
         let entry = &parsed.launches.unwrap().entries[0];
         assert_eq!(entry.name, "gl_legacy_kernel");
         assert!(entry.config.is_none());
+    }
+
+    #[test]
+    fn raw_launch_samples_override_archived_derived_totals() {
+        let telemetry = Json::obj([
+            ("prefill", Json::Null), ("decode", Json::Null), ("backend", Json::Null),
+            ("memory", Json::Null), ("moe", Json::Null),
+            ("launches", Json::obj([
+                ("timing_source", Json::s("cuda_events_on_launch_stream")),
+                ("coverage", Json::s("test")),
+                ("observed_launches", Json::Num(2.0)),
+                ("timed_launches", Json::Num(2.0)),
+                ("entries", Json::Arr(vec![Json::obj([
+                    ("name", Json::s("gl_kernel")), ("kind", Json::s("kernel")),
+                    ("total_ms", Json::Num(999.0)), ("launches", Json::Num(999.0)),
+                    ("samples_ms", Json::Arr(vec![Json::Num(1.0), Json::Num(3.0)])),
+                ])])),
+            ])),
+        ]);
+
+        let parsed = telemetry_from_json(&telemetry).unwrap();
+        let entry = &parsed.launches.unwrap().entries[0];
+        assert_eq!(entry.total_ms, 4.0);
+        assert_eq!(entry.launches, 2);
+        assert_eq!(entry.percentiles_ms().unwrap()[0], 2.0);
     }
 }

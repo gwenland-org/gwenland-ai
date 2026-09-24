@@ -453,15 +453,19 @@ fn telemetry_section(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option
             profile.timed_launches, profile.untimed_launches(), profile.total_ms(),
         ));
         if !profile.entries.is_empty() {
-            s.push_str("| Kind | Entry | Launches | Total ms | ms/launch | Work share |\n");
-            s.push_str("|------|-------|---------:|---------:|----------:|-----------:|\n");
+            s.push_str("| Kind | Entry | Launches | Total ms | Mean ms | P50 ms | P90 ms | P99 ms | Work share |\n");
+            s.push_str("|------|-------|---------:|---------:|--------:|-------:|-------:|-------:|-----------:|\n");
             let total_ms = profile.total_ms();
             for entry in &profile.entries {
                 let per_launch = if entry.launches > 0 { format!("{:.4}", entry.total_ms / entry.launches as f64) } else { "-".into() };
                 let share = if total_ms > 0.0 { format!("{:.1}%", entry.total_ms / total_ms * 100.0) } else { "-".into() };
+                let percentiles = entry.percentiles_ms();
+                let percentile = |index: usize| percentiles
+                    .map_or("-".into(), |values| format!("{:.4}", values[index]));
                 s.push_str(&format!(
-                    "| {} | `{}` | {} | {:.3} | {} | {} |\n",
-                    entry.kind, entry.name, entry.launches, entry.total_ms, per_launch, share,
+                    "| {} | `{}` | {} | {:.3} | {} | {} | {} | {} | {} |\n",
+                    entry.kind, entry.name, entry.launches, entry.total_ms, per_launch,
+                    percentile(0), percentile(1), percentile(2), share,
                 ));
             }
             s.push('\n');
@@ -729,6 +733,7 @@ mod tests {
                         kind: "kernel".into(),
                         total_ms: 7.5,
                         launches: 3,
+                        samples_ms: vec![1.5, 2.5, 3.5],
                         config: Some(glcore::telemetry::LaunchConfig {
                             grid: [28, 4, 1], block: [128, 1, 1],
                             dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
@@ -752,6 +757,8 @@ mod tests {
         assert!(report.contains("CUDA launch resources"), "{report}");
         assert!(report.contains("projected residency"), "{report}");
         assert!(report.contains("28x4x1"), "{report}");
+        assert!(report.contains("P99 ms"), "{report}");
+        assert!(report.contains("3.4800"), "{report}");
     }
 
     #[test]

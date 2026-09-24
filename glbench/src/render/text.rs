@@ -280,13 +280,20 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
         s.push_str(&format!("  coverage: {}\n", profile.coverage));
         s.push_str("  note: summed event durations are work attribution, not wall time when streams overlap\n");
         if !profile.entries.is_empty() {
-            let mut tab = Table::new(&["kind", "entry", "launches", "total ms", "ms/launch", "share"])
-                .right_align(2).right_align(3).right_align(4).right_align(5);
+            let mut tab = Table::new(&[
+                "kind", "entry", "launches", "total ms", "mean", "p50", "p90", "p99", "share",
+            ])
+                .right_align(2).right_align(3).right_align(4).right_align(5)
+                .right_align(6).right_align(7).right_align(8);
             for entry in &profile.entries {
+                let percentiles = entry.percentiles_ms();
+                let percentile = |index: usize| percentiles
+                    .map_or("-".into(), |values| format!("{:.4}", values[index]));
                 tab.row(&[
                     entry.kind.clone(), entry.name.clone(), entry.launches.to_string(),
                     format!("{:.3}", entry.total_ms),
                     if entry.launches > 0 { format!("{:.4}", entry.total_ms / entry.launches as f64) } else { "-".into() },
+                    percentile(0), percentile(1), percentile(2),
                     if total_ms > 0.0 { format!("{:.1}%", entry.total_ms / total_ms * 100.0) } else { "-".into() },
                 ]);
             }
@@ -802,6 +809,7 @@ mod tests {
                         kind: "graph_replay".into(),
                         total_ms: 2.5,
                         launches: 5,
+                        samples_ms: vec![],
                         config: None,
                     }],
                     timing_source: "cuda_events_on_launch_stream".into(),
@@ -828,6 +836,7 @@ mod tests {
                     entries: vec![glcore::telemetry::LaunchTiming {
                         name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
                         total_ms: 7.5, launches: 3,
+                        samples_ms: vec![1.5, 2.5, 3.5],
                         config: Some(glcore::telemetry::LaunchConfig {
                             grid: [28, 4, 1], block: [128, 1, 1],
                             dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
@@ -847,6 +856,8 @@ mod tests {
         assert!(report.contains("28x4x1"), "{report}");
         assert!(report.contains("128x1x1"), "{report}");
         assert!(report.contains("projected capacity, not achieved occupancy"), "{report}");
+        assert!(report.contains("p99"), "{report}");
+        assert!(report.contains("3.4800"), "{report}");
     }
 
     #[test]

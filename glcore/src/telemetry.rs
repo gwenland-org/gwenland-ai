@@ -240,12 +240,6 @@ pub struct BackendTelemetry {
     pub kernels: Vec<(String, String)>,
 }
 
-/// GPU time accumulated for one unit of work submitted by the CPU.
-///
-/// CUDA calls this submission a launch or dispatch. It can be one kernel, or
-/// one replay of a previously captured graph containing many kernels. Keeping
-/// those kinds separate prevents a graph replay from being mistaken for one
-/// giant kernel.
 /// Resource shape for one directly launched GPU kernel variant.
 ///
 /// Every value is descriptive. In particular, resident blocks and warps are
@@ -274,6 +268,12 @@ pub struct LaunchConfig {
     pub active_warps_per_sm: Option<u32>,
 }
 
+/// GPU time accumulated for one unit of work submitted by the CPU.
+///
+/// CUDA calls this submission a launch or dispatch. It can be one kernel, or
+/// one replay of a previously captured graph containing many kernels. Keeping
+/// those kinds separate prevents a graph replay from being mistaken for one
+/// giant kernel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchTiming {
     /// Device entry name, e.g. `"gl_attn_rows_qk4_f32"`.
@@ -288,10 +288,41 @@ pub struct LaunchTiming {
     pub total_ms: f64,
     /// Number of successfully timed launches aggregated into `total_ms`.
     pub launches: u64,
+    /// Raw duration of every successfully timed launch in observation order.
+    /// New archives retain these samples so consumers can recompute tail
+    /// statistics. Legacy archives leave the vector empty.
+    pub samples_ms: Vec<f64>,
     /// Launch geometry and compiler/occupancy resources for this kernel
     /// variant. Graph replays and legacy archives have no config because their
     /// internal kernel nodes are not visible at the driver launch seam.
     pub config: Option<LaunchConfig>,
+}
+
+impl LaunchTiming {
+    /// Compute `[P50, P90, P99]` from raw launch durations using linear
+    /// interpolation between adjacent ranks (the same type-7 convention used
+    /// by glbench's session statistics). The samples are sorted once for all
+    /// three values. Returns `None` for legacy aggregate-only entries.
+    pub fn percentiles_ms(&self) -> Option<[f64; 3]> {
+        if self.samples_ms.is_empty() {
+            return None;
+        }
+        let mut sorted = self.samples_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some([
+            Self::percentile(&sorted, 50.0),
+            Self::percentile(&sorted, 90.0),
+            Self::percentile(&sorted, 99.0),
+        ])
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let rank = percentile.clamp(0.0, 100.0) / 100.0 * (sorted.len() - 1) as f64;
+        let lower = rank.floor() as usize;
+        let upper = rank.ceil() as usize;
+        let weight = rank - lower as f64;
+        sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+    }
 }
 
 /// GPU timing collected at the backend's device-submission boundary.
@@ -466,6 +497,7 @@ mod tests {
             entries: vec![
                 LaunchTiming {
                     name: "attention".into(), kind: "kernel".into(), total_ms: 4.5, launches: 3,
+                    samples_ms: vec![1.0, 1.5, 2.0],
                     config: Some(LaunchConfig {
                         grid: [28, 4, 1], block: [128, 1, 1], dynamic_shared_bytes: 9_728,
                         registers_per_thread: Some(64), static_shared_bytes: Some(0),
@@ -475,6 +507,7 @@ mod tests {
                 },
                 LaunchTiming {
                     name: "decode".into(), kind: "graph_replay".into(), total_ms: 2.0, launches: 2,
+                    samples_ms: vec![],
                     config: None,
                 },
             ],
@@ -487,5 +520,20 @@ mod tests {
         assert_eq!(profile.untimed_launches(), 2);
         assert_eq!(profile.entries[0].config.unwrap().active_warps_per_sm, Some(8));
         assert!(profile.entries[1].config.is_none());
+    }
+
+    #[test]
+    fn launch_percentiles_use_raw_samples_and_linear_interpolation() {
+        let timing = LaunchTiming {
+            name: "kernel".into(), kind: "kernel".into(), total_ms: 15.0, launches: 4,
+            samples_ms: vec![8.0, 1.0, 4.0, 2.0], config: None,
+        };
+        let [p50, p90, p99] = timing.percentiles_ms().unwrap();
+        assert_eq!(p50, 3.0);
+        assert!((p90 - 6.8).abs() < 1e-12);
+        assert!((p99 - 7.88).abs() < 1e-12);
+
+        let legacy = LaunchTiming { samples_ms: vec![], ..timing };
+        assert_eq!(legacy.percentiles_ms(), None);
     }
 }
