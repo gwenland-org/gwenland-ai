@@ -240,37 +240,43 @@ pub struct BackendTelemetry {
     pub kernels: Vec<(String, String)>,
 }
 
-/// GPU time accumulated for one submitted device entry.
+/// GPU time accumulated for one unit of work submitted by the CPU.
 ///
-/// `kind` distinguishes a kernel launch from a replayed device graph. A graph
-/// replay is deliberately not presented as one giant kernel: its internal
-/// kernels are opaque to the launch seam that timed it.
+/// CUDA calls this submission a launch or dispatch. It can be one kernel, or
+/// one replay of a previously captured graph containing many kernels. Keeping
+/// those kinds separate prevents a graph replay from being mistaken for one
+/// giant kernel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchTiming {
     /// Device entry name, e.g. `"gl_attn_rows_qk4_f32"`.
     pub name: String,
-    /// Submission kind, currently `"kernel"` or `"graph_replay"`.
+    /// What was submitted: currently `"kernel"` or `"graph_replay"`.
     pub kind: String,
-    /// Sum of device duration across every timed launch, milliseconds.
-    /// Concurrent streams can overlap, so this is work attribution rather
-    /// than an end-to-end wall clock.
+    /// Sum of GPU duration across every timed launch, in milliseconds.
+    ///
+    /// Two CUDA streams may execute at the same time. Their durations both
+    /// contribute here, so this number ranks where GPU work went; it does not
+    /// claim to be the end-to-end elapsed time seen by the user.
     pub total_ms: f64,
     /// Number of successfully timed launches aggregated into `total_ms`.
     pub launches: u64,
 }
 
-/// Per-dispatch GPU timing collected by an engine-native launch observer.
+/// GPU timing collected at the backend's device-submission boundary.
+///
+/// The profile carries both its measurement method and its coverage limits so
+/// archived numbers remain interpretable without reading backend source code.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct LaunchProfile {
     /// Entries in hotspot order (largest accumulated device time first).
     pub entries: Vec<LaunchTiming>,
     /// Timing mechanism, e.g. `"cuda_events_on_launch_stream"`.
     pub timing_source: String,
-    /// Exact observer boundary, including known blind spots.
+    /// What the observer included and excluded, including known blind spots.
     pub coverage: String,
-    /// Successful dispatches seen by the observer.
+    /// Successful submissions seen by the observer, timed or not.
     pub observed_launches: u64,
-    /// Dispatches whose event pair produced a valid duration.
+    /// Submissions whose start/end timestamps produced a valid duration.
     pub timed_launches: u64,
 }
 

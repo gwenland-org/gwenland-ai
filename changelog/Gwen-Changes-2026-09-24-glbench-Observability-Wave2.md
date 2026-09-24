@@ -36,3 +36,11 @@ The profile covers the engine lifetime, including warmup. Event durations on
 concurrent streams can overlap, so their sum is not end-to-end wall time.
 Graph internals require a later CUPTI/Nsight import path. No T4 timing was run
 in this Windows host gate, so this change claims observability, not speed.
+
+## Open-source readability follow-up
+
+The profiler's internal comments now define "dispatch", explain event and
+CUDA Graph lifetimes, show why event retention is bounded, and document every
+diagnostic fallback. The target reader is a capable student encountering CUDA
+events for the first time, while experienced contributors can still scan the
+contracts without following each branch.
