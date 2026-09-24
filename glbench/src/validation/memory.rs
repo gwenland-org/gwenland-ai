@@ -115,6 +115,7 @@ mod tests {
             prefill: None,
             decode: None,
             backend: None,
+            launches: None,
             memory: Some(MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes: 0 }),
             moe: None,
         });

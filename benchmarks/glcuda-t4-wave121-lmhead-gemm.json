@@ -1,0 +1,16 @@
+{
+  "wave": 121,
+  "status": "rejected",
+  "gpu": "Tesla T4",
+  "model_sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+  "pairs": 6,
+  "oracle_matches": "12/12",
+  "median_gpu_prefill_ms": {"retained": 19.7877120975, "candidate": 19.9827041625},
+  "median_prefill_tps": {"retained": 12330.996332, "candidate": 12210.5775135},
+  "median_lm_head_ms": {"retained": 0.594303995, "candidate": 0.561151981},
+  "total_speedup": 0.990241958074627,
+  "lm_head_speedup": 1.0590784941022957,
+  "target_15000_tps_achieved": false,
+  "archive": "benchmarks/glcuda-t4-wave121-lmhead-gemm-results.zip",
+  "archive_sha256": "2400ffa84bd325ab482a763875be501a6cb1200e4b37984166fb79242abdffa6"
+}

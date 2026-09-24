@@ -30,7 +30,7 @@ use crate::core::availability::{self, VLAvailabilityMap};
 use crate::core::inference::VLInferenceSession;
 use crate::core::metrics::{IterationMetrics, MeasurementSet};
 use crate::core::mode::{ENInferenceRole, ENSessionMode};
-use crate::core::result::SessionMetadata;
+use crate::core::result::{ENMeasurementMode, SessionMetadata};
 use crate::core::session::BenchmarkSession;
 use crate::core::workload::WorkloadSpec;
 use crate::engine::metadata::EngineMetadata;
@@ -182,6 +182,9 @@ pub fn run(args: &TrainArgs) -> Result<BenchmarkSession, String> {
     let mut metadata = SessionMetadata::new(label);
     metadata.session_mode = args.mode;
     metadata.collection_profile = Some(collection_profile(args));
+    // Training always runs with an observer attached. Its step timing is
+    // useful diagnostic evidence, but never an uninstrumented production run.
+    metadata.measurement_mode = ENMeasurementMode::Instrumented;
 
     // The workload spec describes the training run in the fields it has. There
     // is no model path, so it stays empty rather than being given a fake one.

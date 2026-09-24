@@ -51,6 +51,19 @@ use sampler::{Sampler, SamplerConfig};
 pub struct GlcudaConfig {
     /// Fixed RNG seed for reproducible sampling; `None` = time-seeded.
     pub seed: Option<u64>,
+    /// Benchmark-only override for Wave 111's deferred FFN residual path.
+    ///
+    /// `None` preserves the production environment contract. The dedicated
+    /// Wave 118 harness uses `Some` so both arms can coexist in one process
+    /// without mutating process-global environment variables.
+    #[doc(hidden)]
+    pub benchmark_defer_ffn_residual: Option<bool>,
+    /// Benchmark-only override for Wave 123's Q8 no-store path.
+    #[doc(hidden)]
+    pub benchmark_q8_nostore: Option<bool>,
+    /// Benchmark-only override for Wave 123's stacked FFN gate/up path.
+    #[doc(hidden)]
+    pub benchmark_ffn_gate_up_stacked: Option<bool>,
 }
 
 /// Optional per-token callback threaded through [`GlcudaEngine::run`].
@@ -97,6 +110,34 @@ impl GlcudaEngine {
     /// The loaded kernel suite, once initialized.
     pub fn kernels(&self) -> Option<&KernelSet> {
         self.kernels.as_ref()
+    }
+
+    /// Select the retained or Wave 111 path between synchronized iterations
+    /// in the dedicated Wave 118 benchmark harness.
+    #[doc(hidden)]
+    pub fn set_benchmark_defer_ffn_residual(&self, enabled: bool) -> Result<(), GlError> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
+        kernels.set_benchmark_defer_ffn_residual(enabled);
+        Ok(())
+    }
+
+    /// Select the retained or Wave 123 Q8 no-store/stacked-gate-up path between
+    /// synchronized iterations in the dedicated benchmark harness.
+    #[doc(hidden)]
+    pub fn set_benchmark_q8_nostore(
+        &self,
+        no_store: bool,
+        stacked_gate_up: bool,
+    ) -> Result<(), GlError> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
+        kernels.set_benchmark_q8_nostore(no_store, stacked_gate_up);
+        Ok(())
     }
 
     /// Encode `text` to token ids with the loaded model's tokenizer, adding
@@ -197,6 +238,12 @@ impl GlcudaEngine {
 }
 
 impl GlEngine for GlcudaEngine {
+    fn begin_telemetry_window(&self) {
+        if let Some(cuda) = &self.cuda {
+            cuda.begin_kernel_profile_window();
+        }
+    }
+
     /// Per-stage prefill cost, memory breakdown, and the kernel path taken.
     ///
     /// Until this existed `glcuda` inherited the trait's `None`, so glbench's
@@ -232,24 +279,38 @@ impl GlEngine for GlcudaEngine {
             // overstates a pipelined wall clock -- which is why `on_stream`
             // is reported and why this total is not compared against
             // end-to-end throughput.
-            let total_ms = stages.iter().map(|s| s.total_ms).sum();
+            // Prefer the enclosing GPU event. Summing adjacent stages is a
+            // useful attribution check, but it cannot represent gaps and it
+            // previously encouraged consumers to compare profiler-inflated
+            // host wall time with production throughput.
+            let total_ms = p
+                .total_gpu_ms
+                .unwrap_or_else(|| stages.iter().map(|s| s.total_ms).sum());
             PhaseProfile { stages, total_ms }
         });
 
         let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
             MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
         });
+        let launches = self.cuda.as_ref().and_then(Cuda::kernel_profile);
 
         // Absence must read as "not measured", never as a zeroed report.
-        if prefill.is_none() && memory.is_none() {
+        if prefill.is_none() && launches.is_none() && memory.is_none() {
             return None;
         }
-        Some(EngineTelemetry { prefill, decode: None, backend: None, memory, moe: None })
+        Some(EngineTelemetry {
+            prefill, decode: None, backend: None, launches, memory, moe: None,
+        })
     }
 
     fn init(&mut self) -> Result<(), GlError> {
         let cuda = Cuda::probe()?;
-        let kernels = KernelSet::load(&cuda)?;
+        let kernels = KernelSet::load_with_benchmark_overrides(
+            &cuda,
+            self.config.benchmark_defer_ffn_residual,
+            self.config.benchmark_q8_nostore,
+            self.config.benchmark_ffn_gate_up_stacked,
+        )?;
         let i = &cuda.info;
         // One startup line, like glproc's [simd] line: name the hardware
         // path so a silent mis-selection is visible.

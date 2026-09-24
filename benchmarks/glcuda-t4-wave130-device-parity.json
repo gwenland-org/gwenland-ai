@@ -1,0 +1,61 @@
+{
+  "wave": 130,
+  "build": "wave130-device-parity-v1",
+  "kaggle_kernel": "jinxsuperdev/glcuda-t4-wave130-device-parity",
+  "source": {
+    "base_rev": "5de5be39c0190b9367da18f0f2001e7f40208c92",
+    "patch_bytes": 120823
+  },
+  "gpu": {
+    "name": "Tesla T4",
+    "count": 2,
+    "memory_mib_each": 15360,
+    "driver": "580.159.04"
+  },
+  "host_tests": { "passed": 68, "failed": 0 },
+  "cuda_parity": { "passed": 36, "failed": 0, "serial": true },
+  "resource": {
+    "registers_per_thread": 80,
+    "barriers": 1,
+    "static_shared_bytes": 16384,
+    "stack_frame_bytes": 0,
+    "spill_store_bytes": 0,
+    "spill_load_bytes": 0
+  },
+  "occupancy": {
+    "kernel": "gl_gemm_mma_q8_bstage_n16_fused_swiglu_specialized",
+    "threads": 256,
+    "active_blocks_per_sm": 3
+  },
+  "direct_diagnostic": {
+    "warmup": 10,
+    "iters": 100,
+    "repeats": 5,
+    "hidden": 4864,
+    "in_dim": 896,
+    "ntok": 244,
+    "retained_us": 322.731,
+    "candidate_us": 302.001,
+    "speedup": 1.0686,
+    "q8_bit_exact": true,
+    "scale_bit_exact": true,
+    "full_slabs": 3,
+    "ragged_tail_rows": 52
+  },
+  "gates": {
+    "resource_passed": true,
+    "module_load_passed": true,
+    "occupancy_passed": true,
+    "cuda_parity_passed": true,
+    "direct_exact_output_passed": true,
+    "production_dispatch_wired": false,
+    "production_timing_run": false,
+    "target_15000_tps_achieved": false
+  },
+  "sha256": {
+    "candidate_ptx": "80cdd36f64ce8873679d1a75ea0e01ad7525177a26f4ea69fe0d37737be4d06b",
+    "embedded_patch": "7fc9843b89aa443024d21ec7a4c3c9ce8b76f162aa03851dc8a0db3d778c3265",
+    "notebook": "0b1b3db8b71e7c235e4011c8ab2d502b1eae6fb2469e74dea8ff070184de421c",
+    "raw_archive": "c6a542ab97317abe3282c64d1d01cb63d6ff7a49cbee5277e7bbb08640028b27"
+  }
+}

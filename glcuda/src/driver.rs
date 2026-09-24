@@ -5,14 +5,16 @@
 //! and kernel launch. Everything numeric happens in the PTX kernels.
 
 use std::ffi::c_void;
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use glcore::GlError;
 
 use crate::ffi::{
     CUcontext, CUdevice, CUdeviceptr, CUevent, CUfunction, CUgraph, CUgraphExec, CUmodule,
     CUresult, CUstream, DriverApi, ATTR_COMPUTE_CAPABILITY_MAJOR, ATTR_COMPUTE_CAPABILITY_MINOR,
-    ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS,
+    ATTR_MULTIPROCESSOR_COUNT, CUDA_SUCCESS, FUNC_ATTR_LOCAL_SIZE_BYTES, FUNC_ATTR_NUM_REGS,
+    FUNC_ATTR_SHARED_SIZE_BYTES,
 };
 
 /// The process-wide driver API table, loaded on first use. `None` when the
@@ -105,6 +107,245 @@ impl Drop for EventRing {
 unsafe impl Send for EventRing {}
 unsafe impl Sync for EventRing {}
 
+/// Stable archive label for timings produced by CUDA events recorded on the
+/// same stream as the work they surround.
+const KERNEL_TIMING_SOURCE: &str = "cuda_events_on_launch_stream";
+/// One launch needs a start and end event. The cap bounds driver resources on
+/// long benchmark sessions; launches beyond it are counted but left untimed.
+/// This is a resource ceiling, not a claim that later launches are irrelevant.
+const MAX_KERNEL_EVENT_PAIRS: usize = 16_384;
+/// Human-readable scope stored with every profile so a result cannot be read
+/// as more complete than the observer really is.
+const KERNEL_TIMING_COVERAGE_FROM_INIT: &str =
+    "successful direct kernel launches and CUDA graph replays since engine init; may include setup and warmup; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
+const KERNEL_TIMING_COVERAGE_RESET_WINDOW: &str =
+    "successful direct kernel launches and CUDA graph replays since the most recent telemetry-window reset; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
+
+/// Give a kernel name process lifetime so the copyable [`Kernel`] handle can
+/// carry it without owning or cloning a `String` on every launch.
+///
+/// The public loader still accepts an ordinary `&str`. We allocate only when a
+/// module resolves a new entry name, then reuse that allocation for equal
+/// names. The allocations intentionally live until process exit; the set is
+/// bounded by the kernel entries loaded by the application, not by launches.
+fn intern_kernel_name(name: &str) -> &'static str {
+    static NAMES: OnceLock<Mutex<std::collections::BTreeMap<String, &'static str>>> =
+        OnceLock::new();
+    let names = NAMES.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()));
+    let Ok(mut names) = names.lock() else {
+        // Another thread panicked while holding the registry lock. That must
+        // not make CUDA initialization panic too, so keep this name alive
+        // independently. The only cost is losing name deduplication here.
+        return Box::leak(name.to_string().into_boxed_str());
+    };
+    if let Some(&name) = names.get(name) {
+        return name;
+    }
+    let interned = Box::leak(name.to_string().into_boxed_str());
+    names.insert(interned.to_string(), interned);
+    interned
+}
+
+/// Ownership bundle for timestamps from one successful device submission.
+struct KernelLaunchRecord {
+    /// PTX entry or synthetic dispatch name shown in the report.
+    name: &'static str,
+    /// `kernel` and `graph_replay` must stay distinct: a graph contains many
+    /// kernels, but this launch seam can only time the replay as one unit.
+    kind: &'static str,
+    /// Exact launch shape and the driver's resource projection. `None` for a
+    /// graph replay because its internal nodes are hidden behind one handle.
+    config: Option<glcore::telemetry::LaunchConfig>,
+    /// Start/end events remain alive until `snapshot` reads their timestamps.
+    events: EventRing,
+}
+
+/// Cache key for resource queries whose answers stay fixed for a launch shape.
+/// The raw handle distinguishes equal entry names loaded from different PTX
+/// modules; the geometry distinguishes one entry launched in several ways.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct KernelResourceKey {
+    function: usize,
+    grid: [u32; 3],
+    block: [u32; 3],
+    dynamic_shared_bytes: u32,
+}
+
+/// Mutable evidence accumulated across the lifetime of one CUDA engine.
+#[derive(Default)]
+struct KernelProfilerState {
+    /// Dispatches with an event pair. Missing pairs are represented by the
+    /// gap between `observed_launches` and the snapshot's `timed_launches`.
+    records: Vec<KernelLaunchRecord>,
+    /// CUDA function attributes are immutable after module load, while the
+    /// occupancy answer is fixed by function, block shape, and dynamic shared
+    /// memory. Cache both so an instrumented run queries each variant once.
+    configs: std::collections::BTreeMap<KernelResourceKey, glcore::telemetry::LaunchConfig>,
+    /// Successful submissions seen since CUDA initialization, including
+    /// warmup. Failed CUDA submissions are errors, not performance samples.
+    observed_launches: u64,
+    /// Reuse a completed aggregation when telemetry is requested repeatedly.
+    /// Recording another launch clears it before appending new evidence.
+    cached: Option<glcore::telemetry::LaunchProfile>,
+    /// Distinguishes the engine-lifetime window from an explicit caller
+    /// boundary so archived coverage never claims warmup was excluded unless
+    /// the observer was actually reset.
+    window_was_reset: bool,
+}
+
+/// Opt-in observer for work submitted from the CPU to the CUDA driver.
+///
+/// A "dispatch" is either one kernel launch or one CUDA Graph replay. This
+/// object exists only when `GLCUDA_TELEMETRY` was present before CUDA
+/// initialization, so an ordinary production run allocates no timing events,
+/// stores no records, and acquires no profiler lock.
+struct KernelProfiler {
+    /// Launches may come from any thread because [`Cuda`] is `Sync`; the mutex
+    /// protects record ownership, not GPU execution.
+    state: Mutex<KernelProfilerState>,
+    /// Atomically reserves the bounded event budget before allocating events.
+    reserved_event_pairs: AtomicUsize,
+}
+
+impl KernelProfiler {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(KernelProfilerState::default()),
+            reserved_event_pairs: AtomicUsize::new(0),
+        }
+    }
+
+    /// Reserve room for one start/end event pair.
+    ///
+    /// `false` means the launch still runs and is counted, but its duration is
+    /// unavailable. This preserves inference correctness under profiler limits.
+    fn reserve_event_pair(&self) -> bool {
+        // This atomic protects only the numeric reservation count; it does not
+        // publish any other memory, so ordering with other reads is unnecessary.
+        self.reserved_event_pairs
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |reserved| {
+                (reserved < MAX_KERNEL_EVENT_PAIRS).then_some(reserved + 1)
+            })
+            .is_ok()
+    }
+
+    /// Record one successful driver submission and invalidate the old summary.
+    ///
+    /// `events` is `None` when the driver lacks event support, event creation
+    /// failed, or the bounded event budget is exhausted. The launch remains
+    /// observable through `observed_launches` instead of being reported as a
+    /// zero-duration sample.
+    fn record(
+        &self,
+        name: &'static str,
+        kind: &'static str,
+        config: Option<glcore::telemetry::LaunchConfig>,
+        events: Option<EventRing>,
+    ) {
+        // Profiling is diagnostic. If another profiler thread panicked while
+        // holding this lock, drop this sample instead of failing inference.
+        let Ok(mut state) = self.state.lock() else { return };
+        state.observed_launches += 1;
+        state.cached = None;
+        if let Some(events) = events {
+            state.records.push(KernelLaunchRecord { name, kind, config, events });
+        }
+    }
+
+    /// Return cached resource metadata, computing it once for a new launch
+    /// shape. A poisoned diagnostic lock skips caching; the launch itself is
+    /// still allowed to proceed.
+    fn config_for(
+        &self,
+        key: KernelResourceKey,
+        build: impl FnOnce() -> glcore::telemetry::LaunchConfig,
+    ) -> glcore::telemetry::LaunchConfig {
+        if let Ok(state) = self.state.lock() {
+            if let Some(config) = state.configs.get(&key) {
+                return *config;
+            }
+        }
+        let config = build();
+        if let Ok(mut state) = self.state.lock() {
+            state.configs.entry(key).or_insert(config);
+        }
+        config
+    }
+
+    /// Discard dynamic launch evidence at a quiescent phase boundary.
+    ///
+    /// Kernel resources are immutable for a loaded function and launch shape,
+    /// so their cache survives the reset. Event records, counters, and the
+    /// event-pair budget belong to the old observation window and do not.
+    fn reset_window(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.records.clear();
+        state.observed_launches = 0;
+        state.cached = None;
+        state.window_was_reset = true;
+        self.reserved_event_pairs.store(0, Ordering::Relaxed);
+    }
+
+    /// Wait for recorded end events, aggregate them by `(kind, name)`, and
+    /// return the slowest entries first.
+    ///
+    /// Synchronization happens when the caller asks for telemetry, rather than
+    /// between launches. glbench asks after its workload, so collection does
+    /// not serialize the measured GPU work. The sum is work attribution, not
+    /// wall time, because streams can run concurrently.
+    fn snapshot(&self) -> Option<glcore::telemetry::LaunchProfile> {
+        // A poisoned lock means the diagnostic state is unreliable. Return no
+        // profile rather than publishing a partial result as trustworthy.
+        let mut state = self.state.lock().ok()?;
+        if let Some(snapshot) = &state.cached {
+            return Some(snapshot.clone());
+        }
+        // BTreeMap gives deterministic key order before the hotspot sort. The
+        // explicit tie-breakers below then keep archives stable when two
+        // entries have equal measured time.
+        let mut grouped = std::collections::BTreeMap::<
+            (&'static str, &'static str, Option<glcore::telemetry::LaunchConfig>), Vec<f64>,
+        >::new();
+        let mut timed_launches = 0u64;
+        for record in &state.records {
+            let Some(ms) = record.events.elapsed_ms(0, 1) else { continue };
+            grouped.entry((record.kind, record.name, record.config)).or_default().push(ms);
+            timed_launches += 1;
+        }
+        let mut entries: Vec<glcore::telemetry::LaunchTiming> = grouped
+            .into_iter()
+            .map(|((kind, name, config), samples_ms)| glcore::telemetry::LaunchTiming {
+                name: name.to_string(),
+                kind: kind.to_string(),
+                total_ms: samples_ms.iter().sum(),
+                launches: samples_ms.len() as u64,
+                samples_ms,
+                config,
+            })
+            .collect();
+        entries.sort_by(|a, b| {
+            b.total_ms.partial_cmp(&a.total_ms).unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.kind.cmp(&b.kind)).then_with(|| a.name.cmp(&b.name))
+        });
+        let snapshot = glcore::telemetry::LaunchProfile {
+            entries,
+            timing_source: KERNEL_TIMING_SOURCE.to_string(),
+            coverage: if state.window_was_reset {
+                KERNEL_TIMING_COVERAGE_RESET_WINDOW
+            } else {
+                KERNEL_TIMING_COVERAGE_FROM_INIT
+            }
+            .to_string(),
+            observed_launches: state.observed_launches,
+            timed_launches,
+        };
+        state.cached = Some(snapshot.clone());
+        Some(snapshot)
+    }
+}
+
 /// Returned when graph capture or replay is asked of a driver that does not
 /// export the CUDA Graph API. Not a failure state: the caller is expected to
 /// fall back to issuing kernels individually.
@@ -179,6 +420,14 @@ pub struct Cuda {
     /// graph instead of executing. `AtomicPtr` so `Cuda` stays `Sync`;
     /// only ever flipped between launches by the single owning thread.
     launch_stream: std::sync::atomic::AtomicPtr<c_void>,
+    /// True while calls to `launch` are adding nodes to a CUDA Graph instead
+    /// of executing them. Those calls have no duration yet, so the profiler
+    /// skips them and times each later graph replay as one dispatch. Relaxed
+    /// atomic access is enough because this flag guards no other memory; it
+    /// only selects which launch path to take.
+    capture_active: AtomicBool,
+    /// Native launch timing. `None` is the normal production configuration.
+    kernel_profiler: Option<KernelProfiler>,
     /// Streams for issuing independent prefill sub-slabs concurrently.
     ///
     /// `None` unless `GLCUDA_MULTI_STREAM_PREFILL` is set, and never created
@@ -335,6 +584,9 @@ impl Cuda {
                 device,
                 ctx,
                 launch_stream: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
+                capture_active: AtomicBool::new(false),
+                kernel_profiler: std::env::var_os("GLCUDA_TELEMETRY")
+                    .is_some().then(KernelProfiler::new),
                 prefill_streams: std::sync::OnceLock::new(),
                 info: DeviceInfo {
                     name,
@@ -543,11 +795,6 @@ impl Cuda {
         })
     }
 
-    /// Launch `f` with the given geometry onto the current launch stream
-    /// ([`Cuda::launch_stream`] — NULL for normal execution, or the capture
-    /// stream while a graph is being recorded). `params` holds one pointer
-    /// per kernel parameter, in declaration order, each pointing at a live
-    /// host value (the driver reads them at launch/record time).
     /// Resident blocks per SM for `func`, as the DRIVER computes it.
     ///
     /// Wave 15C derived this from bytes and got every point on its sweep axis
@@ -568,10 +815,83 @@ impl Cuda {
         // the handle is live for this context; `blocks` is a local the driver
         // only writes. Taking `Kernel` rather than a raw `CUfunction` is what
         // keeps this callable safely, exactly as `launch` does.
-        let rc = unsafe { query(&mut blocks, func.0, block_threads, dynamic_smem) };
+        let rc = unsafe { query(&mut blocks, func.raw, block_threads, dynamic_smem) };
         (rc == 0).then_some(blocks)
     }
 
+    /// Read one immutable compiler/JIT resource attribute for a kernel.
+    /// Missing symbols, unsupported selectors, and invalid negative values are
+    /// reported as unavailable metadata rather than inference failures.
+    fn function_attribute(&self, func: Kernel, attribute: i32) -> Option<u32> {
+        let query = self.api.cu_func_get_attribute?;
+        let mut value = 0i32;
+        // SAFETY: `func` came from a live Module on this context; `value` is a
+        // valid output pointer for the duration of the driver call. The safe
+        // wrapper accepts only the integer selectors declared in `ffi.rs`.
+        let result = unsafe { query(&mut value, attribute, func.raw) };
+        if result != CUDA_SUCCESS {
+            return None;
+        }
+        u32::try_from(value).ok()
+    }
+
+    /// Build the archived launch shape and resource projection for one direct
+    /// kernel launch. The profiler caches this by handle and geometry, so the
+    /// driver queries run once per variant rather than once per launch.
+    fn launch_config(
+        &self,
+        profiler: &KernelProfiler,
+        func: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        dynamic_shared_bytes: u32,
+    ) -> glcore::telemetry::LaunchConfig {
+        let key = KernelResourceKey {
+            function: func.raw as usize,
+            grid: [grid.0, grid.1, grid.2],
+            block: [block.0, block.1, block.2],
+            dynamic_shared_bytes,
+        };
+        profiler.config_for(key, || {
+            let block_threads = block.0.checked_mul(block.1)
+                .and_then(|threads| threads.checked_mul(block.2));
+            let active_blocks_per_sm = block_threads
+                .and_then(|threads| i32::try_from(threads).ok())
+                .and_then(|threads| {
+                    self.max_active_blocks_per_sm(func, threads, dynamic_shared_bytes as usize)
+                })
+                .and_then(|blocks| u32::try_from(blocks).ok());
+            let active_warps_per_sm = active_blocks_per_sm
+                .zip(block_threads)
+                .and_then(|(blocks, threads)| blocks.checked_mul(threads.saturating_add(31) / 32));
+
+            glcore::telemetry::LaunchConfig {
+                grid: key.grid,
+                block: key.block,
+                dynamic_shared_bytes: dynamic_shared_bytes as u64,
+                registers_per_thread: self.function_attribute(func, FUNC_ATTR_NUM_REGS),
+                static_shared_bytes: self
+                    .function_attribute(func, FUNC_ATTR_SHARED_SIZE_BYTES)
+                    .map(u64::from),
+                local_bytes_per_thread: self
+                    .function_attribute(func, FUNC_ATTR_LOCAL_SIZE_BYTES)
+                    .map(u64::from),
+                active_blocks_per_sm,
+                active_warps_per_sm,
+            }
+        })
+    }
+
+    /// Launch `f` on the current stream.
+    ///
+    /// `params` contains one pointer per PTX parameter, in declaration order;
+    /// each pointed-to host value must stay alive for this driver call. The
+    /// current stream is normally CUDA's default stream, but graph capture and
+    /// multi-stream prefill temporarily replace it.
+    ///
+    /// With telemetry enabled, `observe_dispatch` adds asynchronous
+    /// event marks. During graph capture it deliberately records nothing: the
+    /// kernel nodes execute only when the completed graph is replayed.
     pub fn launch(
         &self,
         f: Kernel,
@@ -580,9 +900,29 @@ impl Cuda {
         shared_bytes: u32,
         params: &mut [*mut c_void],
     ) -> Result<(), GlError> {
-        let stream = self
-            .launch_stream
-            .load(std::sync::atomic::Ordering::Relaxed);
+        // Capture records future work, not elapsed work. Timing these calls
+        // would attach timestamps to graph construction and mislabel them as
+        // kernel execution.
+        if let Some(profiler) = self.kernel_profiler.as_ref()
+            .filter(|_| !self.capture_active.load(Ordering::Relaxed))
+        {
+            let config = self.launch_config(profiler, f, grid, block, shared_bytes);
+            return self.observe_dispatch(f.name, "kernel", Some(config), || {
+                self.launch_raw(f, grid, block, shared_bytes, params)
+            });
+        }
+        self.launch_raw(f, grid, block, shared_bytes, params)
+    }
+
+    fn launch_raw(
+        &self,
+        f: Kernel,
+        grid: (u32, u32, u32),
+        block: (u32, u32, u32),
+        shared_bytes: u32,
+        params: &mut [*mut c_void],
+    ) -> Result<(), GlError> {
+        let stream = self.launch_stream.load(Ordering::Relaxed);
         // SAFETY: f belongs to a live module on this context; params
         // pointers are valid for the duration of the call; stream is NULL
         // or a live stream owned for the length of a capture.
@@ -590,7 +930,7 @@ impl Cuda {
             check(
                 &self.api,
                 (self.api.cu_launch_kernel)(
-                    f.0,
+                    f.raw,
                     grid.0,
                     grid.1,
                     grid.2,
@@ -604,6 +944,52 @@ impl Cuda {
                 ),
                 "cuLaunchKernel",
             )
+        }
+    }
+
+    /// Submit one device entry with CUDA events immediately before and after it.
+    ///
+    /// Event recording is asynchronous: it inserts timestamps into the same
+    /// stream as the work but does not wait for the GPU. A later `snapshot`
+    /// performs the wait and reads elapsed time. If events are unavailable,
+    /// `submit` still runs normally and the successful launch is counted as
+    /// observed-but-untimed. Submission errors are returned to the caller and
+    /// are not performance samples.
+    fn observe_dispatch<T>(
+        &self,
+        name: &'static str,
+        kind: &'static str,
+        config: Option<glcore::telemetry::LaunchConfig>,
+        submit: impl FnOnce() -> Result<T, GlError>,
+    ) -> Result<T, GlError> {
+        let events = self.kernel_profiler.as_ref()
+            .filter(|profiler| profiler.reserve_event_pair())
+            .and_then(|_| self.event_ring(2));
+        if let Some(events) = events.as_ref() { events.record(self, 0); }
+        let result = submit();
+        if result.is_ok() {
+            if let Some(events) = events.as_ref() { events.record(self, 1); }
+            if let Some(profiler) = &self.kernel_profiler {
+                profiler.record(name, kind, config, events);
+            }
+        }
+        result
+    }
+
+    /// Snapshot the native launch observer.
+    ///
+    /// Returns `None` when telemetry was disabled before CUDA initialization,
+    /// or when a profiler thread panicked and made its shared state unreliable.
+    pub fn kernel_profile(&self) -> Option<glcore::telemetry::LaunchProfile> {
+        self.kernel_profiler.as_ref()?.snapshot()
+    }
+
+    /// Start a fresh launch-observation window without discarding immutable
+    /// kernel-resource metadata. Does nothing when telemetry was not enabled
+    /// before CUDA initialization.
+    pub fn begin_kernel_profile_window(&self) {
+        if let Some(profiler) = &self.kernel_profiler {
+            profiler.reset_window();
         }
     }
 
@@ -700,8 +1086,11 @@ impl Cuda {
             )?
         };
 
-        // Point launches at the capture stream; guarantee restore + destroy.
+        // Point launches at the capture stream and mark them as graph nodes,
+        // not executed kernels. Both pieces of state are restored below even
+        // when capture or graph instantiation returns an error.
         self.launch_stream.store(stream, Ordering::Relaxed);
+        self.capture_active.store(true, Ordering::Relaxed);
         let result = (|| -> Result<GraphExec, GlError> {
             // SAFETY: stream is live and idle.
             unsafe {
@@ -734,6 +1123,7 @@ impl Cuda {
         // stream regardless of outcome.
         self.launch_stream
             .store(std::ptr::null_mut(), Ordering::Relaxed);
+        self.capture_active.store(false, Ordering::Relaxed);
         // SAFETY: stream is live and no longer referenced.
         unsafe {
             let _ = (self.api.cu_stream_destroy)(stream);
@@ -862,28 +1252,34 @@ impl Cuda {
         Ok(())
     }
 
-    /// Replay a captured graph on the default stream and wait for it.
+    /// Replay a captured graph on the default stream and wait for completion.
+    ///
+    /// The launch seam cannot see individual nodes during replay, so telemetry
+    /// reports the whole replay as `cuda_graph_replay`. Per-node attribution
+    /// requires an external graph-aware profiler such as CUPTI or Nsight.
     pub fn graph_launch(&self, exec: &GraphExec) -> Result<(), GlError> {
         // A live GraphExec can only exist if capture succeeded, so this is
         // always Some in practice; the check keeps the unwrap out of the code.
         let launch = self
             .cu_graph_launch_fn()
             .ok_or_else(|| GlError::Engine(GRAPHS_UNSUPPORTED.into()))?;
-        // SAFETY: exec is a live instantiated graph; NULL = default stream.
-        unsafe {
-            check(
-                &self.api,
-                launch(exec.exec, std::ptr::null_mut()),
-                "cuGraphLaunch",
-            )?
+        let submit = || {
+            // SAFETY: exec is a live instantiated graph; NULL = default stream.
+            unsafe { check(&self.api, launch(exec.exec, std::ptr::null_mut()), "cuGraphLaunch") }
         };
+        if self.kernel_profiler.is_some() {
+            self.observe_dispatch("cuda_graph_replay", "graph_replay", None, submit)?;
+        } else {
+            submit()?;
+        }
         self.synchronize()
     }
 }
 
 impl Drop for Cuda {
     fn drop(&mut self) {
-        // ⛔ Streams first, context second, and the order is not stylistic.
+        // ⛔ Timing events and streams first, CUDA context second. The order is
+        // a lifetime requirement, not a style preference.
         //
         // Rust drops a struct's fields AFTER its own `Drop::drop` body runs,
         // so leaving `prefill_streams` to the implicit path would call
@@ -897,6 +1293,7 @@ impl Drop for Cuda {
         // was already written, so the measurements survived and only the
         // process died. A crash that arrives after the useful work is the
         // easiest kind to dismiss and still means undefined behaviour ran.
+        drop(self.kernel_profiler.take());
         drop(self.prefill_streams.take());
         // SAFETY: releasing a context we retained; errors on teardown are
         // unreportable, so they are intentionally ignored.
@@ -909,7 +1306,13 @@ impl Drop for Cuda {
 /// A resolved kernel handle, owned by its module — valid only while that
 /// `Module` is alive. Plain data; copying does not duplicate GPU state.
 #[derive(Clone, Copy)]
-pub struct Kernel(CUfunction);
+pub struct Kernel {
+    /// Driver-owned function handle. It is valid while the parent `Module`
+    /// remains loaded.
+    raw: CUfunction,
+    /// Process-lifetime entry name used only when telemetry is enabled.
+    name: &'static str,
+}
 
 // SAFETY: function handles are context-level objects; the driver API is
 // thread-safe.
@@ -929,7 +1332,9 @@ unsafe impl Send for Module {}
 unsafe impl Sync for Module {}
 
 impl Module {
-    /// Resolve a kernel by its `.entry` name.
+    /// Resolve a PTX `.entry` and retain its readable name for telemetry.
+    ///
+    /// The returned handle remains valid only while this module is loaded.
     pub fn get_function(&self, name: &str) -> Result<Kernel, GlError> {
         let cname = std::ffi::CString::new(name)
             .map_err(|_| GlError::Engine("kernel name contains NUL".into()))?;
@@ -942,7 +1347,7 @@ impl Module {
                 "cuModuleGetFunction",
             )?
         };
-        Ok(Kernel(f))
+        Ok(Kernel { raw: f, name: intern_kernel_name(name) })
     }
 }
 
@@ -979,5 +1384,100 @@ impl Drop for GraphExec {
                 let _ = destroy(self.exec);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_profiler_bounds_event_pair_retention() {
+        let profiler = KernelProfiler::new();
+        for _ in 0..MAX_KERNEL_EVENT_PAIRS {
+            assert!(profiler.reserve_event_pair());
+        }
+        assert!(!profiler.reserve_event_pair());
+    }
+
+    #[test]
+    fn kernel_names_are_interned_without_requiring_static_input() {
+        let dynamic = String::from("gl_test_entry");
+        let first = intern_kernel_name(&dynamic);
+        let second = intern_kernel_name("gl_test_entry");
+        assert!(std::ptr::eq(first, second));
+    }
+
+    #[test]
+    fn kernel_resource_queries_are_cached_per_launch_shape() {
+        let profiler = KernelProfiler::new();
+        let key = KernelResourceKey {
+            function: 7,
+            grid: [28, 4, 1],
+            block: [128, 1, 1],
+            dynamic_shared_bytes: 9_728,
+        };
+        let builds = AtomicUsize::new(0);
+        let build = || {
+            builds.fetch_add(1, Ordering::Relaxed);
+            glcore::telemetry::LaunchConfig {
+                grid: key.grid,
+                block: key.block,
+                dynamic_shared_bytes: key.dynamic_shared_bytes as u64,
+                registers_per_thread: Some(64),
+                static_shared_bytes: Some(0),
+                local_bytes_per_thread: Some(0),
+                active_blocks_per_sm: Some(2),
+                active_warps_per_sm: Some(8),
+            }
+        };
+
+        assert_eq!(profiler.config_for(key, build).registers_per_thread, Some(64));
+        assert_eq!(profiler.config_for(key, build).active_warps_per_sm, Some(8));
+        assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn kernel_profiler_reset_starts_a_bounded_window_and_keeps_resources() {
+        let profiler = KernelProfiler::new();
+        let key = KernelResourceKey {
+            function: 9,
+            grid: [1, 1, 1],
+            block: [128, 1, 1],
+            dynamic_shared_bytes: 0,
+        };
+        let config = glcore::telemetry::LaunchConfig {
+            grid: key.grid,
+            block: key.block,
+            dynamic_shared_bytes: 0,
+            registers_per_thread: Some(32),
+            static_shared_bytes: Some(0),
+            local_bytes_per_thread: Some(0),
+            active_blocks_per_sm: Some(4),
+            active_warps_per_sm: Some(16),
+        };
+        profiler.config_for(key, || config);
+        profiler.record("warmup_kernel", "kernel", Some(config), None);
+        assert!(profiler.reserve_event_pair());
+        assert_eq!(profiler.snapshot().unwrap().observed_launches, 1);
+
+        profiler.reset_window();
+        let snapshot = profiler.snapshot().unwrap();
+        assert_eq!(snapshot.observed_launches, 0);
+        assert!(snapshot.entries.is_empty());
+        assert!(snapshot
+            .coverage
+            .contains("most recent telemetry-window reset"));
+        assert_eq!(
+            profiler.config_for(key, || panic!("resource cache was discarded")),
+            config
+        );
+
+        // The old window's reservation no longer consumes the new window's
+        // bounded event budget.
+        for _ in 0..MAX_KERNEL_EVENT_PAIRS {
+            assert!(profiler.reserve_event_pair());
+        }
+        assert!(!profiler.reserve_event_pair());
     }
 }

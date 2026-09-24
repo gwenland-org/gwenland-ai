@@ -240,6 +240,123 @@ pub struct BackendTelemetry {
     pub kernels: Vec<(String, String)>,
 }
 
+/// Resource shape for one directly launched GPU kernel variant.
+///
+/// Every value is descriptive. In particular, resident blocks and warps are
+/// the driver's capacity projection, not a measurement of scheduler activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct LaunchConfig {
+    /// Number of thread blocks submitted along the X, Y, and Z axes.
+    pub grid: [u32; 3],
+    /// Threads per block along the X, Y, and Z axes.
+    pub block: [u32; 3],
+    /// Shared memory requested by the launch in addition to the kernel's
+    /// statically declared shared memory.
+    pub dynamic_shared_bytes: u64,
+    /// Registers assigned to each thread by the CUDA compiler/JIT.
+    pub registers_per_thread: Option<u32>,
+    /// Shared memory declared by the compiled kernel itself.
+    pub static_shared_bytes: Option<u64>,
+    /// Per-thread local memory reported by the driver. A non-zero value can
+    /// indicate stack use or register spilling and deserves inspection.
+    pub local_bytes_per_thread: Option<u64>,
+    /// Resident blocks per SM projected by the CUDA occupancy calculator for
+    /// this exact block shape and dynamic shared-memory request.
+    pub active_blocks_per_sm: Option<u32>,
+    /// Resident warps per SM derived from `active_blocks_per_sm` and the block
+    /// shape. This is projected capacity, not measured achieved occupancy.
+    pub active_warps_per_sm: Option<u32>,
+}
+
+/// GPU time accumulated for one unit of work submitted by the CPU.
+///
+/// CUDA calls this submission a launch or dispatch. It can be one kernel, or
+/// one replay of a previously captured graph containing many kernels. Keeping
+/// those kinds separate prevents a graph replay from being mistaken for one
+/// giant kernel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LaunchTiming {
+    /// Device entry name, e.g. `"gl_attn_rows_qk4_f32"`.
+    pub name: String,
+    /// What was submitted: currently `"kernel"` or `"graph_replay"`.
+    pub kind: String,
+    /// Sum of GPU duration across every timed launch, in milliseconds.
+    ///
+    /// Two CUDA streams may execute at the same time. Their durations both
+    /// contribute here, so this number ranks where GPU work went; it does not
+    /// claim to be the end-to-end elapsed time seen by the user.
+    pub total_ms: f64,
+    /// Number of successfully timed launches aggregated into `total_ms`.
+    pub launches: u64,
+    /// Raw duration of every successfully timed launch in observation order.
+    /// New archives retain these samples so consumers can recompute tail
+    /// statistics. Legacy archives leave the vector empty.
+    pub samples_ms: Vec<f64>,
+    /// Launch geometry and compiler/occupancy resources for this kernel
+    /// variant. Graph replays and legacy archives have no config because their
+    /// internal kernel nodes are not visible at the driver launch seam.
+    pub config: Option<LaunchConfig>,
+}
+
+impl LaunchTiming {
+    /// Compute `[P50, P90, P99]` from raw launch durations using linear
+    /// interpolation between adjacent ranks (the same type-7 convention used
+    /// by glbench's session statistics). The samples are sorted once for all
+    /// three values. Returns `None` for legacy aggregate-only entries.
+    pub fn percentiles_ms(&self) -> Option<[f64; 3]> {
+        if self.samples_ms.is_empty() {
+            return None;
+        }
+        let mut sorted = self.samples_ms.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        Some([
+            Self::percentile(&sorted, 50.0),
+            Self::percentile(&sorted, 90.0),
+            Self::percentile(&sorted, 99.0),
+        ])
+    }
+
+    fn percentile(sorted: &[f64], percentile: f64) -> f64 {
+        let rank = percentile.clamp(0.0, 100.0) / 100.0 * (sorted.len() - 1) as f64;
+        let lower = rank.floor() as usize;
+        let upper = rank.ceil() as usize;
+        let weight = rank - lower as f64;
+        sorted[lower] * (1.0 - weight) + sorted[upper] * weight
+    }
+}
+
+/// GPU timing collected at the backend's device-submission boundary.
+///
+/// The profile carries both its measurement method and its coverage limits so
+/// archived numbers remain interpretable without reading backend source code.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct LaunchProfile {
+    /// Entries in hotspot order (largest accumulated device time first).
+    pub entries: Vec<LaunchTiming>,
+    /// Timing mechanism, e.g. `"cuda_events_on_launch_stream"`.
+    pub timing_source: String,
+    /// What the observer included and excluded, including known blind spots.
+    pub coverage: String,
+    /// Successful submissions seen by the observer, timed or not.
+    pub observed_launches: u64,
+    /// Submissions whose start/end timestamps produced a valid duration.
+    pub timed_launches: u64,
+}
+
+impl LaunchProfile {
+    /// Sum of attributed device work. This is not wall time when streams
+    /// overlap; [`LaunchTiming::total_ms`] documents that distinction.
+    pub fn total_ms(&self) -> f64 {
+        self.entries.iter().map(|entry| entry.total_ms).sum()
+    }
+
+    /// Dispatches observed but not timed because the event API refused a
+    /// record or query.
+    pub fn untimed_launches(&self) -> u64 {
+        self.observed_launches.saturating_sub(self.timed_launches)
+    }
+}
+
 /// Everything an engine chooses to report about a completed run.
 ///
 /// All fields optional: an engine that collects nothing returns
@@ -253,6 +370,8 @@ pub struct EngineTelemetry {
     pub decode: Option<PhaseProfile>,
     /// Which kernels and SIMD path the engine selected.
     pub backend: Option<BackendTelemetry>,
+    /// Per-kernel or per-graph-replay GPU time from the native launch seam.
+    pub launches: Option<LaunchProfile>,
     /// Memory breakdown.
     pub memory: Option<MemoryTelemetry>,
     /// MoE routing stats. `None` on a dense model — which is itself the signal
@@ -369,6 +488,52 @@ mod tests {
     fn empty_telemetry_is_all_none() {
         // An engine that collects nothing must cost nothing and report nothing.
         let t = EngineTelemetry::default();
-        assert!(t.prefill.is_none() && t.decode.is_none() && t.moe.is_none());
+        assert!(t.prefill.is_none() && t.decode.is_none() && t.launches.is_none() && t.moe.is_none());
+    }
+
+    #[test]
+    fn launch_profile_distinguishes_work_sum_from_missing_timings() {
+        let profile = LaunchProfile {
+            entries: vec![
+                LaunchTiming {
+                    name: "attention".into(), kind: "kernel".into(), total_ms: 4.5, launches: 3,
+                    samples_ms: vec![1.0, 1.5, 2.0],
+                    config: Some(LaunchConfig {
+                        grid: [28, 4, 1], block: [128, 1, 1], dynamic_shared_bytes: 9_728,
+                        registers_per_thread: Some(64), static_shared_bytes: Some(0),
+                        local_bytes_per_thread: Some(0), active_blocks_per_sm: Some(2),
+                        active_warps_per_sm: Some(8),
+                    }),
+                },
+                LaunchTiming {
+                    name: "decode".into(), kind: "graph_replay".into(), total_ms: 2.0, launches: 2,
+                    samples_ms: vec![],
+                    config: None,
+                },
+            ],
+            timing_source: "cuda_events_on_launch_stream".into(),
+            coverage: "driver launch seam".into(),
+            observed_launches: 7,
+            timed_launches: 5,
+        };
+        assert_eq!(profile.total_ms(), 6.5);
+        assert_eq!(profile.untimed_launches(), 2);
+        assert_eq!(profile.entries[0].config.unwrap().active_warps_per_sm, Some(8));
+        assert!(profile.entries[1].config.is_none());
+    }
+
+    #[test]
+    fn launch_percentiles_use_raw_samples_and_linear_interpolation() {
+        let timing = LaunchTiming {
+            name: "kernel".into(), kind: "kernel".into(), total_ms: 15.0, launches: 4,
+            samples_ms: vec![8.0, 1.0, 4.0, 2.0], config: None,
+        };
+        let [p50, p90, p99] = timing.percentiles_ms().unwrap();
+        assert_eq!(p50, 3.0);
+        assert!((p90 - 6.8).abs() < 1e-12);
+        assert!((p99 - 7.88).abs() < 1e-12);
+
+        let legacy = LaunchTiming { samples_ms: vec![], ..timing };
+        assert_eq!(legacy.percentiles_ms(), None);
     }
 }

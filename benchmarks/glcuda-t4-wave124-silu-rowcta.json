@@ -1,0 +1,71 @@
+{
+  "wave": 124,
+  "status": "REJECT",
+  "candidate": "stacked_silu_rowcta",
+  "build": "wave124-stacked-silu-rowcta-v1",
+  "source_revision": "c0e325b2a754c088f88c652b76c3adb5364bf624",
+  "base_revision": "5de5be39c0190b9367da18f0f2001e7f40208c92",
+  "patch_sha256": "5a3e304c1328ddf00f4194760c1a206ba7c75ef19ca3b0f52371173f5d14df0d",
+  "gpu": {
+    "name": "Tesla T4",
+    "compute_capability": "7.5",
+    "count": 2,
+    "driver": "580.159.04"
+  },
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "production_ab": {
+    "prompt_tokens": 244,
+    "samples_per_arm": 40,
+    "retained_median_ms": 18.638322,
+    "candidate_median_ms": 18.775233,
+    "retained_mean_ms": 18.60737995,
+    "candidate_mean_ms": 18.810402425,
+    "retained_p95_ms": 19.00662715,
+    "candidate_p95_ms": 19.3033419,
+    "retained_tps": 13091.307254,
+    "candidate_tps": 12995.844046,
+    "speedup": 0.9927078934,
+    "change_percent": -0.7292106575,
+    "oracle_token": 3323,
+    "invocations": [
+      {
+        "order": "a",
+        "retained_median_ms": 18.564845,
+        "candidate_median_ms": 18.721807,
+        "speedup": 0.991616
+      },
+      {
+        "order": "b",
+        "retained_median_ms": 18.672686,
+        "candidate_median_ms": 18.860016,
+        "speedup": 0.990067
+      }
+    ]
+  },
+  "resource_gate": {
+    "registers_per_thread": 20,
+    "static_shared_bytes": 0,
+    "spill_stores_bytes": 0,
+    "spill_loads_bytes": 0,
+    "barriers": 0,
+    "retained_registers_per_thread": 18
+  },
+  "correctness": {
+    "cuda_parity_passed": 37,
+    "cuda_parity_failed": 0,
+    "library_tests_passed": 67,
+    "library_tests_failed": 0,
+    "exact_oracle_all_samples": true
+  },
+  "retention_gate": {
+    "minimum_combined_speedup": 1.02,
+    "combined_speedup_pass": false,
+    "both_invocations_positive": false,
+    "passed": false
+  },
+  "target_15000_tps_achieved": false,
+  "archive_sha256": "26f05d98d477ffe264b741edd5b4f7d46e9728c92b2cf763c1f4e27070045b7b"
+}

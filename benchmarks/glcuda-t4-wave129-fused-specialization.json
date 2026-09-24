@@ -1,0 +1,37 @@
+{
+  "wave": 129,
+  "build": "wave129-fused-specialization-v1",
+  "kaggle_kernel": "jinxsuperdev/glcuda-t4-wave129-fused-specialization",
+  "gpu": {
+    "name": "Tesla T4",
+    "count": 2,
+    "memory_mib_each": 15360,
+    "driver": "580.159.04"
+  },
+  "host_tests": {
+    "before": { "passed": 67, "failed": 0 },
+    "after": { "passed": 68, "failed": 0 }
+  },
+  "resource": {
+    "registers_per_thread": 80,
+    "barriers": 1,
+    "static_shared_bytes": 16384,
+    "stack_frame_bytes": 0,
+    "spill_store_bytes": 0,
+    "spill_load_bytes": 0
+  },
+  "gates": {
+    "resource_passed": true,
+    "production_dispatch_wired": false,
+    "occupancy_run": false,
+    "cuda_parity_run": false,
+    "direct_exact_output_run": false,
+    "production_timing_run": false,
+    "target_15000_tps_achieved": false
+  },
+  "sha256": {
+    "candidate_ptx": "80cdd36f64ce8873679d1a75ea0e01ad7525177a26f4ea69fe0d37737be4d06b",
+    "notebook": "2ba5a3fe3533bb1626f777b96943556cfbaf3095ef997c2674f8e7b33a120964",
+    "raw_archive": "7834e64ed92813b4c27cca868377879f1e6cd5a6558488adfa9a18800413c3bc"
+  }
+}

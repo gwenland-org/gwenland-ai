@@ -6,6 +6,7 @@
 
 use crate::comparison::runs::ComparisonReport;
 use crate::comparison::statistics::Stats;
+use crate::core::result::ENMeasurementMode;
 use crate::core::session::BenchmarkSession;
 use crate::measurement::memory::bytes_to_gib;
 use crate::environment::bandwidth::CEILING_TOLERANCE;
@@ -32,6 +33,29 @@ pub fn session(session: &BenchmarkSession) -> String {
         session.environment.runtime.arch,
         session.environment.runtime.glbench_version,
     ));
+    match session.metadata.measurement_mode {
+        ENMeasurementMode::Production => {
+            s.push_str("measurement production | throughput is eligible as production evidence\n")
+        }
+        ENMeasurementMode::Instrumented => s.push_str(
+            "measurement INSTRUMENTED | diagnostic only; throughput is non-authoritative\n",
+        ),
+        ENMeasurementMode::Unknown => s.push_str(
+            "measurement UNKNOWN | legacy archive; throughput authority was not recorded\n",
+        ),
+    }
+    if let Some(dispatch) = &session.metadata.dispatch {
+        s.push_str(&format!("dispatch config {}", dispatch.config_fingerprint));
+        if !dispatch.engine_overrides.is_empty() {
+            let names: Vec<&str> = dispatch
+                .engine_overrides
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            s.push_str(&format!(" | overrides {}", names.join(",")));
+        }
+        s.push('\n');
+    }
     let hw = &session.environment.hardware;
     if let Some(name) = &hw.gpu.name {
         s.push_str(&format!(
@@ -242,6 +266,64 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
         ));
         for (role, kernel) in &b.kernels {
             s.push_str(&format!("  {role:<20} {kernel}\n"));
+        }
+    }
+
+    if let Some(profile) = &t.launches {
+        let total_ms = profile.total_ms();
+        s.push_str(&format!("\nCUDA dispatch profile ({total_ms:.2} ms summed GPU work)\n"));
+        s.push_str(&format!(
+            "  source: {} | observed {} | timed {} | untimed {}\n",
+            profile.timing_source, profile.observed_launches, profile.timed_launches,
+            profile.untimed_launches(),
+        ));
+        s.push_str(&format!("  coverage: {}\n", profile.coverage));
+        s.push_str("  note: summed event durations are work attribution, not wall time when streams overlap\n");
+        if !profile.entries.is_empty() {
+            let mut tab = Table::new(&[
+                "kind", "entry", "launches", "total ms", "mean", "p50", "p90", "p99", "share",
+            ])
+                .right_align(2).right_align(3).right_align(4).right_align(5)
+                .right_align(6).right_align(7).right_align(8);
+            for entry in &profile.entries {
+                let percentiles = entry.percentiles_ms();
+                let percentile = |index: usize| percentiles
+                    .map_or("-".into(), |values| format!("{:.4}", values[index]));
+                tab.row(&[
+                    entry.kind.clone(), entry.name.clone(), entry.launches.to_string(),
+                    format!("{:.3}", entry.total_ms),
+                    if entry.launches > 0 { format!("{:.4}", entry.total_ms / entry.launches as f64) } else { "-".into() },
+                    percentile(0), percentile(1), percentile(2),
+                    if total_ms > 0.0 { format!("{:.1}%", entry.total_ms / total_ms * 100.0) } else { "-".into() },
+                ]);
+            }
+            s.push_str(&tab.render());
+
+            let configured: Vec<_> = profile.entries.iter()
+                .filter_map(|entry| entry.config.map(|config| (entry, config)))
+                .collect();
+            if !configured.is_empty() {
+                s.push_str("  resource projection (driver-reported; projected capacity, not achieved occupancy)\n");
+                let mut resources = Table::new(&[
+                    "entry", "grid", "block", "regs/t", "static smem", "dynamic smem",
+                    "local/t", "blocks/SM", "warps/SM",
+                ])
+                .right_align(3).right_align(4).right_align(5).right_align(6)
+                .right_align(7).right_align(8);
+                for (entry, config) in configured {
+                    let dim = |v: [u32; 3]| format!("{}x{}x{}", v[0], v[1], v[2]);
+                    resources.row(&[
+                        entry.name.clone(), dim(config.grid), dim(config.block),
+                        config.registers_per_thread.map_or("-".into(), |v| v.to_string()),
+                        config.static_shared_bytes.map_or("-".into(), |v| v.to_string()),
+                        config.dynamic_shared_bytes.to_string(),
+                        config.local_bytes_per_thread.map_or("-".into(), |v| v.to_string()),
+                        config.active_blocks_per_sm.map_or("-".into(), |v| v.to_string()),
+                        config.active_warps_per_sm.map_or("-".into(), |v| v.to_string()),
+                    ]);
+                }
+                s.push_str(&resources.render());
+            }
         }
     }
 
@@ -706,6 +788,76 @@ mod tests {
         assert!(s.contains(std::env::consts::OS));
         assert!(s.contains(std::env::consts::ARCH));
         assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn instrumented_report_marks_throughput_non_authoritative() {
+        let mut sess = sample();
+        sess.metadata.measurement_mode = ENMeasurementMode::Instrumented;
+        let report = session(&sess);
+        assert!(report.contains("measurement INSTRUMENTED"), "{report}");
+        assert!(report.contains("throughput is non-authoritative"), "{report}");
+    }
+
+    #[test]
+    fn launch_profile_names_provenance_and_graph_replays() {
+        let report = telemetry(
+            &glcore::telemetry::EngineTelemetry {
+                launches: Some(glcore::telemetry::LaunchProfile {
+                    entries: vec![glcore::telemetry::LaunchTiming {
+                        name: "cuda_graph_replay".into(),
+                        kind: "graph_replay".into(),
+                        total_ms: 2.5,
+                        launches: 5,
+                        samples_ms: vec![],
+                        config: None,
+                    }],
+                    timing_source: "cuda_events_on_launch_stream".into(),
+                    coverage: "graph internals excluded".into(),
+                    observed_launches: 6,
+                    timed_launches: 5,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(report.contains("CUDA dispatch profile"), "{report}");
+        assert!(report.contains("cuda_events_on_launch_stream"), "{report}");
+        assert!(report.contains("graph_replay"), "{report}");
+        assert!(report.contains("untimed 1"), "{report}");
+        assert!(report.contains("not wall time"), "{report}");
+    }
+
+    #[test]
+    fn launch_profile_renders_kernel_resources_without_claiming_achieved_occupancy() {
+        let report = telemetry(
+            &glcore::telemetry::EngineTelemetry {
+                launches: Some(glcore::telemetry::LaunchProfile {
+                    entries: vec![glcore::telemetry::LaunchTiming {
+                        name: "gl_attn_rows_qk4_f32".into(), kind: "kernel".into(),
+                        total_ms: 7.5, launches: 3,
+                        samples_ms: vec![1.5, 2.5, 3.5],
+                        config: Some(glcore::telemetry::LaunchConfig {
+                            grid: [28, 4, 1], block: [128, 1, 1],
+                            dynamic_shared_bytes: 9_728, registers_per_thread: Some(64),
+                            static_shared_bytes: Some(0), local_bytes_per_thread: Some(0),
+                            active_blocks_per_sm: Some(2), active_warps_per_sm: Some(8),
+                        }),
+                    }],
+                    timing_source: "cuda_events_on_launch_stream".into(),
+                    coverage: "graph internals excluded".into(),
+                    observed_launches: 3, timed_launches: 3,
+                }),
+                ..Default::default()
+            },
+            None,
+        );
+        assert!(report.contains("resource projection"), "{report}");
+        assert!(report.contains("28x4x1"), "{report}");
+        assert!(report.contains("128x1x1"), "{report}");
+        assert!(report.contains("projected capacity, not achieved occupancy"), "{report}");
+        assert!(report.contains("p99"), "{report}");
+        assert!(report.contains("3.4800"), "{report}");
     }
 
     #[test]

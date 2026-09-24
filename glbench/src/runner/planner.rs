@@ -70,6 +70,12 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
         adapter.run_once(spec)?;
     }
 
+    // Cold and warmup inference intentionally exercise the same engine, but
+    // their launch samples describe different phases from the throughput
+    // figures below. Open a fresh observer window before starting any measured
+    // clock so clearing old event records cannot inflate production timing.
+    adapter.begin_telemetry_window();
+
     // 4. Measured iterations, bracketed by the energy meter so Joules cover
     //    exactly the work the tok/s figures describe. RAPL is package-level
     //    and Linux-only; where unreadable the meter is None and the report
@@ -130,17 +136,20 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
 
     // 6. Assemble the session, then run the derived passes.
     let label = default_label(spec);
+    let mut metadata = SessionMetadata::new(label);
+    metadata.measurement_mode = adapter.observation().measurement_mode;
+    metadata.dispatch = Some(adapter.observation().dispatch.clone());
     let mut session = BenchmarkSession::new(
-        SessionMetadata::new(label),
+        metadata,
         environment,
         engine_meta,
         spec.clone(),
         measurements,
     );
 
-    // 7. Pull the engine's own view of the last run. Taken after the measured
-    //    iterations (not the warmups) so the stage timings describe the same
-    //    work the reported tok/s came from.
+    // 7. Pull the engine's own view after the measured iterations. Accumulating
+    //    observers were reset at the phase boundary above, while last-run
+    //    snapshots naturally describe the final measured iteration.
     session.telemetry = adapter.telemetry();
 
     // 8. Behavioral signals, from one EXTRA traced run.

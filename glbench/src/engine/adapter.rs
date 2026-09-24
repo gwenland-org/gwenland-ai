@@ -25,6 +25,7 @@ use glcore::GlError;
 use crate::core::metrics::IterationMetrics;
 use crate::core::workload::WorkloadSpec;
 use crate::engine::metadata::EngineMetadata;
+use crate::engine::observation::VLObservationPlan;
 use crate::environment::gpu::GpuInfo;
 
 /// The set of engine names glbench can construct. Kept explicit rather than a
@@ -60,6 +61,7 @@ pub struct EngineAdapter {
     backend: Backend,
     metadata: EngineMetadata,
     gpu: GpuInfo,
+    observation: VLObservationPlan,
 }
 
 impl EngineAdapter {
@@ -68,10 +70,10 @@ impl EngineAdapter {
     /// The engine is created here (the only place glbench names concrete engine
     /// types); everything after goes through [`Backend`].
     pub fn load(spec: &WorkloadSpec) -> Result<EngineAdapter, GlError> {
-        enable_engine_profiling();
+        let observation = VLObservationPlan::prepare(spec)?;
 
         if spec.engine == "gllm" {
-            return Self::load_gllm(spec);
+            return Self::load_gllm(spec, observation);
         }
 
         let (engine, gpu) = build_engine(&spec.engine)?;
@@ -88,14 +90,22 @@ impl EngineAdapter {
         let mut runtime = Runtime::new(engine)?;
         runtime.load(&spec.model_path)?;
 
-        Ok(EngineAdapter { backend: Backend::Tokenized(Box::new(runtime)), metadata, gpu })
+        Ok(EngineAdapter {
+            backend: Backend::Tokenized(Box::new(runtime)),
+            metadata,
+            gpu,
+            observation,
+        })
     }
 
     /// The GLLM path: no `Runtime`, no tokenizer — see the module docs.
     /// `spec.model_path` is a GLLM package root (a directory, or the
     /// `gllm.json` inside one).
     #[cfg(feature = "gllm-bench")]
-    fn load_gllm(spec: &WorkloadSpec) -> Result<EngineAdapter, GlError> {
+    fn load_gllm(
+        spec: &WorkloadSpec,
+        observation: VLObservationPlan,
+    ) -> Result<EngineAdapter, GlError> {
         let mut engine = glictus_caliburni::runtime::GllmEngine::new();
         engine.init()?;
         engine.load_model(&spec.model_path)?;
@@ -113,11 +123,15 @@ impl EngineAdapter {
             backend: Backend::RawTokens { engine: Box::new(engine), vocab_size },
             metadata,
             gpu: GpuInfo::default(),
+            observation,
         })
     }
 
     #[cfg(not(feature = "gllm-bench"))]
-    fn load_gllm(_spec: &WorkloadSpec) -> Result<EngineAdapter, GlError> {
+    fn load_gllm(
+        _spec: &WorkloadSpec,
+        _observation: VLObservationPlan,
+    ) -> Result<EngineAdapter, GlError> {
         Err(GlError::Engine(
             "engine 'gllm' needs glbench built with --features gllm-bench".into(),
         ))
@@ -134,6 +148,12 @@ impl EngineAdapter {
         &self.gpu
     }
 
+    /// Measurement authority and whitelisted dispatch configuration captured
+    /// before the engine was constructed.
+    pub fn observation(&self) -> &VLObservationPlan {
+        &self.observation
+    }
+
     /// Per-stage telemetry from the engine's most recent run, or `None` if it
     /// collects none (profiling off, or a backend that reports nothing).
     ///
@@ -145,6 +165,16 @@ impl EngineAdapter {
         match &self.backend {
             Backend::Tokenized(rt) => rt.telemetry(),
             Backend::RawTokens { engine, .. } => engine.telemetry(),
+        }
+    }
+
+    /// Tell the selected engine that subsequent dynamic telemetry belongs to
+    /// a new observation window. This changes no inference policy or dispatch;
+    /// it only prevents earlier phases from contaminating later evidence.
+    pub fn begin_telemetry_window(&self) {
+        match &self.backend {
+            Backend::Tokenized(rt) => rt.begin_telemetry_window(),
+            Backend::RawTokens { engine, .. } => engine.begin_telemetry_window(),
         }
     }
 
@@ -224,37 +254,6 @@ impl EngineAdapter {
                 engine.stream(config, &|_id, _text| {})
             }
         }
-    }
-}
-
-/// Ask `glproc` to collect its own per-stage telemetry for this process.
-///
-/// `glproc::runner::Runner` only populates `backend`/`memory`/`moe` stage
-/// timings when the `GLPROC_PROFILE` env var is set — off by default because
-/// per-stage instrumentation has real overhead the engine does not want to
-/// pay on every request unconditionally. glbench had never set it, which
-/// meant the entire telemetry section (`render::text::telemetry`'s
-/// backend/timeline/memory/MoE breakdown, and everything built on top of it —
-/// the ASCII flame graph, the KV-cache memory-risk validation check) was
-/// silently unreachable through the normal `glbench run` CLI: `session.telemetry`
-/// was always `None` unless a caller happened to already know and export a
-/// glproc-internal env var name themselves. Found while E2E-verifying the
-/// flame graph feature: the telemetry section never printed on a real run.
-///
-/// glbench exists specifically to observe engine internals, so it should
-/// always ask for that data rather than requiring the user to know how. Set
-/// once per process, here at the single boundary where every engine gets
-/// constructed — not restored afterward, unlike `thread_scale`'s sweep,
-/// because this is a permanent "yes, profile yourself" instruction for
-/// glbench's whole run, not a transient parameter sweep.
-fn enable_engine_profiling() {
-    if std::env::var_os("GLPROC_PROFILE").is_some() {
-        return; // Respect an explicit caller override, don't clobber it.
-    }
-    // SAFETY: called once, synchronously, before any engine or thread that
-    // reads this variable is constructed (the very first line of `load`).
-    unsafe {
-        std::env::set_var("GLPROC_PROFILE", "1");
     }
 }
 

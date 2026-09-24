@@ -16,8 +16,10 @@ pub const GLBENCH_VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// v2 (glbench v3, D-20) adds `inference`, `training`, `availability` and
 /// `integrity` at the top level, and `session_mode`, `host_identifier` and
-/// `collection_profile` to `metadata`. Nothing was removed and nothing changed
-/// meaning, so the break is for *writers* only: this build reads a v1 archive
+/// `collection_profile` to `metadata`. Later v2 writers add the optional
+/// `measurement_mode` and `dispatch` metadata plus `instrument_engine` in the
+/// workload; missing values keep a defined legacy reading. Nothing was removed
+/// or changed meaning, so the break is for *writers* only: this build reads a v1 archive
 /// by defaulting the new fields, and a v1 build correctly refuses a v2 one via
 /// the existing check in `storage::archive::read`.
 pub const SCHEMA_VERSION: u32 = 2;

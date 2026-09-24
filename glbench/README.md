@@ -67,6 +67,47 @@ glbench run --engine glproc --model model.gguf \
     --out benchmarks/qwen-glproc-001.json
 ```
 
+Collect an engine stage breakdown in a separate diagnostic run:
+
+```sh
+glbench run --engine glcuda --model model.gguf --profile stages \
+    --out benchmarks/qwen-glcuda-profile.json
+```
+
+The default run is `production`. `--profile stages` is `instrumented`: its
+stage timings are useful for locating cost, but its tok/s is clearly marked
+non-authoritative because instrumentation can perturb wall time. Run both when
+making an optimization decision; only the production run decides retention.
+
+### CUDA launch observability
+
+With `--engine glcuda --profile stages`, glbench also archives the native CUDA
+launch profile behind the stage totals. Each direct kernel variant records its
+entry name, launch count, raw event durations, mean, P50/P90/P99, grid/block
+shape, shared memory, registers and local bytes per thread, plus projected
+blocks and warps per SM. CUDA Graph replay remains one opaque `graph_replay`
+entry because the driver replay boundary cannot see its internal nodes.
+
+The launch observer is reset after cold-start and warmup, before glbench starts
+its measured wall, CPU and energy clocks. Its samples therefore cover the same
+measured iterations as the session statistics. Immutable kernel-resource data
+stays cached across that reset, so the measurement window does not repeat
+driver attribute and occupancy queries.
+
+Interpret these values as diagnostic GPU work, not production wall time:
+
+- enabling the observer makes the session `instrumented`;
+- CUDA events can perturb execution;
+- independent streams may overlap, so summed durations are not elapsed time;
+- at most 16,384 dispatches retain event pairs; later launches remain counted
+  as observed but untimed;
+- projected residency is a resource-limit calculation, not achieved occupancy
+  or a hardware-counter measurement.
+
+The raw launch samples and resources round-trip through schema-v2 archives.
+Older v2 archives remain readable: absent samples or resources are rendered as
+unavailable rather than reconstructed from an average.
+
 A/B two (or more) models under one identical workload, in one command — each
 candidate is diffed against the first. Sequential on purpose: parallel decodes
 would contend for the memory bus and corrupt every number:
@@ -146,6 +187,7 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--kind`        | end_to_end | `prefill`, `decode`, `end_to_end`, `stress`   |
 | `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--verify-against` | unset | oracle engine to auto cross-check the first 50 tokens against, folded into the validation report; skipped (not just trivial) when equal to `--engine` |
+| `--profile stages` | off | collect engine stage telemetry in a diagnostic-only run; headline tok/s is non-authoritative |
 | `--out`         | —       | archive the session as JSON                      |
 
 `validate` additionally takes `--against <oracle>` (default `glproc`); `scale`
@@ -162,6 +204,12 @@ inputs were actually measured, absent otherwise:
   runs before warmup, every iteration individually timed and reported as
   median + range, never mixed into the warm statistics (see
   [Interpreting Results](#interpreting-results)).
+- **measurement authority and dispatch provenance** — every new run says
+  `production` or `instrumented`, records a fingerprint of whitelisted engine
+  overrides, and preserves those facts through archive inspect/export.
+- **CUDA launch profile** — for instrumented glcuda runs, measured-window
+  per-entry distributions and launch resources, with explicit event coverage
+  and graph-replay limitations.
 - **roofline** — engine stage telemetry bucketed into attention / ffn /
   lm_head, each classified against the *measured* bandwidth ceiling
   (bandwidth-bound / not-bandwidth-bound / indeterminate).

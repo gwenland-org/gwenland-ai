@@ -822,7 +822,8 @@ impl GpuModel {
         }
         let output_norm = up_f32(cuda, &mut buf, &host.output_norm)?;
         // The vocabulary projection is GEMV-only (last prefill row + decode),
-        // so a prefill B-stage duplicate would consume VRAM without a launch.
+        // so a prefill B-stage duplicate would consume VRAM without a useful
+        // production speedup (measured and rejected in Wave 121).
         // One machine-readable line so a benchmark arm can prove which QKV
         // path it ran instead of inferring it from a timing. Emitted once per
         // upload, never on the hot path.

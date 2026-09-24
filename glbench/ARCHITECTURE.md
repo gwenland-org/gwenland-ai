@@ -45,7 +45,9 @@ glbench/
 │   ├── lib.rs            — re-exports, top-level module doc
 │   ├── core/             — BenchmarkSession data model (see DESIGN.md §4)
 │   ├── environment/       — machine probe (CPU/GPU/memory/storage/runtime)
-│   ├── engine/            — the only boundary to glcore/glproc/glcuda/gllm
+│   ├── engine/            — the only boundary to glcore/glproc/glcuda/gllm;
+│   │                         observation.rs owns production/instrumented mode
+│   │                         and dispatch-configuration provenance
 │   ├── runner/            — orchestrates one run: warmup → iterations → phases
 │   ├── measurement/        — raw facts only (latency, tok/s, bytes, peak RSS,
 │   │                         process CPU-time / utilization)

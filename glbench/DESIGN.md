@@ -170,6 +170,27 @@ that measurement stores facts:
 Both are elaborations of the same idea §6 already states: be honest about what
 you do not know, in the file itself and not only in the docs.
 
+## 8c. Production and instrumented runs are different evidence
+
+Engine stage timing is opt-in. A normal `run` leaves engine instrumentation
+off and records `metadata.measurement_mode = production`. `--profile stages`
+starts glbench with the engine's profiling contract active and records
+`instrumented`; its stage split is diagnostic, but its headline tok/s is never
+presented as production evidence. Legacy archives that predate the field read
+as `unknown`, not optimistically as production.
+
+The archive also records a `dispatch` block: a `sha256-128` configuration
+fingerprint plus a strict allowlist of engine environment overrides. This is a
+fingerprint of dispatch *inputs*, not a claim about resolved kernels. Actual
+hardware-dependent choices remain engine telemetry. The allowlist is deliberate:
+copying the whole process environment would leak unrelated credentials and
+machine state into a file users routinely share.
+
+Telemetry is raw measured evidence, so it round-trips through archive reads.
+`inspect`, `export`, and comparisons therefore see the same stage timings,
+backend choice, memory split, and MoE routing facts as the live run. Derived
+fields such as stage share and GB/s are recomputed from the archived raw counts.
+
 ## 9. Dependencies: zero, on purpose
 
 glbench adds **no** crates.io dependencies. The JSON reader/writer
