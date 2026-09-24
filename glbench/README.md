@@ -79,6 +79,35 @@ stage timings are useful for locating cost, but its tok/s is clearly marked
 non-authoritative because instrumentation can perturb wall time. Run both when
 making an optimization decision; only the production run decides retention.
 
+### CUDA launch observability
+
+With `--engine glcuda --profile stages`, glbench also archives the native CUDA
+launch profile behind the stage totals. Each direct kernel variant records its
+entry name, launch count, raw event durations, mean, P50/P90/P99, grid/block
+shape, shared memory, registers and local bytes per thread, plus projected
+blocks and warps per SM. CUDA Graph replay remains one opaque `graph_replay`
+entry because the driver replay boundary cannot see its internal nodes.
+
+The launch observer is reset after cold-start and warmup, before glbench starts
+its measured wall, CPU and energy clocks. Its samples therefore cover the same
+measured iterations as the session statistics. Immutable kernel-resource data
+stays cached across that reset, so the measurement window does not repeat
+driver attribute and occupancy queries.
+
+Interpret these values as diagnostic GPU work, not production wall time:
+
+- enabling the observer makes the session `instrumented`;
+- CUDA events can perturb execution;
+- independent streams may overlap, so summed durations are not elapsed time;
+- at most 16,384 dispatches retain event pairs; later launches remain counted
+  as observed but untimed;
+- projected residency is a resource-limit calculation, not achieved occupancy
+  or a hardware-counter measurement.
+
+The raw launch samples and resources round-trip through schema-v2 archives.
+Older v2 archives remain readable: absent samples or resources are rendered as
+unavailable rather than reconstructed from an average.
+
 A/B two (or more) models under one identical workload, in one command — each
 candidate is diffed against the first. Sequential on purpose: parallel decodes
 would contend for the memory bus and corrupt every number:
@@ -178,6 +207,9 @@ inputs were actually measured, absent otherwise:
 - **measurement authority and dispatch provenance** — every new run says
   `production` or `instrumented`, records a fingerprint of whitelisted engine
   overrides, and preserves those facts through archive inspect/export.
+- **CUDA launch profile** — for instrumented glcuda runs, measured-window
+  per-entry distributions and launch resources, with explicit event coverage
+  and graph-replay limitations.
 - **roofline** — engine stage telemetry bucketed into attention / ffn /
   lm_head, each classified against the *measured* bandwidth ceiling
   (bandwidth-bound / not-bandwidth-bound / indeterminate).
