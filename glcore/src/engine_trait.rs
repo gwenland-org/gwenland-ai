@@ -109,6 +109,15 @@ pub trait GlEngine: Send + Sync {
         None
     }
 
+    /// Start a new dynamic-telemetry observation window.
+    ///
+    /// Benchmark runners call this only at a quiescent phase boundary, after
+    /// warmup has returned and before measured work begins. Engines whose
+    /// telemetry is already a last-run snapshot or contains only static facts
+    /// may keep the default no-op. Engines that accumulate counters must drop
+    /// the old dynamic samples while retaining immutable metadata caches.
+    fn begin_telemetry_window(&self) {}
+
     /// Stream tokens via callback, returning the same stats as
     /// [`GlEngine::infer`] — the default implementation wraps `infer` and
     /// replays tokens after the fact.

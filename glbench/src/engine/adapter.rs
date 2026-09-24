@@ -168,6 +168,16 @@ impl EngineAdapter {
         }
     }
 
+    /// Tell the selected engine that subsequent dynamic telemetry belongs to
+    /// a new observation window. This changes no inference policy or dispatch;
+    /// it only prevents earlier phases from contaminating later evidence.
+    pub fn begin_telemetry_window(&self) {
+        match &self.backend {
+            Backend::Tokenized(rt) => rt.begin_telemetry_window(),
+            Backend::RawTokens { engine, .. } => engine.begin_telemetry_window(),
+        }
+    }
+
     /// Run one inference request for `spec`'s prompt and token budget, returning
     /// the raw per-iteration facts. This is a thin pass-through to the engine —
     /// the engine already separates prefill from decode timing in its output.

@@ -238,6 +238,12 @@ impl GlcudaEngine {
 }
 
 impl GlEngine for GlcudaEngine {
+    fn begin_telemetry_window(&self) {
+        if let Some(cuda) = &self.cuda {
+            cuda.begin_kernel_profile_window();
+        }
+    }
+
     /// Per-stage prefill cost, memory breakdown, and the kernel path taken.
     ///
     /// Until this existed `glcuda` inherited the trait's `None`, so glbench's

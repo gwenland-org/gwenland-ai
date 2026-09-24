@@ -116,8 +116,10 @@ const KERNEL_TIMING_SOURCE: &str = "cuda_events_on_launch_stream";
 const MAX_KERNEL_EVENT_PAIRS: usize = 16_384;
 /// Human-readable scope stored with every profile so a result cannot be read
 /// as more complete than the observer really is.
-const KERNEL_TIMING_COVERAGE: &str =
-    "successful direct kernel launches and CUDA graph replays since engine init, including warmup; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
+const KERNEL_TIMING_COVERAGE_FROM_INIT: &str =
+    "successful direct kernel launches and CUDA graph replays since engine init; may include setup and warmup; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
+const KERNEL_TIMING_COVERAGE_RESET_WINDOW: &str =
+    "successful direct kernel launches and CUDA graph replays since the most recent telemetry-window reset; direct launch resources from CUDA Driver queries; graph internals excluded; at most 16384 event pairs";
 
 /// Give a kernel name process lifetime so the copyable [`Kernel`] handle can
 /// carry it without owning or cloning a `String` on every launch.
@@ -185,6 +187,10 @@ struct KernelProfilerState {
     /// Reuse a completed aggregation when telemetry is requested repeatedly.
     /// Recording another launch clears it before appending new evidence.
     cached: Option<glcore::telemetry::LaunchProfile>,
+    /// Distinguishes the engine-lifetime window from an explicit caller
+    /// boundary so archived coverage never claims warmup was excluded unless
+    /// the observer was actually reset.
+    window_was_reset: bool,
 }
 
 /// Opt-in observer for work submitted from the CPU to the CUDA driver.
@@ -266,6 +272,22 @@ impl KernelProfiler {
         config
     }
 
+    /// Discard dynamic launch evidence at a quiescent phase boundary.
+    ///
+    /// Kernel resources are immutable for a loaded function and launch shape,
+    /// so their cache survives the reset. Event records, counters, and the
+    /// event-pair budget belong to the old observation window and do not.
+    fn reset_window(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.records.clear();
+        state.observed_launches = 0;
+        state.cached = None;
+        state.window_was_reset = true;
+        self.reserved_event_pairs.store(0, Ordering::Relaxed);
+    }
+
     /// Wait for recorded end events, aggregate them by `(kind, name)`, and
     /// return the slowest entries first.
     ///
@@ -310,7 +332,12 @@ impl KernelProfiler {
         let snapshot = glcore::telemetry::LaunchProfile {
             entries,
             timing_source: KERNEL_TIMING_SOURCE.to_string(),
-            coverage: KERNEL_TIMING_COVERAGE.to_string(),
+            coverage: if state.window_was_reset {
+                KERNEL_TIMING_COVERAGE_RESET_WINDOW
+            } else {
+                KERNEL_TIMING_COVERAGE_FROM_INIT
+            }
+            .to_string(),
             observed_launches: state.observed_launches,
             timed_launches,
         };
@@ -957,6 +984,15 @@ impl Cuda {
         self.kernel_profiler.as_ref()?.snapshot()
     }
 
+    /// Start a fresh launch-observation window without discarding immutable
+    /// kernel-resource metadata. Does nothing when telemetry was not enabled
+    /// before CUDA initialization.
+    pub fn begin_kernel_profile_window(&self) {
+        if let Some(profiler) = &self.kernel_profiler {
+            profiler.reset_window();
+        }
+    }
+
     /// True when this driver exports the CUDA event entry points, i.e.
     /// [`EventRing`] can time stages on-stream.
     pub fn events_available(&self) -> bool {
@@ -1399,5 +1435,49 @@ mod tests {
         assert_eq!(profiler.config_for(key, build).registers_per_thread, Some(64));
         assert_eq!(profiler.config_for(key, build).active_warps_per_sm, Some(8));
         assert_eq!(builds.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn kernel_profiler_reset_starts_a_bounded_window_and_keeps_resources() {
+        let profiler = KernelProfiler::new();
+        let key = KernelResourceKey {
+            function: 9,
+            grid: [1, 1, 1],
+            block: [128, 1, 1],
+            dynamic_shared_bytes: 0,
+        };
+        let config = glcore::telemetry::LaunchConfig {
+            grid: key.grid,
+            block: key.block,
+            dynamic_shared_bytes: 0,
+            registers_per_thread: Some(32),
+            static_shared_bytes: Some(0),
+            local_bytes_per_thread: Some(0),
+            active_blocks_per_sm: Some(4),
+            active_warps_per_sm: Some(16),
+        };
+        profiler.config_for(key, || config);
+        profiler.record("warmup_kernel", "kernel", Some(config), None);
+        assert!(profiler.reserve_event_pair());
+        assert_eq!(profiler.snapshot().unwrap().observed_launches, 1);
+
+        profiler.reset_window();
+        let snapshot = profiler.snapshot().unwrap();
+        assert_eq!(snapshot.observed_launches, 0);
+        assert!(snapshot.entries.is_empty());
+        assert!(snapshot
+            .coverage
+            .contains("most recent telemetry-window reset"));
+        assert_eq!(
+            profiler.config_for(key, || panic!("resource cache was discarded")),
+            config
+        );
+
+        // The old window's reservation no longer consumes the new window's
+        // bounded event budget.
+        for _ in 0..MAX_KERNEL_EVENT_PAIRS {
+            assert!(profiler.reserve_event_pair());
+        }
+        assert!(!profiler.reserve_event_pair());
     }
 }

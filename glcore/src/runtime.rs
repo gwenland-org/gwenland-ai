@@ -91,6 +91,15 @@ impl Runtime {
         self.engine.telemetry()
     }
 
+    /// Mark the start of a caller-defined telemetry window.
+    ///
+    /// This deliberately exposes only the phase-boundary signal, not the
+    /// underlying engine. See [`crate::engine_trait::GlEngine`] for the reset
+    /// contract accumulated telemetry must implement.
+    pub fn begin_telemetry_window(&self) {
+        self.engine.begin_telemetry_window();
+    }
+
     /// Run inference on a text prompt; returns the generated text.
     pub fn infer(&self, prompt: &str, mut config: InferInput) -> Result<String, GlError> {
         config.token_ids = self.encode_prompt(prompt)?;
