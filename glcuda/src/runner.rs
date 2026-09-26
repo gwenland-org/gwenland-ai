@@ -1140,6 +1140,19 @@ impl GpuModel {
                     && down_q8_only
                     && layer.w_gate_up.out_dim == (2 * hidden) as u32
                     && layer.w_gate_up.in_dim == dim as u32;
+                let fused_gate_up = stacked_gate_up
+                    && k.n16_fused_swiglu_enabled(hidden as u32, dim as u32, n as u32)
+                    && layer.w_gate_up.bstage.is_some();
+                // Wave 129 cannot overwrite its quantized input while peer
+                // CTAs may still read it. Its output therefore reuses the
+                // otherwise-dead f32 gate/up slabs as byte/scale storage; the
+                // down GEMM consumes those pointers before either slab is
+                // written again. This preserves the zero-allocation contract.
+                let (ffn_qs, ffn_scales) = if fused_gate_up {
+                    (pf_gate, pf_up)
+                } else {
+                    (pf_qs, pf_scales)
+                };
 
                 // --- attention block (M2.3: every per-token op is ONE
                 // batched launch over the chunk's rows) ---
@@ -1415,7 +1428,37 @@ impl GpuModel {
                     }
                 });
                 phase!(t_gu, ST_GU, {
-                    if stacked_gate_up {
+                    if fused_gate_up {
+                        static WAVE131_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+                        WAVE131_ANNOUNCED.call_once(|| {
+                            eprintln!(
+                                "[glcuda-gemm] {{\"path\":\"wave129-fused-swiglu-production\",\"hidden_dim\":{},\"in_dim\":{},\"ntok\":{}}}",
+                                hidden, dim, n
+                            );
+                        });
+                        // The B-stage image is tiled in N128 blocks. Gate is
+                        // the first half and up begins at the first whole tile
+                        // after `hidden`; Wave 129 consumes both directly and
+                        // writes the Q8 activation expected by the down GEMM.
+                        let tiled = layer.w_gate_up.bstage.as_ref().expect("guarded above");
+                        let (up_qs_offset, up_scale_offset) =
+                            bstage_tile_offsets(hidden as u32, dim as u32)
+                                .expect("Wave 129 shape is N128/K32 aligned");
+                        k.gemm_mma_q8_bstage_n16_fused_swiglu(
+                            cuda,
+                            tiled.qs.dptr,
+                            tiled.scales.dptr,
+                            tiled.qs.dptr + up_qs_offset,
+                            tiled.scales.dptr + up_scale_offset,
+                            pf_qs,
+                            pf_scales,
+                            ffn_qs,
+                            ffn_scales,
+                            hidden as u32,
+                            dim as u32,
+                            n as u32,
+                        )?;
+                    } else if stacked_gate_up {
                         gemm_rows(
                             cuda,
                             k,
@@ -1456,7 +1499,9 @@ impl GpuModel {
                     }
                 });
                 phase!(t_elt, ST_SILU, {
-                    if k.fuse_q8_glue_enabled() {
+                    if fused_gate_up {
+                        // Wave 129 already applied SwiGLU and emitted Q8_0.
+                    } else if k.fuse_q8_glue_enabled() {
                         if stacked_gate_up {
                             k.silu_mul_quantize_q8_stacked_nostore(
                                 cuda,
@@ -1498,8 +1543,8 @@ impl GpuModel {
                         0,
                         dim as u32,
                         pf_gate,
-                        pf_qs,
-                        pf_scales,
+                        ffn_qs,
+                        ffn_scales,
                         pf_proj,
                         n as u32,
                     )?;

@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         benchmark_defer_ffn_residual: Some(true),
         benchmark_q8_nostore: Some(false),
         benchmark_ffn_gate_up_stacked: Some(false),
+        benchmark_n16_fused_swiglu: Some(false),
     });
     gpu.init()?;
     gpu.load_model(&model)?;

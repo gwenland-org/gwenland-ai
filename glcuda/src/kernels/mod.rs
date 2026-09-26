@@ -220,9 +220,13 @@ pub struct KernelSet {
     wave59: Option<Wave59Module>,
     /// Opt-in Wave 88 wide-grid N16 register-prefetch candidate.
     wave88: Option<Wave88Module>,
-    /// Opt-in Wave 129 fused-only specialization, never selected by the
-    /// production runner in Wave 130.
+    /// Opt-in Wave 129 fused-only specialization. Wave 131 may select it in
+    /// the production runner for its exact pinned shape.
     wave129: Option<Wave129Module>,
+    /// Wave 131: replace the stacked gate/up GEMM plus the following SwiGLU
+    /// quantizer with Wave 129's single specialized launch. Kept atomic so
+    /// the production A/B harness can switch arms in one CUDA context.
+    n16_fused_swiglu: AtomicBool,
     /// Whether prefill should drive the r256 (256-row) GEMM instead of the
     /// 64-row one. Read once at load from `GLCUDA_R256`; see
     /// [`KernelSet::r256_enabled`].
@@ -330,6 +334,10 @@ fn resolve_defer_ffn_residual(
     fuse_q8_glue && benchmark_override.unwrap_or(environment_enabled)
 }
 
+fn resolve_n16_fused_swiglu(environment_enabled: bool, benchmark_override: Option<bool>) -> bool {
+    benchmark_override.unwrap_or(environment_enabled)
+}
+
 impl KernelSet {
     /// JIT the embedded PTX and resolve every entry point. On sm_75+ the
     /// tensor-core module is loaded too (`GLCUDA_NO_MMA=1` opts out, for
@@ -345,7 +353,7 @@ impl KernelSet {
         cuda: &Cuda,
         defer_ffn_residual_override: Option<bool>,
     ) -> Result<KernelSet, GlError> {
-        Self::load_with_benchmark_overrides(cuda, defer_ffn_residual_override, None, None)
+        Self::load_with_benchmark_overrides(cuda, defer_ffn_residual_override, None, None, None)
     }
 
     /// Load the kernel suite with benchmark-only overrides for paths that must
@@ -357,6 +365,7 @@ impl KernelSet {
         defer_ffn_residual_override: Option<bool>,
         q8_nostore_override: Option<bool>,
         ffn_gate_up_stacked_override: Option<bool>,
+        n16_fused_swiglu_override: Option<bool>,
     ) -> Result<KernelSet, GlError> {
         let module = cuda.load_module(PTX)?;
         let sm = (cuda.info.sm_major, cuda.info.sm_minor);
@@ -454,12 +463,12 @@ impl KernelSet {
         } else {
             None
         };
-        let n16_fused_swiglu = gemm_n16_prefetch
+        let n16_fused_swiglu_requested = gemm_n16_prefetch
             && fuse_q8_glue
             && q8_nostore
             && ffn_gate_up_stacked
             && std::env::var_os("GLCUDA_N16_FUSED_SWIGLU").is_some();
-        let wave129 = if n16_fused_swiglu {
+        let wave129 = if n16_fused_swiglu_requested {
             let module = cuda.load_module(PTX_SM75_WAVE129)?;
             let fused_swiglu =
                 module.get_function("gl_gemm_mma_q8_bstage_n16_fused_swiglu_specialized")?;
@@ -489,7 +498,7 @@ impl KernelSet {
         };
         eprintln!(
             "[glcuda-contract] {{\"exact_fusion\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu_requested, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -497,6 +506,10 @@ impl KernelSet {
             wave59,
             wave88,
             wave129,
+            n16_fused_swiglu: AtomicBool::new(resolve_n16_fused_swiglu(
+                n16_fused_swiglu_requested,
+                n16_fused_swiglu_override,
+            )),
             r256,
             grid2d,
             fuse_q8_glue,
@@ -1923,7 +1936,9 @@ impl KernelSet {
 
     /// Whether the isolated Wave 129 module covers this direct gate shape.
     pub fn n16_fused_swiglu_enabled(&self, hidden_dim: u32, in_dim: u32, ntok: u32) -> bool {
-        self.wave129.is_some() && n16_fused_swiglu_shape(hidden_dim, in_dim, ntok)
+        self.wave129.is_some()
+            && self.n16_fused_swiglu.load(Ordering::Relaxed)
+            && n16_fused_swiglu_shape(hidden_dim, in_dim, ntok)
     }
 
     /// Whether non-final prefill layers may defer their FFN residual add into
@@ -1951,6 +1966,15 @@ impl KernelSet {
             .store(self.fuse_q8_glue && no_store, Ordering::Relaxed);
         self.ffn_gate_up_stacked
             .store(self.fuse_q8_glue && stacked_gate_up, Ordering::Relaxed);
+    }
+
+    /// Switch only Wave 131's fused gate/up path between synchronized
+    /// production benchmark iterations. The module must have been loaded by
+    /// the normal environment contract before this switch can enable it.
+    #[doc(hidden)]
+    pub fn set_benchmark_n16_fused_swiglu(&self, enabled: bool) {
+        self.n16_fused_swiglu
+            .store(self.wave129.is_some() && enabled, Ordering::Relaxed);
     }
 
     /// The Wave 27 wide-grid entry used by the driver's occupancy query.
@@ -3037,6 +3061,14 @@ mod tests {
         assert!(resolve_defer_ffn_residual(true, false, Some(true)));
         assert!(!resolve_defer_ffn_residual(true, true, Some(false)));
         assert!(!resolve_defer_ffn_residual(false, true, Some(true)));
+    }
+
+    #[test]
+    fn wave131_fused_swiglu_override_preserves_the_production_default() {
+        assert!(!resolve_n16_fused_swiglu(false, None));
+        assert!(resolve_n16_fused_swiglu(true, None));
+        assert!(!resolve_n16_fused_swiglu(true, Some(false)));
+        assert!(resolve_n16_fused_swiglu(true, Some(true)));
     }
 
     /// The PTX image must declare exactly the entry points KernelSet

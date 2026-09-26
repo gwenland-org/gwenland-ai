@@ -1,0 +1,390 @@
+{
+  "wave": 131,
+  "candidate": "wave129_fused_swiglu_production",
+  "gpu": [
+    "0",
+    "Tesla T4",
+    "7.5",
+    "15360",
+    "580.159.04"
+  ],
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "glbench_ceiling_runs": [
+    {
+      "order": 1,
+      "arm": "retained",
+      "prefill_tps": {
+        "ci95": 75.94213655789736,
+        "count": 10,
+        "max": 14928.208471207676,
+        "mean": 14826.960256957293,
+        "median": 14882.05673226423,
+        "min": 14602.714596765787,
+        "p95": 14920.127328135093,
+        "p99": 14926.592242593159,
+        "std_dev": 100.71901400251639
+      },
+      "decode_tps": {
+        "ci95": 0.7739302793893137,
+        "count": 10,
+        "max": 212.90202859739307,
+        "mean": 210.83108244250033,
+        "median": 210.9091585925227,
+        "min": 209.10719263037248,
+        "p95": 212.28189152582175,
+        "p99": 212.7780011830788,
+        "std_dev": 1.0264327312855621
+      },
+      "ceiling_efficiency": 0.4451901336105787,
+      "ceiling_basis": "estimated_from_table",
+      "bottleneck": "compute_bound",
+      "notes": [
+        "Decode 210.8 tok/s vs bandwidth ceiling 473.6 tok/s (320 GB/s, the device's PUBLISHED spec, not measured, over 0.68 GB weights) = 45% of peak. Real devices commonly run 60-85% of their advertised peak even when fully optimized, so this fraction is an underestimate of how well-utilized the device actually is.",
+        "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+      ]
+    },
+    {
+      "order": 2,
+      "arm": "candidate",
+      "prefill_tps": {
+        "ci95": 56.535621104918995,
+        "count": 10,
+        "max": 15951.382278798783,
+        "mean": 15830.67204516267,
+        "median": 15836.876208412781,
+        "min": 15702.690913509192,
+        "p95": 15930.993953181656,
+        "p99": 15947.304613675358,
+        "std_dev": 74.98092984737268
+      },
+      "decode_tps": {
+        "ci95": 0.34856410492346784,
+        "count": 10,
+        "max": 211.9303873713623,
+        "mean": 211.0460779549017,
+        "median": 211.00169805874188,
+        "min": 210.16122081313392,
+        "p95": 211.71414152891214,
+        "p99": 211.88713820287228,
+        "std_dev": 0.462286611304334
+      },
+      "ceiling_efficiency": 0.445644117339082,
+      "ceiling_basis": "estimated_from_table",
+      "bottleneck": "compute_bound",
+      "notes": [
+        "Decode 211.0 tok/s vs bandwidth ceiling 473.6 tok/s (320 GB/s, the device's PUBLISHED spec, not measured, over 0.68 GB weights) = 45% of peak. Real devices commonly run 60-85% of their advertised peak even when fully optimized, so this fraction is an underestimate of how well-utilized the device actually is.",
+        "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+      ]
+    },
+    {
+      "order": 3,
+      "arm": "candidate",
+      "prefill_tps": {
+        "ci95": 79.9864366221964,
+        "count": 10,
+        "max": 15942.870162245494,
+        "mean": 15772.807559274423,
+        "median": 15790.701442173948,
+        "min": 15594.012691609036,
+        "p95": 15918.753823880266,
+        "p99": 15938.046894572448,
+        "std_dev": 106.0828071912419
+      },
+      "decode_tps": {
+        "ci95": 0.4587682359129344,
+        "count": 10,
+        "max": 211.81984173053104,
+        "mean": 210.65108418728306,
+        "median": 210.7267552048403,
+        "min": 209.44306591818304,
+        "p95": 211.44874381667137,
+        "p99": 211.7456221477591,
+        "std_dev": 0.608445936224051
+      },
+      "ceiling_efficiency": 0.44481004996085544,
+      "ceiling_basis": "estimated_from_table",
+      "bottleneck": "compute_bound",
+      "notes": [
+        "Decode 210.7 tok/s vs bandwidth ceiling 473.6 tok/s (320 GB/s, the device's PUBLISHED spec, not measured, over 0.68 GB weights) = 44% of peak. Real devices commonly run 60-85% of their advertised peak even when fully optimized, so this fraction is an underestimate of how well-utilized the device actually is.",
+        "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+      ]
+    },
+    {
+      "order": 4,
+      "arm": "retained",
+      "prefill_tps": {
+        "ci95": 109.10319030940153,
+        "count": 10,
+        "max": 14856.247237666528,
+        "mean": 14495.78848085387,
+        "median": 14464.500042217693,
+        "min": 14292.530015045231,
+        "p95": 14735.785302178429,
+        "p99": 14832.154850568908,
+        "std_dev": 144.69919139177924
+      },
+      "decode_tps": {
+        "ci95": 0.23456000680073355,
+        "count": 10,
+        "max": 209.5132084672367,
+        "mean": 209.0121652620691,
+        "median": 209.13815403255103,
+        "min": 208.47700602210588,
+        "p95": 209.40155618638082,
+        "p99": 209.49087801106552,
+        "std_dev": 0.31108754217603923
+      },
+      "ceiling_efficiency": 0.4413493148223736,
+      "ceiling_basis": "estimated_from_table",
+      "bottleneck": "compute_bound",
+      "notes": [
+        "Decode 209.0 tok/s vs bandwidth ceiling 473.6 tok/s (320 GB/s, the device's PUBLISHED spec, not measured, over 0.68 GB weights) = 44% of peak. Real devices commonly run 60-85% of their advertised peak even when fully optimized, so this fraction is an underestimate of how well-utilized the device actually is.",
+        "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+      ]
+    }
+  ],
+  "production_ab": {
+    "samples_per_arm": 40,
+    "retained_median_ms": 18.587111,
+    "candidate_median_ms": 17.812217,
+    "retained_tps": 13127.376277034124,
+    "candidate_tps": 13698.463251374043,
+    "speedup": 1.0435035122242222,
+    "all_candidate_deltas_positive": false,
+    "invocation_summaries": [
+      {
+        "invocation": "a",
+        "quartets": 10,
+        "samples_per_arm": 20,
+        "retained_median_ms": 18.573529,
+        "candidate_median_ms": 17.800363,
+        "retained_tps": 13136.975747,
+        "candidate_tps": 13707.585626,
+        "speedup": 1.043435,
+        "oracle_token": 3323
+      },
+      {
+        "invocation": "b",
+        "quartets": 10,
+        "samples_per_arm": 20,
+        "retained_median_ms": 18.799143,
+        "candidate_median_ms": 17.907811,
+        "retained_tps": 12979.315068,
+        "candidate_tps": 13625.339244,
+        "speedup": 1.049773,
+        "oracle_token": 3323
+      }
+    ]
+  },
+  "candidate_profile": {
+    "prompt_tokens": 244,
+    "host_prefill_ms": 20.014939,
+    "gpu_prefill_ms": 19.513343811,
+    "gpu_prefill_tps": 12504.26387,
+    "oracle_token": 3323
+  },
+  "candidate_stages": [
+    {
+      "name": "qkv",
+      "total_ms": 1.509471986,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 1.021280002,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.37872,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0
+    },
+    {
+      "name": "attention",
+      "total_ms": 3.007807985,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.461503996,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.329856008,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264
+    },
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 5.164767981,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.952479988,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.606592,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.501951996,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 0.05264,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.063808,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0
+    }
+  ],
+  "candidate_ranked_stages": [
+    {
+      "name": "ffn_gate_up",
+      "total_ms": 5.164767981,
+      "calls": 24,
+      "bytes_read": 889061376,
+      "macs": 51042582528,
+      "share_of_gpu_total": 0.2646787773035872,
+      "share_of_stage_sum": 0.28612278169236743
+    },
+    {
+      "name": "ffn_down",
+      "total_ms": 4.329856008,
+      "calls": 24,
+      "bytes_read": 444530688,
+      "macs": 25521291264,
+      "share_of_gpu_total": 0.22189205755495314,
+      "share_of_stage_sum": 0.2398695255806051
+    },
+    {
+      "name": "attention",
+      "total_ms": 3.007807985,
+      "calls": 24,
+      "bytes_read": 5163024384,
+      "macs": 1285509120,
+      "share_of_gpu_total": 0.15414108489722034,
+      "share_of_stage_sum": 0.1666294382691873
+    },
+    {
+      "name": "qkv",
+      "total_ms": 1.509471986,
+      "calls": 24,
+      "bytes_read": 125396992,
+      "macs": 6044516352,
+      "share_of_gpu_total": 0.07735588531726098,
+      "share_of_stage_sum": 0.08362318019122307
+    },
+    {
+      "name": "attn_norm",
+      "total_ms": 1.021280002,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.05233751897633696,
+      "share_of_stage_sum": 0.05657785134472754
+    },
+    {
+      "name": "attn_out",
+      "total_ms": 0.952479988,
+      "calls": 24,
+      "bytes_read": 81887232,
+      "macs": 4701290496,
+      "share_of_gpu_total": 0.0488117258233861,
+      "share_of_stage_sum": 0.05276640202917816
+    },
+    {
+      "name": "lm_head",
+      "total_ms": 0.606592,
+      "calls": 1,
+      "bytes_read": 144643072,
+      "macs": 136134656,
+      "share_of_gpu_total": 0.031086009956840608,
+      "share_of_stage_sum": 0.03360456675514241
+    },
+    {
+      "name": "ffn_residual_norm_quant",
+      "total_ms": 0.501951996,
+      "calls": 24,
+      "bytes_read": 42061824,
+      "macs": 0,
+      "share_of_gpu_total": 0.025723525442986415,
+      "share_of_stage_sum": 0.027807619219275843
+    },
+    {
+      "name": "attn_out_quant",
+      "total_ms": 0.461503996,
+      "calls": 24,
+      "bytes_read": 20987904,
+      "macs": 0,
+      "share_of_gpu_total": 0.023650687471608145,
+      "share_of_stage_sum": 0.025566842031129612
+    },
+    {
+      "name": "attn_kv_write",
+      "total_ms": 0.37872,
+      "calls": 24,
+      "bytes_read": 0,
+      "macs": 0,
+      "share_of_gpu_total": 0.01940825742979577,
+      "share_of_stage_sum": 0.02098069463742933
+    },
+    {
+      "name": "ffn_residual_add",
+      "total_ms": 0.063808,
+      "calls": 24,
+      "bytes_read": 1748992,
+      "macs": 0,
+      "share_of_gpu_total": 0.0032699674959875595,
+      "share_of_stage_sum": 0.0035348969249711943
+    },
+    {
+      "name": "ffn_silu_quant",
+      "total_ms": 0.05264,
+      "calls": 24,
+      "bytes_read": 227868672,
+      "macs": 0,
+      "share_of_gpu_total": 0.002697641189016818,
+      "share_of_stage_sum": 0.0029162013247630964
+    }
+  ],
+  "candidate_stage_sum_ms": 18.050879941999998,
+  "candidate_attention_ms": 7.331263957,
+  "candidate_ffn_ms": 10.113023985,
+  "retention_authority": true,
+  "target_15000_tps_achieved": false
+}

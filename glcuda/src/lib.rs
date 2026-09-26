@@ -64,6 +64,9 @@ pub struct GlcudaConfig {
     /// Benchmark-only override for Wave 123's stacked FFN gate/up path.
     #[doc(hidden)]
     pub benchmark_ffn_gate_up_stacked: Option<bool>,
+    /// Benchmark-only override for Wave 131's production fused SwiGLU path.
+    #[doc(hidden)]
+    pub benchmark_n16_fused_swiglu: Option<bool>,
 }
 
 /// Optional per-token callback threaded through [`GlcudaEngine::run`].
@@ -137,6 +140,18 @@ impl GlcudaEngine {
             .as_ref()
             .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
         kernels.set_benchmark_q8_nostore(no_store, stacked_gate_up);
+        Ok(())
+    }
+
+    /// Select the retained or Wave 131 fused gate/up path between synchronized
+    /// iterations in the dedicated production benchmark harness.
+    #[doc(hidden)]
+    pub fn set_benchmark_n16_fused_swiglu(&self, enabled: bool) -> Result<(), GlError> {
+        let kernels = self
+            .kernels
+            .as_ref()
+            .ok_or_else(|| GlError::Engine("glcuda not initialized".into()))?;
+        kernels.set_benchmark_n16_fused_swiglu(enabled);
         Ok(())
     }
 
@@ -310,6 +325,7 @@ impl GlEngine for GlcudaEngine {
             self.config.benchmark_defer_ffn_residual,
             self.config.benchmark_q8_nostore,
             self.config.benchmark_ffn_gate_up_stacked,
+            self.config.benchmark_n16_fused_swiglu,
         )?;
         let i = &cuda.info;
         // One startup line, like glproc's [simd] line: name the hardware
