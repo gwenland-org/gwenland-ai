@@ -705,10 +705,48 @@ impl GpuModel {
         let q_ptr = ws.qkv.dptr;
         let k_ptr = at(ws.qkv.dptr, q_dim);
         let v_ptr = at(ws.qkv.dptr, q_dim + kv_dim);
+        let decode_q8_glue = k.decode_q8_glue_enabled();
+        let mut pending_ffn_residual = None;
+
+        if decode_q8_glue {
+            static WAVE132_ANNOUNCED: std::sync::Once = std::sync::Once::new();
+            WAVE132_ANNOUNCED.call_once(|| {
+                eprintln!(
+                    "[glcuda-decode] {{\"path\":\"wave132-exact-q8-glue\",\"graph_static\":true}}"
+                );
+            });
+        }
 
         for (l, layer) in self.layers.iter().enumerate() {
             // --- attention block ---
-            k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
+            let qkv_reads_q8 = consumes_q8_act(&layer.wq.w)
+                && consumes_q8_act(&layer.wk.w)
+                && consumes_q8_act(&layer.wv.w);
+            let qkv_needs_q8 = consumes_q8_act(&layer.wq.w)
+                || consumes_q8_act(&layer.wk.w)
+                || consumes_q8_act(&layer.wv.w);
+            if decode_q8_glue && qkv_reads_q8 {
+                // Fold the previous layer's deferred FFN residual into this
+                // layer's attention norm, then emit exactly the Q8 bytes read
+                // by Q/K/V. The normalized f32 scratch is dead on this path.
+                k.rms_quantize_q8_rows_nostore(
+                    cuda,
+                    x,
+                    pending_ffn_residual.take(),
+                    layer.attn_norm.dptr,
+                    xn,
+                    ws.q8_qs.dptr,
+                    ws.q8_scales.dptr,
+                    dim,
+                    c.rms_eps,
+                    1,
+                )?;
+            } else {
+                if let Some(residual) = pending_ffn_residual.take() {
+                    k.add(cuda, x, residual, dim)?;
+                }
+                k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
+            }
 
             // q/k/v read the SAME normalized activation `xn` over the same
             // in_dim, so the int8 copy is made once and all three GEMVs share
@@ -723,10 +761,7 @@ impl GpuModel {
                 layer.wq.in_dim == dim && layer.wk.in_dim == dim && layer.wv.in_dim == dim,
                 "q/k/v must share in_dim with the shared quantize below"
             );
-            if consumes_q8_act(&layer.wq.w)
-                || consumes_q8_act(&layer.wk.w)
-                || consumes_q8_act(&layer.wv.w)
-            {
+            if qkv_needs_q8 && !(decode_q8_glue && qkv_reads_q8) {
                 k.quantize_q8(cuda, xn, ws.q8_qs.dptr, ws.q8_scales.dptr, dim)?;
             }
             gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
@@ -843,23 +878,88 @@ impl GpuModel {
             )?;
 
             gemv_w(cuda, k, ws, &layer.wo, ws.attn_out.dptr, ws.proj.dptr)?;
-            k.add(cuda, x, ws.proj.dptr, dim)?;
 
             // --- SwiGLU feed-forward block ---
             // One GEMV over the fused gate+up weight streams `xn` once and
             // writes gate into [0, hidden) and up into [hidden, 2*hidden).
-            k.rms_norm(cuda, x, layer.ffn_norm.dptr, xn, dim, c.rms_eps)?;
             let gate = ws.gate_up.dptr;
             let up = at(ws.gate_up.dptr, c.hidden_dim);
-            gemv_w(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
-            k.silu_mul(cuda, gate, up, c.hidden_dim as u32)?;
-            gemv_w(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
-            k.add(cuda, x, ws.proj.dptr, dim)?;
+            if decode_q8_glue && consumes_q8_act(&layer.w_gate_up.w) {
+                // The attention-output residual, FFN norm, and activation
+                // quantizer are one exact kernel. Gate/up consumes only Q8,
+                // so the normalized f32 scratch need not be materialized.
+                k.rms_quantize_q8_rows_nostore(
+                    cuda,
+                    x,
+                    Some(ws.proj.dptr),
+                    layer.ffn_norm.dptr,
+                    xn,
+                    ws.q8_qs.dptr,
+                    ws.q8_scales.dptr,
+                    dim,
+                    c.rms_eps,
+                    1,
+                )?;
+                gemv_w_pre(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
+            } else {
+                k.add(cuda, x, ws.proj.dptr, dim)?;
+                k.rms_norm(cuda, x, layer.ffn_norm.dptr, xn, dim, c.rms_eps)?;
+                gemv_w(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
+            }
+
+            if decode_q8_glue && consumes_q8_act(&layer.w_down.w) {
+                // The down projection reads only this quantized product; skip
+                // the otherwise-dead f32 SwiGLU write entirely.
+                k.silu_mul_quantize_q8_nostore(
+                    cuda,
+                    gate,
+                    up,
+                    ws.q8_qs.dptr,
+                    ws.q8_scales.dptr,
+                    c.hidden_dim as u32,
+                )?;
+                gemv_w_pre(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
+            } else {
+                k.silu_mul(cuda, gate, up, c.hidden_dim as u32)?;
+                gemv_w(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
+            }
+
+            if decode_q8_glue {
+                // `ws.proj` remains live until the next layer consumes it in
+                // the fused residual+attention-norm kernel. CUDA graph nodes
+                // preserve this dependency without allocating another buffer.
+                pending_ffn_residual = Some(ws.proj.dptr);
+            } else {
+                k.add(cuda, x, ws.proj.dptr, dim)?;
+            }
         }
 
         if want_logits {
-            k.rms_norm(cuda, x, self.output_norm.dptr, xn, dim, c.rms_eps)?;
-            gemv_w(cuda, k, ws, &self.output, xn, ws.logits.dptr)?;
+            if decode_q8_glue && consumes_q8_act(&self.output.w) {
+                k.rms_quantize_q8_rows_nostore(
+                    cuda,
+                    x,
+                    pending_ffn_residual.take(),
+                    self.output_norm.dptr,
+                    xn,
+                    ws.q8_qs.dptr,
+                    ws.q8_scales.dptr,
+                    dim,
+                    c.rms_eps,
+                    1,
+                )?;
+                gemv_w_pre(cuda, k, ws, &self.output, xn, ws.logits.dptr)?;
+            } else {
+                if let Some(residual) = pending_ffn_residual.take() {
+                    k.add(cuda, x, residual, dim)?;
+                }
+                k.rms_norm(cuda, x, self.output_norm.dptr, xn, dim, c.rms_eps)?;
+                gemv_w(cuda, k, ws, &self.output, xn, ws.logits.dptr)?;
+            }
+        } else if let Some(residual) = pending_ffn_residual {
+            // Direct non-logit execution still leaves the residual stream in
+            // the same materialized state as the retained path.
+            k.add(cuda, x, residual, dim)?;
         }
         Ok(())
     }

@@ -235,8 +235,11 @@ pub struct KernelSet {
     /// launch. Read once from `GLCUDA_GRID2D`; see
     /// [`KernelSet::grid2d_enabled`].
     grid2d: bool,
-    /// Wave 11 exact adjacent-chain fusion; prefill-only and opt-in.
+    /// Wave 11 exact adjacent-chain fusion; opt-in production primitive.
     fuse_q8_glue: bool,
+    /// Wave 132: reuse the exact Wave 11 glue kernels inside the captured
+    /// single-token decode graph when adjacent consumers are Q8-native.
+    decode_q8_glue: bool,
     /// Wave 123: skip f32 scratch writes when the downstream prefill GEMM reads
     /// only the Q8 activation copy.
     q8_nostore: AtomicBool,
@@ -338,6 +341,10 @@ fn resolve_n16_fused_swiglu(environment_enabled: bool, benchmark_override: Optio
     benchmark_override.unwrap_or(environment_enabled)
 }
 
+fn resolve_decode_q8_glue(fuse_q8_glue: bool, decode_requested: bool) -> bool {
+    fuse_q8_glue && decode_requested
+}
+
 impl KernelSet {
     /// JIT the embedded PTX and resolve every entry point. On sm_75+ the
     /// tensor-core module is loaded too (`GLCUDA_NO_MMA=1` opts out, for
@@ -428,6 +435,10 @@ impl KernelSet {
             eprintln!("[glcuda] 2-D token-grid prefill GEMM enabled");
         }
         let fuse_q8_glue = std::env::var_os("GLCUDA_FUSE_Q8_GLUE").is_some();
+        let decode_q8_glue = resolve_decode_q8_glue(
+            fuse_q8_glue,
+            std::env::var_os("GLCUDA_DECODE_Q8_GLUE").is_some(),
+        );
         let q8_nostore = fuse_q8_glue
             && q8_nostore_override
                 .unwrap_or_else(|| std::env::var_os("GLCUDA_Q8_NOSTORE").is_some());
@@ -497,8 +508,8 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu_requested, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"decode_q8_glue\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, decode_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu_requested, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -513,6 +524,7 @@ impl KernelSet {
             r256,
             grid2d,
             fuse_q8_glue,
+            decode_q8_glue,
             q8_nostore: AtomicBool::new(q8_nostore),
             ffn_gate_up_stacked: AtomicBool::new(ffn_gate_up_stacked),
             gqa_group,
@@ -720,6 +732,12 @@ impl KernelSet {
         self.fuse_q8_glue
     }
 
+    /// Whether Wave 132 may replace exact decode glue chains with the
+    /// already-parity-tested fused Q8 kernels during graph capture.
+    pub fn decode_q8_glue_enabled(&self) -> bool {
+        self.decode_q8_glue
+    }
+
     /// Whether Wave 123 may skip f32 scratch writes for Q8-only prefill consumers.
     pub fn q8_nostore_enabled(&self) -> bool {
         self.q8_nostore.load(Ordering::Relaxed)
@@ -732,7 +750,8 @@ impl KernelSet {
 
     /// RMSNorm followed by the byte-compatible Q8 activation quantizer, with
     /// an optional in-place residual add before the unchanged RMS reduction.
-    /// This is prefill-only: decode graph geometry and entry points stay fixed.
+    /// Decode may also use this entry when Wave 132's exact Q8-glue path is
+    /// selected; its one-row launch remains graph-static.
     #[allow(clippy::too_many_arguments)]
     pub fn rms_quantize_q8_rows(
         &self,
@@ -3069,6 +3088,14 @@ mod tests {
         assert!(resolve_n16_fused_swiglu(true, None));
         assert!(!resolve_n16_fused_swiglu(true, Some(false)));
         assert!(resolve_n16_fused_swiglu(true, Some(true)));
+    }
+
+    #[test]
+    fn wave132_decode_q8_glue_requires_the_exact_fusion_contract() {
+        assert!(!resolve_decode_q8_glue(false, false));
+        assert!(!resolve_decode_q8_glue(false, true));
+        assert!(!resolve_decode_q8_glue(true, false));
+        assert!(resolve_decode_q8_glue(true, true));
     }
 
     /// The PTX image must declare exactly the entry points KernelSet
