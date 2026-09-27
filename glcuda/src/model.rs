@@ -505,6 +505,13 @@ pub struct GpuModel {
     /// decode step and replayed thereafter. `None` until captured; the
     /// prefill path never uses it.
     pub(crate) graph: Option<crate::driver::GraphExec>,
+    /// CUDA events captured between logical decode stages when
+    /// `GLCUDA_PROFILE_DECODE_STAGES=1`. The events become graph nodes and
+    /// therefore keep the same fixed-address replay contract as the kernels.
+    pub(crate) decode_profile_events: Option<crate::driver::EventRing>,
+    /// Accumulated graph-internal stage timings for the current telemetry
+    /// window. Absent when the opt-in event profiler is disabled.
+    pub(crate) decode_profile: Option<crate::runner::DecodeProfile>,
     /// Per-stage prefill cost from the most recent `prefill_batched`.
     ///
     /// `None` until a prefill has run with profiling available -- and it must
@@ -908,6 +915,8 @@ impl GpuModel {
             kv,
             ws,
             graph: None,
+            decode_profile_events: None,
+            decode_profile: None,
             prefill_profile: None,
             buffer: buf,
             total_vram_bytes: total,

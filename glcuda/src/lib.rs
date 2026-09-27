@@ -257,6 +257,11 @@ impl GlEngine for GlcudaEngine {
         if let Some(cuda) = &self.cuda {
             cuda.begin_kernel_profile_window();
         }
+        if let Some(model) = &self.model {
+            if let Ok(mut model) = model.lock() {
+                model.reset_decode_profile();
+            }
+        }
     }
 
     /// Per-stage prefill cost, memory breakdown, and the kernel path taken.
@@ -304,17 +309,37 @@ impl GlEngine for GlcudaEngine {
             PhaseProfile { stages, total_ms }
         });
 
+        let decode = m.decode_profile.as_ref().map(|p| {
+            let stages: Vec<StageTiming> = crate::runner::DECODE_STAGE_NAMES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| p.calls[*i] > 0)
+                .map(|(i, name)| StageTiming {
+                    name: (*name).to_string(),
+                    total_ms: p.ms[i].unwrap_or(0.0),
+                    calls: p.calls[i],
+                    // Decode graph events identify time, not traffic. Leave
+                    // these absent rather than inventing cache-hit-adjusted
+                    // byte counts or attributing fused-kernel MACs twice.
+                    bytes_read: None,
+                    macs: None,
+                })
+                .collect();
+            let total_ms = stages.iter().map(|stage| stage.total_ms).sum();
+            PhaseProfile { stages, total_ms }
+        });
+
         let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
             MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
         });
         let launches = self.cuda.as_ref().and_then(Cuda::kernel_profile);
 
         // Absence must read as "not measured", never as a zeroed report.
-        if prefill.is_none() && launches.is_none() && memory.is_none() {
+        if prefill.is_none() && decode.is_none() && launches.is_none() && memory.is_none() {
             return None;
         }
         Some(EngineTelemetry {
-            prefill, decode: None, backend: None, launches, memory, moe: None,
+            prefill, decode, backend: None, launches, memory, moe: None,
         })
     }
 

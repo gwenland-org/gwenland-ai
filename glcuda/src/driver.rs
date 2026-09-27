@@ -68,6 +68,31 @@ impl EventRing {
         }
     }
 
+    /// Capture mark `i` as an event-record node rather than a dependency
+    /// edge. CUDA's ordinary event-record operation is intentionally not a
+    /// timing node during stream capture, so graph-internal timing must use
+    /// `CU_EVENT_RECORD_EXTERNAL`.
+    pub fn record_external(&self, cuda: &Cuda, i: usize) -> Result<(), GlError> {
+        const CU_EVENT_RECORD_EXTERNAL: u32 = 1;
+        let record = self.api.cu_event_record_with_flags.ok_or_else(|| {
+            GlError::Engine("CUDA graph event-record nodes are unavailable".into())
+        })?;
+        let event = *self.events.get(i).ok_or_else(|| {
+            GlError::Engine(format!("CUDA event boundary {i} is out of range"))
+        })?;
+        let stream = cuda.launch_stream.load(Ordering::Relaxed);
+        // SAFETY: `event` belongs to this live ring, `stream` is the live
+        // capture stream selected by `Cuda::capture`, and the external flag
+        // is valid specifically while that stream is being captured.
+        unsafe {
+            check(
+                &self.api,
+                record(event, stream, CU_EVENT_RECORD_EXTERNAL),
+                "cuEventRecordWithFlags(CU_EVENT_RECORD_EXTERNAL)",
+            )
+        }
+    }
+
     /// Milliseconds between marks `a` and `b`, after waiting for `b`.
     ///
     /// Returns `None` when either index is unmarked or the driver refuses —
@@ -1026,6 +1051,15 @@ impl Cuda {
             api: self.api.clone(),
             events,
         })
+    }
+
+    /// Allocate timing events that can become real event-record nodes inside
+    /// a captured graph. Older drivers still keep ordinary event profiling,
+    /// but this diagnostic is disabled when the flags-taking entry point is
+    /// absent because dependency-only events cannot produce timestamps.
+    pub fn graph_event_ring(&self, n: usize) -> Option<EventRing> {
+        self.api.cu_event_record_with_flags?;
+        self.event_ring(n)
     }
 
     /// True when this driver exports the CUDA Graph entry points, i.e.

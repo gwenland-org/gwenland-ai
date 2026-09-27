@@ -1,0 +1,393 @@
+{
+  "wave": 133,
+  "purpose": "captured_decode_stage_profile",
+  "retention_authority": false,
+  "gpu": [
+    "0",
+    "Tesla T4",
+    "7.5",
+    "15360",
+    "580.159.04"
+  ],
+  "model": {
+    "bytes": 675710816,
+    "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
+  },
+  "runs": [
+    {
+      "order": 1,
+      "arm": "control",
+      "prefill_tps": {
+        "ci95": 79.5302238644967,
+        "count": 10,
+        "max": 15257.229065846761,
+        "mean": 15046.639452967915,
+        "median": 15049.005287937849,
+        "min": 14906.52569817829,
+        "p95": 15203.902944962192,
+        "p99": 15246.563841669848,
+        "std_dev": 105.47775048341738
+      },
+      "decode_tps": {
+        "ci95": 0.662216984857435,
+        "count": 10,
+        "max": 208.0331851936606,
+        "mean": 206.3887881592612,
+        "median": 206.49152346607127,
+        "min": 204.92284747648173,
+        "p95": 207.6222777215625,
+        "p99": 207.951003699241,
+        "std_dev": 0.8782718632061473
+      },
+      "decode_profile": null
+    },
+    {
+      "order": 2,
+      "arm": "profile",
+      "prefill_tps": {
+        "ci95": 67.45124417503587,
+        "count": 10,
+        "max": 15184.280535805965,
+        "mean": 15066.010985471314,
+        "median": 15048.451538493755,
+        "min": 14940.006078868048,
+        "p95": 15179.731612913387,
+        "p99": 15183.37075122745,
+        "std_dev": 89.45788352126775
+      },
+      "decode_tps": {
+        "ci95": 0.3027070712524511,
+        "count": 10,
+        "max": 100.66093957194668,
+        "mean": 99.92525394447478,
+        "median": 99.90915304437837,
+        "min": 99.28390690972726,
+        "p95": 100.50469070769573,
+        "p99": 100.6296897990965,
+        "std_dev": 0.4014682642605452
+      },
+      "decode_profile": {
+        "stages": [
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_input",
+            "share": 0.036335492943616876,
+            "total_ms": 218.42576053598896
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "qkv",
+            "share": 0.11260656313160818,
+            "total_ms": 676.9186875084415
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_prepare",
+            "share": 0.08946031020689357,
+            "total_ms": 537.7782083498314
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attention",
+            "share": 0.17239551970715689,
+            "total_ms": 1036.3316816277802
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_out",
+            "share": 0.08241344539803883,
+            "total_ms": 495.4169609695673
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_input",
+            "share": 0.050262865632494505,
+            "total_ms": 302.14822376379743
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_gate_up",
+            "share": 0.19596632349292306,
+            "total_ms": 1178.0242892205715
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_activation",
+            "share": 0.04444332476052733,
+            "total_ms": 267.1648634746671
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_down",
+            "share": 0.1524087086803693,
+            "total_ms": 916.1837478708476
+          },
+          {
+            "bytes_read": null,
+            "calls": 640,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "lm_head",
+            "share": 0.06370744604637149,
+            "total_ms": 382.96844840049744
+          }
+        ],
+        "total_ms": 6011.36087172199,
+        "unattributed_ms": 0
+      }
+    },
+    {
+      "order": 3,
+      "arm": "profile",
+      "prefill_tps": {
+        "ci95": 52.41024165303607,
+        "count": 10,
+        "max": 15143.029638632699,
+        "mean": 15045.309804011704,
+        "median": 15078.986487949885,
+        "min": 14931.735653937198,
+        "p95": 15121.976017209063,
+        "p99": 15138.818914347972,
+        "std_dev": 69.50960431437144
+      },
+      "decode_tps": {
+        "ci95": 0.24483229529444453,
+        "count": 10,
+        "max": 100.68224808357634,
+        "mean": 100.26882068705076,
+        "median": 100.34714445438256,
+        "min": 99.51036531139815,
+        "p95": 100.64303124203599,
+        "p99": 100.67440471526827,
+        "std_dev": 0.32471126696875935
+      },
+      "decode_profile": {
+        "stages": [
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_input",
+            "share": 0.03843417549657394,
+            "total_ms": 230.05420852499083
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "qkv",
+            "share": 0.11344692574003673,
+            "total_ms": 679.0556158293039
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_prepare",
+            "share": 0.08149156495600579,
+            "total_ms": 487.7814402207732
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attention",
+            "share": 0.17417791366190785,
+            "total_ms": 1042.5711375959218
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "attn_out",
+            "share": 0.08267809542180345,
+            "total_ms": 494.88361748028547
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_input",
+            "share": 0.04984304365925278,
+            "total_ms": 298.3439038656652
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_gate_up",
+            "share": 0.19718537791109156,
+            "total_ms": 1180.286176610738
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_activation",
+            "share": 0.04430927050519969,
+            "total_ms": 265.22057582065463
+          },
+          {
+            "bytes_read": null,
+            "calls": 15360,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "ffn_down",
+            "share": 0.1537453468891697,
+            "total_ms": 920.2685796171427
+          },
+          {
+            "bytes_read": null,
+            "calls": 640,
+            "gb_per_s": null,
+            "gmac_per_s": null,
+            "macs": null,
+            "name": "lm_head",
+            "share": 0.06468828575895852,
+            "total_ms": 387.20259219408035
+          }
+        ],
+        "total_ms": 5985.667847759556,
+        "unattributed_ms": 0
+      }
+    },
+    {
+      "order": 4,
+      "arm": "control",
+      "prefill_tps": {
+        "ci95": 80.55408502809411,
+        "count": 10,
+        "max": 15196.38809258362,
+        "mean": 15017.827440492107,
+        "median": 15001.521221480638,
+        "min": 14851.05427269092,
+        "p95": 15169.757443496313,
+        "p99": 15191.061962766158,
+        "std_dev": 106.83565653593385
+      },
+      "decode_tps": {
+        "ci95": 0.540609781671384,
+        "count": 10,
+        "max": 205.6195845303365,
+        "mean": 204.38684429702087,
+        "median": 204.5057416340033,
+        "min": 202.71322658383028,
+        "p95": 205.2942100806221,
+        "p99": 205.55450964039363,
+        "std_dev": 0.7169891003599257
+      },
+      "decode_profile": null
+    }
+  ],
+  "control_decode_p50_tps": 205.49863255003729,
+  "instrumented_decode_p50_tps": 100.12814874938047,
+  "instrumentation_slowdown": 2.0523562566246762,
+  "ranked_decode_stages": [
+    {
+      "name": "ffn_gate_up",
+      "median_total_ms": 1179.1552329156548,
+      "runs": 2
+    },
+    {
+      "name": "attention",
+      "median_total_ms": 1039.451409611851,
+      "runs": 2
+    },
+    {
+      "name": "ffn_down",
+      "median_total_ms": 918.2261637439951,
+      "runs": 2
+    },
+    {
+      "name": "qkv",
+      "median_total_ms": 677.9871516688727,
+      "runs": 2
+    },
+    {
+      "name": "attn_prepare",
+      "median_total_ms": 512.7798242853023,
+      "runs": 2
+    },
+    {
+      "name": "attn_out",
+      "median_total_ms": 495.1502892249264,
+      "runs": 2
+    },
+    {
+      "name": "lm_head",
+      "median_total_ms": 385.0855202972889,
+      "runs": 2
+    },
+    {
+      "name": "ffn_input",
+      "median_total_ms": 300.2460638147313,
+      "runs": 2
+    },
+    {
+      "name": "ffn_activation",
+      "median_total_ms": 266.19271964766085,
+      "runs": 2
+    },
+    {
+      "name": "attn_input",
+      "median_total_ms": 224.2399845304899,
+      "runs": 2
+    }
+  ],
+  "profile_source": "cuda_events_inside_captured_graph",
+  "profile_is_perturbing": true
+}

@@ -211,6 +211,98 @@ pub struct PrefillProfile {
     pub total_gpu_ms: Option<f64>,
 }
 
+/// Decode stages timed inside the captured CUDA graph. Boundaries are broad
+/// enough to stay readable while separating every weight-streaming projection
+/// from the glue and attention work that feeds it.
+pub const DECODE_STAGE_NAMES: [&str; 10] = [
+    "attn_input",   // previous residual + attention RMSNorm + Q8
+    "qkv",          // Q/K/V projections
+    "attn_prepare", // bias, per-head norm, RoPE, KV writes
+    "attention",    // fused QK + softmax + AV
+    "attn_out",     // activation Q8 + output projection
+    "ffn_input",    // attention residual + FFN RMSNorm + Q8
+    "ffn_gate_up",  // fused gate/up projection
+    "ffn_activation", // SiLU multiply + Q8
+    "ffn_down",     // down projection
+    "lm_head",      // final residual + output norm + vocabulary projection
+];
+
+const DECODE_LAYER_STAGES: usize = DECODE_STAGE_NAMES.len() - 1;
+const DECODE_LM_STAGE: usize = DECODE_STAGE_NAMES.len() - 1;
+
+/// Graph-internal decode timing accumulated over replayed tokens.
+///
+/// Times come from event nodes captured on the same stream as the kernels.
+/// This diagnostic graph is intentionally opt-in because each boundary adds
+/// an event node and therefore perturbs the graph being observed.
+#[derive(Debug, Clone)]
+pub struct DecodeProfile {
+    /// Accumulated device milliseconds per logical stage.
+    pub ms: [Option<f64>; DECODE_STAGE_NAMES.len()],
+    /// Number of layer-stage or tail-stage samples accumulated.
+    pub calls: [u64; DECODE_STAGE_NAMES.len()],
+    /// Completed graph replays represented by this profile.
+    pub tokens: usize,
+}
+
+impl Default for DecodeProfile {
+    fn default() -> Self {
+        Self {
+            ms: [None; DECODE_STAGE_NAMES.len()],
+            calls: [0; DECODE_STAGE_NAMES.len()],
+            tokens: 0,
+        }
+    }
+}
+
+impl DecodeProfile {
+    fn accumulate(&mut self, sample_ms: [Option<f64>; DECODE_STAGE_NAMES.len()], layers: usize) {
+        let mut measured = false;
+        for (stage, sample) in sample_ms.into_iter().enumerate() {
+            let Some(ms) = sample else { continue };
+            self.ms[stage] = Some(self.ms[stage].unwrap_or(0.0) + ms);
+            self.calls[stage] += if stage == DECODE_LM_STAGE { 1 } else { layers as u64 };
+            measured = true;
+        }
+        if measured {
+            self.tokens += 1;
+        }
+    }
+}
+
+fn decode_profile_event_count(layers: usize) -> usize {
+    layers * DECODE_LAYER_STAGES + 2
+}
+
+fn record_decode_boundary(
+    events: Option<&crate::driver::EventRing>,
+    cuda: &Cuda,
+    next_event: &mut usize,
+) -> Result<(), GlError> {
+    let Some(events) = events else { return Ok(()) };
+    events.record_external(cuda, *next_event)?;
+    *next_event += 1;
+    Ok(())
+}
+
+fn decode_profile_sample(
+    events: &crate::driver::EventRing,
+    layers: usize,
+) -> [Option<f64>; DECODE_STAGE_NAMES.len()] {
+    let mut sample = [None; DECODE_STAGE_NAMES.len()];
+    for layer in 0..layers {
+        let base = layer * DECODE_LAYER_STAGES;
+        for (stage, slot) in sample.iter_mut().take(DECODE_LAYER_STAGES).enumerate() {
+            if let Some(ms) = events.elapsed_ms(base + stage, base + stage + 1) {
+                *slot = Some(slot.unwrap_or(0.0) + ms);
+            }
+        }
+    }
+    let lm_start = layers * DECODE_LAYER_STAGES;
+    sample[DECODE_LM_STAGE] = events.elapsed_ms(lm_start, lm_start + 1);
+    sample
+}
+
 /// Does this weight's GEMV read the int8 activation scratch
 /// (`ws.q8_qs`/`ws.q8_scales`), or the f32 activation directly?
 ///
@@ -707,6 +799,9 @@ impl GpuModel {
         let v_ptr = at(ws.qkv.dptr, q_dim + kv_dim);
         let decode_q8_glue = k.decode_q8_glue_enabled();
         let mut pending_ffn_residual = None;
+        let decode_events = self.decode_profile_events.as_ref();
+        let mut next_decode_event = 0;
+        record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
         if decode_q8_glue {
             static WAVE132_ANNOUNCED: std::sync::Once = std::sync::Once::new();
@@ -747,6 +842,7 @@ impl GpuModel {
                 }
                 k.rms_norm(cuda, x, layer.attn_norm.dptr, xn, dim, c.rms_eps)?;
             }
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             // q/k/v read the SAME normalized activation `xn` over the same
             // in_dim, so the int8 copy is made once and all three GEMVs share
@@ -767,6 +863,7 @@ impl GpuModel {
             gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
             gemv_w_pre(cuda, k, ws, &layer.wk, xn, k_ptr)?;
             gemv_w_pre(cuda, k, ws, &layer.wv, xn, v_ptr)?;
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             if let Some(b) = &layer.bq {
                 k.add(cuda, q_ptr, b.dptr, q_dim as u32)?;
@@ -860,6 +957,7 @@ impl GpuModel {
                 c.n_kv_heads as u32,
                 head_stride,
             )?;
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             // Fused decode attention over ALL heads (cached_len from device).
             let scale = 1.0 / (head_dim as f32).sqrt();
@@ -876,8 +974,10 @@ impl GpuModel {
                 head_stride,
                 scale,
             )?;
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             gemv_w(cuda, k, ws, &layer.wo, ws.attn_out.dptr, ws.proj.dptr)?;
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             // --- SwiGLU feed-forward block ---
             // One GEMV over the fused gate+up weight streams `xn` once and
@@ -900,12 +1000,20 @@ impl GpuModel {
                     c.rms_eps,
                     1,
                 )?;
-                gemv_w_pre(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
             } else {
                 k.add(cuda, x, ws.proj.dptr, dim)?;
                 k.rms_norm(cuda, x, layer.ffn_norm.dptr, xn, dim, c.rms_eps)?;
-                gemv_w(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
+                if consumes_q8_act(&layer.w_gate_up.w) {
+                    k.quantize_q8(cuda, xn, ws.q8_qs.dptr, ws.q8_scales.dptr, dim)?;
+                }
             }
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
+
+            // `gemv_w_pre` is also valid for direct-f32 weights; those variants
+            // ignore the Q8 scratch. Keeping the projection outside the input
+            // branch gives the profiler a real FFN-input / gate-up boundary.
+            gemv_w_pre(cuda, k, ws, &layer.w_gate_up, xn, gate)?;
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             if decode_q8_glue && consumes_q8_act(&layer.w_down.w) {
                 // The down projection reads only this quantized product; skip
@@ -918,11 +1026,14 @@ impl GpuModel {
                     ws.q8_scales.dptr,
                     c.hidden_dim as u32,
                 )?;
+                record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
                 gemv_w_pre(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
             } else {
                 k.silu_mul(cuda, gate, up, c.hidden_dim as u32)?;
+                record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
                 gemv_w(cuda, k, ws, &layer.w_down, gate, ws.proj.dptr)?;
             }
+            record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             if decode_q8_glue {
                 // `ws.proj` remains live until the next layer consumes it in
@@ -961,6 +1072,12 @@ impl GpuModel {
             // the same materialized state as the retained path.
             k.add(cuda, x, residual, dim)?;
         }
+        record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
+        debug_assert!(
+            decode_events.is_none()
+                || next_decode_event == decode_profile_event_count(self.layers.len()),
+            "decode event layout drifted from the stage vocabulary"
+        );
         Ok(())
     }
 
@@ -1842,6 +1959,28 @@ impl GpuModel {
         debug_assert_eq!(pos, self.kv.current_pos());
         self.set_token_inputs(cuda, token, pos)?;
 
+        // Event nodes must exist before capture; adding them after a graph is
+        // instantiated would require a second graph and defeat the fixed-DAG
+        // contract. The ordinary graph stays untouched when the flag is off.
+        if self.graph.is_none()
+            && self.decode_profile_events.is_none()
+            && std::env::var_os("GLCUDA_PROFILE_DECODE_STAGES").is_some()
+        {
+            let event_count = decode_profile_event_count(self.layers.len());
+            self.decode_profile_events = cuda.graph_event_ring(event_count);
+            if self.decode_profile_events.is_some() {
+                eprintln!(
+                    "[glcuda-decode-profile] {{\"source\":\"cuda_events_inside_captured_graph\",\"stages\":{},\"events\":{},\"instrumented\":true}}",
+                    DECODE_STAGE_NAMES.len(),
+                    event_count
+                );
+            } else {
+                eprintln!(
+                    "[glcuda-decode-profile] CUDA event API unavailable; stage timing disabled"
+                );
+            }
+        }
+
         // Degraded mode: a driver without the CUDA Graph API (pre-CUDA 10)
         // runs the identical kernel sequence launch-by-launch. Same math,
         // same order, same buffers — only the per-launch host overhead the
@@ -1851,6 +1990,10 @@ impl GpuModel {
         // branch below.
         if !cuda.graphs_available() {
             self.record_forward(cuda, k, true)?;
+            if self.decode_profile_events.is_some() {
+                cuda.synchronize()?;
+                self.accumulate_decode_profile();
+            }
             self.kv.advance();
             return Ok(());
         }
@@ -1877,8 +2020,27 @@ impl GpuModel {
         // Replay.
         let graph = self.graph.as_ref().expect("graph captured above");
         cuda.graph_launch(graph)?;
+        self.accumulate_decode_profile();
         self.kv.advance();
         Ok(())
+    }
+
+    fn accumulate_decode_profile(&mut self) {
+        let Some(events) = self.decode_profile_events.as_ref() else {
+            return;
+        };
+        let layers = self.layers.len();
+        let sample = decode_profile_sample(events, layers);
+        self.decode_profile
+            .get_or_insert_with(DecodeProfile::default)
+            .accumulate(sample, layers);
+    }
+
+    /// Start a new decode telemetry window without rebuilding the graph. The
+    /// captured event nodes keep writing the same event handles; only the host
+    /// accumulator is cleared between benchmark warmup and measurement.
+    pub(crate) fn reset_decode_profile(&mut self) {
+        self.decode_profile = None;
     }
 
     /// Embedding row lookup into a caller buffer (host side).
@@ -2025,8 +2187,9 @@ impl GpuModel {
 #[cfg(test)]
 mod tests {
     use super::{
-        bstage_tile_offsets, consumes_q8_act, deferred_ffn_boundaries, elementwise_read_bytes,
-        elementwise_read_bytes_split, n16_bstage_shape, r256_pays,
+        bstage_tile_offsets, consumes_q8_act, decode_profile_event_count,
+        deferred_ffn_boundaries, elementwise_read_bytes, elementwise_read_bytes_split,
+        n16_bstage_shape, r256_pays, DecodeProfile, DECODE_STAGE_NAMES,
     };
     use crate::buffer::DevSlice;
     use crate::model::GpuWeight;
@@ -2035,6 +2198,26 @@ mod tests {
     /// never dereferences, so no GPU and no real allocation are involved.
     fn slice() -> DevSlice {
         DevSlice { dptr: 0, bytes: 0 }
+    }
+
+    #[test]
+    fn wave133_decode_profile_layout_and_accumulator_match() {
+        // Nine layer stages share adjacent boundaries, then the LM head owns
+        // the final pair. Qwen2.5-0.5B has 24 layers: 24*9 + 2 = 218 events.
+        assert_eq!(decode_profile_event_count(24), 218);
+
+        let mut profile = DecodeProfile::default();
+        let mut sample = [None; DECODE_STAGE_NAMES.len()];
+        sample[0] = Some(1.25);
+        sample[DECODE_STAGE_NAMES.len() - 1] = Some(0.5);
+        profile.accumulate(sample, 24);
+        profile.accumulate(sample, 24);
+
+        assert_eq!(profile.tokens, 2);
+        assert_eq!(profile.calls[0], 48);
+        assert_eq!(profile.calls[DECODE_STAGE_NAMES.len() - 1], 2);
+        assert_eq!(profile.ms[0], Some(2.5));
+        assert_eq!(profile.ms[DECODE_STAGE_NAMES.len() - 1], Some(1.0));
     }
 
     #[test]

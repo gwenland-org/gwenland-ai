@@ -197,6 +197,12 @@ pub struct DriverApi {
         Option<unsafe extern "system" fn(*mut i32, CUfunction, i32, usize) -> CUresult>,
     pub cu_event_create: Option<unsafe extern "system" fn(*mut CUevent, u32) -> CUresult>,
     pub cu_event_record: Option<unsafe extern "system" fn(CUevent, CUstream) -> CUresult>,
+    /// Optional CUDA 11.1+ entry point. The `EXTERNAL` record flag is what
+    /// turns an event recorded during stream capture into an actual graph
+    /// node; plain `cuEventRecord` only contributes dependency edges and
+    /// therefore does not leave a timestamp for `cuEventElapsedTime`.
+    pub cu_event_record_with_flags:
+        Option<unsafe extern "system" fn(CUevent, CUstream, u32) -> CUresult>,
     pub cu_event_synchronize: Option<unsafe extern "system" fn(CUevent) -> CUresult>,
     pub cu_event_elapsed_time:
         Option<unsafe extern "system" fn(*mut f32, CUevent, CUevent) -> CUresult>,
@@ -330,6 +336,7 @@ impl DriverApi {
             ),
             cu_event_create: sym_opt(lib, &[b"cuEventCreate\0"]),
             cu_event_record: sym_opt(lib, &[b"cuEventRecord\0"]),
+            cu_event_record_with_flags: sym_opt(lib, &[b"cuEventRecordWithFlags\0"]),
             cu_event_synchronize: sym_opt(lib, &[b"cuEventSynchronize\0"]),
             cu_event_elapsed_time: sym_opt(lib, &[b"cuEventElapsedTime\0"]),
             cu_event_destroy: sym_opt(lib, &[b"cuEventDestroy_v2\0", b"cuEventDestroy\0"]),
