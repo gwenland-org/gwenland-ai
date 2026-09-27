@@ -278,6 +278,101 @@ fn gemv_q8_0_soa_matches_dequantized_reference() {
     assert_close(&got, &want, EPS_Q8_GEMV, "gemv_q8_0_soa");
 }
 
+/// Wave 136 changes only how independent Q, K, and V rows share a launch.
+/// Cover a five-block input tail and the real Qwen2.5-0.5B projection widths.
+#[test]
+fn gemv_q8_0_soa_qkv_matches_three_dequantized_references() {
+    let Some((cuda, k)) = gpu() else { return };
+
+    fn make_weight(out_dim: usize, in_dim: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<f32>) {
+        let source = randv(out_dim * in_dim, seed, 0.1);
+        let blocks = glproc::kernels::dequant::q8_0::scalar::quantize(&source);
+        let dequantized = glproc::kernels::dequant::q8_0::scalar::run(&blocks);
+        let mut qs = Vec::with_capacity(out_dim * in_dim);
+        let mut scales = Vec::with_capacity(out_dim * (in_dim / 32) * 2);
+        for block in blocks.chunks_exact(34) {
+            scales.extend_from_slice(&block[0..2]);
+            qs.extend_from_slice(&block[2..34]);
+        }
+        (qs, scales, dequantized)
+    }
+
+    for (case, q_dim, kv_dim, in_dim) in [(0u64, 96usize, 32usize, 160usize), (1, 896, 128, 896)] {
+        let (q_qs, q_sc, q_deq) = make_weight(q_dim, in_dim, 136 + case * 10);
+        let (k_qs, k_sc, k_deq) = make_weight(kv_dim, in_dim, 137 + case * 10);
+        let (v_qs, v_sc, v_deq) = make_weight(kv_dim, in_dim, 138 + case * 10);
+        let x = randv(in_dim, 139 + case * 10, 1.0);
+        let x_deq = q8_round_trip(&x);
+        let mut want_q = vec![0f32; q_dim];
+        let mut want_k = vec![0f32; kv_dim];
+        let mut want_v = vec![0f32; kv_dim];
+        glproc::kernels::matmul::scalar::run_matvec(&q_deq, &x_deq, &mut want_q, q_dim, in_dim);
+        glproc::kernels::matmul::scalar::run_matvec(&k_deq, &x_deq, &mut want_k, kv_dim, in_dim);
+        glproc::kernels::matmul::scalar::run_matvec(&v_deq, &x_deq, &mut want_v, kv_dim, in_dim);
+
+        let bytes = q_qs.len()
+            + q_sc.len()
+            + k_qs.len()
+            + k_sc.len()
+            + v_qs.len()
+            + v_sc.len()
+            + (in_dim + q_dim + 2 * kv_dim) * 4
+            + 8192;
+        let mut buf = BackendBuffer::new(&cuda, bytes as u64).unwrap();
+        let d_q_qs = buf.alloc(q_qs.len() as u64).unwrap().dptr;
+        let d_q_sc = buf.alloc(q_sc.len() as u64).unwrap().dptr;
+        let d_k_qs = buf.alloc(k_qs.len() as u64).unwrap().dptr;
+        let d_k_sc = buf.alloc(k_sc.len() as u64).unwrap().dptr;
+        let d_v_qs = buf.alloc(v_qs.len() as u64).unwrap().dptr;
+        let d_v_sc = buf.alloc(v_sc.len() as u64).unwrap().dptr;
+        cuda.htod(d_q_qs, &q_qs).unwrap();
+        cuda.htod(d_q_sc, &q_sc).unwrap();
+        cuda.htod(d_k_qs, &k_qs).unwrap();
+        cuda.htod(d_k_sc, &k_sc).unwrap();
+        cuda.htod(d_v_qs, &v_qs).unwrap();
+        cuda.htod(d_v_sc, &v_sc).unwrap();
+        let d_x = upload(&cuda, &mut buf, &x);
+        let d_x_qs = buf.alloc(in_dim as u64).unwrap().dptr;
+        let d_x_sc = buf.alloc_f32(in_dim / 32).unwrap().dptr;
+        k.quantize_q8(&cuda, d_x, d_x_qs, d_x_sc, in_dim as u32)
+            .unwrap();
+        let d_q_out = buf.alloc_f32(q_dim).unwrap().dptr;
+        let d_k_out = buf.alloc_f32(kv_dim).unwrap().dptr;
+        let d_v_out = buf.alloc_f32(kv_dim).unwrap().dptr;
+        k.gemv_q8_0_soa_qkv(
+            &cuda,
+            d_q_qs,
+            d_q_sc,
+            d_k_qs,
+            d_k_sc,
+            d_v_qs,
+            d_v_sc,
+            d_x_qs,
+            d_x_sc,
+            d_q_out,
+            d_k_out,
+            d_v_out,
+            q_dim as u32,
+            kv_dim as u32,
+            in_dim as u32,
+        )
+        .unwrap();
+        cuda.synchronize().unwrap();
+
+        let mut got_q = vec![0f32; q_dim];
+        let mut got_k = vec![0f32; kv_dim];
+        let mut got_v = vec![0f32; kv_dim];
+        cuda.dtoh_f32(&mut got_q, d_q_out).unwrap();
+        cuda.dtoh_f32(&mut got_k, d_k_out).unwrap();
+        cuda.dtoh_f32(&mut got_v, d_v_out).unwrap();
+        buf.free(&cuda).unwrap();
+
+        assert_close(&got_q, &want_q, EPS_Q8_GEMV, "gemv_q8_0_soa_qkv/q");
+        assert_close(&got_k, &want_k, EPS_Q8_GEMV, "gemv_q8_0_soa_qkv/k");
+        assert_close(&got_v, &want_v, EPS_Q8_GEMV, "gemv_q8_0_soa_qkv/v");
+    }
+}
+
 /// M2.1 Task A: the native Q4_K SoA GEMV against the glproc scalar ground
 /// truth. Weights are synthetic Q4_K super-blocks (random nibbles + packed
 /// 6-bit scales, sane f16 d/dmin), dequantized by glproc for the reference;

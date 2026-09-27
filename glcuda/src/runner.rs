@@ -860,9 +860,48 @@ impl GpuModel {
             if qkv_needs_q8 && !(decode_q8_glue && qkv_reads_q8) {
                 k.quantize_q8(cuda, xn, ws.q8_qs.dptr, ws.q8_scales.dptr, dim)?;
             }
-            gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
-            gemv_w_pre(cuda, k, ws, &layer.wk, xn, k_ptr)?;
-            gemv_w_pre(cuda, k, ws, &layer.wv, xn, v_ptr)?;
+            let fused_qkv = if k.decode_qkv_fused_enabled()
+                && layer.wq.in_dim == layer.wk.in_dim
+                && layer.wq.in_dim == layer.wv.in_dim
+                && layer.wq.out_dim == q_dim as u32
+                && layer.wk.out_dim == kv_dim as u32
+                && layer.wv.out_dim == kv_dim as u32
+            {
+                match (&layer.wq.w, &layer.wk.w, &layer.wv.w) {
+                    (
+                        GpuWeight::Q8_0Soa { qs: q_qs, scales: q_scales },
+                        GpuWeight::Q8_0Soa { qs: k_qs, scales: k_scales },
+                        GpuWeight::Q8_0Soa { qs: v_qs, scales: v_scales },
+                    ) => {
+                        k.gemv_q8_0_soa_qkv(
+                            cuda,
+                            q_qs.dptr,
+                            q_scales.dptr,
+                            k_qs.dptr,
+                            k_scales.dptr,
+                            v_qs.dptr,
+                            v_scales.dptr,
+                            ws.q8_qs.dptr,
+                            ws.q8_scales.dptr,
+                            q_ptr,
+                            k_ptr,
+                            v_ptr,
+                            q_dim as u32,
+                            kv_dim as u32,
+                            dim,
+                        )?;
+                        true
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+            if !fused_qkv {
+                gemv_w_pre(cuda, k, ws, &layer.wq, xn, q_ptr)?;
+                gemv_w_pre(cuda, k, ws, &layer.wk, xn, k_ptr)?;
+                gemv_w_pre(cuda, k, ws, &layer.wv, xn, v_ptr)?;
+            }
             record_decode_boundary(decode_events, cuda, &mut next_decode_event)?;
 
             if let Some(b) = &layer.bq {

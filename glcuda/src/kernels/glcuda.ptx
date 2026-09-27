@@ -1214,6 +1214,173 @@ SOA_DONE:
 }
 
 // ---------------------------------------------------------------------------
+// gl_gemv_q8_0_soa_qkv: Q, K, and V Q8_0 SoA projections in one decode grid.
+// The three weight/scales and output buffers remain separate. A warp first
+// maps its global row to Q, K, or V, then executes the exact retained
+// gl_gemv_q8_0_soa dot order for that local row. Adjacent lanes still read
+// adjacent weight and activation bytes. This changes scheduling only; it does
+// not concatenate or duplicate model weights.
+// Launch: grid ceil((q_dim + 2*kv_dim) / 8) x 256 threads (8 warps/block).
+// Reads Q/K/V SoA weights plus one shared Q8 activation; writes f32 Q/K/V.
+// Tolerance class: Q8 GEMV parity against glproc.
+// ---------------------------------------------------------------------------
+.visible .entry gl_gemv_q8_0_soa_qkv(
+    .param .u64 p_q_qs,
+    .param .u64 p_q_sc,
+    .param .u64 p_k_qs,
+    .param .u64 p_k_sc,
+    .param .u64 p_v_qs,
+    .param .u64 p_v_sc,
+    .param .u64 p_x_qs,
+    .param .u64 p_x_sc,
+    .param .u64 p_q_out,
+    .param .u64 p_k_out,
+    .param .u64 p_v_out,
+    .param .u32 p_q_dim,
+    .param .u32 p_kv_dim,
+    .param .u32 p_in
+)
+{
+    .reg .pred %p<8>;
+    .reg .b16 %h<3>;
+    .reg .b32 %r<48>;
+    .reg .f32 %f<12>;
+    .reg .b64 %rd<56>;
+
+    ld.param.u64 %rd1, [p_q_qs];
+    ld.param.u64 %rd2, [p_q_sc];
+    ld.param.u64 %rd3, [p_k_qs];
+    ld.param.u64 %rd4, [p_k_sc];
+    ld.param.u64 %rd5, [p_v_qs];
+    ld.param.u64 %rd6, [p_v_sc];
+    ld.param.u64 %rd7, [p_x_qs];
+    ld.param.u64 %rd8, [p_x_sc];
+    ld.param.u64 %rd9, [p_q_out];
+    ld.param.u64 %rd10, [p_k_out];
+    ld.param.u64 %rd11, [p_v_out];
+    ld.param.u32 %r1, [p_q_dim];
+    ld.param.u32 %r2, [p_kv_dim];
+    ld.param.u32 %r3, [p_in];
+
+    mov.u32 %r4, %tid.x;
+    shr.u32 %r5, %r4, 5;                // warp within block
+    and.b32 %r6, %r4, 31;               // lane
+    mov.u32 %r7, %ntid.x;
+    shr.u32 %r8, %r7, 5;                // warps per block
+    mov.u32 %r9, %ctaid.x;
+    mad.lo.s32 %r10, %r9, %r8, %r5;     // row across Q then K then V
+    shl.b32 %r11, %r2, 1;
+    add.s32 %r11, %r11, %r1;            // total rows
+    setp.ge.u32 %p1, %r10, %r11;
+    @%p1 bra QKV_SOA_DONE;
+
+    // Default to Q. Branches are warp-uniform except at projection borders.
+    mov.b64 %rd20, %rd1;                // selected weight bytes
+    mov.b64 %rd21, %rd2;                // selected weight scales
+    mov.b64 %rd22, %rd9;                // selected output
+    mov.u32 %r12, %r10;                 // row within selected projection
+    setp.ge.u32 %p2, %r10, %r1;
+    @!%p2 bra QKV_SOA_SELECTED;
+    sub.s32 %r13, %r10, %r1;
+    setp.ge.u32 %p3, %r13, %r2;
+    @%p3 bra QKV_SOA_SELECT_V;
+    mov.b64 %rd20, %rd3;
+    mov.b64 %rd21, %rd4;
+    mov.b64 %rd22, %rd10;
+    mov.u32 %r12, %r13;
+    bra QKV_SOA_SELECTED;
+QKV_SOA_SELECT_V:
+    mov.b64 %rd20, %rd5;
+    mov.b64 %rd21, %rd6;
+    mov.b64 %rd22, %rd11;
+    sub.s32 %r12, %r13, %r2;
+
+QKV_SOA_SELECTED:
+    cvta.to.global.u64 %rd23, %rd20;
+    cvta.to.global.u64 %rd24, %rd21;
+    cvta.to.global.u64 %rd25, %rd7;
+    cvta.to.global.u64 %rd26, %rd8;
+    cvta.to.global.u64 %rd27, %rd22;
+    shr.u32 %r14, %r3, 5;               // blocks per weight row
+
+    mul.wide.u32 %rd28, %r12, %r3;
+    add.s64 %rd29, %rd23, %rd28;        // selected qs row
+    mul.wide.u32 %rd30, %r12, %r14;
+    shl.b64 %rd30, %rd30, 1;
+    add.s64 %rd31, %rd24, %rd30;        // selected scale row
+
+    shl.b32 %r15, %r6, 2;               // four adjacent bytes per lane
+    cvt.u64.u32 %rd32, %r15;
+    add.s64 %rd33, %rd29, %rd32;
+    add.s64 %rd34, %rd25, %rd32;
+    shr.u32 %r16, %r6, 3;               // block within four-block group
+    cvt.u64.u32 %rd35, %r16;
+    shl.b64 %rd36, %rd35, 1;
+    add.s64 %rd37, %rd31, %rd36;
+    shl.b64 %rd38, %rd35, 2;
+    add.s64 %rd39, %rd26, %rd38;
+
+    mov.f32 %f1, 0f00000000;
+    shr.u32 %r17, %r14, 2;
+    mov.u32 %r18, 0;
+
+QKV_SOA_LOOP:
+    setp.ge.u32 %p4, %r18, %r17;
+    @%p4 bra QKV_SOA_TAIL;
+    ld.global.u32 %r19, [%rd33];
+    ld.global.u32 %r20, [%rd34];
+    dp4a.s32.s32 %r21, %r19, %r20, 0;
+    cvt.rn.f32.s32 %f2, %r21;
+    ld.global.u16 %h1, [%rd37];
+    cvt.f32.f16 %f3, %h1;
+    ld.global.f32 %f4, [%rd39];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f1, %f2, %f5, %f1;
+    add.s64 %rd33, %rd33, 128;
+    add.s64 %rd34, %rd34, 128;
+    add.s64 %rd37, %rd37, 8;
+    add.s64 %rd39, %rd39, 16;
+    add.s32 %r18, %r18, 1;
+    bra QKV_SOA_LOOP;
+
+QKV_SOA_TAIL:
+    and.b32 %r22, %r14, 3;
+    setp.lt.u32 %p5, %r16, %r22;
+    @!%p5 bra QKV_SOA_REDUCE;
+    ld.global.u32 %r19, [%rd33];
+    ld.global.u32 %r20, [%rd34];
+    dp4a.s32.s32 %r21, %r19, %r20, 0;
+    cvt.rn.f32.s32 %f2, %r21;
+    ld.global.u16 %h1, [%rd37];
+    cvt.f32.f16 %f3, %h1;
+    ld.global.f32 %f4, [%rd39];
+    mul.rn.f32 %f5, %f3, %f4;
+    fma.rn.f32 %f1, %f2, %f5, %f1;
+
+QKV_SOA_REDUCE:
+    mov.b32 %r23, %f1;
+    shfl.sync.down.b32 %r24, %r23, 16, 31, 0xffffffff;
+    mov.b32 %f6, %r24; add.f32 %f1, %f1, %f6; mov.b32 %r23, %f1;
+    shfl.sync.down.b32 %r24, %r23, 8, 31, 0xffffffff;
+    mov.b32 %f6, %r24; add.f32 %f1, %f1, %f6; mov.b32 %r23, %f1;
+    shfl.sync.down.b32 %r24, %r23, 4, 31, 0xffffffff;
+    mov.b32 %f6, %r24; add.f32 %f1, %f1, %f6; mov.b32 %r23, %f1;
+    shfl.sync.down.b32 %r24, %r23, 2, 31, 0xffffffff;
+    mov.b32 %f6, %r24; add.f32 %f1, %f1, %f6; mov.b32 %r23, %f1;
+    shfl.sync.down.b32 %r24, %r23, 1, 31, 0xffffffff;
+    mov.b32 %f6, %r24; add.f32 %f1, %f1, %f6;
+
+    setp.ne.u32 %p6, %r6, 0;
+    @%p6 bra QKV_SOA_DONE;
+    mul.wide.u32 %rd40, %r12, 4;
+    add.s64 %rd41, %rd27, %rd40;
+    st.global.f32 [%rd41], %f1;
+
+QKV_SOA_DONE:
+    ret;
+}
+
+// ---------------------------------------------------------------------------
 // gl_gemm_q8_0_soa: batched GEMM Y[ntok, out] = X[ntok, in] @ W[out, in]^T,
 // Q8_0 SoA weights + int8 activations. For PREFILL: the weight row is streamed
 // ONCE and reused across a tile of T=4 tokens (4x fewer weight streams than

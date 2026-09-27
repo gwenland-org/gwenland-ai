@@ -227,6 +227,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ============================================================
+    // 2e. Wave 136 fused Q/K/V decode grid. The parity suite exercises three
+    //     distinct weight buffers; this timing probe reuses one deterministic
+    //     image because it only compares three launches with one fused grid.
+    // ============================================================
+    {
+        let (q_dim, kv_dim, in_dim) = (896usize, 128usize, 896usize);
+        let nb = in_dim / 32;
+        let qb = |i: usize| -> i8 { (((i * 131 + 7) % 255) as i32 - 127) as i8 };
+        let w_qs: Vec<i8> = (0..q_dim * in_dim).map(qb).collect();
+        let w_sc: Vec<u16> = (0..q_dim * nb)
+            .map(|i| [0x3C00, 0x3800, 0x3E00, 0x3400][i % 4])
+            .collect();
+        let x_qs: Vec<i8> = (0..in_dim).map(|i| qb(i * 7 + 3)).collect();
+        let x_sc: Vec<f32> = (0..nb).map(|b| 0.5 + (b % 3) as f32 * 0.25).collect();
+        let mark = buf.mark();
+        let d_w_qs = buf.alloc(w_qs.len() as u64)?.dptr;
+        let d_w_sc = buf.alloc((w_sc.len() * 2) as u64)?.dptr;
+        let d_x_qs = buf.alloc(x_qs.len() as u64)?.dptr;
+        let d_x_sc = buf.alloc_f32(x_sc.len())?.dptr;
+        let d_q = buf.alloc_f32(q_dim)?.dptr;
+        let d_k = buf.alloc_f32(kv_dim)?.dptr;
+        let d_v = buf.alloc_f32(kv_dim)?.dptr;
+        let as_u8 = |v: &[i8]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len()) };
+        let scale_bytes = unsafe {
+            std::slice::from_raw_parts(w_sc.as_ptr() as *const u8, w_sc.len() * 2)
+        };
+        cuda.htod(d_w_qs, as_u8(&w_qs))?;
+        cuda.htod(d_w_sc, scale_bytes)?;
+        cuda.htod(d_x_qs, as_u8(&x_qs))?;
+        cuda.htod_f32(d_x_sc, &x_sc)?;
+
+        let retained = || -> Result<(), glcore::GlError> {
+            k.gemv_q8_0_soa(&cuda, d_w_qs, d_w_sc, d_x_qs, d_x_sc, d_q, q_dim as u32, in_dim as u32)?;
+            k.gemv_q8_0_soa(&cuda, d_w_qs, d_w_sc, d_x_qs, d_x_sc, d_k, kv_dim as u32, in_dim as u32)?;
+            k.gemv_q8_0_soa(&cuda, d_w_qs, d_w_sc, d_x_qs, d_x_sc, d_v, kv_dim as u32, in_dim as u32)
+        };
+        retained()?;
+        cuda.synchronize()?;
+        let mut expected = vec![0f32; q_dim + 2 * kv_dim];
+        cuda.dtoh_f32(&mut expected[..q_dim], d_q)?;
+        cuda.dtoh_f32(&mut expected[q_dim..q_dim + kv_dim], d_k)?;
+        cuda.dtoh_f32(&mut expected[q_dim + kv_dim..], d_v)?;
+        k.gemv_q8_0_soa_qkv(
+            &cuda, d_w_qs, d_w_sc, d_w_qs, d_w_sc, d_w_qs, d_w_sc,
+            d_x_qs, d_x_sc, d_q, d_k, d_v, q_dim as u32, kv_dim as u32, in_dim as u32,
+        )?;
+        cuda.synchronize()?;
+        let mut got = vec![0f32; expected.len()];
+        cuda.dtoh_f32(&mut got[..q_dim], d_q)?;
+        cuda.dtoh_f32(&mut got[q_dim..q_dim + kv_dim], d_k)?;
+        cuda.dtoh_f32(&mut got[q_dim + kv_dim..], d_v)?;
+        let max_abs = expected.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+
+        let iters = 200;
+        let start = Instant::now();
+        for _ in 0..iters { retained()?; }
+        cuda.synchronize()?;
+        let retained_s = start.elapsed().as_secs_f64() / iters as f64;
+        let start = Instant::now();
+        for _ in 0..iters {
+            k.gemv_q8_0_soa_qkv(
+                &cuda, d_w_qs, d_w_sc, d_w_qs, d_w_sc, d_w_qs, d_w_sc,
+                d_x_qs, d_x_sc, d_q, d_k, d_v, q_dim as u32, kv_dim as u32, in_dim as u32,
+            )?;
+        }
+        cuda.synchronize()?;
+        let fused_s = start.elapsed().as_secs_f64() / iters as f64;
+        println!(
+            "[qkv-fused] retained {:>6.1} us | fused {:>6.1} us | {:>5.3}x | max_abs {:.1e}",
+            retained_s * 1e6, fused_s * 1e6, retained_s / fused_s, max_abs,
+        );
+        buf.reset_to(mark);
+    }
+
+    // ============================================================
     // 2g. Q4_K SoA GEMV (gl_gemv_q4_k_soa, M2.1 Task A) — the Q4_K_M decode
     //     kernel, at Qwen2.5-7B shapes (in_dim must be a multiple of 256, so
     //     the 0.5B dims don't apply). Validates vs a CPU reference on

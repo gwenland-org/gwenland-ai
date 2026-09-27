@@ -240,6 +240,9 @@ pub struct KernelSet {
     /// Wave 132: reuse the exact Wave 11 glue kernels inside the captured
     /// single-token decode graph when adjacent consumers are Q8-native.
     decode_q8_glue: bool,
+    /// Wave 136: submit Q, K, and V Q8 SoA rows through one decode grid while
+    /// preserving the retained one-warp-per-output-row arithmetic.
+    decode_qkv_fused: bool,
     /// Wave 123: skip f32 scratch writes when the downstream prefill GEMM reads
     /// only the Q8 activation copy.
     q8_nostore: AtomicBool,
@@ -289,6 +292,7 @@ pub struct KernelSet {
     f_rms_quantize_q8_rows: Kernel,
     f_gemv_q8_0: Kernel,
     f_gemv_q8_0_soa: Kernel,
+    f_gemv_q8_0_soa_qkv: Kernel,
     f_gemm_q8_0_soa: Kernel,
     f_gemv_q4_k_soa: Kernel,
     f_gemv_q4_0_soa: Kernel,
@@ -343,6 +347,10 @@ fn resolve_n16_fused_swiglu(environment_enabled: bool, benchmark_override: Optio
 
 fn resolve_decode_q8_glue(fuse_q8_glue: bool, decode_requested: bool) -> bool {
     fuse_q8_glue && decode_requested
+}
+
+fn resolve_decode_qkv_fused(decode_q8_glue: bool, qkv_requested: bool) -> bool {
+    decode_q8_glue && qkv_requested
 }
 
 impl KernelSet {
@@ -439,6 +447,13 @@ impl KernelSet {
             fuse_q8_glue,
             std::env::var_os("GLCUDA_DECODE_Q8_GLUE").is_some(),
         );
+        let decode_qkv_fused = resolve_decode_qkv_fused(
+            decode_q8_glue,
+            std::env::var_os("GLCUDA_DECODE_QKV_FUSED").is_some(),
+        );
+        if decode_qkv_fused {
+            eprintln!("[glcuda] Wave 136 fused QKV decode grid enabled");
+        }
         let q8_nostore = fuse_q8_glue
             && q8_nostore_override
                 .unwrap_or_else(|| std::env::var_os("GLCUDA_Q8_NOSTORE").is_some());
@@ -508,8 +523,8 @@ impl KernelSet {
             _ => 1,
         };
         eprintln!(
-            "[glcuda-contract] {{\"exact_fusion\":{},\"decode_q8_glue\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
-            fuse_q8_glue, decode_q8_glue, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu_requested, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
+            "[glcuda-contract] {{\"exact_fusion\":{},\"decode_q8_glue\":{},\"decode_qkv_fused\":{},\"q8_nostore\":{},\"ffn_gate_up_stacked\":{},\"defer_ffn_residual\":{},\"gqa_group\":{},\"grid2d\":{},\"r256\":{},\"ntile128\":{},\"bstage\":{},\"gemm_n16\":{},\"gemm_n32\":{},\"gemm_n16_prefetch\":{},\"n16_fused_swiglu\":{},\"attn_rows_forced\":{},\"gqa7_chains\":{},\"attn_mma4\":{},\"attn_mma4_regq\":{},\"attn_mma4_av\":{}}}",
+            fuse_q8_glue, decode_q8_glue, decode_qkv_fused, q8_nostore, ffn_gate_up_stacked, defer_ffn_residual, gqa_group, grid2d, r256, ntile128, bstage, gemm_n16, gemm_n32, gemm_n16_prefetch, n16_fused_swiglu_requested, rows_forced, gqa7_chains, mma4_attention, mma4_regq_attention, mma4_regq_avmma_attention
         );
         eprintln!("[glcuda] dynamic-shared prefill attention enabled");
         Ok(KernelSet {
@@ -525,6 +540,7 @@ impl KernelSet {
             grid2d,
             fuse_q8_glue,
             decode_q8_glue,
+            decode_qkv_fused,
             q8_nostore: AtomicBool::new(q8_nostore),
             ffn_gate_up_stacked: AtomicBool::new(ffn_gate_up_stacked),
             gqa_group,
@@ -551,6 +567,7 @@ impl KernelSet {
             f_rms_quantize_q8_rows: module.get_function("gl_rms_quantize_q8_rows")?,
             f_gemv_q8_0: module.get_function("gl_gemv_q8_0")?,
             f_gemv_q8_0_soa: module.get_function("gl_gemv_q8_0_soa")?,
+            f_gemv_q8_0_soa_qkv: module.get_function("gl_gemv_q8_0_soa_qkv")?,
             f_gemm_q8_0_soa: module.get_function("gl_gemm_q8_0_soa")?,
             f_gemv_q4_k_soa: module.get_function("gl_gemv_q4_k_soa")?,
             f_gemv_q4_0_soa: module.get_function("gl_gemv_q4_0_soa")?,
@@ -736,6 +753,12 @@ impl KernelSet {
     /// already-parity-tested fused Q8 kernels during graph capture.
     pub fn decode_q8_glue_enabled(&self) -> bool {
         self.decode_q8_glue
+    }
+
+    /// Whether Wave 136 may replace the three decode Q/K/V GEMV launches
+    /// with one grid over their independent output rows.
+    pub fn decode_qkv_fused_enabled(&self) -> bool {
+        self.decode_qkv_fused
     }
 
     /// Whether Wave 123 may skip f32 scratch writes for Q8-only prefill consumers.
@@ -1873,6 +1896,60 @@ impl KernelSet {
         cuda.launch(
             self.f_gemv_q8_0_soa,
             (ceil_div(out_dim, 8), 1, 1),
+            (256, 1, 1),
+            0,
+            &mut params,
+        )
+    }
+
+    /// Wave 136 Q8 SoA decode projection for Q, K, and V in one grid. Each
+    /// warp still computes one output row with the retained accumulation
+    /// order; the row index only selects which weight and output buffer owns
+    /// that work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q8_0_soa_qkv(
+        &self,
+        cuda: &Cuda,
+        q_qs: CUdeviceptr,
+        q_scales: CUdeviceptr,
+        k_qs: CUdeviceptr,
+        k_scales: CUdeviceptr,
+        v_qs: CUdeviceptr,
+        v_scales: CUdeviceptr,
+        x_qs: CUdeviceptr,
+        x_scales: CUdeviceptr,
+        q_out: CUdeviceptr,
+        k_out: CUdeviceptr,
+        v_out: CUdeviceptr,
+        q_dim: u32,
+        kv_dim: u32,
+        in_dim: u32,
+    ) -> Result<(), GlError> {
+        debug_assert_eq!(in_dim % 32, 0, "Q8_0 rows are whole blocks");
+        let (mut qqs, mut qsc, mut kqs, mut ksc) = (q_qs, q_scales, k_qs, k_scales);
+        let (mut vqs, mut vsc, mut xqs, mut xsc) = (v_qs, v_scales, x_qs, x_scales);
+        let (mut qo, mut ko, mut vo) = (q_out, k_out, v_out);
+        let (mut qd, mut kvd, mut id) = (q_dim, kv_dim, in_dim);
+        let mut params = [
+            &mut qqs as *mut _ as *mut c_void,
+            &mut qsc as *mut _ as *mut c_void,
+            &mut kqs as *mut _ as *mut c_void,
+            &mut ksc as *mut _ as *mut c_void,
+            &mut vqs as *mut _ as *mut c_void,
+            &mut vsc as *mut _ as *mut c_void,
+            &mut xqs as *mut _ as *mut c_void,
+            &mut xsc as *mut _ as *mut c_void,
+            &mut qo as *mut _ as *mut c_void,
+            &mut ko as *mut _ as *mut c_void,
+            &mut vo as *mut _ as *mut c_void,
+            &mut qd as *mut _ as *mut c_void,
+            &mut kvd as *mut _ as *mut c_void,
+            &mut id as *mut _ as *mut c_void,
+        ];
+        let total_rows = q_dim + 2 * kv_dim;
+        cuda.launch(
+            self.f_gemv_q8_0_soa_qkv,
+            (ceil_div(total_rows, 8), 1, 1),
             (256, 1, 1),
             0,
             &mut params,
@@ -3098,6 +3175,14 @@ mod tests {
         assert!(resolve_decode_q8_glue(true, true));
     }
 
+    #[test]
+    fn wave136_fused_qkv_requires_the_decode_q8_contract() {
+        assert!(!resolve_decode_qkv_fused(false, false));
+        assert!(!resolve_decode_qkv_fused(false, true));
+        assert!(!resolve_decode_qkv_fused(true, false));
+        assert!(resolve_decode_qkv_fused(true, true));
+    }
+
     /// The PTX image must declare exactly the entry points KernelSet
     /// resolves — catches drift between the .ptx file and this module
     /// without needing a GPU.
@@ -3114,6 +3199,7 @@ mod tests {
             "gl_rms_quantize_q8_rows",
             "gl_gemv_q8_0",
             "gl_gemv_q8_0_soa",
+            "gl_gemv_q8_0_soa_qkv",
             "gl_gemm_q8_0_soa",
             "gl_gemv_q4_k_soa",
             "gl_gemv_q4_0_soa",
