@@ -1,0 +1,392 @@
+{
+  "analysis": {
+    "bottleneck": "compute_bound",
+    "ceiling_basis": "estimated_from_table",
+    "ceiling_efficiency": 0.4512810220866562,
+    "decode_tps": {
+      "ci95": 0.6254734946724635,
+      "count": 10,
+      "max": 215.38948008028618,
+      "mean": 213.7155772088899,
+      "median": 213.79308177648264,
+      "min": 212.55027615245916,
+      "p95": 215.00218702286367,
+      "p99": 215.31202146880167,
+      "std_dev": 0.8295404438626838
+    },
+    "health": 0.6112388961962159,
+    "hypotheses": [],
+    "notes": [
+      "Decode 213.7 tok/s vs bandwidth ceiling 473.6 tok/s (320 GB/s, the device's PUBLISHED spec, not measured, over 0.68 GB weights) = 45% of peak. Real devices commonly run 60-85% of their advertised peak even when fully optimized, so this fraction is an underestimate of how well-utilized the device actually is.",
+      "Throughput is well under the bandwidth ceiling; the limiter is compute or kernel efficiency, so tensor-core / vectorization work is the lever."
+    ],
+    "prefill_tps": {
+      "ci95": 64.49252109962364,
+      "count": 10,
+      "max": 15437.142549484583,
+      "mean": 15305.148742458212,
+      "median": 15273.543719052566,
+      "min": 15165.192452507466,
+      "p95": 15429.703237884318,
+      "p99": 15435.65468716453,
+      "std_dev": 85.53384761223295
+    },
+    "roofline": null
+  },
+  "availability": {
+    "analysis.roofline": "unavailable",
+    "behavior.anomaly": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.confidence_divergence": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.cot": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.entropy": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.ood": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.stall": {
+      "note": "needs a traced run; tracing perturbs timing so it never shares a measured run",
+      "status": "unavailable"
+    },
+    "behavior.toxicity": {
+      "note": "deliberately unimplemented; see glbench::behavior::toxicity",
+      "status": "does_not_exist"
+    },
+    "comparison": {
+      "note": "filled only by 'glbench compare' and 'glbench ab'",
+      "status": "not_applicable"
+    },
+    "environment.hardware.tpu": "unavailable",
+    "inference.analysis": {
+      "note": "standalone session: the measured facts are the top-level fields",
+      "status": "not_applicable"
+    },
+    "inference.behavior": {
+      "note": "standalone session: the measured facts are the top-level fields",
+      "status": "not_applicable"
+    },
+    "inference.measurements": {
+      "note": "standalone session: the measured facts are the top-level fields",
+      "status": "not_applicable"
+    },
+    "measurements.energy_joules": "unavailable",
+    "measurements.observed_bandwidth_gbs": "unavailable",
+    "metadata.collection_profile": "unavailable",
+    "metadata.host_identifier": "unavailable",
+    "telemetry.backend": {
+      "note": "the engine reported no telemetry for this phase",
+      "status": "unavailable"
+    },
+    "telemetry.decode": {
+      "note": "the engine reported no telemetry for this phase",
+      "status": "unavailable"
+    },
+    "telemetry.launches": {
+      "note": "the engine reported no telemetry for this phase",
+      "status": "unavailable"
+    },
+    "telemetry.moe": {
+      "note": "the engine reported no telemetry for this phase",
+      "status": "unavailable"
+    },
+    "telemetry.prefill": {
+      "note": "the engine reported no telemetry for this phase",
+      "status": "unavailable"
+    },
+    "training": "not_applicable",
+    "workload.cot_mode": "unavailable"
+  },
+  "behavior": {
+    "anomaly": null,
+    "confidence_divergence": null,
+    "cot": null,
+    "entropy": null,
+    "ood": null,
+    "repetition": {
+      "looks_degenerate": false,
+      "max_token_run": 1,
+      "tokens": 64,
+      "unique_1gram_ratio": 0.921875,
+      "unique_2gram_ratio": 1,
+      "unique_3gram_ratio": 1
+    },
+    "stall": null,
+    "toxicity": null
+  },
+  "comparison": null,
+  "engine": {
+    "available": true,
+    "backend": "cuda",
+    "model_arch": "qwen2",
+    "name": "glcuda",
+    "quantization": "Q8_0",
+    "thinking_capable": false
+  },
+  "environment": {
+    "hardware": {
+      "cpu": {
+        "isa": {
+          "avx2": true,
+          "avx512_vnni": false,
+          "avx512bw": true,
+          "avx512f": true,
+          "avx_vnni": false,
+          "f16c": true,
+          "fma": true
+        },
+        "logical_cores": 4,
+        "mhz": 2000.184,
+        "model": "Intel(R) Xeon(R) CPU @ 2.00GHz",
+        "physical_cores": 2,
+        "read_bandwidth_gbs": 25.707389524779693
+      },
+      "gpu": {
+        "backend": "cuda",
+        "compute": "sm_75",
+        "name": "Tesla T4",
+        "peak_bandwidth_gbs": 320,
+        "peak_compute_tops": 130,
+        "total_memory_bytes": 15636037632
+      },
+      "memory": {
+        "available_bytes": 31902973952,
+        "total_bytes": 33659379712
+      },
+      "storage": {
+        "model_file_bytes": 675710816
+      },
+      "thermal": {
+        "avg_mhz": 2000.184,
+        "end_mhz": 2000.184,
+        "start_mhz": 2000.184,
+        "throttled": false
+      },
+      "tpu": null
+    },
+    "runtime": {
+      "arch": "x86_64",
+      "build_profile": "release",
+      "glbench_version": "0.1.163",
+      "os": "linux"
+    }
+  },
+  "inference": {
+    "analysis": null,
+    "behavior": null,
+    "measurements": null,
+    "role": "standalone"
+  },
+  "integrity": {
+    "algorithm": "sha256-128",
+    "digest": "790c34e8b58893f013a8a6a64fb7610a",
+    "note": "128-bit content digest: detects accidental modification. Not a signature — anyone who can edit this file can recompute it."
+  },
+  "measurements": {
+    "cold": [
+      {
+        "decode_ms": 364.591573,
+        "generated_tokens": 64,
+        "prefill_ms": 36.802436,
+        "prompt_tokens": 244,
+        "total_ms": 401
+      }
+    ],
+    "cpu_utilization_pct": 24.950423342482328,
+    "energy_joules": null,
+    "iterations": [
+      {
+        "decode_ms": 298.89218,
+        "generated_tokens": 64,
+        "prefill_ms": 15.978247000000001,
+        "prompt_tokens": 244,
+        "total_ms": 314
+      },
+      {
+        "decode_ms": 300.09599399999996,
+        "generated_tokens": 64,
+        "prefill_ms": 16.004597999999998,
+        "prompt_tokens": 244,
+        "total_ms": 316
+      },
+      {
+        "decode_ms": 298.32820300000003,
+        "generated_tokens": 64,
+        "prefill_ms": 15.806034,
+        "prompt_tokens": 244,
+        "total_ms": 314
+      },
+      {
+        "decode_ms": 299.218756,
+        "generated_tokens": 64,
+        "prefill_ms": 15.972427000000001,
+        "prompt_tokens": 244,
+        "total_ms": 315
+      },
+      {
+        "decode_ms": 301.10523099999995,
+        "generated_tokens": 64,
+        "prefill_ms": 15.928284000000001,
+        "prompt_tokens": 244,
+        "total_ms": 317
+      },
+      {
+        "decode_ms": 299.0219,
+        "generated_tokens": 64,
+        "prefill_ms": 15.832254,
+        "prompt_tokens": 244,
+        "total_ms": 314
+      },
+      {
+        "decode_ms": 299.491106,
+        "generated_tokens": 64,
+        "prefill_ms": 15.822979,
+        "prompt_tokens": 244,
+        "total_ms": 315
+      },
+      {
+        "decode_ms": 300.52815599999997,
+        "generated_tokens": 64,
+        "prefill_ms": 15.984865000000001,
+        "prompt_tokens": 244,
+        "total_ms": 316
+      },
+      {
+        "decode_ms": 297.136146,
+        "generated_tokens": 64,
+        "prefill_ms": 16.089475999999998,
+        "prompt_tokens": 244,
+        "total_ms": 313
+      },
+      {
+        "decode_ms": 300.861688,
+        "generated_tokens": 64,
+        "prefill_ms": 16.009283,
+        "prompt_tokens": 244,
+        "total_ms": 316
+      }
+    ],
+    "model_bytes": 675710816,
+    "observed_bandwidth_gbs": null,
+    "peak_memory_bytes": 1643692032
+  },
+  "metadata": {
+    "collection_profile": null,
+    "created_unix": 1790485055,
+    "dispatch": {
+      "config_fingerprint": "sha256-128:ed80e767ad6849217985d7189a61e09a",
+      "engine_overrides": [
+        {
+          "name": "GLCUDA_ATTN_MMA4",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_ATTN_MMA4_AV",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_ATTN_MMA4_REGQ",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_BSTAGE",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_DEFER_FFN_RESIDUAL",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_FFN_GATE_UP_STACKED",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_FORCE_Q8",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_FUSE_Q8_GLUE",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_GEMM_N16",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_GEMM_N16_PREFETCH",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_GRID2D",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_N16_FUSED_SWIGLU",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_NTILE128",
+          "value": "1"
+        },
+        {
+          "name": "GLCUDA_Q8_NOSTORE",
+          "value": "1"
+        }
+      ]
+    },
+    "glbench_version": "0.1.163",
+    "host_identifier": null,
+    "label": "glcuda-qwen2.5-0.5b-instruct-q8_0",
+    "measurement_mode": "production",
+    "schema_version": 2,
+    "session_mode": "inference_only"
+  },
+  "telemetry": {
+    "backend": null,
+    "decode": null,
+    "launches": null,
+    "memory": {
+      "kv_cache_bytes": 100663296,
+      "model_bytes": 905311380,
+      "scratch_bytes": 36519276
+    },
+    "moe": null,
+    "prefill": null
+  },
+  "training": null,
+  "validation": {
+    "findings": [
+      {
+        "check": "parity",
+        "message": "50/50 tokens match oracle 'glproc' (100% agreement)",
+        "severity": "info"
+      }
+    ],
+    "passed": true
+  },
+  "workload": {
+    "cold_iters": 1,
+    "cot_mode": null,
+    "engine": "glcuda",
+    "instrument_engine": false,
+    "kind": "end_to_end",
+    "max_new_tokens": 64,
+    "measure_iters": 10,
+    "model_path": "/tmp/wave135/qwen2.5-0.5b-instruct-q8_0.gguf",
+    "prompt": "Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. Measure this deterministic systems prompt carefully. Explain how token-parallel integer matrix multiplication uses shared memory, Tensor Cores, and fixed launch geometry. ",
+    "seed": 42,
+    "temperature": 0,
+    "verify_against": "glproc",
+    "warmup_iters": 2
+  }
+}
