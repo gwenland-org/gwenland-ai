@@ -10,7 +10,8 @@
 > selects and routes but owns zero compute, and `glproc` (CPU) as the
 > numerical ground truth every other engine is validated against.
 
-Last updated: **2026-07-28**. Agents: read
+Last updated: **2026-11-05** (after a ~5-week pause; last engineering commit
+2026-09-27). Agents: read
 [`gl-agent-skills/`](gl-agent-skills/README.md) before touching anything.
 
 ---
@@ -21,12 +22,13 @@ Last updated: **2026-07-28**. Agents: read
 |-------|------|--------|
 | `glcore` | parsers (GGUF/safetensors), BPE tokenizer (14 vocab families exact vs reference, see below), tensor types, `GlEngine` trait, runtime | ✅ shipped |
 | `glproc` | CPU engine — SIMD (AVX2) + threading, Q8_0 hot path, Q4_K→Q8_0 repack | ✅ M1 + M1.5 done |
-| `glcuda` | CUDA engine — driver FFI, hand-written PTX, arena VRAM, CUDA-graph decode, INT8-MMA prefill | ✅ **M2 passed** (T4-validated) |
-| `glbench` | profiler/benchmark — telemetry roofline, behavior signals, A/B, archives | ✅ v2 "Mensura Veritatis" shipped |
+| `glcuda` | CUDA engine — driver FFI, hand-written PTX, arena VRAM, CUDA-graph decode, INT8-MMA prefill | ✅ **M2 passed**; ceiling sprint at Wave 136 (prefill ~15.8k tok/s on T4, see below) |
+| `glbench` | profiler/benchmark — telemetry roofline, behavior signals, A/B, archives, training observation, CUDA launch telemetry | ✅ v3 shipped → ▶ **v4 "No Celah" is the current focus** |
 | `glcli` | the `gwen` binary | ✅ (CPU engine; CUDA wiring pending) |
 | `glvulkan` | cross-vendor GPU backend | ◻ stub (planned) |
 | `glmetal` | Apple Silicon backend | ◻ stub (planned) |
 | `glictus-caliburni` | GLLM shard format (MoE, lazy experts) | 🧪 experimental |
+| `gljax` + `glserve` | StableHLO/PJRT client + OpenAI-compatible HTTP server (research track, below) | 🧪 runs on CI; generates coherent text |
 | `packages/mcp` | MCP server | ✅ separate track |
 | `gltrain` (Stummañ) | from-scratch training framework, own workspace | ✅ M1 + M2 + M2.5 |
 
@@ -90,6 +92,44 @@ separation, behavioral signals from raw logits (CoT-aware), cross-signal
 hypotheses, session archives + `ab`/`compare`. glbench observes; it never
 optimizes.
 
+### glcuda ceiling sprint (Waves 1–136, 2026-08 → 2026-09-27)
+Throughput work on the T4 with Qwen2.5-0.5B-Instruct **Q8_0** and a fixed
+244-token prompt. Every candidate had to pass oracle-token parity before it
+was timed, and was kept only if it won a counterbalanced production A/B. Most
+waves were *rejected*; each one has a write-up in
+[`architecture/glcuda-research/`](architecture/glcuda-research/).
+
+| | At M2 | Now (production `glbench`, P50) |
+|---|---:|---:|
+| prefill | 73 tok/s (7B) | **~15,800 tok/s** (0.5B, Wave 131; 15,000 target met) |
+| decode | 29.2 tok/s (7B) | **~224 tok/s** (0.5B, Wave 136; ≈47 % of the *estimated* ceiling) |
+
+Caveats that stay attached to these numbers: the newest paths are opt-in
+`GLCUDA_*` flags, not the default; the last llama.cpp head-to-head (Wave 116:
+12,258 vs 11,307 tok/s prefill) predates the latest +29 %; Q4 is unmeasured on
+this path. Waves 131–136 live on `engine/glcuda-ceiling-wave132`, not yet
+merged; Wave 137 (fused attention-prepare) is coded but not run.
+
+### Stummañ (`gltrain/`) — M1, M2, M2.5
+From-scratch autograd on `glcore`/`glproc` (M1, 2026-08-17), LoRA training
+with AdamW/Adafactor/Lion (M2, 2026-08-19), and an observer hook for glbench
+(M2.5, 2026-08-20). The candle-based crate that used to live at that path was
+deleted. Own workspace, own CI (`.github/workflows/gltrain.yml`).
+
+### Observability — glbench v3 + CUDA launch telemetry
+v3 (2026-08-20, 5 waves): schema-v2 archives with content digest and null
+semantics, `glbench join`, GLBitProf bit profiles, training observation
+(`glbench train` / `unified`). Then (2026-09-24): native glcuda launch
+telemetry — per-kernel P50/P90/P99, grid/block, registers, shared memory,
+projected occupancy — aligned to the measured window, with every session
+labelled `production` or `instrumented`. Design:
+[`architecture/glbench-v3/DESIGN.md`](architecture/glbench-v3/DESIGN.md).
+
+### Hygiene pass (2026-08-15)
+Every `unsafe` site in glproc documented (a real OOB read in `run_matvec` was
+found and fixed while doing it), first tests for glcli and the MCP server, and
+`glserve` binds loopback by default.
+
 ### Closed dead ends (measured, documented, not to be revisited)
 Native Q4_K CPU compute (−33 %), L2 decode tiling, interleaved rows (−35 %),
 AVX-512F on this tier, software prefetch, lazy mmap layer paging, topology
@@ -98,20 +138,72 @@ threading (−23 %). Full list with reasoning:
 
 ---
 
-## ▶ Now — M2.5: make the CUDA engine a first-class citizen
+## ▶ Now — glbench v4 "No Celah": an observer with no blind spots
 
-The engine is validated standalone; the product must route to it.
+glbench already reports a lot, and it is honest about what it cannot see. v4
+closes the gaps those admissions describe. Every item below is a limit that
+glbench or a wave write-up has *already documented*; none is a guess about
+what might be missing. The boundary stays the same: glbench observes, engines
+optimize, and no crates are added.
 
+**Blind spots in what it sees**
+- [ ] **CUDA Graph decode is opaque.** Graph replay shows up as one
+      `graph_replay` entry. Un-graphing it to profile (Wave 133) made decode
+      2.05× slower, so the instrumented view is not the production path.
+      Goal: per-stage attribution of the *production* graph, with the
+      perturbation measured and reported.
+- [ ] **GPU ceilings come from a spec sheet.** The 473.6 tok/s T4 decode
+      ceiling is `estimated_from_table` (320 GB/s published). Goal: a measured
+      device bandwidth probe, so GPU `ceiling_efficiency` uses the `measured`
+      basis the way CPU already does.
+- [ ] **Bit profiles cannot see a permutation.** Measured in v3: a correct
+      decode and a nibble-swapped one score exactly zero divergence. That is
+      the Q6_K bug class that once corrupted every layer. Goal: an
+      order-sensitive check that catches it, with the existing blind-spot test
+      flipped into a detection test.
+- [ ] **No per-token decode timeline.** Needs an engine hook that streams
+      per-token timestamps (a coordinated engine-side change).
+
+**Blind spots in how it compares**
+- [ ] **`glbench ab` is sequential.** This machine drifts ~24 % between
+      sessions (Kaggle T4 ~8 %), and a sequential A/B once reported an
+      impossible 17 %. Every trustworthy A/B since was A-B-B-A, done by hand
+      in notebooks. Goal: counterbalanced order inside `ab`/`compare`, with
+      the per-order agreement reported.
+- [ ] **llama.cpp decode rows are not the same work.** `llama-bench` does not
+      sample. Goal: the head-to-head flags a work mismatch instead of printing
+      the two numbers side by side.
+
+**Coverage**
+- [ ] **GLLM engine:** no tokenizer (synthetic token ids) and F32 only, so its
+      behavior signals do not describe a real prompt.
+- [ ] **Reports:** HTML report and roofline chart (zero-dependency, inlined),
+      still open in [`glbench/ROADMAP.md`](glbench/ROADMAP.md).
+
+**Accepted limits (not targets):** cache counters, PCIe, and Windows/macOS
+energy need kernel drivers or external deps. Toxicity scoring stays
+deliberately unimplemented.
+
+**Exit criteria:** each item is either closed with a test that proves it, or
+moved to "accepted limits" with the measurement that shows why.
+
+## ▶ Then — make the CUDA engine a first-class citizen
+
+The engine is validated and fast on its own, but `gwen run` still only uses
+the CPU.
+
+- [ ] **Merge the ceiling-sprint branch** and decide which `GLCUDA_*` opt-in
+      paths become defaults.
 - [ ] **Wire glcuda into the runtime fallback chain** (glcuda → glvulkan →
       glmetal → glproc) so `gwen run` uses it automatically; explicit
       `--engine glcuda` fails loudly instead of silently falling back.
 - [ ] **Fallback-decision logging + session recording** — every selection
       reason visible to users and to glbench sessions.
+- [ ] **Re-run the llama.cpp head-to-head** on the current build; measure Q4.
 - [ ] **MoE `_exps` layout verification** — inspect real Qwen3-MoE GGUF
       bytes vs llama.cpp dequant; close the `_EXPS_LAYOUT_ASSUMPTION`
-      marker (currently the biggest silent-corruption risk).
-- [ ] **CUDA-graph decode: fusion pass** — attack inter-kernel dependency
-      edges (the measured residual), not launch overhead (already spent).
+      marker (still open in `glproc/src/loader.rs`, and still the biggest
+      silent-corruption risk).
 
 **Exit criteria:** on a CUDA machine, `gwen run model.gguf` decodes on
 glcuda with parity output and the selection is visible in logs + glbench.
@@ -169,31 +261,26 @@ platform features):
 
 ## Research track: gljax (separate from the M1–M4 line above)
 
-A from-scratch StableHLO/PJRT engine, explored as a design track rather than
-folded into the gl-stack milestones — it targets a different execution model
-(compiled IR through XLA/PJRT vs. the gl-stack's hand-written kernels) and
-isn't on the gl-stack's critical path. **Status: 17 architecture documents,
-zero code, not a workspace member.** Start at
-[`gljax/architecture/Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md).
+A from-scratch StableHLO/PJRT client, explored as a design track rather than
+folded into the gl-stack milestones. It targets a different execution model
+(compiled IR through XLA/PJRT instead of hand-written kernels) and isn't on
+the gl-stack's critical path.
 
-The one exception is [`gljax/probes/`](gljax/probes/) — three small,
-independently reproducible Python scripts that settled real open questions
-(what a PJRT CPU plugin does with quantized weights; where tile-streamed
-dequantisation stops winning over whole-weight dequant, measured at the
-M≈64–256 crossover). Those are measurements, not gljax code, and they don't
-require gljax to exist to run.
-
-**Next step, when picked up:** implementation starts at ARTX01 (PJRT FFI
-bring-up on the CPU plugin) per the build order in `Overall-Architecture.md`
-§3.1 — not at ARTX10, whose design is complete but frozen until ARTX01–05
-produce a real generated token.
+**Status (2026-07-30):** real code, 284 tests. On Linux CI it loads a pinned
+PJRT CPU plugin and Qwen2-0.5B and generates coherent English (Gate A5); the
+KV cache matches the recompute oracle token-for-token and is 4×–80× faster.
+`glserve` exposes it as an OpenAI-compatible HTTP server. It cannot run on the
+Windows dev machine (no PJRT plugin for Windows). Start at
+[`gljax/architecture/Overall-Architecture.md`](gljax/architecture/Overall-Architecture.md);
+the measurements in [`gljax/probes/`](gljax/probes/) settled the quantized
+runtime design (ARTX10). No active work planned.
 
 ## Non-goals
 
 - **Cloud orchestration / serving APIs** — a separate layer someday, never
   coupled into the engine (contradicts Inference First).
-- **Training at scale** — CPU-only training experiments live in
-  [`Experimental/`](Experimental/README.md) until they graduate.
+- **Training at scale** — Stummañ (`gltrain/`) is a from-scratch, CPU-first
+  framework for small fine-tunes (LoRA), not a distributed trainer.
 - **Chasing llama.cpp feature-for-feature** — GwenLand's product is a fully
   understood engine, not a feature matrix.
 
