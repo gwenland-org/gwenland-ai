@@ -220,6 +220,16 @@ pub struct MemoryTelemetry {
     pub kv_cache_bytes: u64,
     /// Per-run scratch/workspace buffers, bytes.
     pub scratch_bytes: u64,
+    /// Weight bytes one decoded token must read, in the format the engine
+    /// actually computes on: every layer's projection weights once plus the
+    /// LM head. The embedding lookup (one row) and prefill-only copies are
+    /// excluded. This is the denominator of a decode bandwidth ceiling.
+    ///
+    /// Not `model_bytes` and not the file size: an engine that repacks Q4_K to
+    /// Q8_0 streams Q8_0 bytes from a smaller Q4_K file, and resident weights
+    /// also hold tables decode never sweeps. `None` when the engine cannot say
+    /// (e.g. MoE, where the bytes depend on which experts the router picks).
+    pub decode_weight_bytes: Option<u64>,
 }
 
 /// What the engine actually chose to run on this machine.

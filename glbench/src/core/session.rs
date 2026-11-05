@@ -697,6 +697,10 @@ fn telemetry_json(t: &glcore::telemetry::EngineTelemetry) -> Json {
             ("model_bytes", Json::Num(m.model_bytes as f64)),
             ("kv_cache_bytes", Json::Num(m.kv_cache_bytes as f64)),
             ("scratch_bytes", Json::Num(m.scratch_bytes as f64)),
+            (
+                "decode_weight_bytes",
+                m.decode_weight_bytes.map(|b| Json::Num(b as f64)).unwrap_or(Json::Null),
+            ),
         ]),
         None => Json::Null,
     };
@@ -879,6 +883,8 @@ fn telemetry_from_json(v: &Json) -> Result<glcore::telemetry::EngineTelemetry, S
             model_bytes: required_u64(value, "model_bytes", "telemetry.memory")?,
             kv_cache_bytes: required_u64(value, "kv_cache_bytes", "telemetry.memory")?,
             scratch_bytes: required_u64(value, "scratch_bytes", "telemetry.memory")?,
+            // Absent in archives written before 2026-11-05.
+            decode_weight_bytes: optional_u64(value, "decode_weight_bytes", "telemetry.memory")?,
         }),
     };
 
@@ -1231,6 +1237,7 @@ mod tests {
                 model_bytes: 1_000,
                 kv_cache_bytes: 2_000,
                 scratch_bytes: 3_000,
+                decode_weight_bytes: Some(900),
             }),
             moe: Some(MoeTelemetry {
                 num_experts: 4,

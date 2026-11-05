@@ -116,7 +116,12 @@ mod tests {
             decode: None,
             backend: None,
             launches: None,
-            memory: Some(MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes: 0 }),
+            memory: Some(MemoryTelemetry {
+                model_bytes,
+                kv_cache_bytes,
+                scratch_bytes: 0,
+                decode_weight_bytes: None,
+            }),
             moe: None,
         });
         session

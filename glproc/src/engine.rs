@@ -221,6 +221,22 @@ impl GlprocEngine {
         };
 
         let mut model_bytes = wbytes(&model.token_embd) + wbytes(&model.output);
+        // Decode reads every projection once plus the LM head, but only one
+        // embedding row, so the table is excluded. MoE decode bytes depend on
+        // the router's picks, so a model with any MoE layer reports none.
+        let mut decode_bytes = Some(wbytes(&model.output));
+        for l in &model.layers {
+            let qkv = match &l.qkv {
+                crate::model::QkvWeights::FusedQuant(_, p) => p.len(),
+                crate::model::QkvWeights::Split(q, k, v) => wbytes(q) + wbytes(k) + wbytes(v),
+            };
+            decode_bytes = match (&l.ffn, decode_bytes) {
+                (FfnLayer::Dense { gate_up, w_down }, Some(acc)) => {
+                    Some(acc + wbytes(&l.wo) + qkv + gu_bytes(gate_up) + wbytes(w_down))
+                }
+                _ => None,
+            };
+        }
         for l in &model.layers {
             model_bytes += wbytes(&l.wo);
             model_bytes += match &l.qkv {
@@ -246,6 +262,7 @@ impl GlprocEngine {
             model_bytes: model_bytes as u64,
             kv_cache_bytes: crate::runner::kv_cache_bytes(&model.config) as u64,
             scratch_bytes: 0, // workspace is per-Runner and already dropped
+            decode_weight_bytes: decode_bytes.map(|b| b as u64),
         }
     }
 }

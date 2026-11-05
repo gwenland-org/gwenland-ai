@@ -930,6 +930,38 @@ impl GpuModel {
     /// sized for `max_context` at load and the cursor never shrinks it. That
     /// distinction matters when reading a memory report -- a cache 2% filled
     /// still occupies all of this.
+    /// Weight bytes one decode step reads: each layer's projections once, in
+    /// their uploaded device format, plus the LM head. Excludes the host-side
+    /// embedding table (one row per token) and the prefill-only B-stage copies.
+    pub fn decode_weight_bytes(&self) -> u64 {
+        let mat = |m: &GpuMat| -> u64 {
+            match &m.w {
+                GpuWeight::F32(s) | GpuWeight::Q8_0(s) | GpuWeight::Q4_0(s) => s.bytes,
+                GpuWeight::Q8_0Soa { qs, scales } | GpuWeight::Q4_0Soa { qs, scales } => {
+                    qs.bytes + scales.bytes
+                }
+                GpuWeight::Q4KSoa { qs, scales, mins } => qs.bytes + scales.bytes + mins.bytes,
+                GpuWeight::Q6KSoa { ql, qh, scales, d } => {
+                    ql.bytes + qh.bytes + scales.bytes + d.bytes
+                }
+            }
+        };
+        let layers: u64 = self
+            .layers
+            .iter()
+            .map(|l| {
+                // The stacked QKV image and the three projections describe the
+                // same rows; decode reads one of them, never both.
+                let qkv = match &l.w_qkv {
+                    Some(w) => mat(w),
+                    None => mat(&l.wq) + mat(&l.wk) + mat(&l.wv),
+                };
+                qkv + mat(&l.wo) + mat(&l.w_gate_up) + mat(&l.w_down)
+            })
+            .sum();
+        layers + mat(&self.output)
+    }
+
     pub fn vram_breakdown(&self) -> Option<(u64, u64, u64)> {
         let kv = (KvCacheDev::numel(
             self.kv.n_layers,

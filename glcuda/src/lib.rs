@@ -330,7 +330,12 @@ impl GlEngine for GlcudaEngine {
         });
 
         let memory = m.vram_breakdown().map(|(model_bytes, kv_cache_bytes, scratch_bytes)| {
-            MemoryTelemetry { model_bytes, kv_cache_bytes, scratch_bytes }
+            MemoryTelemetry {
+                model_bytes,
+                kv_cache_bytes,
+                scratch_bytes,
+                decode_weight_bytes: Some(m.decode_weight_bytes()),
+            }
         });
         let launches = self.cuda.as_ref().and_then(Cuda::kernel_profile);
 

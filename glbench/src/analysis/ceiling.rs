@@ -137,12 +137,27 @@ pub fn bandwidth_for_run(session: &BenchmarkSession) -> Option<(f64, CeilingBasi
 pub fn analyze(session: &BenchmarkSession, decode_tps: &Stats) -> Ceiling {
     let mut c = Ceiling::default();
 
-    // Weight footprint decode must stream: prefer the measured model bytes,
-    // else the model file size on disk.
-    let model_bytes = session
-        .measurements
-        .model_bytes
-        .or(session.environment.hardware.storage.model_file_bytes);
+    // Weight bytes decode must stream. The engine's own count comes first: it
+    // knows the format it computes on. The file size is only a fallback, and a
+    // wrong one whenever the engine repacks -- the 2026-11-05 T4 audit had a
+    // Q4_K_M file repacked to Q8_0 judged against 0.49 GB when it streamed the
+    // same Q8_0 bytes as the Q8_0 run, flipping the verdict for identical work.
+    let engine_bytes = session
+        .telemetry
+        .as_ref()
+        .and_then(|t| t.memory.as_ref())
+        .and_then(|m| m.decode_weight_bytes);
+    let (model_bytes, bytes_source) = match engine_bytes {
+        Some(b) => (Some(b), "weights streamed per decode token, reported by the engine"),
+        None => (
+            session
+                .measurements
+                .model_bytes
+                .or(session.environment.hardware.storage.model_file_bytes),
+            "model file size; wrong whenever the engine repacks weights or holds \
+             tables decode never reads",
+        ),
+    };
 
     let winner = bandwidth_for_run(session);
     let peak_bw = winner.map(|(bw, _)| bw);
@@ -204,6 +219,7 @@ pub fn analyze(session: &BenchmarkSession, decode_tps: &Stats) -> Ceiling {
             CeilingBasis::Undetermined => unreachable!("efficiency requires a basis"),
         };
         c.notes.push(basis_note);
+        c.notes.push(format!("Weight bytes in that ceiling: {bytes_source}."));
     }
     c
 }
@@ -305,6 +321,43 @@ mod tests {
         let c = analyze(&sess, &dec);
         assert_eq!(c.basis, CeilingBasis::Undetermined);
         assert_eq!(c.efficiency, None);
+    }
+
+    /// Regression for the 2026-11-05 T4 audit: a Q4_K_M file (0.49 GB) that
+    /// glcuda repacks to Q8_0 streams the same bytes as the Q8_0 run, so both
+    /// must get the same ceiling. Judging it against the file size flipped
+    /// the verdict for identical work (47% vs 34%).
+    #[test]
+    fn engine_reported_decode_bytes_beat_the_file_size() {
+        use glcore::telemetry::{EngineTelemetry, MemoryTelemetry};
+
+        let mut sess = sample_gpu(200.0);
+        sess.environment.hardware.gpu.peak_bandwidth_gbs = Some(320.0);
+        sess.measurements.model_bytes = Some(491_400_032); // the Q4_K_M file
+        sess.telemetry = Some(EngineTelemetry {
+            memory: Some(MemoryTelemetry {
+                model_bytes: 905_311_380,
+                kv_cache_bytes: 0,
+                scratch_bytes: 0,
+                decode_weight_bytes: Some(640_000_000),
+            }),
+            ..Default::default()
+        });
+        let dec = Stats::from_samples(&sess.measurements.decode_tps_samples());
+        let c = analyze(&sess, &dec);
+        assert_eq!(c.decode_tps_ceiling, Some(320e9 / 640_000_000.0));
+        assert!(
+            c.notes.iter().any(|n| n.contains("reported by the engine")),
+            "notes must say where the bytes came from: {:?}",
+            c.notes
+        );
+
+        // Without the engine's count the file size is still used, and the
+        // note says so rather than passing it off as the stream.
+        sess.telemetry = None;
+        let c = analyze(&sess, &dec);
+        assert_eq!(c.decode_tps_ceiling, Some(320e9 / 491_400_032.0));
+        assert!(c.notes.iter().any(|n| n.contains("model file size")));
     }
 
     #[test]
