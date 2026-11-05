@@ -25,6 +25,7 @@ use glbench::kl_divergence::{self, KlDivArgs};
 use glbench::ppl::{self, PplArgs};
 use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
+use glbench::render::text::ENVerbosity;
 use glbench::runner::{planner, scale, thread_scale};
 use glbench::numerical::scope::{self, ENBitScope};
 #[cfg(feature = "train-bench")]
@@ -154,6 +155,7 @@ usage:
                   [--seed N] [--kind prefill|decode|end_to_end|stress]
                   [--profile stages]
                   [--cot on|off] [--verify-against <oracle>] [--out <file.json>]
+                  [-q | -v | -vv]
                   (--verify-against loads a second engine and cross-checks the
                    first 50 generated tokens against it, folding the result into
                    the validation report; skipped, not just trivial, when the
@@ -181,7 +183,7 @@ usage:
                    --sweep, sequentially, and reports speedup/efficiency
                    relative to the lowest thread count — glproc only, since
                    GLPROC_THREADS is glproc's own env override)
-  glbench inspect <session.json> [--no-verify]
+  glbench inspect <session.json> [--no-verify] [-q | -v | -vv]
                   (verifies the archive's content digest by default; a
                    mismatch is reported and the session is still rendered,
                    because refusing to show a modified archive is useless
@@ -244,6 +246,19 @@ bit profiling (run):
   --bit-scope <scope>         weights (default) | gradients | optimizer.
                               weights needs --features gllm-bench; the two
                               training scopes are Wave 4 and say so.
+
+report verbosity (run, ab, inspect):
+  -q, --quiet     one line: prefill/decode medians, authority, ceiling, validation
+  (default)       decision facts and every warning
+  -v, --verbose   every section: environment, roofline, telemetry, behavior
+  -vv, --greedy   everything: raw iterations, override values, engine memory,
+                  why each absent field is absent. On 'run' it also COLLECTS
+                  more: a second, instrumented --profile stages pass in a child
+                  process, printed with its observation cost. The production
+                  numbers never come from the instrumented pass. With --out,
+                  that pass is archived beside it as <name>.instrumented.json.
+                  Archives always keep everything collected, so -vv on
+                  'inspect' shows what a -q run recorded.
 
 archive options (run, ab, scale, ...):
   --null-semantics strict|lenient
@@ -316,6 +331,8 @@ struct RunArgs {
     null_semantics: ENNullSemantics,
     /// Which tensor family to bit-profile, if `--profile bits` was given.
     bit_scope: Option<ENBitScope>,
+    /// How much of the report to print (`-q`, default, `-v`, `-vv`).
+    verbosity: ENVerbosity,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
@@ -328,6 +345,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     // named before or after the profile is asked for, in either order.
     let mut profile_bits = false;
     let mut bit_scope: Option<ENBitScope> = None;
+    let mut verbosity = ENVerbosity::default();
 
     let mut i = 0;
     while i < args.len() {
@@ -388,7 +406,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 scope.availability()?;
                 bit_scope = Some(scope);
             }
-            other => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+            other => match ENVerbosity::from_flag(other) {
+                Some(v) => verbosity = v,
+                None => return Err(format!("unknown flag '{other}'\n\n{USAGE}")),
+            },
         }
         i += 1;
     }
@@ -410,7 +431,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         // A representative default prompt (~long enough to exercise prefill).
         spec.prompt = default_prompt();
     }
-    Ok(RunArgs { spec, models, out_path, null_semantics, bit_scope })
+    Ok(RunArgs { spec, models, out_path, null_semantics, bit_scope, verbosity })
 }
 
 /// Progress heartbeat to stderr so stdout stays the report.
@@ -430,7 +451,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let session = planner::run(&a.spec, &progress).map_err(|e| e.to_string())?;
 
     // Report to stdout.
-    print!("{}", text::session(&session));
+    print!("{}", text::session_at(&session, a.verbosity));
 
     // GLBitProf, if asked for. Runs after the measured iterations and reads the
     // model file, not the run — profiling is static, so it cannot perturb the
@@ -440,14 +461,129 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
 
     // Archive if requested.
-    if let Some(path) = a.out_path {
-        let report = archive::write_with_policy(&session, &path, a.null_semantics)?;
+    if let Some(path) = &a.out_path {
+        let report = archive::write_with_policy(&session, path, a.null_semantics)?;
         for finding in &report.findings {
             eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
         }
         eprintln!("archived to {}", path.display());
     }
+
+    // Greedy collects as well as prints: a second, instrumented pass for the
+    // stage and launch profile. It never shares a process or a session with
+    // the production pass above, so the headline numbers stay authoritative,
+    // and the gap between the two passes is reported as the observation cost.
+    if a.verbosity == ENVerbosity::Greedy && !a.spec.instrument_engine {
+        greedy_instrumented_pass(args, &session, a.out_path.as_deref())?;
+    }
     Ok(())
+}
+
+/// Run the instrumented half of `run --greedy` as a child `glbench run
+/// --profile stages`, then print its profile and what observing cost.
+///
+/// A child, not an in-process second run: both engines read their profiling
+/// switches at construction, and the stage-profile re-exec already exists to
+/// set them before any runtime state does.
+fn greedy_instrumented_pass(
+    args: &[String],
+    production: &glbench::BenchmarkSession,
+    out_path: Option<&Path>,
+) -> Result<(), String> {
+    let engine = production.workload.engine.as_str();
+    if !matches!(engine, "glproc" | "glcuda") {
+        println!("\ngreedy: engine '{engine}' exposes no stage profile; no instrumented pass");
+        return Ok(());
+    }
+
+    // The production archive keeps its name; the instrumented one sits beside
+    // it. Without --out the instrumented archive is a temporary file.
+    let (instrumented_path, keep) = match out_path {
+        Some(path) => {
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+            (path.with_file_name(format!("{stem}.instrumented.json")), true)
+        }
+        None => (
+            std::env::temp_dir().join(format!("glbench-greedy-{}.json", std::process::id())),
+            false,
+        ),
+    };
+
+    let mut child_args: Vec<String> = vec!["run".into()];
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--out" {
+            i += 2;
+            continue;
+        }
+        if ENVerbosity::from_flag(arg).is_none() {
+            child_args.push(args[i].clone());
+        }
+        i += 1;
+    }
+    child_args.extend(
+        ["--profile", "stages", "-q", "--out"].iter().map(|s| s.to_string()),
+    );
+    child_args.push(instrumented_path.display().to_string());
+
+    eprintln!("=== greedy: instrumented pass (stage profile) ===");
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("locating glbench for the greedy pass: {error}"))?;
+    let status = std::process::Command::new(executable)
+        .args(&child_args)
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|error| format!("starting the greedy instrumented pass: {error}"))?;
+    if !status.success() {
+        return Err("greedy instrumented pass failed; the production report above stands".into());
+    }
+
+    let instrumented = archive::read(&instrumented_path)?;
+    if !keep {
+        let _ = std::fs::remove_file(&instrumented_path);
+    }
+    print!("{}", greedy_observation_cost(production, &instrumented));
+    if let Some(t) = &instrumented.telemetry {
+        println!("\n== greedy: instrumented pass profile (diagnostic, not production) ==");
+        print!("{}", text::telemetry_report(t, instrumented.environment.hardware.cpu.read_bandwidth_gbs));
+    }
+    // A kept archive was already announced by the child's own "archived to".
+    Ok(())
+}
+
+/// The throughput the instrumented pass lost relative to production.
+///
+/// One pair of sessions, run back to back rather than interleaved, so this is
+/// an estimate of the observation cost, not a retention-grade A/B.
+fn greedy_observation_cost(
+    production: &glbench::BenchmarkSession,
+    instrumented: &glbench::BenchmarkSession,
+) -> String {
+    use glbench::comparison::statistics::Stats;
+    let median = |s: &glbench::BenchmarkSession, prefill: bool| {
+        let samples = if prefill {
+            s.measurements.prefill_tps_samples()
+        } else {
+            s.measurements.decode_tps_samples()
+        };
+        Stats::from_samples(&samples).median
+    };
+    let mut out = String::from("\n== greedy: observation cost ==\n");
+    for (label, prefill) in [("prefill", true), ("decode", false)] {
+        let (p, i) = (median(production, prefill), median(instrumented, prefill));
+        if p > 0.0 {
+            out.push_str(&format!(
+                "  {label:<8} production {p:.1} tok/s | instrumented {i:.1} tok/s | {:+.1}%\n",
+                (i / p - 1.0) * 100.0
+            ));
+        }
+    }
+    out.push_str(
+        "  (one back-to-back pair, not interleaved: an estimate of what profiling \
+         costs, not a retention-grade A/B)\n",
+    );
+    out
 }
 
 /// Render the GLBitProf summary for a finished session.
@@ -567,7 +703,7 @@ fn cmd_ab(args: &[String]) -> Result<(), String> {
 
     // Every session's full report first (the facts) ...
     for s in &sessions {
-        print!("{}", text::session(s));
+        print!("{}", text::session_at(s, a.verbosity));
         println!();
     }
     // ... then each candidate against the baseline (the deltas).
@@ -974,10 +1110,14 @@ fn render_training(session: &glbench::BenchmarkSession) -> String {
 fn cmd_inspect(args: &[String]) -> Result<(), String> {
     let mut path: Option<&String> = None;
     let mut verify = true;
+    let mut verbosity = ENVerbosity::default();
     for arg in args {
         match arg.as_str() {
             "--no-verify" => verify = false,
-            other if other.starts_with("--") => return Err(format!("unknown flag '{other}'")),
+            other if ENVerbosity::from_flag(other).is_some() => {
+                verbosity = ENVerbosity::from_flag(other).unwrap_or_default()
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag '{other}'")),
             _ => path = Some(arg),
         }
     }
@@ -996,7 +1136,7 @@ fn cmd_inspect(args: &[String]) -> Result<(), String> {
     for finding in &report.findings {
         eprintln!("glbench: [{}] {}: {}", finding.severity.as_str(), finding.check, finding.message);
     }
-    print!("{}", text::session(&session));
+    print!("{}", text::session_at(&session, verbosity));
     if !report.passed() {
         return Err("archive failed integrity verification".into());
     }

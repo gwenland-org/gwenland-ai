@@ -12,8 +12,51 @@ use crate::measurement::memory::bytes_to_gib;
 use crate::environment::bandwidth::CEILING_TOLERANCE;
 use crate::render::table::Table;
 
-/// Render a full session report for the terminal.
+/// How much of a session the terminal report shows.
+///
+/// Verbosity chooses what is *printed*, never what is *kept*: an archive holds
+/// everything the run collected at every level, so a session written under
+/// `-q` can be re-read with `glbench inspect -vv` later. Greedy is the one
+/// level that also changes what a `run` collects — see `glbench run --greedy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum ENVerbosity {
+    /// One line: throughput, measurement authority, ceiling, validation.
+    Quiet,
+    /// The decision-relevant facts and every warning. The default.
+    #[default]
+    Normal,
+    /// Every section the report has: environment, roofline, hypotheses,
+    /// telemetry, behavior.
+    Verbose,
+    /// Verbose, plus every raw fact in the session: the workload, each
+    /// override's value, every iteration, every engine memory figure, and why
+    /// each absent field is absent.
+    Greedy,
+}
+
+impl ENVerbosity {
+    /// Parse a verbosity flag; `None` for anything else.
+    pub fn from_flag(flag: &str) -> Option<ENVerbosity> {
+        Some(match flag {
+            "-q" | "--quiet" => ENVerbosity::Quiet,
+            "-v" | "--verbose" => ENVerbosity::Verbose,
+            "-vv" | "--greedy" => ENVerbosity::Greedy,
+            _ => return None,
+        })
+    }
+}
+
+/// Render a full session report for the terminal (verbose level).
 pub fn session(session: &BenchmarkSession) -> String {
+    session_at(session, ENVerbosity::Verbose)
+}
+
+/// Render a session report at the given verbosity.
+pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String {
+    if verbosity == ENVerbosity::Quiet {
+        return quiet(session);
+    }
+    let full = verbosity >= ENVerbosity::Verbose;
     let mut s = String::new();
     let m = &session.measurements;
     let dec = Stats::from_samples(&m.decode_tps_samples());
@@ -26,13 +69,15 @@ pub fn session(session: &BenchmarkSession) -> String {
         session.engine.backend,
         session.workload.model_path,
     ));
-    s.push_str(&format!(
-        "run at unix {} | {} {} | glbench {}\n",
-        session.metadata.created_unix,
-        session.environment.runtime.os,
-        session.environment.runtime.arch,
-        session.environment.runtime.glbench_version,
-    ));
+    if full {
+        s.push_str(&format!(
+            "run at unix {} | {} {} | glbench {}\n",
+            session.metadata.created_unix,
+            session.environment.runtime.os,
+            session.environment.runtime.arch,
+            session.environment.runtime.glbench_version,
+        ));
+    }
     match session.metadata.measurement_mode {
         ENMeasurementMode::Production => {
             s.push_str("measurement production | throughput is eligible as production evidence\n")
@@ -46,7 +91,9 @@ pub fn session(session: &BenchmarkSession) -> String {
     }
     if let Some(dispatch) = &session.metadata.dispatch {
         s.push_str(&format!("dispatch config {}", dispatch.config_fingerprint));
-        if !dispatch.engine_overrides.is_empty() {
+        if !full && !dispatch.engine_overrides.is_empty() {
+            s.push_str(&format!(" | {} engine overrides", dispatch.engine_overrides.len()));
+        } else if !dispatch.engine_overrides.is_empty() {
             let names: Vec<&str> = dispatch
                 .engine_overrides
                 .iter()
@@ -75,43 +122,11 @@ pub fn session(session: &BenchmarkSession) -> String {
         }
         s.push_str(")\n");
     }
-    // Capability: what the CPU supports. The engine's actual pick is printed in
-    // the profile section below — they differ, and the difference is the point.
-    let isa = hw.cpu.isa.names();
-    if !isa.is_empty() {
-        s.push_str(&format!("isa {}\n", isa.join(" ")));
-    }
-    match (hw.memory.total_bytes, hw.memory.available_bytes) {
-        (Some(total), Some(avail)) => s.push_str(&format!(
-            "ram {:.1} GiB total, {:.1} GiB available\n",
-            bytes_to_gib(total),
-            bytes_to_gib(avail),
-        )),
-        (Some(total), None) => s.push_str(&format!("ram {:.1} GiB total\n", bytes_to_gib(total))),
-        (None, _) => s.push_str("ram not available (no /proc/meminfo on this OS)\n"),
-    }
-    match hw.thermal.avg_mhz {
-        Some(avg) => {
-            s.push_str(&format!("clock avg {avg:.0} MHz during run"));
-            if let (Some(start), Some(end)) = (hw.thermal.start_mhz, hw.thermal.end_mhz) {
-                s.push_str(&format!(" (start {start:.0}, end {end:.0}"));
-                if hw.thermal.throttled() {
-                    s.push_str(", THROTTLED");
-                }
-                s.push(')');
-            }
-            s.push('\n');
-        }
-        None => s.push_str("clock avg not available (no readable clock speed on this OS)\n"),
-    }
-    if let Some(bytes) = hw.storage.model_file_bytes {
-        s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
-    }
-    if let Some(bytes) = m.peak_memory_bytes {
-        s.push_str(&format!("peak RSS {:.2} GiB (process high-water mark, includes model load)\n", bytes_to_gib(bytes)));
-    }
-    if let Some(pct) = m.cpu_utilization_pct {
-        s.push_str(&format!("CPU utilization {pct:.1}% (measured phase, {} logical cores)\n", hw.cpu.logical_cores));
+    if full {
+        s.push_str(&environment(session));
+    } else if hw.thermal.throttled() {
+        // The one environment fact that changes how to read the numbers.
+        s.push_str("WARNING: CPU clock dropped during the run (THROTTLED); -v for clocks\n");
     }
     s.push('\n');
 
@@ -154,7 +169,10 @@ pub fn session(session: &BenchmarkSession) -> String {
         // estimates from TDP, so absence always means "not available", never
         // "zero". Say so — a missing line reads as "forgot to check", not as
         // "not applicable on this OS".
-        None => s.push_str("energy: not available (RAPL is Linux-only; not estimated from TDP)\n"),
+        None if full => s.push_str(
+            "energy: not available (RAPL is Linux-only; not estimated from TDP)\n",
+        ),
+        None => {}
     }
     s.push('\n');
 
@@ -177,11 +195,11 @@ pub fn session(session: &BenchmarkSession) -> String {
             s.push_str(&format!("  - {note}\n"));
         }
 
-        if let Some(r) = &a.roofline {
+        if let Some(r) = a.roofline.as_ref().filter(|_| full) {
             s.push_str(&roofline(r));
         }
 
-        if !a.hypotheses.is_empty() {
+        if full && !a.hypotheses.is_empty() {
             s.push_str("\nhypotheses (patterns, not verdicts — each says what the data is consistent with)\n");
             for h in &a.hypotheses {
                 s.push_str(&format!("  * {h}\n"));
@@ -189,11 +207,11 @@ pub fn session(session: &BenchmarkSession) -> String {
         }
     }
 
-    if let Some(t) = &session.telemetry {
+    if let Some(t) = session.telemetry.as_ref().filter(|_| full) {
         s.push_str(&telemetry(t, hw.cpu.read_bandwidth_gbs));
     }
 
-    if let Some(b) = &session.behavior {
+    if let Some(b) = session.behavior.as_ref().filter(|_| full) {
         s.push_str(&behavior(b, uses_synthetic_prompts(session)));
     }
 
@@ -212,6 +230,229 @@ pub fn session(session: &BenchmarkSession) -> String {
         ));
         for f in &v.findings {
             s.push_str(&format!("  [{}] {}: {}\n", f.severity.as_str(), f.check, f.message));
+        }
+    }
+
+    match verbosity {
+        ENVerbosity::Normal => s.push_str(
+            "\n(-v adds environment, roofline, hypotheses, telemetry and behavior; \
+             -vv adds every raw fact)\n",
+        ),
+        ENVerbosity::Greedy => s.push_str(&greedy(session)),
+        ENVerbosity::Quiet | ENVerbosity::Verbose => {}
+    }
+    s
+}
+
+/// The environment block: what the CPU supports, memory, clocks, footprint.
+fn environment(session: &BenchmarkSession) -> String {
+    let mut s = String::new();
+    let hw = &session.environment.hardware;
+    let m = &session.measurements;
+    // Capability: what the CPU supports. The engine's actual pick is printed in
+    // the profile section below — they differ, and the difference is the point.
+    let isa = hw.cpu.isa.names();
+    if !isa.is_empty() {
+        s.push_str(&format!("isa {}\n", isa.join(" ")));
+    }
+    match (hw.memory.total_bytes, hw.memory.available_bytes) {
+        (Some(total), Some(avail)) => s.push_str(&format!(
+            "ram {:.1} GiB total, {:.1} GiB available\n",
+            bytes_to_gib(total),
+            bytes_to_gib(avail),
+        )),
+        (Some(total), None) => s.push_str(&format!("ram {:.1} GiB total\n", bytes_to_gib(total))),
+        (None, _) => s.push_str("ram not available (no /proc/meminfo on this OS)\n"),
+    }
+    match hw.thermal.avg_mhz {
+        Some(avg) => {
+            s.push_str(&format!("clock avg {avg:.0} MHz during run"));
+            if let (Some(start), Some(end)) = (hw.thermal.start_mhz, hw.thermal.end_mhz) {
+                s.push_str(&format!(" (start {start:.0}, end {end:.0}"));
+                if hw.thermal.throttled() {
+                    s.push_str(", THROTTLED");
+                }
+                s.push(')');
+            }
+            s.push('\n');
+        }
+        None => s.push_str("clock avg not available (no readable clock speed on this OS)\n"),
+    }
+    if let Some(bytes) = hw.storage.model_file_bytes {
+        s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
+    }
+    if let Some(bytes) = m.peak_memory_bytes {
+        s.push_str(&format!("peak RSS {:.2} GiB (process high-water mark, includes model load)\n", bytes_to_gib(bytes)));
+    }
+    if let Some(pct) = m.cpu_utilization_pct {
+        s.push_str(&format!("CPU utilization {pct:.1}% (measured phase, {} logical cores)\n", hw.cpu.logical_cores));
+    }
+    s
+}
+
+/// One line for scripts and CI: the two throughput medians, the measurement
+/// authority, the ceiling fraction, and the validation verdict.
+fn quiet(session: &BenchmarkSession) -> String {
+    let m = &session.measurements;
+    let pre = Stats::from_samples(&m.prefill_tps_samples());
+    let dec = Stats::from_samples(&m.decode_tps_samples());
+    let mode = match session.metadata.measurement_mode {
+        ENMeasurementMode::Production => "production",
+        ENMeasurementMode::Instrumented => "INSTRUMENTED",
+        ENMeasurementMode::Unknown => "unknown-authority",
+    };
+    let mut line = format!(
+        "{}  prefill {:.1} tok/s  decode {:.1} tok/s  {mode}",
+        session.metadata.label, pre.median, dec.median
+    );
+    if let Some(a) = &session.analysis {
+        if let Some(eff) = a.ceiling_efficiency {
+            let est = match a.ceiling_basis {
+                crate::analysis::ceiling::CeilingBasis::EstimatedFromTable => " (est.)",
+                _ => "",
+            };
+            line.push_str(&format!("  {:.0}% of ceiling{est}", eff * 100.0));
+        }
+    }
+    if let Some(v) = &session.validation {
+        line.push_str(if v.passed() { "  validation passed" } else { "  validation FAILED" });
+    }
+    line.push('\n');
+    line
+}
+
+/// Everything the other levels leave out: the raw facts behind every number.
+fn greedy(session: &BenchmarkSession) -> String {
+    let mut s = String::new();
+    let w = &session.workload;
+    s.push_str("\n== greedy: raw session facts ==\n");
+
+    s.push_str("\nworkload\n");
+    s.push_str(&format!(
+        "  kind {} | tokens {} | temperature {} | seed {} | cot {}\n",
+        w.kind.as_str(),
+        w.max_new_tokens,
+        w.temperature,
+        w.seed,
+        w.cot_mode.map_or("auto".to_string(), |c| c.to_string()),
+    ));
+    s.push_str(&format!(
+        "  iterations: cold {} | warmup {} (untimed) | measured {} | verify against {}\n",
+        w.cold_iters,
+        w.warmup_iters,
+        w.measure_iters,
+        w.verify_against.as_deref().unwrap_or("none"),
+    ));
+    s.push_str(&format!("  prompt {} chars\n", w.prompt.chars().count()));
+
+    let e = &session.engine;
+    s.push_str(&format!(
+        "\nengine {} | backend {} | arch {} | quantization {} | thinking {}\n",
+        e.name,
+        e.backend,
+        e.model_arch.as_deref().unwrap_or("?"),
+        e.quantization.as_deref().unwrap_or("?"),
+        e.thinking_capable.map_or("?".to_string(), |t| t.to_string()),
+    ));
+    if let Some(dispatch) = &session.metadata.dispatch {
+        if dispatch.engine_overrides.is_empty() {
+            s.push_str("  engine overrides: none (engine defaults)\n");
+        }
+        for (name, value) in &dispatch.engine_overrides {
+            s.push_str(&format!("  {name}={value}\n"));
+        }
+    }
+
+    let hw = &session.environment.hardware;
+    s.push_str("\nhardware\n");
+    s.push_str(&format!(
+        "  cpu {} | {} logical / {} physical cores | {} MHz | read bandwidth {}\n",
+        hw.cpu.model.as_deref().unwrap_or("?"),
+        hw.cpu.logical_cores,
+        hw.cpu.physical_cores.map_or("?".to_string(), |p| p.to_string()),
+        hw.cpu.mhz.map_or("?".to_string(), |v| format!("{v:.0}")),
+        hw.cpu.read_bandwidth_gbs.map_or("not measured".to_string(), |v| format!("{v:.1} GB/s")),
+    ));
+    if hw.gpu.is_present() {
+        s.push_str(&format!(
+            "  gpu {} | {} | {} | {} | peak bandwidth {} | peak compute {}\n",
+            hw.gpu.name.as_deref().unwrap_or("?"),
+            hw.gpu.backend.as_deref().unwrap_or("?"),
+            hw.gpu.compute.as_deref().unwrap_or("?"),
+            hw.gpu
+                .total_memory_bytes
+                .map_or("?".to_string(), |b| format!("{:.1} GiB", bytes_to_gib(b))),
+            hw.gpu.peak_bandwidth_gbs.map_or("?".to_string(), |v| format!("{v:.0} GB/s (spec)")),
+            hw.gpu.peak_compute_tops.map_or("?".to_string(), |v| format!("{v:.0} TOPS (spec)")),
+        ));
+    }
+    s.push_str(&format!(
+        "  build {} | model file {}\n",
+        session.environment.runtime.build_profile,
+        hw.storage
+            .model_file_bytes
+            .map_or("?".to_string(), |b| format!("{b} bytes")),
+    ));
+
+    if let Some(mem) = session.telemetry.as_ref().and_then(|t| t.memory.as_ref()) {
+        s.push_str(&format!(
+            "\nengine memory: weights {} B | kv cache {} B | scratch {} B | streamed per decode token {}\n",
+            mem.model_bytes,
+            mem.kv_cache_bytes,
+            mem.scratch_bytes,
+            mem.decode_weight_bytes.map_or("not reported".to_string(), |b| format!("{b} B")),
+        ));
+    }
+
+    let m = &session.measurements;
+    let mut t = Table::new(&[
+        "iter", "prompt", "prefill ms", "prefill tok/s", "generated", "decode ms", "decode tok/s",
+    ])
+    .right_align(1)
+    .right_align(2)
+    .right_align(3)
+    .right_align(4)
+    .right_align(5)
+    .right_align(6);
+    let rows = m
+        .cold
+        .iter()
+        .enumerate()
+        .map(|(i, it)| (format!("cold {}", i + 1), it))
+        .chain(m.iterations.iter().enumerate().map(|(i, it)| (format!("{}", i + 1), it)));
+    for (label, it) in rows {
+        let rate = |tokens: u64, ms: f64| {
+            if ms > 0.0 { format!("{:.1}", tokens as f64 * 1000.0 / ms) } else { "-".into() }
+        };
+        t.row(&[
+            label,
+            it.prompt_tokens.to_string(),
+            format!("{:.3}", it.prefill_ms),
+            rate(it.prompt_tokens, it.prefill_ms),
+            it.generated_tokens.to_string(),
+            format!("{:.3}", it.decode_ms),
+            rate(it.generated_tokens, it.decode_ms),
+        ]);
+    }
+    s.push_str("\niterations (raw)\n");
+    s.push_str(&t.render());
+
+    // The map is filled at finalisation, which a live run has not reached
+    // yet; annotate a copy so a live report says the same as its archive.
+    let mut annotated = session.clone();
+    let availability = match annotated.annotate_availability() {
+        Ok(()) => annotated.availability,
+        Err(_) => session.availability.clone(),
+    };
+    if !availability.is_empty() {
+        s.push_str("\nabsent fields and why\n");
+        for (path, entry) in &availability {
+            match &entry.note {
+                Some(note) => {
+                    s.push_str(&format!("  {path}: {} ({note})\n", entry.status.as_str()))
+                }
+                None => s.push_str(&format!("  {path}: {}\n", entry.status.as_str())),
+            }
         }
     }
     s
@@ -256,6 +497,12 @@ fn roofline(r: &crate::analysis::roofline::RooflineReport) -> String {
 /// Only sections the engine actually reported are printed. A missing section
 /// means "not measured" — it is left out rather than rendered as zeros, because
 /// a zeroed row is a claim and an absent row is an admission.
+/// The engine-telemetry section on its own, for a report that shows a second
+/// session's profile beside the first (`run --greedy`).
+pub fn telemetry_report(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -> String {
+    telemetry(t, ceiling_gbs)
+}
+
 fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -> String {
     let mut s = String::new();
 
@@ -788,6 +1035,62 @@ mod tests {
         assert!(s.contains(std::env::consts::OS));
         assert!(s.contains(std::env::consts::ARCH));
         assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn verbosity_flags_parse_and_reject_anything_else() {
+        assert_eq!(ENVerbosity::from_flag("-q"), Some(ENVerbosity::Quiet));
+        assert_eq!(ENVerbosity::from_flag("--quiet"), Some(ENVerbosity::Quiet));
+        assert_eq!(ENVerbosity::from_flag("-v"), Some(ENVerbosity::Verbose));
+        assert_eq!(ENVerbosity::from_flag("-vv"), Some(ENVerbosity::Greedy));
+        assert_eq!(ENVerbosity::from_flag("--greedy"), Some(ENVerbosity::Greedy));
+        assert_eq!(ENVerbosity::from_flag("-vvv"), None);
+        assert_eq!(ENVerbosity::default(), ENVerbosity::Normal);
+    }
+
+    #[test]
+    fn quiet_is_exactly_one_line_with_both_throughputs() {
+        let report = session_at(&sample(), ENVerbosity::Quiet);
+        assert_eq!(report.lines().count(), 1, "{report}");
+        assert!(report.contains("prefill 1000.0 tok/s"), "{report}");
+        assert!(report.contains("decode 32.0 tok/s"), "{report}");
+        assert!(report.contains("production"), "{report}");
+    }
+
+    /// Each level must contain everything the level below it shows.
+    #[test]
+    fn each_level_is_a_superset_of_the_one_below() {
+        let mut sess = sample();
+        let mut v = ValidationReport::default();
+        v.push(Severity::Warning, "parity", "an example finding");
+        sess.validation = Some(v);
+        let normal = session_at(&sess, ENVerbosity::Normal);
+        let verbose = session_at(&sess, ENVerbosity::Verbose);
+        let greedy = session_at(&sess, ENVerbosity::Greedy);
+        for line in normal.lines().filter(|l| !l.starts_with("(-v ") && !l.is_empty()) {
+            assert!(verbose.contains(line), "verbose lost {line:?}");
+        }
+        for line in verbose.lines().filter(|l| !l.is_empty()) {
+            assert!(greedy.contains(line), "greedy lost {line:?}");
+        }
+        assert!(normal.contains("an example finding"), "warnings must survive Normal");
+        assert!(!normal.contains("run at unix"));
+        assert!(verbose.contains("run at unix"));
+        assert!(greedy.contains("iterations (raw)"));
+        assert!(!verbose.contains("iterations (raw)"));
+    }
+
+    #[test]
+    fn greedy_lists_every_override_with_its_value() {
+        let mut sess = sample();
+        sess.metadata.dispatch = Some(crate::core::result::VLDispatchProvenance {
+            config_fingerprint: "sha256-128:x".into(),
+            engine_overrides: vec![("GLCUDA_FORCE_Q8".into(), "1".into())],
+        });
+        let normal = session_at(&sess, ENVerbosity::Normal);
+        assert!(normal.contains("1 engine overrides"), "{normal}");
+        assert!(!normal.contains("GLCUDA_FORCE_Q8"));
+        assert!(session_at(&sess, ENVerbosity::Greedy).contains("GLCUDA_FORCE_Q8=1"));
     }
 
     #[test]
