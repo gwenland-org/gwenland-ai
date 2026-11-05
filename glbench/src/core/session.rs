@@ -1242,6 +1242,18 @@ mod tests {
 
         let back = BenchmarkSession::from_json(&session.to_json()).unwrap();
         assert_eq!(back.telemetry, session.telemetry);
+
+        // The same profile must also survive finalisation under strict null
+        // semantics: the graph-replay entry's null `config` sits in a column
+        // whose kernel entries carry one. Before the 2026-11-05 fix this was
+        // refused, so no glcuda `--profile stages` run could be archived.
+        session.annotate_availability().unwrap();
+        let report = crate::validation::availability::check_value(
+            &session.to_json(),
+            &session.availability,
+            crate::validation::availability::ENNullSemantics::Strict,
+        );
+        assert!(report.passed(), "findings: {:?}", report.findings);
     }
 
     #[test]

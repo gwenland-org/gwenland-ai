@@ -105,15 +105,21 @@ fn walk_nulls(value: &Json, path: &str, out: &mut Vec<String>) {
     }
 }
 
-/// Look up a normalised dotted path and report whether it holds a non-null
-/// value somewhere.
+/// Look up a normalised dotted path and report whether a status on it explains
+/// at least one real gap — a `null`, or a field that is absent.
 ///
-/// "Somewhere" matters for array paths: `steps[].tokens` is non-null if *any*
-/// step carries a number there. A status claiming the whole column is
-/// unavailable is wrong as soon as one element disproves it.
-fn holds_a_value(value: &Json, path: &str) -> bool {
+/// For a plain path that is simply "null or absent". For an array column it is
+/// "null or absent in *some* element": a column can legitimately be mixed. The
+/// CUDA launch profile is the case that forced this — kernel entries carry a
+/// launch `config`, the CUDA Graph replay entry cannot (the driver does not
+/// expose its internal launches), so `entries[].config` is null in one element
+/// and a value in the rest. Direction 1 demands an entry for that null; the
+/// entry must therefore be allowed to stand next to the elements that do carry
+/// a value. A status on a column with *no* gap anywhere is still the
+/// copy-pasted lie Direction 2 exists to catch.
+fn has_a_gap(value: &Json, path: &str) -> bool {
     if path.is_empty() {
-        return !matches!(value, Json::Null);
+        return matches!(value, Json::Null);
     }
     // Split off the first segment, keeping any `[]` suffix with it.
     let (head, rest) = match path.split_once('.') {
@@ -125,22 +131,19 @@ fn holds_a_value(value: &Json, path: &str) -> bool {
         None => (head, false),
     };
 
-    let Some(child) = value.get(key) else {
-        return false;
+    let child = match value.get(key) {
+        None | Some(Json::Null) => return true,
+        Some(child) => child,
     };
     if is_array {
         let Some(items) = child.as_arr() else {
-            return false;
+            return true;
         };
-        return items.iter().any(|item| match rest {
-            Some(r) => holds_a_value(item, r),
-            None => !matches!(item, Json::Null),
-        });
+        // An empty column has no element that could carry a value.
+        return items.is_empty()
+            || items.iter().any(|item| has_a_gap(item, rest.unwrap_or("")));
     }
-    match rest {
-        Some(r) => holds_a_value(child, r),
-        None => !matches!(child, Json::Null),
-    }
+    has_a_gap(child, rest.unwrap_or(""))
 }
 
 /// Run the D-10 check over a serialised session and its availability map.
@@ -170,9 +173,10 @@ pub fn check_value(
         }
     }
 
-    // Direction 2: every entry needs its path to actually be null or absent.
+    // Direction 2: every entry must explain a real gap — its path is null or
+    // absent, or for an array column, null or absent in at least one element.
     for (path, entry) in availability {
-        if holds_a_value(value, path) {
+        if !has_a_gap(value, path) {
             report.push(
                 severity,
                 CHECK,
@@ -323,12 +327,36 @@ mod tests {
         assert!(report.passed(), "findings: {:?}", report.findings);
     }
 
-    /// If even one element carries a number, a blanket status over the column
-    /// is wrong — and must be caught.
+    /// A mixed column — null in some elements, a value in others — must be
+    /// writable: Direction 1 demands an entry for the null elements, so
+    /// Direction 2 cannot reject that same entry. Regression test for the
+    /// 2026-11-05 T4 audit, where every `--profile stages` glcuda run was
+    /// refused because the CUDA Graph replay entry has no launch config.
     #[test]
-    fn an_array_column_status_is_rejected_when_any_element_holds_a_value() {
+    fn a_mixed_array_column_accepts_the_entry_its_nulls_require() {
         let steps = Json::Arr(vec![
             Json::obj([("tokens", Json::Null)]),
+            Json::obj([("tokens", Json::n(512.0))]),
+        ]);
+        let value = Json::obj([("training", Json::obj([("steps", steps)]))]);
+        let mut map = VLAvailabilityMap::new();
+        availability::set(&mut map, "training.steps[].tokens", ENAvailability::NotApplicable)
+            .unwrap();
+
+        let report = check_value(&value, &map, ENNullSemantics::Strict);
+        assert!(report.passed(), "findings: {:?}", report.findings);
+
+        // And without the entry, the null element is still an error.
+        let bare = check_value(&value, &VLAvailabilityMap::new(), ENNullSemantics::Strict);
+        assert!(!bare.passed());
+    }
+
+    /// If *every* element carries a number, a status over the column explains
+    /// nothing — and must be caught.
+    #[test]
+    fn an_array_column_status_is_rejected_when_every_element_holds_a_value() {
+        let steps = Json::Arr(vec![
+            Json::obj([("tokens", Json::n(256.0))]),
             Json::obj([("tokens", Json::n(512.0))]),
         ]);
         let value = Json::obj([("training", Json::obj([("steps", steps)]))]);

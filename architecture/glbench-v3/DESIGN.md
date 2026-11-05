@@ -753,7 +753,11 @@ note for `Estimated` and `Derived`.
    `Severity::Error` finding naming the exact path.
 4. Any `availability` entry whose path holds a **non-null value** produces a
    finding too — a status of `unsupported` on a field that carries a number is
-   the same class of lie in the other direction.
+   the same class of lie in the other direction. For an array column the
+   entry is a lie only if **no** element is null or absent: a mixed column
+   (the CUDA launch profile's `entries[].config`, null only on the graph-replay
+   entry) needs the entry that step 3 demands. Amended 2026-11-05 after every
+   glcuda `--profile stages` run was refused.
 
 Runs in-process at session finalisation, so a malformed archive is never
 written. Also exposed as `glbench validate --availability <archive>` for
