@@ -12,7 +12,7 @@ The repo is a single Cargo workspace rooted at the repository root — run cargo
 - `glcli` — the `gwen` binary: `cargo run -p glcli` runs local inference through the engines.
 - `glictus-caliburni` — the `.gllm` package format and GLLM runtime (Pridwen quantization research: GQ4A/GQ2A superblock formats, CPP assignment policy). Experimental and separate from the GGUF path `glcli` uses today — see `architecture/Pridwen-proposal-v5.md`.
 
-The training crate sits outside this workspace on purpose, declaring its own `[workspace]` table so `cargo build --workspace` at the root never resolves its dependencies: `gltrain/` (Stummañ, GwenLand's from-scratch training framework, built on `glcore`/`glproc` rather than candle — see `gltrain/README_AUTOGRAD.md`). A candle-backed training crate previously occupied that path; it was deleted on 2026-08-20, having no live consumers. `packages/` now holds just `packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired to `.abandoned/gltui/` on 2026-07-18 — it never called the GL engines, its `CoreBridge` was a stub — and is no longer a workspace member; don't build against it. Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
+The training crate sits outside this workspace on purpose, declaring its own `[workspace]` table so `cargo build --workspace` at the root never resolves its dependencies: `gltrain/` (Stummañ, GwenLand's from-scratch training framework, built on `glcore`/`glproc` rather than candle — see `gltrain/README_AUTOGRAD.md`). A candle-backed training crate previously occupied that path; it was deleted on 2026-08-20, having no live consumers. `packages/` now holds just `packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired on 2026-07-18 — it never called the GL engines, its `CoreBridge` was a stub — and was removed from the tree on 2026-11-05 (it remains in git history). Per-session notes go in `changelog/`, and `Cargo.lock` is committed, so build with `--locked` if you want reproducible deps.
 
 Note the workspace mixes editions: `glcore`/`glproc`/`glcli`/`glbench`/`glcuda`/`glvulkan`/`glmetal` are edition 2021; `glictus-caliburni` and `packages/*` are edition 2024.
 
@@ -46,7 +46,7 @@ A few notes on the test suites:
 - **glcuda's GPU tests skip themselves when no CUDA device is present** — they print `SKIP` and pass, so the suite is green on a GPU-less machine and meaningful on one with a GPU. On a GPU runner, run the parity/forward suites with `--test-threads=1` so the VRAM-leak check isn't perturbed by concurrent allocations.
 - If any core tests touch process-global state (a panic hook, a test env var), run them single-threaded (`-- --test-threads=1`) so they don't race each other.
 
-There's a GitLab pipeline in `.gitlab-ci.yml.disabled` that runs the checks. It's parked because GitLab's shared runners want a credit card; re-enable it by renaming it back once you've sorted that out, or just run the checks above by hand.
+CI runs on GitHub Actions (`.github/workflows/`); you can also run the checks above by hand.
 
 ## A note on platform-specific code
 

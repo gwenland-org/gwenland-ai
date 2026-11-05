@@ -38,8 +38,8 @@ gwen tui: not wired to the GL engines yet — coming in M2.
 Meanwhile, run the standalone TUI with: cargo run -p gltui
 ```
 
-**That second line no longer works.** `gltui` was retired to `.abandoned/gltui/`
-on 2026-07-18 — it never called the GL engines (its `CoreBridge` was a stub) and
+**That second line no longer works.** `gltui` was retired
+on 2026-07-18 (and removed from the tree on 2026-11-05) — it never called the GL engines (its `CoreBridge` was a stub) and
 it is not a workspace member, so `cargo run -p gltui` fails.
 
 The subcommand is kept only because removing a CLI verb is a breaking change to

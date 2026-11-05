@@ -90,11 +90,11 @@ its dependencies: `gltrain/` (Stummañ, GwenLand's from-scratch training
 framework, built on `glcore`/`glproc` — see below). A second, candle-backed
 training crate previously occupied that path and was deleted on 2026-08-20; it
 had no live consumers. `packages/` now holds just
-`packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired to
-`.abandoned/gltui/` on 2026-07-18 — it never called the GL engines — and is no
-longer a workspace member.
+`packages/mcp`, an MCP server. `gltui` (the former terminal UI) was retired on
+2026-07-18 — it never called the GL engines — and was removed from the tree on
+2026-11-05; it remains in git history.
 
-## Stummañ: the training arm (M1 complete)
+## Stummañ: the training arm
 
 [`gltrain/`](gltrain/) is GwenLand's from-scratch training framework — a
 define-by-run autograd engine built on `glcore`/`glproc` instead of candle,
@@ -105,7 +105,9 @@ replays it in reverse, backward functions for every op the trait exposes, and
 a gradient check that verifies each one against an independent scalar
 reference backend rather than trusting the math by inspection.
 
-No optimizer, no LoRA layer, no GPU backend yet — that's M2 and later. Start
+Since then M2 added LoRA parameters, in-place weight updates, a `Trainer`
+step, and three optimizers (AdamW, Adafactor, Lion), and M2.5 added training
+observability through `glbench`. There is still no GPU backend. Start
 at [`gltrain/README_AUTOGRAD.md`](gltrain/README_AUTOGRAD.md) for the API and
 a runnable example, or [`gltrain/KNOWN_ISSUES.md`](gltrain/KNOWN_ISSUES.md)
 for the constraints that are deliberate rather than missing.
@@ -195,14 +197,33 @@ output, tensor-by-tensor numerical parity against the CPU engine (14/14 tests),
 backend-buffer reuse (zero `cudaMalloc` after init), mmap loading, no VRAM
 leaks.
 
-Measured on the T4 (Qwen2.5-7B-Q8_0):
+At the M2 milestone, on the T4 with Qwen2.5-7B-Q8_0: decode 29.2 tok/s (88 %
+of the card's memory bandwidth) and prefill 73 tok/s, with coherent output and
+parity with the CPU reference within spec ε.
 
-- **decode 29.2 tok/s** — 88 % of the card's memory bandwidth (bandwidth-bound,
-  as expected for weight-streaming decode)
-- **prefill 73 tok/s** via batched GEMM
-- coherent output, parity with the CPU reference within spec ε
+Since M2, the "ceiling sprint" (Waves 1–136) has worked on throughput with
+Tensor-Core INT8 MMA prefill, fused kernels, and CUDA-graph decode. Latest
+production `glbench` numbers on the T4, Qwen2.5-0.5B-Instruct **Q8_0**, 244-token
+prompt:
 
-Full write-up, charts, and the Definition-of-Done table:
+| | Throughput | Source |
+|---|---:|---|
+| prefill | **~15,800 tok/s** (P50, all runs ≥ 15,000) | Wave 131, re-confirmed in Waves 132–136 |
+| decode | **~224 tok/s** (≈ 47 % of the estimated bandwidth ceiling) | Wave 136 |
+
+- Every retained change passes oracle-token parity (50/50) before it is timed.
+- The newest paths are **opt-in** through `GLCUDA_*` environment flags and are
+  not yet the default.
+- The last head-to-head against llama.cpp (Wave 116, same Q8_0 model and
+  prompt) measured GwenLand 12,258 vs llama.cpp 11,307 tok/s prefill. That run
+  predates the +29 % since then; it has not been re-run.
+- Q4 models have not been measured on this path.
+
+Each wave (including the rejected ones) has a write-up in
+[`architecture/glcuda-research/`](architecture/glcuda-research/) and raw results
+in [`benchmarks/`](benchmarks/).
+
+Full M2 write-up, charts, and the Definition-of-Done table:
 [`docs/ArchGLCuda/ArchGLML_Done.md`](docs/ArchGLCuda/ArchGLML_Done.md).
 Benchmark methodology:
 [`docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md`](docs/ArchGLCuda/BENCHMARK_ArchGLCuda.md).

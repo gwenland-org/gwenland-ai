@@ -27,7 +27,8 @@ Last updated: **2026-07-28**. Agents: read
 | `glvulkan` | cross-vendor GPU backend | ◻ stub (planned) |
 | `glmetal` | Apple Silicon backend | ◻ stub (planned) |
 | `glictus-caliburni` | GLLM shard format (MoE, lazy experts) | 🧪 experimental |
-| `packages/` (gltui, mcp, core) | TUI, MCP server, legacy core | ✅ working, separate track |
+| `packages/mcp` | MCP server | ✅ separate track |
+| `gltrain` (Stummañ) | from-scratch training framework, own workspace | ✅ M1 + M2 + M2.5 |
 
 **Model support today:** Llama & Qwen2/Qwen3 families (GQA, NeoX RoPE),
 Q8_0 + Q4_K GGUF. Qwen3-MoE compute path verified; `_exps` tensor layout

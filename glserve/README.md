@@ -47,7 +47,7 @@ convention are all gone or absent:
 
 | Cited consumer | Reality |
 |---|---|
-| `packages/tui` serve command | retired to `.abandoned/gltui/` (2026-07-18) |
+| `packages/tui` serve command | retired 2026-07-18, removed 2026-11-05 |
 | Tauri GUI SSE endpoint | not in this repository |
 | `general.default_port` config schema | only in `.kiro/specs/`, legacy candle/mistralrs specs |
 

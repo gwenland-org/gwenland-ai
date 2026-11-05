@@ -13,11 +13,6 @@ members = [
     "packages/mcp",
 ]
 
-# `.abandoned/` holds retired crates kept for reference only. They are not
-# workspace members and are not built: gltui was a TUI over the legacy
-# `gwenland` stack that never called the GL engines (its CoreBridge was a
-# stub), retired 2026-07-18.
-#
 # `gltrain/` (Stummañ) is GwenLand's training arm and stays under active
 # development. It is excluded because the training crate is allowed
 # dependencies the "Inference First" rule forbids in the inference tree, and
@@ -34,7 +29,7 @@ members = [
 # `gwenland-core`, ~31k lines, 381 crates in its tree) was deleted 2026-08-20.
 # It had no live consumers and glbench v3 chose Stummañ over it as the
 # training arm to observe (design finding F-01).
-exclude = [".abandoned", "gltrain"]
+exclude = ["gltrain"]
 resolver = "2"
 
 [profile.release]
