@@ -2,8 +2,18 @@
 //!
 //! Profiling is configured before engine construction because both glproc and
 //! glcuda read their switches while building runtime state. The configuration
-//! is then captured from a strict allowlist so an archive can reproduce the
-//! dispatch inputs without copying unrelated process environment.
+//! is then captured from the engine's own environment namespace (`GLPROC_*`,
+//! `GLCUDA_*`) so an archive can reproduce the dispatch inputs without copying
+//! unrelated process environment.
+//!
+//! # Why a namespace and not a list of names
+//!
+//! This used to be a hand-maintained allowlist. It silently fell behind the
+//! engine: the 2026-11-05 T4 audit found `GLCUDA_DECODE_Q8_GLUE` and
+//! `GLCUDA_DECODE_QKV_FUSED` missing, so the two arms of the Wave 132 and
+//! Wave 136 A/Bs carried the *same* dispatch fingerprint. A list keyed by name
+//! cannot notice a name it was never told about; the prefix is the property
+//! every switch actually shares.
 
 use glcore::GlError;
 
@@ -11,42 +21,20 @@ use crate::core::result::{ENMeasurementMode, VLDispatchProvenance};
 use crate::core::schema::GLBENCH_VERSION;
 use crate::core::workload::WorkloadSpec;
 
-const GLPROC_OVERRIDES: &[&str] = &[
-    "GLPROC_ATTN_SEQ",
-    "GLPROC_FORCE_SCALAR",
-    "GLPROC_NO_LOCK",
-    "GLPROC_PROFILE",
-    "GLPROC_Q4K_NATIVE",
-    "GLPROC_ROW_TILE",
-    "GLPROC_THREADS",
-    "GLPROC_VNNI512",
-];
+/// Every glproc switch lives under this prefix.
+const GLPROC_PREFIX: &str = "GLPROC_";
 
-const GLCUDA_OVERRIDES: &[&str] = &[
-    "GLCUDA_ATTN_MMA4",
-    "GLCUDA_ATTN_MMA4_AV",
-    "GLCUDA_ATTN_MMA4_REGQ",
-    "GLCUDA_ATTN_ROWS",
-    "GLCUDA_BSTAGE",
-    "GLCUDA_CACHE",
-    "GLCUDA_DEFER_FFN_RESIDUAL",
-    "GLCUDA_FFN_GATE_UP_STACKED",
-    "GLCUDA_FORCE_Q8",
-    "GLCUDA_FUSE_Q8_GLUE",
-    "GLCUDA_GEMM_N16",
-    "GLCUDA_GEMM_N16_PREFETCH",
-    "GLCUDA_GEMM_N32",
-    "GLCUDA_GQA7_CHAINS",
-    "GLCUDA_GQA_GROUP",
-    "GLCUDA_GRID2D",
-    "GLCUDA_MULTI_STREAM_PREFILL",
-    "GLCUDA_N16_FUSED_SWIGLU",
-    "GLCUDA_NO_MMA",
-    "GLCUDA_NTILE128",
+/// Every glcuda switch lives under this prefix.
+const GLCUDA_PREFIX: &str = "GLCUDA_";
+
+/// glcuda switches that add timing instrumentation. Presence semantics: any
+/// value, including "0", enables them. `GLCUDA_PROFILE_DECODE_STAGES` turns
+/// captured decode-graph nodes into timed events and measured 2.05x slower
+/// decode on the T4 (Wave 133), so a run with it set is never production.
+const GLCUDA_INSTRUMENTATION: &[&str] = &[
     "GLCUDA_PROFILE_DECODE",
+    "GLCUDA_PROFILE_DECODE_STAGES",
     "GLCUDA_PROFILE_PREFILL",
-    "GLCUDA_Q8_NOSTORE",
-    "GLCUDA_R256",
     "GLCUDA_TELEMETRY",
 ];
 
@@ -117,45 +105,114 @@ fn instrumentation_active(engine: &str) -> bool {
             .ok()
             .is_some_and(|value| !value.is_empty() && value != "0"),
         // glcuda's switches use presence semantics, including a value of "0".
-        "glcuda" => [
-            "GLCUDA_TELEMETRY",
-            "GLCUDA_PROFILE_PREFILL",
-            "GLCUDA_PROFILE_DECODE",
-        ]
-        .iter()
-        .any(|key| std::env::var_os(key).is_some()),
+        "glcuda" => GLCUDA_INSTRUMENTATION
+            .iter()
+            .any(|key| std::env::var_os(key).is_some()),
         _ => false,
     }
 }
 
 fn capture_overrides(engine: &str) -> Vec<(String, String)> {
-    let allowlist = match engine {
-        "glproc" => GLPROC_OVERRIDES,
-        "glcuda" => GLCUDA_OVERRIDES,
-        _ => &[],
+    let prefix = match engine {
+        "glproc" => GLPROC_PREFIX,
+        "glcuda" => GLCUDA_PREFIX,
+        _ => return Vec::new(),
     };
-    allowlist
-        .iter()
-        .filter_map(|name| {
-            std::env::var_os(name)
-                .map(|value| ((*name).to_string(), value.to_string_lossy().into_owned()))
+    overrides_in(std::env::vars_os(), prefix)
+}
+
+/// Keep the variables under `prefix`, sorted by name so the fingerprint does
+/// not depend on the order the OS hands the environment over.
+fn overrides_in(
+    vars: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+    prefix: &str,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = vars
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let name = name.into_string().ok()?;
+            name.starts_with(prefix)
+                .then(|| (name, value.to_string_lossy().into_owned()))
         })
-        .collect()
+        .collect();
+    out.sort();
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn env(pairs: &[(&str, &str)]) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        pairs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect()
+    }
+
+    /// The switches the old allowlist missed are captured without anyone
+    /// having to list them.
     #[test]
-    fn override_allowlists_are_sorted_for_stable_fingerprints() {
-        assert!(GLPROC_OVERRIDES.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(GLCUDA_OVERRIDES.windows(2).all(|pair| pair[0] < pair[1]));
+    fn every_switch_in_the_engine_namespace_is_captured() {
+        let vars = env(&[
+            ("GLCUDA_DECODE_QKV_FUSED", "1"),
+            ("GLCUDA_DECODE_Q8_GLUE", "1"),
+            ("GLCUDA_SOME_FUTURE_SWITCH", "0"),
+        ]);
+        let names: Vec<String> =
+            overrides_in(vars, GLCUDA_PREFIX).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            ["GLCUDA_DECODE_Q8_GLUE", "GLCUDA_DECODE_QKV_FUSED", "GLCUDA_SOME_FUTURE_SWITCH"]
+        );
     }
 
     #[test]
-    fn allowlists_do_not_capture_unrelated_environment() {
-        assert!(!GLPROC_OVERRIDES.contains(&"PATH"));
-        assert!(!GLCUDA_OVERRIDES.contains(&"PATH"));
+    fn unrelated_environment_and_the_other_engine_are_not_captured() {
+        let vars = env(&[
+            ("PATH", "/usr/bin"),
+            ("GLPROC_THREADS", "4"),
+            ("XGLCUDA_FAKE", "1"),
+            ("GLCUDA_FORCE_Q8", "1"),
+        ]);
+        assert_eq!(
+            overrides_in(vars, GLCUDA_PREFIX),
+            vec![("GLCUDA_FORCE_Q8".to_string(), "1".to_string())]
+        );
+    }
+
+    #[test]
+    fn capture_order_does_not_depend_on_environment_order() {
+        let a = env(&[("GLCUDA_B", "1"), ("GLCUDA_A", "1")]);
+        let b = env(&[("GLCUDA_A", "1"), ("GLCUDA_B", "1")]);
+        assert_eq!(overrides_in(a, GLCUDA_PREFIX), overrides_in(b, GLCUDA_PREFIX));
+    }
+
+    /// Every timing switch glcuda reads must mark the run instrumented. Read
+    /// from the engine's own source so a new profiling switch cannot be added
+    /// there and forgotten here — the same drift that broke the allowlist.
+    #[test]
+    fn every_glcuda_profiling_switch_marks_the_run_instrumented() {
+        let sources = [
+            include_str!("../../../glcuda/src/runner.rs"),
+            include_str!("../../../glcuda/src/model.rs"),
+            include_str!("../../../glcuda/src/driver.rs"),
+        ];
+        let mut found = Vec::new();
+        for source in sources {
+            for (index, _) in source.match_indices("\"GLCUDA_PROFILE") {
+                let name: String = source[index + 1..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                    .collect();
+                found.push(name);
+            }
+        }
+        found.sort();
+        found.dedup();
+        assert!(!found.is_empty(), "scan found no GLCUDA_PROFILE_* switch at all");
+        for name in found {
+            assert!(
+                GLCUDA_INSTRUMENTATION.contains(&name.as_str()),
+                "glcuda reads {name} but glbench would label that run production"
+            );
+        }
     }
 }
