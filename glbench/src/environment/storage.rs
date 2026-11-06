@@ -8,6 +8,10 @@ use std::path::Path;
 pub struct StorageInfo {
     /// Size of the model file on disk in bytes, if it exists.
     pub model_file_bytes: Option<u64>,
+    /// SHA-256 of the model file, lowercase hex: what identifies the weights
+    /// when a path and a size do not. Hashed after the measured iterations, so
+    /// reading the file cannot disturb them. `None` for a package directory.
+    pub model_sha256: Option<String>,
 }
 
 impl StorageInfo {
@@ -27,7 +31,7 @@ impl StorageInfo {
             Ok(m) => Some(m.len()).filter(|&n| n > 0),
             Err(_) => None,
         };
-        StorageInfo { model_file_bytes }
+        StorageInfo { model_file_bytes, model_sha256: None }
     }
 
     /// Sum the byte size of every regular file directly inside `dir` (not

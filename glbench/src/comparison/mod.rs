@@ -60,6 +60,12 @@ pub fn compare_along_axis(
             also.join(" and ")
         ));
     }
+    let storage = |s: &'_ BenchmarkSession| s.environment.hardware.storage.model_sha256.clone();
+    if let (Some(a), Some(b)) = (storage(baseline), storage(candidate)) {
+        if a != b && !quant {
+            report.notes.push("The model files differ, by SHA-256.".to_string());
+        }
+    }
     if baseline.workload.kind != candidate.workload.kind {
         report.axis = report.axis.or(Some("workload"));
         report.notes.push(format!(

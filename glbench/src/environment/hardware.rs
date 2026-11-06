@@ -133,6 +133,10 @@ impl ToJson for HardwareSnapshot {
                 Json::obj([(
                     "model_file_bytes",
                     opt_num(self.storage.model_file_bytes.map(|b| b as f64)),
+                ),
+                (
+                    "model_sha256",
+                    opt_str(self.storage.model_sha256.as_deref()),
                 )]),
             ),
             (

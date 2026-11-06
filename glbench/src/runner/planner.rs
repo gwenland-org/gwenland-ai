@@ -143,6 +143,10 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // 5. Fill in facts known only after the run: the model footprint decode
     //    streams. Prefer the file size the environment probe already captured.
     measurements.model_bytes = environment.hardware.storage.model_file_bytes;
+    let model_path = std::path::Path::new(&spec.model_path);
+    if model_path.is_file() {
+        environment.hardware.storage.model_sha256 = glcore::hash::sha256_file(model_path).ok();
+    }
     measurements.observed_bandwidth_gbs = environment.hardware.gpu.measured_bandwidth_gbs;
 
     // 6. Assemble the session, then run the derived passes.

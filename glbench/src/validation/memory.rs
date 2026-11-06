@@ -95,6 +95,7 @@ mod tests {
             prefill_ms: 5.0,
             decode_ms: 50.0,
             total_ms: 55.0,
+            ttft_ms: None,
         });
         let mut session = BenchmarkSession::new(
             SessionMetadata::new("test"),

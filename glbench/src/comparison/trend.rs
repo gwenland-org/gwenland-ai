@@ -111,6 +111,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 100.0 / tps * 1000.0,
             total_ms: 0.0,
+            ttft_ms: None,
         });
         let mut metadata = SessionMetadata::new(format!("run-{tps}"));
         metadata.measurement_mode = ENMeasurementMode::Production;

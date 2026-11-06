@@ -47,6 +47,7 @@ mod tests {
             prefill_ms: 50.0,
             decode_ms: 400.0,
             total_ms: 470.0,
+            ttft_ms: None,
         };
         let tl = Timeline::from_iteration(&it);
         assert!((tl.overhead_ms() - 20.0).abs() < 1e-9);
@@ -60,6 +61,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 100.0,
             total_ms: 150.0, // less than sum (clock skew)
+            ttft_ms: None,
         };
         assert_eq!(Timeline::from_iteration(&it).overhead_ms(), 0.0);
     }

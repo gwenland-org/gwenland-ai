@@ -168,6 +168,14 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
             dec.median,
         ));
     }
+    let ttft = m.ttft_ms_samples();
+    if !ttft.is_empty() {
+        let ttft = Stats::from_samples(&ttft);
+        s.push_str(&format!(
+            "time to first token: median {:.1} ms (range {:.1}-{:.1})\n",
+            ttft.median, ttft.min, ttft.max
+        ));
+    }
     match m.joules_per_token() {
         Some(jpt) => s.push_str(&format!(
             "energy: {:.2} J/token ({:.1} J total, RAPL package-level)\n",
@@ -404,6 +412,9 @@ fn greedy(session: &BenchmarkSession) -> String {
             .model_file_bytes
             .map_or("?".to_string(), |b| format!("{b} bytes")),
     ));
+    if let Some(sha) = &hw.storage.model_sha256 {
+        s.push_str(&format!("  model sha256 {sha}\n"));
+    }
 
     if let Some(mem) = session.telemetry.as_ref().and_then(|t| t.memory.as_ref()) {
         s.push_str(&format!(
@@ -1100,6 +1111,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 4000.0,
             total_ms: 4100.0,
+            ttft_ms: None,
         });
         BenchmarkSession::new(
             SessionMetadata::new("test-run"),
@@ -1127,6 +1139,14 @@ mod tests {
         assert!(s.contains(std::env::consts::OS));
         assert!(s.contains(std::env::consts::ARCH));
         assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn time_to_first_token_shows_when_measured_and_only_then() {
+        let mut sess = sample();
+        assert!(!session_at(&sess, ENVerbosity::Normal).contains("time to first token"));
+        sess.measurements.iterations[0].ttft_ms = Some(12.5);
+        assert!(session_at(&sess, ENVerbosity::Normal).contains("median 12.5 ms"));
     }
 
     #[test]

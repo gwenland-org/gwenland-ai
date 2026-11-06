@@ -145,6 +145,7 @@ mod tests {
             prefill_ms: 4.0,
             decode_ms: 80.0,
             total_ms: 84.0,
+            ttft_ms: None,
         });
         let mut s = VLInferenceSession::nested(ENInferenceRole::PostTraining);
         s.measurements = Some(m);

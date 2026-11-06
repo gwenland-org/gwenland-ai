@@ -207,6 +207,7 @@ pub fn run(args: &TrainArgs) -> Result<BenchmarkSession, String> {
             prefill_ms: 0.0,
             decode_ms: per_epoch_ms,
             total_ms: per_epoch_ms,
+            ttft_ms: None,
         });
     }
 

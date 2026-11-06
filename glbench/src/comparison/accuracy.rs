@@ -136,6 +136,7 @@ mod tests {
             prefill_ms: 5.0,
             decode_ms: 100.0,
             total_ms: 105.0,
+            ttft_ms: None,
         });
         let mut spec = WorkloadSpec::default();
         spec.model_path = model_path.to_string();

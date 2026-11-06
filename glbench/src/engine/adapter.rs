@@ -190,21 +190,27 @@ impl EngineAdapter {
         // own total is whole milliseconds and is built from the same phases.
         // Only an outside clock can show time spent in neither phase.
         let start = std::time::Instant::now();
-        let out = self.run_request(spec, false)?;
+        let first_token = std::sync::OnceLock::new();
+        let on_token = || {
+            first_token.get_or_init(std::time::Instant::now);
+        };
+        let out = self.run_request(spec, false, &on_token)?;
         let total_ms = start.elapsed().as_secs_f64() * 1e3;
+        let ttft_ms = first_token.get().map(|t| t.duration_since(start).as_secs_f64() * 1e3);
         Ok(IterationMetrics {
             prompt_tokens: out.prompt_tokens as u64,
             generated_tokens: out.tokens_generated as u64,
             prefill_ms: out.prefill_ms,
             decode_ms: out.generation_ms,
             total_ms,
+            ttft_ms,
         })
     }
 
     /// Run a request and return the generated token ids — used by numerical
     /// validation against the glproc oracle.
     pub fn run_tokens(&self, spec: &WorkloadSpec) -> Result<Vec<u32>, GlError> {
-        Ok(self.run_request(spec, false)?.token_ids)
+        Ok(self.run_request(spec, false, &|| {})?.token_ids)
     }
 
     /// Run once **with per-token tracing on**, for the behavioral signals.
@@ -220,11 +226,16 @@ impl EngineAdapter {
         &self,
         spec: &WorkloadSpec,
     ) -> Result<(Vec<u32>, Vec<glcore::trace::TokenTrace>), GlError> {
-        let out = self.run_request(spec, true)?;
+        let out = self.run_request(spec, true, &|| {})?;
         Ok((out.token_ids, out.traces))
     }
 
-    fn run_request(&self, spec: &WorkloadSpec, trace: bool) -> Result<InferOutput, GlError> {
+    fn run_request(
+        &self,
+        spec: &WorkloadSpec,
+        trace: bool,
+        on_token: &(dyn Fn() + Sync),
+    ) -> Result<InferOutput, GlError> {
         let config = InferInput {
             token_ids: Vec::new(), // filled below, per backend
             max_new_tokens: spec.max_new_tokens,
@@ -251,13 +262,13 @@ impl EngineAdapter {
         };
         match &self.backend {
             Backend::Tokenized(rt) => {
-                // A no-op sink: glbench measures, it does not consume the text stream.
-                rt.stream(&spec.prompt, config, |_text| {})
+                // glbench measures; it does not consume the text stream.
+                rt.stream(&spec.prompt, config, |_text| on_token())
             }
             Backend::RawTokens { engine, vocab_size } => {
                 let mut config = config;
                 config.token_ids = synthetic_token_ids(spec, *vocab_size);
-                engine.stream(config, &|_id, _text| {})
+                engine.stream(config, &|_id, _text| on_token())
             }
         }
     }

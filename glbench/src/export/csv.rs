@@ -147,6 +147,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 4000.0,
             total_ms: 4100.0,
+            ttft_ms: None,
         });
         BenchmarkSession::new(
             SessionMetadata::new("test-run"),
@@ -174,6 +175,7 @@ mod tests {
                 prefill_ms: 500.0,
                 decode_ms: 6000.0,
                 total_ms: 6500.0,
+                ttft_ms: None,
             },
             IterationMetrics {
                 prompt_tokens: 100,
@@ -181,6 +183,7 @@ mod tests {
                 prefill_ms: 300.0,
                 decode_ms: 5000.0,
                 total_ms: 5300.0,
+                ttft_ms: None,
             },
         ];
         let out = render(&sess);

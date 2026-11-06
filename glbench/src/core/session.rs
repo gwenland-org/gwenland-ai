@@ -1071,6 +1071,10 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
                 .and_then(|s| s.get("model_file_bytes"))
                 .and_then(|n| n.as_f64())
                 .map(|n| n as u64),
+            model_sha256: storage
+                .and_then(|s| s.get("model_sha256"))
+                .and_then(|s| s.as_str())
+                .map(String::from),
         },
         // Read back, not re-probed: like the ISA flags above, throttling is a
         // fact about the machine that RAN the benchmark.
@@ -1120,6 +1124,7 @@ mod tests {
             prefill_ms: 5.0,
             decode_ms: 100.0,
             total_ms: 105.0,
+            ttft_ms: None,
         });
         let session = BenchmarkSession {
             metadata: SessionMetadata::new("test"),

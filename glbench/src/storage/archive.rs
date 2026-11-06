@@ -233,6 +233,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 4000.0,
             total_ms: 4100.0,
+            ttft_ms: None,
         });
         BenchmarkSession::new(
             SessionMetadata::new("test-run"),

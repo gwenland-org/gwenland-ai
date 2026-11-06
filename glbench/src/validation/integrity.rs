@@ -245,6 +245,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms: 4000.0,
             total_ms: 4100.0,
+            ttft_ms: None,
         });
         BenchmarkSession::new(
             SessionMetadata::new("test-run"),
@@ -300,6 +301,7 @@ mod tests {
             prefill_ms: 100.0,
             decode_ms,
             total_ms: decode_ms + 100.0,
+            ttft_ms: None,
         };
         let mut sess = sample();
         sess.workload.kind = WorkloadKind::Stress;

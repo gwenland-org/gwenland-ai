@@ -18,5 +18,6 @@ pub fn from_infer_output(out: &InferOutput) -> IterationMetrics {
         prefill_ms: out.prefill_ms,
         decode_ms: out.generation_ms,
         total_ms: out.elapsed_ms as f64,
+        ttft_ms: None,
     }
 }

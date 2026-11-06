@@ -73,6 +73,7 @@ mod tests {
                     prefill_ms: 5.0,
                     decode_ms: ms,
                     total_ms: ms + 5.0,
+                    ttft_ms: None,
                 })
                 .collect(),
             ..Default::default()

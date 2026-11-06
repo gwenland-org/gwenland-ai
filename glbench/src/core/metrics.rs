@@ -23,6 +23,10 @@ pub struct IterationMetrics {
     pub decode_ms: f64,
     /// Total request wall-clock, milliseconds.
     pub total_ms: f64,
+    /// Time to first token: request start to the first token handed back,
+    /// milliseconds. Includes tokenizing the prompt, which `prefill_ms` does
+    /// not. `None` when no token came back, or in an older archive.
+    pub ttft_ms: Option<f64>,
 }
 
 impl IterationMetrics {
@@ -55,6 +59,7 @@ impl ToJson for IterationMetrics {
             ("prefill_ms", Json::n(self.prefill_ms)),
             ("decode_ms", Json::n(self.decode_ms)),
             ("total_ms", Json::n(self.total_ms)),
+            ("ttft_ms", opt_num(self.ttft_ms)),
         ])
     }
 }
@@ -67,6 +72,7 @@ impl FromJson for IterationMetrics {
             prefill_ms: field_f64(v, "prefill_ms")?,
             decode_ms: field_f64(v, "decode_ms")?,
             total_ms: field_f64(v, "total_ms")?,
+            ttft_ms: v.get("ttft_ms").and_then(|n| n.as_f64()),
         })
     }
 }
@@ -127,6 +133,11 @@ impl MeasurementSet {
     /// Prefill throughput samples across all iterations, tokens/second.
     pub fn prefill_tps_samples(&self) -> Vec<f64> {
         self.iterations.iter().map(|m| m.prefill_tps()).collect()
+    }
+
+    /// Time-to-first-token samples across the iterations that have one, ms.
+    pub fn ttft_ms_samples(&self) -> Vec<f64> {
+        self.iterations.iter().filter_map(|m| m.ttft_ms).collect()
     }
 
     /// Measured Joules per generated token across the measured iterations.
@@ -232,6 +243,7 @@ mod tests {
             prefill_ms: 0.0,
             decode_ms: 0.0,
             total_ms: 0.0,
+            ttft_ms: None,
         };
         assert_eq!(m.prefill_tps(), 0.0);
         assert_eq!(m.decode_tps(), 0.0);
@@ -245,6 +257,7 @@ mod tests {
             prefill_ms: 500.0, // 0.5 s -> 1000 tps
             decode_ms: 4000.0, // 4.0 s -> 32 tps
             total_ms: 4500.0,
+            ttft_ms: None,
         };
         assert!((m.prefill_tps() - 1000.0).abs() < 1e-6);
         assert!((m.decode_tps() - 32.0).abs() < 1e-6);
@@ -259,6 +272,7 @@ mod tests {
                 prefill_ms: 5.0,
                 decode_ms: 100.0,
                 total_ms: 105.0,
+                ttft_ms: None,
             }],
             peak_memory_bytes: Some(1 << 30),
             observed_bandwidth_gbs: Some(240.5),
@@ -269,6 +283,7 @@ mod tests {
                 prefill_ms: 50.0, // cold prefill pays page-in: 10x the warm one
                 decode_ms: 150.0,
                 total_ms: 200.0,
+                ttft_ms: None,
             }],
             energy_joules: Some(41.5),
             cpu_utilization_pct: Some(65.5),
@@ -299,6 +314,7 @@ mod tests {
                     prefill_ms: 3.0,
                     decode_ms: 4.0,
                     total_ms: 5.0,
+                    ttft_ms: None,
                 }
                 .to_json(),
             ),
@@ -334,6 +350,7 @@ mod tests {
             prefill_ms: 10.0,
             decode_ms: 100.0,
             total_ms: 110.0,
+            ttft_ms: None,
         });
         assert!((set.joules_per_token().unwrap() - 2.0).abs() < 1e-9);
     }
