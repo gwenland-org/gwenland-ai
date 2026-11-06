@@ -174,12 +174,13 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
             jpt,
             m.energy_joules.unwrap_or(0.0),
         )),
-        // `None` here is unambiguous: RAPL is Linux-only and the meter never
+        // `None` means RAPL could not be read, which a container does to Linux
+        // too, never that the host spent nothing; the meter never
         // estimates from TDP, so absence always means "not available", never
         // "zero". Say so — a missing line reads as "forgot to check", not as
         // "not applicable on this OS".
         None if full => s.push_str(
-            "energy: not available (RAPL is Linux-only; not estimated from TDP)\n",
+            "host energy: not readable here (needs Linux RAPL; never estimated from TDP)\n",
         ),
         None => {}
     }
@@ -271,7 +272,7 @@ fn environment(session: &BenchmarkSession) -> String {
             bytes_to_gib(avail),
         )),
         (Some(total), None) => s.push_str(&format!("ram {:.1} GiB total\n", bytes_to_gib(total))),
-        (None, _) => s.push_str("ram not available (no /proc/meminfo on this OS)\n"),
+        (None, _) => s.push_str("ram not available (the OS memory probe failed)\n"),
     }
     match hw.thermal.avg_mhz {
         Some(avg) => {
@@ -285,7 +286,7 @@ fn environment(session: &BenchmarkSession) -> String {
             }
             s.push('\n');
         }
-        None => s.push_str("clock avg not available (no readable clock speed on this OS)\n"),
+        None => s.push_str("clock avg not available (the OS clock probe failed)\n"),
     }
     if let Some(bytes) = hw.storage.model_file_bytes {
         s.push_str(&format!("weights {:.2} GiB\n", bytes_to_gib(bytes)));
@@ -1293,7 +1294,7 @@ mod tests {
         let mut sess = sample();
         sess.measurements.energy_joules = None;
         let s = session(&sess);
-        assert!(s.contains("energy: not available"), "{s}");
+        assert!(s.contains("host energy: not readable"), "{s}");
     }
 
     #[test]

@@ -36,16 +36,10 @@ impl MemoryInfo {
 
     #[cfg(target_os = "windows")]
     fn probe_os(&mut self) {
-        // Both wmic fields are reported in KiB; convert to bytes to match
-        // this struct's unit. `wmic_field` returns None on any failure —
-        // missing binary, non-zero exit, empty output — so an unreadable
-        // counter stays None rather than a guess.
-        self.total_bytes = super::cpu::wmic_field("OS", "TotalVisibleMemorySize")
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|kb| kb * 1024);
-        self.available_bytes = super::cpu::wmic_field("OS", "FreePhysicalMemory")
-            .and_then(|s| s.parse::<u64>().ok())
-            .map(|kb| kb * 1024);
+        if let Some((total, available)) = super::windows::physical_memory() {
+            self.total_bytes = Some(total);
+            self.available_bytes = Some(available);
+        }
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]

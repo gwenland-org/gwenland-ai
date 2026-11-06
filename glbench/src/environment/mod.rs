@@ -11,3 +11,5 @@ pub mod power;
 pub mod runtime;
 pub mod storage;
 pub mod thermal;
+#[cfg(windows)]
+pub(crate) mod windows;

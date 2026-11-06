@@ -40,16 +40,7 @@
 //! kernel. Flagged here rather than presented as equally certain to the
 //! byte-counted memory figures.
 //!
-//! **Windows**: `wmic process where ProcessId=<pid> get
-//! KernelModeTime,UserModeTime`, via the same
-//! [`crate::environment::cpu::wmic_field_where`] helper `measurement::memory`
-//! uses. **Verified empirically** (not assumed from documentation alone,
-//! after `PeakWorkingSetSize`'s KB-not-bytes surprise): a controlled 3-second
-//! busy-loop's wmic-reported kernel+user time, divided by `Get-Process`'s
-//! independently-computed `TotalProcessorTime.TotalSeconds` for the same
-//! PID, converged on 10,000,000 units/second — confirming the documented
-//! 100-nanosecond unit is correct here (unlike `PeakWorkingSetSize`, which
-//! documentation alone would also have gotten wrong).
+//! **Windows**: `GetProcessTimes`, kernel plus user time.
 //!
 //! Both platforms report `None` — never a guessed percentage — when the
 //! underlying read fails.
@@ -96,16 +87,7 @@ fn linux_cpu_time() -> Option<ProcessCpuTime> {
 
 #[cfg(target_os = "windows")]
 fn windows_cpu_time() -> Option<ProcessCpuTime> {
-    const HUNDRED_NS_PER_SEC: f64 = 10_000_000.0;
-    let pid = std::process::id();
-    let condition = format!("ProcessId={pid}");
-    let kernel: f64 = crate::environment::cpu::wmic_field_where("process", Some(&condition), "KernelModeTime")?
-        .parse()
-        .ok()?;
-    let user: f64 = crate::environment::cpu::wmic_field_where("process", Some(&condition), "UserModeTime")?
-        .parse()
-        .ok()?;
-    Some(ProcessCpuTime { total_secs: (kernel + user) / HUNDRED_NS_PER_SEC })
+    crate::environment::windows::process_cpu_secs().map(|total_secs| ProcessCpuTime { total_secs })
 }
 
 /// Aggregate utilization over one phase: how much of `logical_cores`' worth

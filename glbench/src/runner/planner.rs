@@ -99,7 +99,7 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // One clock reading per measured iteration, for `avg_mhz` below — coarser
     // than continuous sampling would be, but representative of the run
     // without needing a background thread, and it costs one `probe_mhz` call
-    // (a file read or a `wmic` process, both cheap) per iteration rather than
+    // (a file read or one Win32 call, both cheap) per iteration rather than
     // per token.
     let mut mhz_readings = Vec::with_capacity(spec.measure_iters.max(1));
     for i in 0..spec.measure_iters.max(1) {

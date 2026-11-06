@@ -146,16 +146,9 @@ impl CpuInfo {
 
     #[cfg(target_os = "windows")]
     fn probe_os(&mut self) {
-        // `wmic` is deprecated (and absent on some stripped-down Windows
-        // installs), but it is still present on the reference machine
-        // (Windows 11) and every other Windows box this crate has been run
-        // on. `wmic_field` returns None on any failure — missing binary,
-        // non-zero exit, empty output — so a machine without it degrades to
-        // exactly the "not observed" state this module already uses for
-        // macOS, rather than a hard error.
-        self.model = wmic_field("cpu", "Name");
-        self.physical_cores = wmic_field("cpu", "NumberOfCores").and_then(|s| s.parse().ok());
-        self.mhz = wmic_field("cpu", "CurrentClockSpeed").and_then(|s| s.parse().ok());
+        self.model = super::windows::cpu_brand();
+        self.physical_cores = super::windows::physical_cores();
+        self.mhz = super::windows::current_mhz();
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
@@ -191,62 +184,10 @@ pub fn probe_mhz() -> Option<f64> {
     }
     #[cfg(target_os = "windows")]
     {
-        wmic_field("cpu", "CurrentClockSpeed").and_then(|s| s.parse().ok())
+        super::windows::current_mhz()
     }
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         None
     }
-}
-
-/// Run `wmic <class> get <field> /format:list` and pull `field`'s value out
-/// of the `KEY=VALUE` output. `None` on any failure — `wmic` missing, a
-/// non-zero exit, or a field absent from the output — never a guessed value.
-///
-/// `wmic`'s `/format:list` output is plain ASCII when captured through
-/// `std::process::Command` (verified against the real binary: no UTF-16
-/// decoding needed, unlike what a console might display), with stray blank
-/// lines and doubled `\r` around each `KEY=VALUE` line.
-///
-/// `pub(crate)` and shared: [`super::memory`] queries the `OS` wmic class
-/// through the same helper rather than duplicating the process-spawning and
-/// parsing logic for one more class.
-#[cfg(target_os = "windows")]
-pub(crate) fn wmic_field(class: &str, field: &str) -> Option<String> {
-    wmic_field_where(class, None, field)
-}
-
-/// As [`wmic_field`], with an optional `where <condition>` clause inserted
-/// before `get` — e.g. `wmic process where ProcessId=1234 get
-/// PeakWorkingSetSize /format:list`, for a single-process query instead of a
-/// system-wide one. [`super::super::measurement::memory`] uses this form;
-/// [`wmic_field`] stays the zero-argument case every other caller wants,
-/// rather than every call site building its own `Vec<&str>` of args.
-#[cfg(target_os = "windows")]
-pub(crate) fn wmic_field_where(class: &str, condition: Option<&str>, field: &str) -> Option<String> {
-    let mut args: Vec<&str> = vec![class];
-    if let Some(cond) = condition {
-        args.push("where");
-        args.push(cond);
-    }
-    args.push("get");
-    args.push(field);
-    args.push("/format:list");
-
-    let output = std::process::Command::new("wmic").args(&args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let prefix = format!("{field}=");
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(value) = line.strip_prefix(&prefix) {
-            let value = value.trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-    None
 }

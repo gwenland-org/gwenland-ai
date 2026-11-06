@@ -57,7 +57,7 @@ pub fn render(session: &BenchmarkSession) -> String {
         (Some(total), None) => {
             s.push_str(&format!("- **RAM:** {:.1} GiB total\n", bytes_to_gib(total)))
         }
-        (None, _) => s.push_str("- **RAM:** not available (no /proc/meminfo on this OS)\n"),
+        (None, _) => s.push_str("- **RAM:** not available (the OS memory probe failed)\n"),
     }
     s.push_str(&format!(
         "- **Environment:** {} {} | glbench {}\n",
@@ -128,7 +128,7 @@ pub fn render(session: &BenchmarkSession) -> String {
         Some(jpt) => s.push_str(&format!("**Energy:** {jpt:.2} J/token (RAPL, package-level)\n\n")),
         // Unambiguous: RAPL is Linux-only and never estimated from TDP, so
         // absence always means "not available", never "zero" or "n/a here".
-        None => s.push_str("**Energy:** not available (RAPL is Linux-only; not estimated from TDP)\n\n"),
+        None => s.push_str("**Host energy:** not readable here (needs Linux RAPL; never estimated from TDP)\n\n"),
     }
 
     // Analysis.
@@ -766,7 +766,7 @@ mod tests {
         let mut sess = sample();
         sess.measurements.energy_joules = None;
         let s = render(&sess);
-        assert!(s.contains("**Energy:** not available"), "{s}");
+        assert!(s.contains("**Host energy:** not readable"), "{s}");
     }
 
     #[test]

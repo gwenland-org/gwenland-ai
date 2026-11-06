@@ -68,31 +68,9 @@ fn linux_status_field(key: &str) -> Option<u64> {
     None
 }
 
-/// `wmic process where ProcessId=<pid> get PeakWorkingSetSize /format:list`,
-/// via [`crate::environment::cpu::wmic_field_where`] — the same
-/// subprocess-and-parse helper `environment::cpu`/`environment::memory`
-/// already use.
-///
-/// **Unit gotcha, verified empirically, not from documentation alone**:
-/// `Win32_Process.PeakWorkingSetSize` is reported in **kilobytes**, unlike
-/// `Win32_Process.WorkingSetSize` (bytes) or the `Win32_OperatingSystem`
-/// class's memory fields (also KB, but at least internally consistent with
-/// each other). Confirmed by cross-checking against `Get-Process`'s
-/// `.NET`-documented-bytes `WorkingSet64`/`PeakWorkingSet64` on the same PID
-/// (`WorkingSetSize` matched directly; `PeakWorkingSetSize` matched only
-/// after ×1024) and by dumping the raw bytes `std::process::Command`
-/// actually receives (plain ASCII, ruling out an encoding explanation) — an
-/// initial version of this function trusted the "bytes" assumption from
-/// `WorkingSetSize`'s behavior and silently under-reported peak RSS by
-/// ~1024x as a result.
 #[cfg(target_os = "windows")]
 fn windows_peak_working_set_bytes() -> Option<u64> {
-    let pid = std::process::id();
-    let condition = format!("ProcessId={pid}");
-    let kb: u64 = crate::environment::cpu::wmic_field_where("process", Some(&condition), "PeakWorkingSetSize")?
-        .parse()
-        .ok()?;
-    Some(kb * 1024)
+    crate::environment::windows::peak_working_set_bytes()
 }
 
 #[cfg(test)]
@@ -109,7 +87,7 @@ mod tests {
     fn peak_rss_is_observable_on_a_running_process() {
         // The test process itself has some nonzero RSS on Linux/Windows —
         // this is the closest thing to an integration test this pure probe
-        // function gets without mocking the filesystem/wmic.
+        // function gets without mocking the OS.
         let peak = peak_rss_bytes();
         assert!(peak.is_some(), "peak RSS should be observable on this platform");
         assert!(peak.unwrap() > 0, "a running process has nonzero RSS");
