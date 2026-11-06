@@ -64,11 +64,10 @@
 //! separates "the profiler is broken" from "the profiler cannot see this class
 //! of defect", and it is the second one.
 //!
-//! Consequence, carried into `numerical::compare`'s own docs and pinned by
-//! `compare::tests::permutation_invariance_is_a_known_blind_spot`: GLBitProf
-//! detects defects that change the **distribution** of values and is blind to
-//! defects that only change their **order**. Catching a permutation needs an
-//! element-wise check against an oracle decode — `validation::parity`'s job.
+//! Consequence: the distribution statistics detect defects that change what
+//! values a tensor holds and are blind to defects that only change their order.
+//! `VLBitDivergence::order_rms` was added for that second class; this example
+//! prints it beside them.
 
 use glbench::numerical::bitprof::profile;
 use glbench::numerical::compare::{compare, VLBitDivergence};
@@ -180,6 +179,7 @@ fn mae(original: &[f32], candidate: &[f32]) -> f64 {
 fn report(label: &str, d: &VLBitDivergence, mae: f64) {
     println!("\n{label}");
     println!("  MAE vs f32 original    : {mae:.6e}");
+    println!("  order RMS (sketch)     : {:.6e}", d.order_rms.unwrap_or(0.0));
     println!("  exponent L1 (0..2)     : {:.4}", d.exponent_l1);
     match d.mantissa_entropy_delta {
         Some(delta) => println!("  mantissa entropy delta : {delta:+.4} bits"),
@@ -253,25 +253,7 @@ fn main() {
     );
 
     println!("\n{}", "-".repeat(78));
-    println!("MEASURED READING - and it contradicts the premise this was built on.");
-    println!();
-    println!("The design expected a nibble-order defect to show as a structured");
-    println!("per-position anomaly. It does not. Against the correct GQ4A decode the");
-    println!("nibble-swapped one scores EXACTLY zero on every axis - exponent L1,");
-    println!("per-position bit deltas, mantissa entropy - while its MAE against the");
-    println!("original is 14x the scheme's own residual.");
-    println!();
-    println!("The reason is structural, not a defect in the profiler: swapping the two");
-    println!("codes inside a byte exchanges weights 2i and 2i+1, which sit in the same");
-    println!("32-weight sub-block and therefore share a scale. The decoded multiset is");
-    println!("unchanged. Every statistic in VLBitProfile is permutation-invariant by");
-    println!("construction, so none of them can see a permutation.");
-    println!();
-    println!("The sub-block rotation arm is the control: it moves codes across a scale");
-    println!("boundary, is NOT a pure permutation, and does register. So the honest");
-    println!("scope is: GLBitProf detects defects that change the DISTRIBUTION of");
-    println!("values and is blind to defects that only change their ORDER. A");
-    println!("permutation-class bug needs a positional check - element-wise comparison");
-    println!("against an oracle decode - which is validation::parity's job, not this");
-    println!("module's.");
+    println!("The distribution axes score a nibble swap EXACTLY zero against a correct");
+    println!("decode: swapping codes inside a byte leaves the decoded multiset unchanged.");
+    println!("Order RMS sees it, and tracks the true difference between the tensors.");
 }

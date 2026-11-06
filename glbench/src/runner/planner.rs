@@ -21,6 +21,7 @@ use crate::engine::model_probe::ModelProbe;
 use crate::environment::hardware::EnvironmentSnapshot;
 use crate::environment::power::EnergyMeter;
 use crate::measurement::gpu::VLGpuMonitor;
+use crate::measurement::timeline::VLTokenTimeline;
 use crate::validation::integrity;
 
 /// A progress callback: `(phase, iteration, total)` — lets the CLI print a
@@ -104,16 +105,19 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // (a file read or one Win32 call, both cheap) per iteration rather than
     // per token.
     let mut mhz_readings = Vec::with_capacity(spec.measure_iters.max(1));
+    let mut token_gaps = Vec::with_capacity(spec.measure_iters.max(1));
     for i in 0..spec.measure_iters.max(1) {
         progress("measure", i, spec.measure_iters.max(1));
-        let iter = adapter.run_once(spec)?;
+        let (iter, gaps) = adapter.run_timed(spec)?;
         measurements.iterations.push(iter);
+        token_gaps.push(gaps);
         if let Some(mhz) = crate::environment::cpu::probe_mhz() {
             mhz_readings.push(mhz);
         }
     }
     measurements.energy_joules = meter.and_then(EnergyMeter::stop);
     measurements.gpu = gpu_monitor.map(VLGpuMonitor::finish);
+    measurements.token_timeline = VLTokenTimeline::from_gaps(&token_gaps);
     measurements.cold = cold;
     // Process high-water-mark RSS, read once after the measured phase (the
     // OS already tracks the peak — no sampling loop needed). Necessarily

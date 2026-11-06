@@ -5,6 +5,7 @@
 
 pub mod bottleneck;
 pub mod ceiling;
+pub mod decode_graph;
 pub mod efficiency;
 pub mod health;
 pub mod hypothesis;

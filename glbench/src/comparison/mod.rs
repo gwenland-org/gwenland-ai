@@ -6,6 +6,7 @@
 pub mod accuracy;
 pub mod engine;
 pub mod hardware;
+pub mod llama_bench;
 pub mod quantization;
 pub mod regression;
 pub mod runs;
@@ -70,6 +71,15 @@ pub fn compare_along_axis(
                 "Mean SM clock differs ({a:.0} vs {b:.0} MHz): the card ran at a different speed."
             ));
         }
+    }
+    if let (Some(a), Some(b)) = (
+        baseline.measurements.prefill_tps_per_mhz(),
+        candidate.measurements.prefill_tps_per_mhz(),
+    ) {
+        report.notes.push(format!(
+            "Prefill per SM MHz, which a clock change does not move: {a:.2} -> {b:.2} ({:+.1}%).",
+            (b / a - 1.0) * 100.0
+        ));
     }
     let storage = |s: &'_ BenchmarkSession| s.environment.hardware.storage.model_sha256.clone();
     if let (Some(a), Some(b)) = (storage(baseline), storage(candidate)) {

@@ -115,6 +115,8 @@ pub struct MeasurementSet {
     /// What the GPU was doing across the measured iterations. `None` on a CPU
     /// run, or when NVML could not be opened.
     pub gpu: Option<crate::measurement::gpu::VLGpuRunStats>,
+    /// Inter-token latency across the measured iterations.
+    pub token_timeline: Option<crate::measurement::timeline::VLTokenTimeline>,
 }
 
 impl MeasurementSet {
@@ -136,6 +138,19 @@ impl MeasurementSet {
     /// Prefill throughput samples across all iterations, tokens/second.
     pub fn prefill_tps_samples(&self) -> Vec<f64> {
         self.iterations.iter().map(|m| m.prefill_tps()).collect()
+    }
+
+    /// Median prefill rate per MHz of mean SM clock.
+    ///
+    /// On a power-capped card the clock moves more than the code does, and tok/s
+    /// moves with it, so this is the figure that survives comparing a cool run
+    /// with a hot one. The clock is sampled across the whole run, which an
+    /// end-to-end workload spends mostly in decode.
+    pub fn prefill_tps_per_mhz(&self) -> Option<f64> {
+        let mhz = self.gpu.as_ref()?.sm_clock_mhz?.mean;
+        let samples = self.prefill_tps_samples();
+        (mhz > 0.0 && !samples.is_empty())
+            .then(|| crate::comparison::statistics::Stats::from_samples(&samples).median / mhz)
     }
 
     /// GPU Joules per generated token across the measured iterations.
@@ -195,6 +210,7 @@ impl ToJson for MeasurementSet {
             ("energy_joules", opt_num(self.energy_joules)),
             ("cpu_utilization_pct", opt_num(self.cpu_utilization_pct)),
             ("gpu", self.gpu.as_ref().map_or(Json::Null, |g| g.to_json())),
+            ("token_timeline", self.token_timeline.as_ref().map_or(Json::Null, |t| t.to_json())),
         ])
     }
 }
@@ -233,6 +249,10 @@ impl FromJson for MeasurementSet {
             gpu: match v.get("gpu") {
                 None | Some(Json::Null) => None,
                 Some(g) => Some(crate::measurement::gpu::VLGpuRunStats::from_json(g)?),
+            },
+            token_timeline: match v.get("token_timeline") {
+                None | Some(Json::Null) => None,
+                Some(t) => Some(crate::measurement::timeline::VLTokenTimeline::from_json(t)?),
             },
         })
     }
@@ -303,6 +323,7 @@ mod tests {
             energy_joules: Some(41.5),
             cpu_utilization_pct: Some(65.5),
             gpu: None,
+            token_timeline: None,
         };
         let back = MeasurementSet::from_json(&set.to_json()).unwrap();
         assert_eq!(back.iterations, set.iterations);

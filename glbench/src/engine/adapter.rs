@@ -28,7 +28,8 @@ use crate::engine::metadata::EngineMetadata;
 use crate::engine::observation::VLObservationPlan;
 use crate::environment::gpu::GpuInfo;
 use glcuda::nvml::Nvml;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 /// The set of engine names glbench can construct. Kept explicit rather than a
 /// registry so an unavailable backend is a clear error, not a silent fallback.
@@ -193,6 +194,12 @@ impl EngineAdapter {
     /// the raw per-iteration facts. This is a thin pass-through to the engine —
     /// the engine already separates prefill from decode timing in its output.
     pub fn run_once(&self, spec: &WorkloadSpec) -> Result<IterationMetrics, GlError> {
+        self.run_timed(spec).map(|(metrics, _)| metrics)
+    }
+
+    /// [`Self::run_once`], plus the gap in milliseconds before each token after
+    /// the first.
+    pub fn run_timed(&self, spec: &WorkloadSpec) -> Result<(IterationMetrics, Vec<f64>), GlError> {
         // Tracing OFF: this is the timed path, and tracing costs an O(vocab)
         // sweep per token. Taxing the measurement with the instrument is
         // exactly the mistake this split exists to avoid.
@@ -200,22 +207,33 @@ impl EngineAdapter {
         // The wall clock is read here rather than taken from the engine, whose
         // own total is whole milliseconds and is built from the same phases.
         // Only an outside clock can show time spent in neither phase.
-        let start = std::time::Instant::now();
-        let first_token = std::sync::OnceLock::new();
+        //
+        // Each token's arrival is one clock read and a push into a buffer sized
+        // up front, against milliseconds of decode per token.
+        let start = Instant::now();
+        let stamps = Mutex::new(Vec::with_capacity(spec.max_new_tokens + 1));
         let on_token = || {
-            first_token.get_or_init(std::time::Instant::now);
+            if let Ok(mut stamps) = stamps.lock() {
+                stamps.push(Instant::now());
+            }
         };
         let out = self.run_request(spec, false, &on_token)?;
         let total_ms = start.elapsed().as_secs_f64() * 1e3;
-        let ttft_ms = first_token.get().map(|t| t.duration_since(start).as_secs_f64() * 1e3);
-        Ok(IterationMetrics {
-            prompt_tokens: out.prompt_tokens as u64,
-            generated_tokens: out.tokens_generated as u64,
-            prefill_ms: out.prefill_ms,
-            decode_ms: out.generation_ms,
-            total_ms,
-            ttft_ms,
-        })
+
+        let stamps = stamps.into_inner().unwrap_or_default();
+        let ms = |later: Instant, earlier: Instant| later.duration_since(earlier).as_secs_f64() * 1e3;
+        let gaps = stamps.windows(2).map(|pair| ms(pair[1], pair[0])).collect();
+        Ok((
+            IterationMetrics {
+                prompt_tokens: out.prompt_tokens as u64,
+                generated_tokens: out.tokens_generated as u64,
+                prefill_ms: out.prefill_ms,
+                decode_ms: out.generation_ms,
+                total_ms,
+                ttft_ms: stamps.first().map(|&first| ms(first, start)),
+            },
+            gaps,
+        ))
     }
 
     /// Run a request and return the generated token ids — used by numerical

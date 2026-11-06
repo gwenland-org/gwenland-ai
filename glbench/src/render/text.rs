@@ -171,6 +171,15 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
     if let Some(gpu) = &m.gpu {
         s.push_str(&gpu_run(gpu, hw, m.gpu_joules_per_token()));
     }
+    if let Some(per_mhz) = m.prefill_tps_per_mhz() {
+        s.push_str(&format!("prefill per SM MHz: {per_mhz:.2} tok/s\n"));
+    }
+    if let Some(t) = &m.token_timeline {
+        s.push_str(&format!(
+            "inter-token latency: p50 {:.2} | p95 {:.2} | p99 {:.2} | max {:.2} ms\n",
+            t.p50_ms, t.p95_ms, t.p99_ms, t.max_ms
+        ));
+    }
     let ttft = m.ttft_ms_samples();
     if !ttft.is_empty() {
         let ttft = Stats::from_samples(&ttft);
@@ -500,6 +509,14 @@ fn greedy(session: &BenchmarkSession) -> String {
     }
 
     let m = &session.measurements;
+    if let Some(timeline) = &m.token_timeline {
+        let stretches: Vec<String> =
+            timeline.by_stretch(8).iter().map(|gap| format!("{gap:.2}")).collect();
+        s.push_str(&format!(
+            "\ntoken gap by stretch of the generation, ms: {}\n",
+            stretches.join(" ")
+        ));
+    }
     let mut t = Table::new(&[
         "iter", "prompt", "prefill ms", "prefill tok/s", "generated", "decode ms", "decode tok/s",
         "overhead ms",
@@ -1012,7 +1029,14 @@ pub fn order_checks(checks: &[crate::runner::ab::VLOrderCheck]) -> String {
         .right_align(2)
         .right_align(3);
     for check in checks {
-        for (metric, changes) in [("decode", &check.decode), ("prefill", &check.prefill)] {
+        for (metric, changes) in [
+            ("decode", &check.decode),
+            ("prefill", &check.prefill),
+            ("prefill per MHz", &check.prefill_per_mhz),
+        ] {
+            if changes.is_empty() {
+                continue;
+            }
             let cell = |i: usize| {
                 changes.get(i).map_or("-".to_string(), |c| format!("{:+.1}%", c * 100.0))
             };
@@ -1030,6 +1054,74 @@ pub fn order_checks(checks: &[crate::runner::ab::VLOrderCheck]) -> String {
         }
     }
     s.push_str(&t.render());
+    s
+}
+
+/// Render a head-to-head, withholding the ratio of any row that measured
+/// different work.
+pub fn head_to_head(h: &crate::comparison::llama_bench::VLHeadToHead) -> String {
+    let mut s = format!("glbench vs llama-bench (build {})\n\n", h.build_commit);
+    let mut t = Table::new(&["phase", "glbench tok/s", "llama-bench tok/s", "ratio"])
+        .right_align(1)
+        .right_align(2)
+        .right_align(3);
+    for row in &h.rows {
+        t.row(&[
+            row.phase.to_string(),
+            format!("{:.1}", row.ours),
+            format!("{:.1}", row.theirs),
+            if row.mismatches.is_empty() && h.setup_mismatches.is_empty() {
+                format!("{:.2}x", row.ratio())
+            } else {
+                "not the same work".to_string()
+            },
+        ]);
+    }
+    s.push_str(&t.render());
+    for mismatch in &h.setup_mismatches {
+        s.push_str(&format!("  - {mismatch}\n"));
+    }
+    for row in &h.rows {
+        for mismatch in &row.mismatches {
+            s.push_str(&format!("  - {}: {mismatch}\n", row.phase));
+        }
+    }
+    s
+}
+
+/// Render the estimated breakdown of the production decode graph.
+pub fn decode_graph(a: &crate::analysis::decode_graph::VLGraphAttribution) -> String {
+    let mut s = format!(
+        "decode {:.3} ms/token in production, {:.3} with stage timing ({:.2}x)\n",
+        a.production_ms_per_token,
+        a.instrumented_ms_per_token,
+        a.instrumented_ms_per_token / a.production_ms_per_token
+    );
+    let mut t = Table::new(&["stage", "measured ms/token", "estimated ms/token", "share"])
+        .right_align(1)
+        .right_align(2)
+        .right_align(3);
+    for stage in &a.stages {
+        t.row(&[
+            stage.name.clone(),
+            format!("{:.3}", stage.measured_ms_per_token),
+            format!("{:.3}", stage.estimated_ms_per_token),
+            format!("{:.1}%", stage.estimated_ms_per_token / a.production_ms_per_token * 100.0),
+        ]);
+    }
+    s.push_str(&t.render());
+    if a.outside_graph_ms_per_token >= 0.0 {
+        s.push_str(&format!(
+            "  outside the graph (host sampling, token handling): {:.3} ms/token ({:.1}%)\n",
+            a.outside_graph_ms_per_token,
+            a.outside_graph_ms_per_token / a.production_ms_per_token * 100.0
+        ));
+    } else {
+        s.push_str(
+            "  the estimated stages exceed production time: the equal-cost assumption failed here\n",
+        );
+    }
+    s.push_str("  (estimated: assumes every timed stage boundary costs the same)\n");
     s
 }
 

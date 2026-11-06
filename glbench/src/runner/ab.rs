@@ -43,6 +43,8 @@ pub struct VLOrderCheck {
     pub decode: Vec<f64>,
     /// Relative prefill change per pass.
     pub prefill: Vec<f64>,
+    /// Relative change in prefill per SM MHz per pass; empty without NVML.
+    pub prefill_per_mhz: Vec<f64>,
 }
 
 impl VLOrderCheck {
@@ -136,6 +138,15 @@ pub fn order_checks(run: &VLAbRun) -> Vec<VLOrderCheck> {
                 label: run.pooled[index].metadata.label.clone(),
                 decode: per_pass(|s| s.measurements.decode_tps_samples()),
                 prefill: per_pass(|s| s.measurements.prefill_tps_samples()),
+                prefill_per_mhz: run
+                    .passes
+                    .iter()
+                    .filter_map(|pass| {
+                        let base = pass[0].measurements.prefill_tps_per_mhz()?;
+                        let candidate = pass[index].measurements.prefill_tps_per_mhz()?;
+                        Some(change(base, candidate))
+                    })
+                    .collect(),
             }
         })
         .collect()

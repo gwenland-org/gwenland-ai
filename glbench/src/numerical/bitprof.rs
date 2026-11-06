@@ -52,6 +52,11 @@
 
 use std::collections::HashMap;
 
+/// Lanes in [`VLBitProfile::order_sketch`]. The distance estimate's relative
+/// error is about `sqrt(2 / lanes)`, 25% here, which is plenty for a detector
+/// whose cases differ by an order of magnitude.
+pub const ORDER_SKETCH_LANES: usize = 32;
+
 /// Largest number of distinct mantissa patterns the sparse map will hold.
 ///
 /// Also used as the element-count precondition: a tensor longer than this
@@ -79,6 +84,9 @@ const FINITE_EXPONENT_SPAN: f64 = 254.0;
 /// What the bits of one tensor look like.
 #[derive(Debug, Clone)]
 pub struct VLBitProfile {
+    /// Position-signed sums of the values; see [`order_sketch`]. The one field
+    /// here that depends on order.
+    pub order_sketch: [f64; ORDER_SKETCH_LANES],
     /// How many values were profiled.
     pub count: u64,
 
@@ -134,6 +142,7 @@ pub struct VLBitProfile {
 /// cannot fill it completely.
 pub fn profile(values: &[f32]) -> VLBitProfile {
     let count = values.len() as u64;
+    let order_sketch = order_sketch(values);
 
     // D-12's precondition. Decided up front, from the length alone — see the
     // module docs for why a mid-run truncation would be a different and much
@@ -250,7 +259,40 @@ pub fn profile(values: &[f32]) -> VLBitProfile {
         subnormal_count,
         nan_count,
         inf_count,
+        order_sketch,
     }
+}
+
+/// Random projections of the tensor, position by position.
+///
+/// Each lane sums the values under a pseudo-random sign fixed by position, so
+/// the difference of two tensors' sketches estimates the L2 distance between
+/// them: for signs r, `E[(sum d_i r_i)^2] = sum d_i^2`. Moving a value changes
+/// its sign in half the lanes, which is what makes this see order. Every other
+/// statistic here sees only the multiset.
+fn order_sketch(values: &[f32]) -> [f64; ORDER_SKETCH_LANES] {
+    let mut sketch = [0.0f64; ORDER_SKETCH_LANES];
+    for (i, &value) in values.iter().enumerate() {
+        if !value.is_finite() {
+            continue;
+        }
+        let bits = f64::from(value).to_bits();
+        let signs = splitmix64(i as u64);
+        // The sign goes straight into the float's sign bit: a branch here costs
+        // five times the rest of the profile, on bits that are random by design.
+        for (lane, slot) in sketch.iter_mut().enumerate() {
+            *slot += f64::from_bits(bits ^ ((signs >> lane & 1) << 63));
+        }
+    }
+    sketch
+}
+
+/// A fixed hash of a position: the same signs for every tensor and every run.
+fn splitmix64(index: u64) -> u64 {
+    let mut z = index.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 /// Binary entropy of a Bernoulli(`p`), in bits. `0·log₂0` is taken as 0, which

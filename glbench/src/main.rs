@@ -60,6 +60,7 @@ fn main() -> ExitCode {
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
         Some("trend") => cmd_trend(&args[1..]),
+        Some("h2h") => cmd_h2h(&args[1..]),
         Some("list") => cmd_list(&args[1..]),
         Some("join") => cmd_join(&args[1..]),
         #[cfg(feature = "train-bench")]
@@ -107,8 +108,7 @@ fn reexec_for_stage_profile(args: &[String]) -> Option<Result<(), String>> {
                 .ok()
                 .is_some_and(|value| !value.is_empty() && value != "0")
         }
-        "GLCUDA_TELEMETRY" => std::env::var_os("GLCUDA_TELEMETRY").is_some(),
-        _ => false,
+        other => std::env::var_os(other).is_some(),
     };
     if active {
         return None;
@@ -134,8 +134,9 @@ fn reexec_for_stage_profile(args: &[String]) -> Option<Result<(), String>> {
 }
 
 fn stage_profile_env_key(args: &[String]) -> Option<&'static str> {
+    let asked = |profile: &str| args.windows(2).any(|pair| pair == ["--profile", profile]);
     if !matches!(args.first().map(String::as_str), Some("run" | "ab"))
-        || !args.windows(2).any(|pair| pair == ["--profile", "stages"])
+        || !(asked("stages") || asked("graph"))
     {
         return None;
     }
@@ -145,6 +146,7 @@ fn stage_profile_env_key(args: &[String]) -> Option<&'static str> {
         .map(|pair| pair[1].as_str())
     {
         Some("glproc") => Some("GLPROC_PROFILE"),
+        Some("glcuda") if asked("graph") => Some("GLCUDA_PROFILE_DECODE_STAGES"),
         Some("glcuda") => Some("GLCUDA_TELEMETRY"),
         _ => None,
     }
@@ -181,6 +183,11 @@ usage:
   glbench trend   <oldest.json> <...> <newest.json> [--threshold F]
                   (throughput across an ordered series of archives, with the
                    first-to-last verdict and the largest drop)
+  glbench h2h     <session.json> <llama-bench.json>
+                  (a session against `llama-bench -o json` output. Each row names
+                   every way the two measured different work, and only a like
+                   for like row gets a ratio; llama-bench does not sample, so
+                   decode never does)
   glbench list    <dir>
                   (the session archives in a directory, one line each)
   glbench validate --engine <name> --model <path> --against <oracle>
@@ -256,6 +263,9 @@ bit profiling (run):
   --profile stages            collect engine stage telemetry. This is an
                               instrumented diagnostic run: its headline tok/s
                               is archived and printed as non-authoritative.
+  --profile graph             glcuda only: time the stages inside the captured
+                              decode graph. The events slow decode about 2x, so
+                              -vv reports them with that cost estimated out.
   --profile bits              profile the model's weight tensors at the bit
                               level after the benchmark (GLBitProf). Static —
                               it reads the model file, not the run, so it
@@ -423,8 +433,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
                 let v = value(&mut i)?;
                 match v.as_str() {
                     "bits" => profile_bits = true,
-                    "stages" => spec.instrument_engine = true,
-                    other => return Err(format!("--profile takes bits|stages, got '{other}'")),
+                    "stages" | "graph" => spec.instrument_engine = true,
+                    other => {
+                        return Err(format!("--profile takes bits|stages|graph, got '{other}'"))
+                    }
                 }
             }
             "--bit-scope" => {
@@ -457,6 +469,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
         }
         (false, None) => None,
     };
+
+    if args.windows(2).any(|pair| pair == ["--profile", "graph"]) && spec.engine != "glcuda" {
+        return Err("--profile graph needs --engine glcuda: only it has a captured graph".into());
+    }
 
     if !prompt_set {
         // A representative default prompt (~long enough to exercise prefill),
@@ -517,12 +533,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// Run the instrumented half of `run --greedy` as a child `glbench run
-/// --profile stages`, then print its profile and what observing cost.
+/// Run the instrumented half of `run --greedy` as child `glbench run` processes,
+/// then print what they saw and what observing cost.
 ///
-/// A child, not an in-process second run: both engines read their profiling
-/// switches at construction, and the stage-profile re-exec already exists to
-/// set them before any runtime state does.
+/// Children, not in-process runs: both engines read their profiling switches at
+/// construction, and the stage-profile re-exec already exists to set them before
+/// any runtime state does.
 fn greedy_instrumented_pass(
     args: &[String],
     production: &glbench::BenchmarkSession,
@@ -534,15 +550,44 @@ fn greedy_instrumented_pass(
         return Ok(());
     }
 
-    // The production archive keeps its name; the instrumented one sits beside
-    // it. Without --out the instrumented archive is a temporary file.
-    let (instrumented_path, keep) = match out_path {
+    let instrumented = greedy_child(args, "stages", "instrumented", out_path)?;
+    print!("{}", greedy_observation_cost(production, &instrumented));
+    if instrumented.telemetry.is_some() {
+        println!("\n== greedy: instrumented pass profile (diagnostic, not production) ==");
+        print!("{}", text::telemetry_report(&instrumented));
+    }
+
+    // Decode replays as one opaque graph above; only timing events captured
+    // inside the graph can see its stages, in a pass of its own because they
+    // slow it down.
+    if engine == "glcuda" {
+        let graph = greedy_child(args, "graph", "graph", out_path)?;
+        println!("\n== greedy: decode graph stages (estimated for production) ==");
+        match glbench::analysis::decode_graph::attribute(production, &graph) {
+            Some(attribution) => print!("{}", text::decode_graph(&attribution)),
+            None => println!("no stage timing came back from the captured graph"),
+        }
+    }
+    Ok(())
+}
+
+/// One instrumented child run. The production archive keeps its name and this
+/// one sits beside it; without `--out` it is a temporary file. A kept archive is
+/// announced by the child's own "archived to".
+fn greedy_child(
+    args: &[String],
+    profile: &str,
+    suffix: &str,
+    out_path: Option<&Path>,
+) -> Result<glbench::BenchmarkSession, String> {
+    let (path, keep) = match out_path {
         Some(path) => {
             let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
-            (path.with_file_name(format!("{stem}.instrumented.json")), true)
+            (path.with_file_name(format!("{stem}.{suffix}.json")), true)
         }
         None => (
-            std::env::temp_dir().join(format!("glbench-greedy-{}.json", std::process::id())),
+            std::env::temp_dir()
+                .join(format!("glbench-greedy-{suffix}-{}.json", std::process::id())),
             false,
         ),
     };
@@ -560,34 +605,26 @@ fn greedy_instrumented_pass(
         }
         i += 1;
     }
-    child_args.extend(
-        ["--profile", "stages", "-q", "--out"].iter().map(|s| s.to_string()),
-    );
-    child_args.push(instrumented_path.display().to_string());
+    child_args.extend(["--profile", profile, "-q", "--out"].iter().map(|s| s.to_string()));
+    child_args.push(path.display().to_string());
 
-    eprintln!("=== greedy: instrumented pass (stage profile) ===");
+    eprintln!("=== greedy: {suffix} pass (--profile {profile}) ===");
     let executable = std::env::current_exe()
         .map_err(|error| format!("locating glbench for the greedy pass: {error}"))?;
     let status = std::process::Command::new(executable)
         .args(&child_args)
         .stdout(std::process::Stdio::null())
         .status()
-        .map_err(|error| format!("starting the greedy instrumented pass: {error}"))?;
+        .map_err(|error| format!("starting the greedy {suffix} pass: {error}"))?;
     if !status.success() {
-        return Err("greedy instrumented pass failed; the production report above stands".into());
+        return Err(format!("greedy {suffix} pass failed; the production report above stands"));
     }
 
-    let instrumented = archive::read(&instrumented_path)?;
+    let session = archive::read(&path)?;
     if !keep {
-        let _ = std::fs::remove_file(&instrumented_path);
+        let _ = std::fs::remove_file(&path);
     }
-    print!("{}", greedy_observation_cost(production, &instrumented));
-    if instrumented.telemetry.is_some() {
-        println!("\n== greedy: instrumented pass profile (diagnostic, not production) ==");
-        print!("{}", text::telemetry_report(&instrumented));
-    }
-    // A kept archive was already announced by the child's own "archived to".
-    Ok(())
+    Ok(session)
 }
 
 /// The throughput the instrumented pass lost relative to production.
@@ -837,6 +874,20 @@ fn cmd_trend(args: &[String]) -> Result<(), String> {
         .map(|path| archive::read(Path::new(path)))
         .collect::<Result<Vec<_>, _>>()?;
     print!("{}", text::trend(&glbench::comparison::trend::trend(&sessions, threshold)));
+    Ok(())
+}
+
+/// `glbench h2h` — a session against llama-bench's JSON, naming what differs.
+fn cmd_h2h(args: &[String]) -> Result<(), String> {
+    use glbench::comparison::llama_bench;
+
+    let [session, llama] = args else {
+        return Err("h2h needs a glbench archive and a `llama-bench -o json` file".into());
+    };
+    let session = archive::read(Path::new(session))?;
+    let text = std::fs::read_to_string(llama).map_err(|e| format!("reading {llama}: {e}"))?;
+    let records = llama_bench::parse(&text)?;
+    print!("{}", text::head_to_head(&llama_bench::head_to_head(&session, &records)));
     Ok(())
 }
 

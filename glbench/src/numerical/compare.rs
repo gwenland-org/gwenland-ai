@@ -5,43 +5,26 @@
 //! Two quantisations of the same weight both show residual KL against the f32
 //! original. Is that the scheme doing its job, or a bug?
 //!
-//! # ⛔ Measured limit: this cannot see a permutation
+//! # Two kinds of defect, two kinds of axis
 //!
-//! The design (research §12 Case 2) expected a wrong-nibble-order defect — the
-//! Q6_K class — to show up here as a *structured per-position anomaly*.
-//! **It does not.** Measured 2026-08-20 by
-//! `glbench/examples/bitprof_quant_divergence.rs`, using the real GQ4A encoder
-//! and the real dequant kernel: a correct GQ4A decode and a nibble-swapped one
-//! score **exactly zero** on every axis this module reports, while their MAE
-//! differs by 14x the scheme's own residual.
+//! The distribution axes (exponent L1, bit fractions, mantissa entropy) see what
+//! values a tensor holds. A quantisation scheme registers on them clearly (GQ4A
+//! vs f32: exponent L1 0.40, entropy -4.29 bits), and so does a defect that moves
+//! values across a scale boundary.
 //!
-//! The reason is structural rather than a defect to fix. Swapping the two 4-bit
-//! codes inside a byte exchanges weights 2i and 2i+1, which share a 32-weight
-//! sub-block and therefore a scale. The decoded *multiset* is unchanged, and
-//! every statistic in a [`VLBitProfile`] — histogram, per-position fraction,
-//! entropy — is permutation-invariant by construction. None of them can see a
-//! reordering. [`permutation_invariance_is_a_known_blind_spot`] pins this so it
-//! cannot be quietly forgotten.
+//! They are blind to order. Measured 2026-08-20 by
+//! `glbench/examples/bitprof_quant_divergence.rs`, with the real GQ4A encoder and
+//! dequant kernel: a correct decode and a nibble-swapped one score exactly zero
+//! on all of them, while their MAE is 14x the scheme's own residual. Swapping the
+//! two 4-bit codes in a byte exchanges weights that share a scale, so the decoded
+//! multiset is unchanged, and those statistics are permutation-invariant by
+//! construction. That is the Q6_K bug class, which corrupted every layer.
 //!
-//! ## What it does see
+//! [`VLBitDivergence::order_rms`] closes that. It compares the two tensors'
+//! position-signed sketches, which estimates the RMS element-wise difference
+//! between them without keeping either tensor. Both axes are needed: a defect
+//! that only reorders shows on this one alone.
 //!
-//! - **A quantisation scheme** shifts the exponent distribution and drops
-//!   mantissa entropy — it throws away low-order information on purpose,
-//!   evenly, and that registers clearly (GQ4A vs f32: exponent L1 0.40,
-//!   entropy −4.29 bits).
-//! - **A defect that moves values across a scale boundary** is not a pure
-//!   permutation and does register — the sub-block rotation control scored
-//!   exponent L1 0.049 against a correct decode of the same scheme.
-//!
-//! So the honest scope is: **this detects defects that change the distribution
-//! of values, and is blind to defects that only change their order.** A
-//! permutation-class bug needs an element-wise positional check against an
-//! oracle decode, which is [`crate::validation::parity`]'s job, not this
-//! module's. Recorded rather than papered over, per
-//! `bench-skills/measurement-discipline.md` rule 9.
-//!
-//! [`permutation_invariance_is_a_known_blind_spot`]: tests::permutation_invariance_is_a_known_blind_spot
-//! [`VLBitProfile`]: crate::numerical::bitprof::VLBitProfile
 
 use crate::numerical::bitprof::VLBitProfile;
 
@@ -70,6 +53,11 @@ pub struct VLBitDivergence {
     pub max_bit_delta: f64,
     /// Bit position of [`Self::max_bit_delta`].
     pub max_bit_position: usize,
+
+    /// Estimated RMS element-wise difference between the two tensors, from
+    /// their order sketches. The axis that sees a reordering. `None` for tensors
+    /// of different lengths, which have no element-wise difference.
+    pub order_rms: Option<f64>,
 }
 
 /// Compare two bit profiles.
@@ -97,7 +85,20 @@ pub fn compare(a: &VLBitProfile, b: &VLBitProfile) -> VLBitDivergence {
         mantissa_entropy_delta,
         max_bit_delta,
         max_bit_position,
+        order_rms: order_rms(a, b),
     }
+}
+
+/// The sketches' distance per lane estimates the L2 distance between the tensors;
+/// dividing by the element count's root makes that an RMS.
+fn order_rms(a: &VLBitProfile, b: &VLBitProfile) -> Option<f64> {
+    if a.count != b.count || a.count == 0 {
+        return None;
+    }
+    let lanes = a.order_sketch.len() as f64;
+    let squares: f64 =
+        a.order_sketch.iter().zip(&b.order_sketch).map(|(x, y)| (x - y) * (x - y)).sum();
+    Some((squares / lanes / a.count as f64).sqrt())
 }
 
 /// L1 distance between two exponent histograms, each normalised to a
@@ -257,7 +258,7 @@ mod tests {
     /// If this test ever fails, something gained positional sensitivity and the
     /// docs above need rewriting in the *good* direction.
     #[test]
-    fn permutation_invariance_is_a_known_blind_spot() {
+    fn a_permutation_is_invisible_to_the_distribution_axes_and_caught_by_order_rms() {
         let values: Vec<f32> = (1..=512).map(|i| i as f32 * 0.017).collect();
 
         // The same multiset, pairwise-swapped — the shape a nibble-order defect
@@ -275,13 +276,29 @@ mod tests {
             close(d.mantissa_entropy_delta.unwrap(), 0.0),
             "entropy axis saw a permutation"
         );
+        let swap_rms = d.order_rms.unwrap();
+        assert!(swap_rms > 0.005, "the order axis must see the swap: {swap_rms}");
 
-        // A reversal is the extreme case and is equally invisible.
+        // The true RMS difference is 0.017 for adjacent values; the sketch
+        // estimates it within its stated error.
+        assert!((swap_rms - 0.017).abs() < 0.017 * 0.75, "estimate off: {swap_rms}");
+
+        // A reversal is the extreme case, equally invisible to the first three.
         let mut reversed = values.clone();
         reversed.reverse();
         let d = compare(&profile(&values), &profile(&reversed));
         assert!(d.exponent_l1 < TOL_BIT);
         assert!(close(d.max_bit_delta, 0.0));
+        assert!(d.order_rms.unwrap() > swap_rms * 10.0, "a reversal moves values far further");
+
+        // And the same tensor in the same order scores exactly zero.
+        assert_eq!(compare(&profile(&values), &profile(&values)).order_rms, Some(0.0));
+    }
+
+    #[test]
+    fn tensors_of_different_lengths_have_no_order_distance() {
+        let d = compare(&profile(&[1.0, 2.0]), &profile(&[1.0, 2.0, 3.0]));
+        assert_eq!(d.order_rms, None);
     }
 
     /// The other half of the same finding: changing the *values* does register,
