@@ -1086,6 +1086,10 @@ pub fn head_to_head(h: &crate::comparison::llama_bench::VLHeadToHead) -> String 
             s.push_str(&format!("  - {}: {mismatch}\n", row.phase));
         }
     }
+    s.push_str(
+        "  llama-bench records no clocks, so the card's state on its side is unknown: \
+         run both back to back, or a power-capped card's temperature is in the ratio\n",
+    );
     s
 }
 

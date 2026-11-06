@@ -145,7 +145,7 @@ fn stage_profile_env_key(args: &[String]) -> Option<&'static str> {
         .find(|pair| pair[0] == "--engine")
         .map(|pair| pair[1].as_str())
     {
-        Some("glproc") => Some("GLPROC_PROFILE"),
+        Some("glproc") if asked("stages") => Some("GLPROC_PROFILE"),
         Some("glcuda") if asked("graph") => Some("GLCUDA_PROFILE_DECODE_STAGES"),
         Some("glcuda") => Some("GLCUDA_TELEMETRY"),
         _ => None,
