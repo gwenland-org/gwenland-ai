@@ -264,8 +264,8 @@ bit profiling (run):
                               instrumented diagnostic run: its headline tok/s
                               is archived and printed as non-authoritative.
   --profile graph             glcuda only: time the stages inside the captured
-                              decode graph. The events slow decode about 2x, so
-                              -vv reports them with that cost estimated out.
+                              decode graph. The events slow decode, so -vv
+                              reports them with that cost estimated out.
   --profile bits              profile the model's weight tensors at the bit
                               level after the benchmark (GLBitProf). Static —
                               it reads the model file, not the run, so it

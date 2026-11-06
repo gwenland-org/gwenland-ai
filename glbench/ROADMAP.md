@@ -39,14 +39,16 @@ Every number below was produced by a command in this repo, not estimated.
 
 - **GLBitProf cost** (`examples/bench_bitprof.rs`, i3-1115G4, release, median
   of 10): Tier 1+3 — the exponent histogram and 32 per-position bit counts that
-  *every* tensor pays — is **~27 ns/element**, flat from 1M to 16M elements.
+  *every* tensor pays — was **~27 ns/element**, flat from 1M to 16M elements.
+  The order sketch added in v4 takes it to ~54 ns/element.
   Tier 2, the sparse mantissa map, is paid only under the cap and multiplies
   that by **4.59×** to ~123 ns/element. Reported as two numbers because their
   average (~75) is a figure no tensor actually incurs.
 - **D-12's birthday-bound premise, measured rather than cited**: 131,072
   near-uniform elements give **128,132** distinct mantissa patterns against the
   `m·(1 − e^(−n/m))` prediction of 130,053 — **ratio 0.985**.
-- **⛔ Bit-profile divergence cannot detect a permutation.** The design expected
+- **⛔ The distribution axes cannot detect a permutation** (v4 added an order
+  sketch for this class, see `VLBitDivergence::order_rms`). The design expected
   a wrong-nibble-order defect (the Q6_K class) to show as a structured
   per-position anomaly. Measured with the real GQ4A encoder and dequant kernel
   (`examples/bitprof_quant_divergence.rs`): a correct decode and a

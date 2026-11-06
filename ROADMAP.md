@@ -149,11 +149,10 @@ what might be missing. The boundary stays the same: glbench observes, engines
 optimize, and no crates are added.
 
 **Blind spots in what it sees**
-- [ ] **CUDA Graph decode is opaque.** Graph replay shows up as one
-      `graph_replay` entry. Un-graphing it to profile (Wave 133) made decode
-      2.05× slower, so the instrumented view is not the production path.
-      Goal: per-stage attribution of the *production* graph, with the
-      perturbation measured and reported.
+- [x] **CUDA Graph decode was opaque.** Closed 2026-11-06: `--profile graph`
+      times the stages inside the captured graph, and `-vv` estimates them for
+      production with the event cost (1.15x on a T4) taken out. An estimate: it
+      assumes every timed boundary costs the same.
 - [x] **GPU ceilings came from a spec sheet.** Closed 2026-11-06: a read kernel
       measures the card before the engine loads (T4: 267 GB/s of a published
       320), and decode is divided by the bytes the engine reports streaming.
@@ -164,13 +163,12 @@ optimize, and no crates are added.
 - [x] **Host probes were dead on current Windows.** Closed 2026-11-06: `wmic` is
       replaced by direct Win32 calls.
 - [x] **No TTFT, no model hash in the archive.** Closed 2026-11-06.
-- [ ] **Bit profiles cannot see a permutation.** Measured in v3: a correct
-      decode and a nibble-swapped one score exactly zero divergence. That is
-      the Q6_K bug class that once corrupted every layer. Goal: an
-      order-sensitive check that catches it, with the existing blind-spot test
-      flipped into a detection test.
-- [ ] **No per-token decode timeline.** Needs an engine hook that streams
-      per-token timestamps (a coordinated engine-side change).
+- [x] **Bit profiles could not see a permutation.** Closed 2026-11-06: an order
+      sketch scores the Q6_K bug class 5.7e-2 where every distribution axis
+      scores exactly zero.
+- [x] **No per-token decode timeline.** Closed 2026-11-06: inter-token
+      p50/p95/p99 and the median gap by position, from tokens that already
+      streamed, so no engine change was needed.
 
 **Blind spots in how it compares**
 - [x] **Comparisons across setups read as regressions.** Closed 2026-11-06:
@@ -178,15 +176,20 @@ optimize, and no crates are added.
       workload comparison and give no regression verdict.
 - [x] **`glbench ab` was sequential.** Closed 2026-11-06: it runs A-B-B-A and
       says DISAGREE when reversing the order flips a difference's sign.
-- [ ] **llama.cpp decode rows are not the same work.** `llama-bench` does not
-      sample. Goal: the head-to-head flags a work mismatch instead of printing
-      the two numbers side by side.
+- [x] **llama.cpp decode rows were not the same work.** Closed 2026-11-06:
+      `glbench h2h` reads `llama-bench -o json`, names every mismatch and
+      withholds the ratio of a row that differs.
+- [x] **Throughput moves with the clock on a power-capped card.** Closed
+      2026-11-06: prefill per SM MHz is reported, compared and order-checked.
+      On one T4 A/B it read +3.9% and +3.7% where raw prefill read +1.8% and
+      +6.8%.
 
-**Coverage**
-- [ ] **GLLM engine:** no tokenizer (synthetic token ids) and F32 only, so its
-      behavior signals do not describe a real prompt.
-- [ ] **Reports:** HTML report and roofline chart (zero-dependency, inlined),
-      still open in [`glbench/ROADMAP.md`](glbench/ROADMAP.md).
+**Deferred**
+- **GLLM engine:** no tokenizer (synthetic token ids) and F32 only, so its
+  behavior signals do not describe a real prompt. Waits for the format to
+  stabilize.
+- **Reports:** HTML report and roofline chart (zero-dependency, inlined), still
+  open in [`glbench/ROADMAP.md`](glbench/ROADMAP.md).
 
 **Accepted limits (not targets):** cache counters, PCIe, and Windows/macOS
 energy need kernel drivers or external deps. Toxicity scoring stays

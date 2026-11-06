@@ -120,11 +120,54 @@ is exact where integrating sampled power is not. A clock-limit reason such as
 `sw_power_cap` becomes a validation warning, and `compare` names a mean SM clock
 that differs, because a slower clock and slower code read the same in tok/s.
 
+`prefill per SM MHz` is the figure a clock change does not move, which matters on
+a power-capped card: in one T4 A/B, raw prefill read +1.8% and +6.8% across the
+two orders, and per MHz read +3.9% and +3.7%. The clock is sampled over the whole
+run, which an end-to-end workload spends mostly in decode.
+
 NVML is loaded at runtime, so this needs nothing beyond the driver. Where it
 cannot be opened, these fields are absent. On a T4 the sampler's cost measured
 -0.45% prefill and 0.0% decode in an A-B-B-A, inside the noise;
 `--no-gpu-sampling` leaves only the energy counter, to check that on other
 hardware.
+
+### Inside the decode graph
+
+Decode replays as one opaque CUDA Graph launch. `--profile graph` (glcuda only)
+captures timing events between its stages, which slows it down, so the raw times
+describe a program production never runs. `-vv` adds this as a third pass and
+estimates each stage for production: the added time per token, spread over the
+timed boundaries, comes off each stage, and what remains of production time is
+work outside the graph. On a T4, at 4.54 ms/token:
+
+```
+stage           measured ms/token  estimated ms/token  share
+attention                   1.104               1.031  22.7%
+ffn_gate_up                 1.023               0.949  20.9%
+lm_head                     0.585               0.582  12.8%
+...
+  outside the graph (host sampling, token handling): 0.534 ms/token (11.8%)
+```
+
+This is an estimate: it assumes every timed boundary costs the same.
+
+### Per-token latency
+
+Every run reports time to first token and inter-token p50/p95/p99, from when each
+token reached the caller. `-vv` adds the median gap by stretch of the generation,
+which shows what a rate cannot: on a T4, 4.08 ms early in a 512-token generation
+and 5.43 ms at the end, as the context grows.
+
+### Against llama-bench
+
+```sh
+llama-bench -m model.gguf -p 244 -n 0 -o json > llama.json
+glbench h2h benchmarks/run.json llama.json
+```
+
+Each row names every way the two figures measured different work, and only a like
+for like row gets a ratio. llama-bench does not sample, so decode never does. It
+also records no clocks, so run both back to back on a power-capped card.
 
 ### CUDA launch observability
 
@@ -254,6 +297,7 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--verify-against` | unset | oracle engine to auto cross-check the first 50 tokens against, folded into the validation report; skipped (not just trivial) when equal to `--engine` |
 | `--profile stages` | off | collect engine stage telemetry in a diagnostic-only run; headline tok/s is non-authoritative |
+| `--profile graph` | off | glcuda: time the stages inside the captured decode graph; also diagnostic-only |
 | `--out`         | —       | archive the session as JSON                      |
 | `--no-gpu-sampling` | off | keep only the GPU energy counter, with no thread beside the measured loop |
 | `-q` / `-v` / `-vv` | default | report verbosity (see [Report verbosity](#report-verbosity)) |

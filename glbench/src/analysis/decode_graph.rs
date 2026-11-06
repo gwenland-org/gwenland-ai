@@ -1,8 +1,8 @@
 //! What the production decode graph spends its time on, estimated.
 //!
 //! A CUDA Graph replays as one opaque launch, so the only way to see inside it
-//! is to capture timing events between its stages, and those events cost more
-//! than the stages: on a T4 they made decode 2.05x slower (Wave 133). The raw
+//! is to capture timing events between its stages, and those events are not
+//! free: on a T4 they made decode 1.15x slower, and 2.05x in Wave 133. The raw
 //! stage times therefore describe a program that never runs in production.
 //!
 //! This takes the slowdown as a measurement rather than a caveat. The added time

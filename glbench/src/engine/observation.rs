@@ -29,8 +29,8 @@ const GLCUDA_PREFIX: &str = "GLCUDA_";
 
 /// glcuda switches that add timing instrumentation. Presence semantics: any
 /// value, including "0", enables them. `GLCUDA_PROFILE_DECODE_STAGES` turns
-/// captured decode-graph nodes into timed events and measured 2.05x slower
-/// decode on the T4 (Wave 133), so a run with it set is never production.
+/// captured decode-graph nodes into timed events, which slowed decode 1.15x to
+/// 2.05x on the T4, so a run with it set is never production.
 const GLCUDA_INSTRUMENTATION: &[&str] = &[
     "GLCUDA_PROFILE_DECODE",
     "GLCUDA_PROFILE_DECODE_STAGES",

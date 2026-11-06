@@ -23,5 +23,16 @@
   the SM clock falls under sustained load, 1,500 to about 1,100 MHz. Prefill
   tracks it at 10.2-10.7 tok/s per MHz. The 15,800 tok/s headline is a cool-card
   figure; sustained prefill-only load measures about 11,500.
+- Added an order sketch to bit profiles: the Q6_K bug class scores 5.7e-2 where
+  every distribution axis scores zero. The always-on tier goes from 27 to 54 ns
+  per element.
+- Added a per-token timeline, `--profile graph` with a production estimate in
+  `-vv`, `glbench h2h` for llama-bench, and prefill per SM MHz.
+- Measured: decode graph events cost 1.15x here, against 2.05x in Wave 133; the
+  difference is not explained. Attention is 22.7% of decode, ffn_gate_up 20.9%,
+  and 11.8% is outside the graph.
+- Q4_K_M, repacked to Q8, beats Q8_0 in prefill per MHz by +3.9% and +3.7% across
+  orders. Cause unknown.
 - Results: `benchmarks/glbench-t4-wired-results.zip`,
-  `benchmarks/glbench-t4-nvml-results.zip`.
+  `benchmarks/glbench-t4-nvml-results.zip`,
+  `benchmarks/glbench-t4-order-results.zip`.
