@@ -28,6 +28,7 @@ fn write_session(path: &Path, label: &str, decode_ms: f64) {
         prefill_ms: 410.0,
         decode_ms,
         total_ms: 410.0 + decode_ms,
+        ttft_ms: None,
     });
     let session = BenchmarkSession::new(
         SessionMetadata::new(label),

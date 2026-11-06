@@ -140,9 +140,13 @@ The raw launch samples and resources round-trip through schema-v2 archives.
 Older v2 archives remain readable: absent samples or resources are rendered as
 unavailable rather than reconstructed from an average.
 
-A/B two (or more) models under one identical workload, in one command — each
-candidate is diffed against the first. Sequential on purpose: parallel decodes
-would contend for the memory bus and corrupt every number:
+A/B two (or more) models under one identical workload, in one command. Every
+model runs forward and then in reverse (A B B A), so a machine drifting during
+the run cannot pass for a difference. Reports pool both passes, each candidate
+is diffed against the first, and an order check says whether the two orders
+agree: if they do not, the sign came from the order, not the model. `--out`
+names a directory for one archive per model per pass. Never in parallel:
+decodes would contend for the memory bus and corrupt every number:
 
 ```sh
 glbench ab --engine glproc --model qwen2.5-0.5b-q8_0.gguf --model qwen2.5-0.5b-q4_k_m.gguf

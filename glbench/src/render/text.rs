@@ -930,6 +930,36 @@ pub fn trend(r: &crate::comparison::trend::TrendReport) -> String {
     s
 }
 
+/// Render whether each candidate's difference survived reversing the order.
+pub fn order_checks(checks: &[crate::runner::ab::VLOrderCheck]) -> String {
+    use crate::runner::ab::VLOrderCheck;
+
+    let mut s = String::from("order check: each candidate against the baseline, pass by pass\n");
+    let mut t = Table::new(&["candidate", "metric", "forward", "reversed", "orders"])
+        .right_align(2)
+        .right_align(3);
+    for check in checks {
+        for (metric, changes) in [("decode", &check.decode), ("prefill", &check.prefill)] {
+            let cell = |i: usize| {
+                changes.get(i).map_or("-".to_string(), |c| format!("{:+.1}%", c * 100.0))
+            };
+            t.row(&[
+                check.label.clone(),
+                metric.to_string(),
+                cell(0),
+                cell(1),
+                if VLOrderCheck::agrees(changes) {
+                    "agree".to_string()
+                } else {
+                    "DISAGREE: no measurable difference".to_string()
+                },
+            ]);
+        }
+    }
+    s.push_str(&t.render());
+    s
+}
+
 /// Render the archives found in a directory.
 pub fn manifest(entries: &[crate::storage::manifest::ManifestEntry]) -> String {
     let mut t = Table::new(&["archive", "label", "engine", "mode", "prefill tps", "decode tps"])

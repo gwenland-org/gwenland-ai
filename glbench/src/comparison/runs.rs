@@ -64,7 +64,7 @@ pub struct ComparisonReport {
     /// Regression verdict on the headline (decode) metric.
     pub regression: Regression,
     /// What the two sides differ in, when that is more than a change to the
-    /// same setup: "engine", "hardware", "quantization" or "workload". `Some` means the
+    /// same setup: "engine", "hardware", "quantization", "model" or "workload". `Some` means the
     /// delta is a comparison of two things, and `regression` is not a finding.
     pub axis: Option<&'static str>,
     /// Observations.

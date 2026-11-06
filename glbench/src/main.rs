@@ -24,6 +24,7 @@ use glbench::kl_divergence::{self, KlDivArgs};
 use glbench::ppl::{self, PplArgs};
 use glbench::quant_info::{self, QuantInfoArgs};
 use glbench::render::text;
+use glbench::runner::ab;
 use glbench::render::text::ENVerbosity;
 use glbench::runner::{planner, scale, thread_scale};
 use glbench::numerical::scope::{self, ENBitScope};
@@ -162,10 +163,13 @@ usage:
                    the validation report; skipped, not just trivial, when the
                    oracle equals --engine)
   glbench ab      --engine <name> --model <baseline> --model <candidate> [...]
-                  (same options as run; each extra --model is benchmarked with
-                   the identical workload, sequentially, and diffed against the
-                   first — sequential on purpose: parallel runs would contend
-                   for bandwidth and corrupt every number)
+                  (same options as run; every model runs under the identical
+                   workload forward and then in reverse, A B B A, so a machine
+                   drifting during the run cannot pass for a difference. Reports
+                   pool both passes, and an order check says whether the two
+                   orders agree. --out names a directory for one archive per
+                   model per pass. Never in parallel: decodes would contend for
+                   bandwidth and corrupt every number)
   glbench compare <baseline.json> <candidate.json> [--threshold F]
                   (a regression verdict only between runs of one setup; two
                    engines, devices or quantizations are reported as that
@@ -706,43 +710,42 @@ fn truncate_name(name: &str, width: usize) -> String {
     format!("...{}", &name[name.len() - (width - 3)..])
 }
 
-/// `glbench ab` — benchmark N models under one identical workload, in one
-/// command, and diff each against the first.
-///
-/// Runs are sequential by design: models on one machine share the memory bus,
-/// so "parallel benchmark" is an oxymoron — two decodes contending for
-/// bandwidth would each report a number describing neither. What v2 adds is
-/// the orchestration (one command, one workload, N models, a delta table),
-/// not concurrency.
+/// `glbench ab` — benchmark N models under one identical workload, forward and
+/// then in reverse, and diff each against the first. See [`ab`] for why.
 fn cmd_ab(args: &[String]) -> Result<(), String> {
     let a = parse_run_args(args)?;
     if a.models.len() < 2 {
         return Err("ab needs at least two --model flags (baseline first)".into());
     }
-    if a.out_path.is_some() {
-        return Err("ab does not take --out; archive individual runs with 'run'".into());
-    }
 
-    // Run them all under the byte-identical spec except the model path.
-    let mut sessions = Vec::new();
-    for (n, model) in a.models.iter().enumerate() {
-        eprintln!("=== model {}/{}: {model}", n + 1, a.models.len());
-        let mut spec = a.spec.clone();
-        spec.model_path = model.clone();
-        sessions.push(planner::run(&spec, &progress).map_err(|e| e.to_string())?);
-    }
+    let result = ab::run(&a.spec, &a.models, &progress).map_err(|e| e.to_string())?;
 
-    // Every session's full report first (the facts) ...
-    for s in &sessions {
+    // Every model's pooled report first (the facts) ...
+    for s in &result.pooled {
         print!("{}", text::session_at(s, a.verbosity));
         println!();
     }
     // ... then each candidate against the baseline (the deltas).
-    let baseline = &sessions[0];
-    for candidate in &sessions[1..] {
+    let baseline = &result.pooled[0];
+    for candidate in &result.pooled[1..] {
         let report = glbench::comparison::compare_along_axis(baseline, candidate, 0.05);
         print!("{}", text::comparison(&report));
         println!();
+    }
+    print!("{}", text::order_checks(&ab::order_checks(&result)));
+
+    // Every pass is a real session and is archived as one; the pool is derived
+    // from them and can be rebuilt.
+    if let Some(dir) = &a.out_path {
+        std::fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        for (pass, sessions) in result.passes.iter().enumerate() {
+            for (index, session) in sessions.iter().enumerate() {
+                let name = format!("model{}-pass{}.json", index + 1, pass + 1);
+                let path = dir.join(name);
+                archive::write_with_policy(session, &path, a.null_semantics)?;
+                eprintln!("archived to {}", path.display());
+            }
+        }
     }
     Ok(())
 }

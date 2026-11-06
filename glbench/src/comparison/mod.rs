@@ -63,6 +63,7 @@ pub fn compare_along_axis(
     let storage = |s: &'_ BenchmarkSession| s.environment.hardware.storage.model_sha256.clone();
     if let (Some(a), Some(b)) = (storage(baseline), storage(candidate)) {
         if a != b && !quant {
+            report.axis = report.axis.or(Some("model"));
             report.notes.push("The model files differ, by SHA-256.".to_string());
         }
     }

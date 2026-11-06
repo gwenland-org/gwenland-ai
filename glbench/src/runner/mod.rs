@@ -2,6 +2,7 @@
 //! measured iterations → analysis + validation); [`prefill`], [`decode`], and
 //! [`stress`] hold the per-kind policy and stability helpers.
 
+pub mod ab;
 pub mod decode;
 pub mod planner;
 pub mod prefill;

@@ -44,6 +44,7 @@ fn session(label: &str) -> BenchmarkSession {
         prefill_ms: 412.5,
         decode_ms: 6203.0,
         total_ms: 6615.5,
+        ttft_ms: None,
     });
     BenchmarkSession::new(
         SessionMetadata::new(label),
