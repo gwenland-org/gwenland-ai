@@ -2,7 +2,7 @@
 
 > **Domain:** bench-skills
 > **Applies to:** [`glbench/`](../../glbench/) (binary: `glbench`); measuring any engine
-> **Last updated:** 2026-07-17
+> **Last updated:** 2026-11-06
 
 ## BEFORE YOU START
 
@@ -43,9 +43,11 @@ anecdotes — and this project has been burned by anecdotes (probes off by
 3. **Determinism unless you're studying sampling:** default
    `--temperature 0.0` (greedy) + fixed `--seed` keeps token streams
    comparable across runs; a changed token stream changes the workload.
-4. **`--kind` matches the question:** `decode`, `prefill`, `end_to_end`, or
-   `stress` — a decode conclusion drawn from an `end_to_end` run is mixing
-   phases with different physics.
+4. **`--kind` matches the question:** `decode` (short prompt unless `--prompt`
+   is given), `prefill` (one generated token), `end_to_end`, or `stress` (32
+   iterations unless `--iters`, reports early-vs-late drift) — a decode
+   conclusion drawn from an `end_to_end` run is mixing phases with different
+   physics.
 5. **Archive decision-grade runs** (`--out benchmarks/….json`). A number
    quoted in a PR/gate without an archived session behind it is
    unverifiable — sessions are the citations.

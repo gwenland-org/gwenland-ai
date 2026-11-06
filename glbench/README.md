@@ -79,6 +79,38 @@ stage timings are useful for locating cost, but its tok/s is clearly marked
 non-authoritative because instrumentation can perturb wall time. Run both when
 making an optimization decision; only the production run decides retention.
 
+### Report verbosity
+
+`run`, `ab` and `inspect` print at one of four levels. Verbosity chooses what is
+printed, never what is kept: an archive holds everything the run collected, so
+`glbench inspect file.json -vv` shows all of what a `-q` run recorded.
+
+| flag | prints |
+|------|--------|
+| `-q`, `--quiet` | one line: prefill and decode medians, authority, ceiling, validation |
+| (default) | throughput, cold start, health, notes, validation and every warning |
+| `-v`, `--verbose` | every section: environment, roofline, hypotheses, telemetry, behavior |
+| `-vv`, `--greedy` | all of that, plus the workload, each override's value, every raw iteration, engine memory, and why each absent field is absent |
+
+On `run`, `--greedy` also collects more: a second `--profile stages` pass in a
+child process, printed with its measured observation cost. The headline numbers
+always come from the production pass. With `--out`, the instrumented pass is
+archived beside it as `<name>.instrumented.json`.
+
+### Workload kinds
+
+`--kind` changes what runs, and the archive records the result:
+
+| kind | what runs |
+|------|-----------|
+| `end_to_end` | prefill then decode, as asked (the default) |
+| `prefill` | one generated token, so only prefill is reported; `--tokens` is ignored, no decode ceiling applies, and warmup lasts at least a second unless `--warmup 0` |
+| `decode` | a short prompt unless `--prompt` is given, because decode cost grows with the context it starts from |
+| `stress` | 32 measured iterations unless `--iters` is given; reports first-quarter against last-quarter decode and warns on a sag past 5% |
+
+A workload too short for its kind gets a validation warning: under 128 prompt
+tokens for a prefill figure, under 32 generated tokens for a decode figure.
+
 ### CUDA launch observability
 
 With `--engine glcuda --profile stages`, glbench also archives the native CUDA
@@ -116,10 +148,25 @@ would contend for the memory bus and corrupt every number:
 glbench ab --engine glproc --model qwen2.5-0.5b-q8_0.gguf --model qwen2.5-0.5b-q4_k_m.gguf
 ```
 
-Compare two archived runs (regression check at a 5% threshold by default):
+Compare two archived runs. Between runs of one setup that is a regression
+check, at a 5% threshold by default. Two engines, devices, quantizations or
+workload kinds are reported as that comparison instead, with no regression
+verdict: glproc against
+glcuda is not a 99% regression. When both runs were profiled, the report also
+says how each stage moved, because every stage moving alike points at the clock
+and one stage alone points at the code. Two training archives add a
+configuration-first section under `--features train-bench`:
 
 ```sh
 glbench compare benchmarks/qwen-glcuda-001.json benchmarks/qwen-glproc-001.json
+```
+
+Follow a metric across an ordered series of archives, oldest first, or list the
+sessions in a directory:
+
+```sh
+glbench trend benchmarks/week1.json benchmarks/week2.json benchmarks/week3.json
+glbench list  benchmarks/
 ```
 
 Check numerical parity against an oracle engine (default `glproc`) — runs
@@ -184,11 +231,12 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--iters`       | 3       | timed measured iterations (feeds the statistics) |
 | `--temperature` | 0.0     | sampling temperature (0 = greedy, deterministic) |
 | `--seed`        | 42      | RNG seed for deterministic sampling              |
-| `--kind`        | end_to_end | `prefill`, `decode`, `end_to_end`, `stress`   |
+| `--kind`        | end_to_end | `prefill`, `decode`, `end_to_end`, `stress` (see [Workload kinds](#workload-kinds)) |
 | `--cot`         | auto    | thinking-model override (`on`/`off`); unset lets the GGUF header decide |
 | `--verify-against` | unset | oracle engine to auto cross-check the first 50 tokens against, folded into the validation report; skipped (not just trivial) when equal to `--engine` |
 | `--profile stages` | off | collect engine stage telemetry in a diagnostic-only run; headline tok/s is non-authoritative |
 | `--out`         | —       | archive the session as JSON                      |
+| `-q` / `-v` / `-vv` | default | report verbosity (see [Report verbosity](#report-verbosity)) |
 
 `validate` additionally takes `--against <oracle>` (default `glproc`); `scale`
 additionally takes `--sweep N,N,N,...` (at least two token budgets) in place
@@ -205,8 +253,9 @@ inputs were actually measured, absent otherwise:
   median + range, never mixed into the warm statistics (see
   [Interpreting Results](#interpreting-results)).
 - **measurement authority and dispatch provenance** — every new run says
-  `production` or `instrumented`, records a fingerprint of whitelisted engine
-  overrides, and preserves those facts through archive inspect/export.
+  `production` or `instrumented`, records a fingerprint of every switch in the
+  engine's namespace (`GLPROC_*`, `GLCUDA_*`), and preserves those facts through
+  archive inspect/export.
 - **CUDA launch profile** — for instrumented glcuda runs, measured-window
   per-entry distributions and launch resources, with explicit event coverage
   and graph-replay limitations.
@@ -229,8 +278,10 @@ inputs were actually measured, absent otherwise:
     much did it make up."
   - `anomaly` — intra-session drift: per-quarter inter-token latency plus
     the worst OOD perplexity window, by position.
-  - `performance` / `drift` — ms/call, share, layer variance, and Δ ms/call
-    between sessions, from engine telemetry rather than traces.
+  - `performance` — the hottest stage, the costliest single call, and how
+    unevenly call cost is spread, printed under each stage table.
+  - `drift` — Δ ms/call per stage between two profiled sessions, printed by
+    `compare`.
   - **`toxicity` is deliberately not implemented** (see
     `src/behavior/toxicity.rs`): every metric considered measures affinity
     to a flagged word list, not toxicity, and is wrong in both directions
@@ -294,14 +345,16 @@ often actually mean.
 ### `ceiling_efficiency` — what fraction of what, exactly?
 
 `ceiling_efficiency` is `observed decode tok/s ÷ theoretical ceiling tok/s`,
-where the ceiling is `peak bandwidth ÷ model weight bytes` (decode is
-memory-bandwidth-bound: every token streams the full weight set once). It
+where the ceiling is `peak bandwidth ÷ weight bytes` (decode is
+memory-bandwidth-bound: every token streams the weights once). The weight bytes
+are what the engine reports reading per decode token, in the format it computes
+on, and fall back to the file size when it reports none; the notes say which. It
 always carries a `ceiling_basis`, and the basis changes what the number is
 worth:
 
-- **`measured`** — the bandwidth is this machine's own sustained sequential
-  read throughput, probed at session start (or, on GPU, an on-device
-  measurement if the engine ever reports one). This is the honest ceiling:
+- **`measured`** — the bandwidth is this machine's own sustained read
+  throughput: host RAM probed at session start, or on a CUDA run device memory
+  probed by a read kernel before the engine loads. This is the honest ceiling:
   it already reflects this exact machine's RAM, channel count, and thermal
   state at the time of the run. An efficiency of 85% here really means "85%
   of what this box can actually do."

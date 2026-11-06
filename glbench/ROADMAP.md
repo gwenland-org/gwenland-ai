@@ -15,6 +15,7 @@ first, do not over-engineer.**
 | 4     | Advanced rendering                                           | 🚧 baseline in place |
 | v2    | Mensura Veritatis v2: CoT-aware quality, per-bucket roofline, intra-session anomaly + hypotheses, cold/warm split, `ab` command, RAPL energy | ✅ done |
 | v3    | Mensura Veritatis v3: schema v2 envelope, null semantics, content digest, join, GLBitProf, training observation | ✅ done (5 waves) |
+| v4    | "No Celah": `-q`/`-v`/`-vv`, working `--kind`, measured GPU ceiling, engine-reported decode bytes, axis-aware `compare`, `trend`, `list` | 🚧 in progress, see the root [`ROADMAP.md`](../ROADMAP.md) |
 
 Phase 1–3 landed together as the first foundation; Phase 4 has a working text +
 table renderer, with the richer output below still open.
