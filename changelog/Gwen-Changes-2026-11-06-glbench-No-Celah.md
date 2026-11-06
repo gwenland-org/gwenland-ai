@@ -14,6 +14,14 @@
 - Fixed CUDA stage rows being percentages of host DDR, and `total_ms` carrying
   no overhead because it was built from the phases it was compared against.
 - Removed `runner/warmup.rs`.
-- Found, not explained: prefill alone runs at ~13,700 tok/s against ~15,800 with
-  decode between iterations on the same build.
-- Results: `benchmarks/glbench-t4-wired-results.zip`.
+- Replaced `wmic`, removed from Windows 11, with direct Win32 calls.
+- Added time to first token and the model SHA-256 to archives.
+- Made `ab` counterbalanced (A-B-B-A) with an order check and `--out`.
+- Added NVML: clocks, temperature, power, GPU energy, VRAM and clock-limit
+  reasons. Sampler cost in an A-B-B-A: -0.45% prefill, 0.0% decode.
+- Found: the T4 sits on its 70 W cap (`sw_power_cap` in nearly every sample) and
+  the SM clock falls under sustained load, 1,500 to about 1,100 MHz. Prefill
+  tracks it at 10.2-10.7 tok/s per MHz. The 15,800 tok/s headline is a cool-card
+  figure; sustained prefill-only load measures about 11,500.
+- Results: `benchmarks/glbench-t4-wired-results.zip`,
+  `benchmarks/glbench-t4-nvml-results.zip`.

@@ -104,9 +104,9 @@ waves were *rejected*; each one has a write-up in
 | prefill | 73 tok/s (7B) | **~15,800 tok/s** (0.5B, Wave 131; 15,000 target met) |
 | decode | 29.2 tok/s (7B) | **~224 tok/s** (0.5B, Wave 136; 44 % of the measured 267 GB/s ceiling) |
 
-Caveats that stay attached to these numbers: prefill alone (`--kind prefill`)
-measures ~13,700 tok/s against ~15,800 with decode between iterations, cause
-unknown; the newest paths are opt-in
+Caveats that stay attached to these numbers: they are short runs on a cool
+card, and the T4 is power-capped, so sustained prefill-only load drops the SM
+clock to ~1,100 MHz and measures ~11,500 tok/s; the newest paths are opt-in
 `GLCUDA_*` flags, not the default; the last llama.cpp head-to-head (Wave 116:
 12,258 vs 11,307 tok/s prefill) predates the latest +29 %; Q4 is unmeasured on
 this path. Waves 131–136 live on `engine/glcuda-ceiling-wave132`, not yet
@@ -157,13 +157,13 @@ optimize, and no crates are added.
 - [x] **GPU ceilings came from a spec sheet.** Closed 2026-11-06: a read kernel
       measures the card before the engine loads (T4: 267 GB/s of a published
       320), and decode is divided by the bytes the engine reports streaming.
-- [ ] **GPU state is invisible.** No clock, temperature, power, energy,
-      VRAM-in-use or throttle reason, so the prefill gap above cannot be
-      explained. Goal: NVML, loaded at runtime the way glcuda loads the driver.
-- [ ] **Host probes are dead on current Windows.** `wmic` is gone from Windows
-      11, so CPU model, clocks, RAM, CPU time and peak RSS are silently absent
-      there. Goal: replace all 16 call sites.
-- [ ] **No TTFT, no model hash in the archive.**
+- [x] **GPU state was invisible.** Closed 2026-11-06: NVML, loaded at runtime,
+      reports clocks, temperature, power, energy, VRAM and clock-limit reasons.
+      The sampler's measured cost is -0.45% prefill and 0.0% decode, inside the
+      noise.
+- [x] **Host probes were dead on current Windows.** Closed 2026-11-06: `wmic` is
+      replaced by direct Win32 calls.
+- [x] **No TTFT, no model hash in the archive.** Closed 2026-11-06.
 - [ ] **Bit profiles cannot see a permutation.** Measured in v3: a correct
       decode and a nibble-swapped one score exactly zero divergence. That is
       the Q6_K bug class that once corrupted every layer. Goal: an
@@ -176,11 +176,8 @@ optimize, and no crates are added.
 - [x] **Comparisons across setups read as regressions.** Closed 2026-11-06:
       `compare`, `ab` and `join` name an engine, hardware, quantization or
       workload comparison and give no regression verdict.
-- [ ] **`glbench ab` is sequential.** This machine drifts ~24 % between
-      sessions (Kaggle T4 ~8 %), and a sequential A/B once reported an
-      impossible 17 %. Every trustworthy A/B since was A-B-B-A, done by hand
-      in notebooks. Goal: counterbalanced order inside `ab`/`compare`, with
-      the per-order agreement reported.
+- [x] **`glbench ab` was sequential.** Closed 2026-11-06: it runs A-B-B-A and
+      says DISAGREE when reversing the order flips a difference's sign.
 - [ ] **llama.cpp decode rows are not the same work.** `llama-bench` does not
       sample. Goal: the head-to-head flags a work mismatch instead of printing
       the two numbers side by side.

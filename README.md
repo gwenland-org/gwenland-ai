@@ -211,9 +211,10 @@ prompt:
 | prefill | **~15,800 tok/s** (P50, all runs ≥ 15,000) | Wave 131, re-confirmed in Waves 132–136 |
 | decode | **~224 tok/s** (44 % of the 267 GB/s read bandwidth measured on the card) | Wave 136 |
 
-- Prefill was measured with decode running between iterations. `glbench --kind
-  prefill`, which runs prefill alone, measures ~13,700 tok/s on the same build;
-  the cause of the gap is not yet known.
+- These are short runs on a cool card. The T4 sits on its 70 W power cap, and
+  NVML shows the SM clock falling under sustained load, from about 1,500 MHz to
+  about 1,100. Prefill tracks that clock at 10.2-10.7 tok/s per MHz, so sustained
+  prefill-only load measures ~11,500 tok/s on the same build.
 - Every retained change passes oracle-token parity (50/50) before it is timed.
 - The newest paths are **opt-in** through `GLCUDA_*` environment flags and are
   not yet the default.

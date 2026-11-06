@@ -111,6 +111,21 @@ archived beside it as `<name>.instrumented.json`.
 A workload too short for its kind gets a validation warning: under 128 prompt
 tokens for a prefill figure, under 32 generated tokens for a decode figure.
 
+### GPU state during a run
+
+On glcuda, a thread samples NVML at 20 Hz beside the measured iterations and the
+report shows SM and memory clocks, temperature, power, utilization and VRAM.
+Energy comes from the card's own counter, read at the two ends of the run, which
+is exact where integrating sampled power is not. A clock-limit reason such as
+`sw_power_cap` becomes a validation warning, and `compare` names a mean SM clock
+that differs, because a slower clock and slower code read the same in tok/s.
+
+NVML is loaded at runtime, so this needs nothing beyond the driver. Where it
+cannot be opened, these fields are absent. On a T4 the sampler's cost measured
+-0.45% prefill and 0.0% decode in an A-B-B-A, inside the noise;
+`--no-gpu-sampling` leaves only the energy counter, to check that on other
+hardware.
+
 ### CUDA launch observability
 
 With `--engine glcuda --profile stages`, glbench also archives the native CUDA
@@ -240,6 +255,7 @@ glbench export  benchmarks/qwen-glcuda-001.json --format csv --out runs.csv
 | `--verify-against` | unset | oracle engine to auto cross-check the first 50 tokens against, folded into the validation report; skipped (not just trivial) when equal to `--engine` |
 | `--profile stages` | off | collect engine stage telemetry in a diagnostic-only run; headline tok/s is non-authoritative |
 | `--out`         | —       | archive the session as JSON                      |
+| `--no-gpu-sampling` | off | keep only the GPU energy counter, with no thread beside the measured loop |
 | `-q` / `-v` / `-vv` | default | report verbosity (see [Report verbosity](#report-verbosity)) |
 
 `validate` additionally takes `--against <oracle>` (default `glproc`); `scale`
@@ -295,9 +311,13 @@ inputs were actually measured, absent otherwise:
     profiler number carries authority it would not have earned here.
 - **hypotheses** — cross-signal root-cause patterns, phrased as what the data
   is *consistent with*, never as verdicts.
-- **energy** — Joules/token via Linux RAPL (powercap sysfs) when readable;
-  never estimated from TDP. Not available on Windows/macOS (RAPL needs a
-  kernel driver there, and glbench will not pretend otherwise).
+- **energy** — host Joules/token via Linux RAPL (powercap sysfs) when readable,
+  never estimated from TDP; not available on Windows/macOS or in most containers.
+  GPU Joules/token come from the card's own counter.
+- **time to first token** — request start to the first streamed token, which
+  includes tokenizing the prompt.
+- **model identity** — the SHA-256 of the model file, hashed after the measured
+  iterations.
 - **parity** (`validate` only) — matching-prefix token length against the
   oracle engine under forced-greedy decoding, plus a pass/fail exit code.
 - **scaling** (`scale` only) — `linear` / `sub-linear` / `saturating` /
