@@ -2,7 +2,7 @@
 //!
 //! Subcommands:
 //!   glbench run     --engine <name> --model <path> [options]   run a benchmark
-//!   glbench ab      --engine <name> --model <A> --model <B>    A/B N models in one command
+//! //!   glbench ab      --engine <name> --model <A> --model <B>    A/B N models, both orders
 //!   glbench compare <baseline.json> <candidate.json>           diff two runs
 //!   glbench validate --engine <name> --model <path> --against <oracle>
 //!                                                               numerical parity vs an oracle engine
@@ -162,6 +162,8 @@ usage:
                    first 50 generated tokens against it, folding the result into
                    the validation report; skipped, not just trivial, when the
                    oracle equals --engine)
+                  (--no-gpu-sampling leaves only the GPU energy counter, with
+                   no thread beside the measured loop)
   glbench ab      --engine <name> --model <baseline> --model <candidate> [...]
                   (same options as run; every model runs under the identical
                    workload forward and then in reverse, A B B A, so a machine
@@ -411,6 +413,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             }
             "--out" => out_path = Some(PathBuf::from(value(&mut i)?)),
             "--verify-against" => spec.verify_against = Some(value(&mut i)?),
+            "--no-gpu-sampling" => spec.sample_gpu = false,
             "--null-semantics" => {
                 let v = value(&mut i)?;
                 null_semantics = ENNullSemantics::from_str(&v)

@@ -30,6 +30,7 @@ pub mod kernels;
 pub mod kv_cache;
 pub mod loader;
 pub mod model;
+pub mod nvml;
 pub mod repack;
 pub mod runner;
 pub mod sampler;

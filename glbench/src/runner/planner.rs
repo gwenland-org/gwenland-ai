@@ -20,6 +20,7 @@ use crate::engine::adapter::EngineAdapter;
 use crate::engine::model_probe::ModelProbe;
 use crate::environment::hardware::EnvironmentSnapshot;
 use crate::environment::power::EnergyMeter;
+use crate::measurement::gpu::VLGpuMonitor;
 use crate::validation::integrity;
 
 /// A progress callback: `(phase, iteration, total)` — lets the CLI print a
@@ -95,6 +96,7 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     let cpu_time_before = crate::measurement::cpu::process_cpu_time();
     let wall_before = std::time::Instant::now();
     let meter = EnergyMeter::start();
+    let gpu_monitor = adapter.gpu_monitor().map(|nvml| VLGpuMonitor::start(nvml, spec.sample_gpu));
     let mut measurements = MeasurementSet::default();
     // One clock reading per measured iteration, for `avg_mhz` below — coarser
     // than continuous sampling would be, but representative of the run
@@ -111,6 +113,7 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
         }
     }
     measurements.energy_joules = meter.and_then(EnergyMeter::stop);
+    measurements.gpu = gpu_monitor.map(VLGpuMonitor::finish);
     measurements.cold = cold;
     // Process high-water-mark RSS, read once after the measured phase (the
     // OS already tracks the peak — no sampling loop needed). Necessarily

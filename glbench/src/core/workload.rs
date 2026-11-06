@@ -92,6 +92,9 @@ pub struct WorkloadSpec {
     /// changes the measurement mode to diagnostic-only because instrumentation
     /// can perturb wall time.
     pub instrument_engine: bool,
+    /// Sample the GPU during the measured iterations. Off leaves only the
+    /// energy counter's two readings, for proving the sampler costs nothing.
+    pub sample_gpu: bool,
 }
 
 impl WorkloadSpec {
@@ -126,6 +129,7 @@ impl Default for WorkloadSpec {
             cot_mode: None,
             verify_against: None,
             instrument_engine: false,
+            sample_gpu: true,
         }
     }
 }
@@ -158,6 +162,7 @@ impl ToJson for WorkloadSpec {
                 },
             ),
             ("instrument_engine", Json::Bool(self.instrument_engine)),
+            ("sample_gpu", Json::Bool(self.sample_gpu)),
         ])
     }
 }
@@ -193,6 +198,7 @@ impl FromJson for WorkloadSpec {
                 .get("instrument_engine")
                 .and_then(Json::as_bool)
                 .unwrap_or(false),
+            sample_gpu: v.get("sample_gpu").and_then(Json::as_bool).unwrap_or(true),
         })
     }
 }

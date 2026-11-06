@@ -81,6 +81,12 @@ mod sys {
         fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
     }
 
+    pub fn open_named(name: &std::ffi::CStr) -> *mut c_void {
+        // SAFETY: NUL-terminated by construction; a null return means the
+        // library is not installed.
+        unsafe { LoadLibraryA(name.as_ptr().cast()) }
+    }
+
     pub fn open() -> *mut c_void {
         // SAFETY: NUL-terminated literal; LoadLibraryA has no other
         // preconditions. A null return means "driver not installed".
@@ -98,6 +104,11 @@ mod sys {
 mod sys {
     use std::ffi::c_void;
 
+    pub fn open_named(name: &std::ffi::CStr) -> *mut c_void {
+        // SAFETY: NUL-terminated by construction; dlopen tolerates missing files.
+        unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_NOW) }
+    }
+
     pub fn open() -> *mut c_void {
         // SAFETY: NUL-terminated literals; dlopen tolerates missing files.
         unsafe {
@@ -114,6 +125,12 @@ mod sys {
         // SAFETY: lib is a live dlopen handle; name is NUL-terminated.
         unsafe { libc::dlsym(lib, name.as_ptr().cast()) }
     }
+}
+
+/// Load the first library in `names` that exists. Never unloaded, for the same
+/// reason as [`Lib`]: the function pointers resolved from it live as long.
+pub(crate) fn load_library(names: &[&std::ffi::CStr]) -> Option<*mut c_void> {
+    names.iter().map(|name| sys::open_named(name)).find(|lib| !lib.is_null())
 }
 
 /// Resolved CUDA Driver API entry points. One instance per process,
@@ -170,6 +187,7 @@ pub struct DriverApi {
 
     /// Optional because this is diagnostic metadata. A driver that cannot
     /// expose compiled function resources must still be able to run kernels.
+    pub cu_device_get_pci_bus_id: Option<unsafe extern "system" fn(*mut u8, i32, CUdevice) -> CUresult>,
     pub cu_func_get_attribute:
         Option<unsafe extern "system" fn(*mut i32, i32, CUfunction) -> CUresult>,
 
@@ -256,7 +274,7 @@ fn sym_v2<T>(lib: *mut c_void, v2: &[u8], v1: &[u8]) -> Result<T, GlError> {
 /// Resolve an OPTIONAL symbol: `None` when the driver does not export it,
 /// instead of failing the whole load. Used for the CUDA Graph entry points,
 /// which gate an optimization rather than a capability.
-fn sym_opt<T>(lib: *mut c_void, names: &[&[u8]]) -> Option<T> {
+pub(crate) fn sym_opt<T>(lib: *mut c_void, names: &[&[u8]]) -> Option<T> {
     names.iter().find_map(|n| sym(lib, n).ok())
 }
 
@@ -324,6 +342,7 @@ impl DriverApi {
             cu_memcpy_dtod: sym_v2(lib, b"cuMemcpyDtoD_v2\0", b"cuMemcpyDtoD\0")?,
             cu_mem_get_info: sym_v2(lib, b"cuMemGetInfo_v2\0", b"cuMemGetInfo\0")?,
             cu_launch_kernel: sym(lib, b"cuLaunchKernel\0")?,
+            cu_device_get_pci_bus_id: sym_opt(lib, &[b"cuDeviceGetPCIBusId\0"]),
             cu_func_get_attribute: sym_opt(lib, &[b"cuFuncGetAttribute\0"]),
 
             cu_stream_create: sym(lib, b"cuStreamCreate\0")?,

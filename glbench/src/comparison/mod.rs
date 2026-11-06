@@ -18,6 +18,9 @@ pub mod trend;
 use crate::core::session::BenchmarkSession;
 use runs::ComparisonReport;
 
+/// A mean SM clock this far apart is worth a sentence in a comparison.
+const CLOCK_NOTE_THRESHOLD: f64 = 0.03;
+
 /// Compare two sessions along whichever axis actually separates them.
 ///
 /// A regression verdict only means something between two runs of the same
@@ -59,6 +62,14 @@ pub fn compare_along_axis(
             "Also differs in {}, so this delta cannot be attributed to one cause.",
             also.join(" and ")
         ));
+    }
+    let clock = |s: &BenchmarkSession| s.measurements.gpu.as_ref()?.sm_clock_mhz.map(|c| c.mean);
+    if let (Some(a), Some(b)) = (clock(baseline), clock(candidate)) {
+        if a > 0.0 && (b / a - 1.0).abs() > CLOCK_NOTE_THRESHOLD {
+            report.notes.push(format!(
+                "Mean SM clock differs ({a:.0} vs {b:.0} MHz): the card ran at a different speed."
+            ));
+        }
     }
     let storage = |s: &'_ BenchmarkSession| s.environment.hardware.storage.model_sha256.clone();
     if let (Some(a), Some(b)) = (storage(baseline), storage(candidate)) {

@@ -26,6 +26,22 @@ pub struct GpuInfo {
     pub measured_bandwidth_gbs: Option<f64>,
     /// Theoretical peak INT8/FP16 compute in TOPS/TFLOPS, if known.
     pub peak_compute_tops: Option<f64>,
+    /// Streaming multiprocessors.
+    pub sm_count: Option<u32>,
+    /// CUDA version the driver supports, e.g. `"13.0"`.
+    pub cuda_version: Option<String>,
+    /// Display driver version, e.g. `"580.82"`.
+    pub driver_version: Option<String>,
+    /// Video BIOS version.
+    pub vbios_version: Option<String>,
+    /// Enforced board power limit, watts.
+    pub power_limit_w: Option<f64>,
+    /// Highest SM clock the board allows, MHz.
+    pub max_sm_clock_mhz: Option<u32>,
+    /// Highest memory clock the board allows, MHz.
+    pub max_mem_clock_mhz: Option<u32>,
+    /// PCIe link now and at best, e.g. `"gen3 x16 (max gen3 x16)"`.
+    pub pcie_link: Option<String>,
 }
 
 impl GpuInfo {

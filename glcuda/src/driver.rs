@@ -638,6 +638,18 @@ impl Cuda {
         }
     }
 
+    /// The device's PCI bus id, the identity NVML shares with CUDA.
+    pub fn pci_bus_id(&self) -> Option<String> {
+        let get = self.api.cu_device_get_pci_bus_id?;
+        let mut buffer = [0u8; 32];
+        // SAFETY: the buffer and its stated length match, and the device is live.
+        if unsafe { get(buffer.as_mut_ptr(), buffer.len() as i32, self.device) } != CUDA_SUCCESS {
+            return None;
+        }
+        let end = buffer.iter().position(|&b| b == 0)?;
+        Some(String::from_utf8_lossy(&buffer[..end]).into_owned())
+    }
+
     /// Allocate raw VRAM. Cold path only — the hot path never allocates
     /// (ArchGLML_X2 §8 Principle 3); [`crate::buffer::BackendBuffer`] calls
     /// this exactly once per engine init.

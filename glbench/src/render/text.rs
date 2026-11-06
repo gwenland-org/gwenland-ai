@@ -168,6 +168,9 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
             dec.median,
         ));
     }
+    if let Some(gpu) = &m.gpu {
+        s.push_str(&gpu_run(gpu, hw, m.gpu_joules_per_token()));
+    }
     let ttft = m.ttft_ms_samples();
     if !ttft.is_empty() {
         let ttft = Stats::from_samples(&ttft);
@@ -258,6 +261,47 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
         ),
         ENVerbosity::Greedy => s.push_str(&greedy(session)),
         ENVerbosity::Quiet | ENVerbosity::Verbose => {}
+    }
+    s
+}
+
+/// What the GPU did during the measured iterations.
+fn gpu_run(
+    gpu: &crate::measurement::gpu::VLGpuRunStats,
+    hw: &crate::environment::hardware::HardwareSnapshot,
+    joules_per_token: Option<f64>,
+) -> String {
+    let mut parts = Vec::new();
+    if let Some(c) = gpu.sm_clock_mhz {
+        let of = hw.gpu.max_sm_clock_mhz.map_or(String::new(), |max| format!(" of {max}"));
+        parts.push(format!("SM {:.0} MHz ({:.0}-{:.0}{of})", c.mean, c.min, c.max));
+    }
+    if let Some(c) = gpu.mem_clock_mhz {
+        parts.push(format!("memory {:.0} MHz", c.mean));
+    }
+    if let Some(t) = gpu.temperature_c {
+        parts.push(format!("{:.0} C (max {:.0})", t.mean, t.max));
+    }
+    if let Some(p) = gpu.power_w {
+        let of = hw.gpu.power_limit_w.map_or(String::new(), |max| format!(" of {max:.0}"));
+        parts.push(format!("{:.0} W{of}", p.mean));
+    }
+    if let Some(u) = gpu.gpu_util_pct {
+        parts.push(format!("busy {:.0}%", u.mean));
+    }
+    if let Some(v) = gpu.vram_used_peak_bytes {
+        parts.push(format!("VRAM {:.2} GiB", bytes_to_gib(v)));
+    }
+    let mut s = String::new();
+    if !parts.is_empty() {
+        s.push_str(&format!("gpu: {}\n", parts.join(" | ")));
+    }
+    if let Some(j) = gpu.energy_joules {
+        s.push_str(&format!("gpu energy: {j:.1} J"));
+        if let Some(per_token) = joules_per_token {
+            s.push_str(&format!(" ({per_token:.3} J/generated token)"));
+        }
+        s.push('\n');
     }
     s
 }
@@ -404,6 +448,35 @@ fn greedy(session: &BenchmarkSession) -> String {
             hw.gpu.peak_bandwidth_gbs.map_or("?".to_string(), |v| format!("{v:.0} GB/s (spec)")),
             hw.gpu.peak_compute_tops.map_or("?".to_string(), |v| format!("{v:.0} TOPS (spec)")),
         ));
+    }
+    if hw.gpu.is_present() {
+        let or_unknown = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".to_string());
+        s.push_str(&format!(
+            "  {} SMs | CUDA {} | driver {} | vbios {} | max clocks SM {} / memory {} MHz | pcie {}\n",
+            hw.gpu.sm_count.map_or("?".to_string(), |n| n.to_string()),
+            or_unknown(&hw.gpu.cuda_version),
+            or_unknown(&hw.gpu.driver_version),
+            or_unknown(&hw.gpu.vbios_version),
+            hw.gpu.max_sm_clock_mhz.map_or("?".to_string(), |n| n.to_string()),
+            hw.gpu.max_mem_clock_mhz.map_or("?".to_string(), |n| n.to_string()),
+            or_unknown(&hw.gpu.pcie_link),
+        ));
+    }
+    if let Some(gpu) = &session.measurements.gpu {
+        s.push_str(&format!("  gpu samples {}", gpu.samples));
+        if let Some((best, worst)) = gpu.pstate_range {
+            s.push_str(&format!(" | P-state P{best}-P{worst}"));
+        }
+        if let Some(c) = gpu.mem_clock_mhz {
+            s.push_str(&format!(" | memory clock {:.0}-{:.0} MHz", c.min, c.max));
+        }
+        if let Some(u) = gpu.mem_util_pct {
+            s.push_str(&format!(" | memory busy {:.0}%", u.mean));
+        }
+        s.push('\n');
+        for (reason, samples) in &gpu.clock_reasons {
+            s.push_str(&format!("  clock reason {reason}: {samples} samples\n"));
+        }
     }
     s.push_str(&format!(
         "  build {} | model file {}\n",

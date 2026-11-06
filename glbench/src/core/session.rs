@@ -1012,6 +1012,9 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
     let hw = v.get("hardware");
     let cpu = hw.and_then(|h| h.get("cpu"));
     let gpu = hw.and_then(|h| h.get("gpu"));
+    let gpu_num = |k: &str| gpu.and_then(|g| g.get(k)).and_then(|n| n.as_f64());
+    let gpu_str =
+        |k: &str| gpu.and_then(|g| g.get(k)).and_then(|s| s.as_str()).map(String::from);
     let storage = hw.and_then(|h| h.get("storage"));
     let thermal = hw.and_then(|h| h.get("thermal"));
     let rt = v.get("runtime");
@@ -1064,6 +1067,14 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
                 .and_then(|g| g.get("measured_bandwidth_gbs"))
                 .and_then(|n| n.as_f64()),
             peak_compute_tops: gpu.and_then(|g| g.get("peak_compute_tops")).and_then(|n| n.as_f64()),
+            sm_count: gpu_num("sm_count").map(|n| n as u32),
+            cuda_version: gpu_str("cuda_version"),
+            driver_version: gpu_str("driver_version"),
+            vbios_version: gpu_str("vbios_version"),
+            power_limit_w: gpu_num("power_limit_w"),
+            max_sm_clock_mhz: gpu_num("max_sm_clock_mhz").map(|n| n as u32),
+            max_mem_clock_mhz: gpu_num("max_mem_clock_mhz").map(|n| n as u32),
+            pcie_link: gpu_str("pcie_link"),
         },
         memory: MemoryInfo::default(),
         storage: StorageInfo {

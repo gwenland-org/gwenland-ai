@@ -27,6 +27,8 @@ use crate::core::workload::WorkloadSpec;
 use crate::engine::metadata::EngineMetadata;
 use crate::engine::observation::VLObservationPlan;
 use crate::environment::gpu::GpuInfo;
+use glcuda::nvml::Nvml;
+use std::sync::Arc;
 
 /// The set of engine names glbench can construct. Kept explicit rather than a
 /// registry so an unavailable backend is a clear error, not a silent fallback.
@@ -61,6 +63,8 @@ pub struct EngineAdapter {
     backend: Backend,
     metadata: EngineMetadata,
     gpu: GpuInfo,
+    /// NVML for the device, when there is one and it opened.
+    monitor: Option<Arc<Nvml>>,
     observation: VLObservationPlan,
 }
 
@@ -76,7 +80,7 @@ impl EngineAdapter {
             return Self::load_gllm(spec, observation);
         }
 
-        let (engine, gpu) = build_engine(&spec.engine)?;
+        let (engine, gpu, monitor) = build_engine(&spec.engine)?;
         let spec_meta = engine.capabilities();
         let metadata = EngineMetadata {
             name: spec_meta.name.to_string(),
@@ -94,6 +98,7 @@ impl EngineAdapter {
             backend: Backend::Tokenized(Box::new(runtime)),
             metadata,
             gpu,
+            monitor,
             observation,
         })
     }
@@ -123,6 +128,7 @@ impl EngineAdapter {
             backend: Backend::RawTokens { engine: Box::new(engine), vocab_size },
             metadata,
             gpu: GpuInfo::default(),
+            monitor: None,
             observation,
         })
     }
@@ -141,6 +147,11 @@ impl EngineAdapter {
     /// by the runner from the GGUF header where available.
     pub fn metadata(&self) -> &EngineMetadata {
         &self.metadata
+    }
+
+    /// NVML for the device the engine runs on; `None` on CPU engines.
+    pub fn gpu_monitor(&self) -> Option<Arc<Nvml>> {
+        self.monitor.clone()
     }
 
     /// GPU facts reported by the engine's backend probe (empty for CPU engines).
@@ -311,15 +322,17 @@ fn synthetic_token_ids(spec: &WorkloadSpec, vocab_size_hint: Option<usize>) -> V
 /// [`EngineAdapter::load_gllm`], since it does not go through `Runtime`).
 /// Adding a backend (glvulkan, glmetal) means one arm here — nothing else in
 /// glbench changes.
-fn build_engine(name: &str) -> Result<(Box<dyn GlEngine>, GpuInfo), GlError> {
+fn build_engine(
+    name: &str,
+) -> Result<(Box<dyn GlEngine>, GpuInfo, Option<Arc<Nvml>>), GlError> {
     match name {
-        "glproc" => Ok((Box::new(glproc::GlprocEngine::new()), GpuInfo::default())),
+        "glproc" => Ok((Box::new(glproc::GlprocEngine::new()), GpuInfo::default(), None)),
         "glcuda" => {
             // The CUDA engine self-probes at init(); reflect its device facts
             // into a GpuInfo (with a published-ceiling lookup) so the analysis
             // layer has a bandwidth ceiling to compare against.
-            let gpu = probe_cuda_gpu();
-            Ok((Box::new(glcuda::GlcudaEngine::new()), gpu))
+            let (gpu, monitor) = probe_cuda_gpu();
+            Ok((Box::new(glcuda::GlcudaEngine::new()), gpu, monitor))
         }
         other => Err(GlError::Engine(format!(
             "unknown engine '{other}' (known: {})",
@@ -331,7 +344,7 @@ fn build_engine(name: &str) -> Result<(Box<dyn GlEngine>, GpuInfo), GlError> {
 /// Probe the CUDA device for its name/compute/memory and attach a published
 /// bandwidth ceiling if the device is in the capability table. Returns an empty
 /// [`GpuInfo`] if no CUDA device is present.
-fn probe_cuda_gpu() -> GpuInfo {
+fn probe_cuda_gpu() -> (GpuInfo, Option<Arc<Nvml>>) {
     use crate::engine::capability;
 
     match glcuda::driver::Cuda::probe() {
@@ -348,7 +361,17 @@ fn probe_cuda_gpu() -> GpuInfo {
                     None
                 }
             };
-            GpuInfo {
+            let monitor = Nvml::open(cuda.pci_bus_id().as_deref());
+            let state = monitor.as_ref().map(Nvml::static_info).unwrap_or_default();
+            let pcie_link = state.pcie_gen.zip(state.pcie_width).map(|(gen, width)| {
+                match state.pcie_max_gen.zip(state.pcie_max_width) {
+                    Some((max_gen, max_width)) => {
+                        format!("gen{gen} x{width} (max gen{max_gen} x{max_width})")
+                    }
+                    None => format!("gen{gen} x{width}"),
+                }
+            });
+            let gpu = GpuInfo {
                 name: Some(i.name.clone()),
                 backend: Some("cuda".to_string()),
                 compute: Some(format!("sm_{}{}", i.sm_major, i.sm_minor)),
@@ -356,9 +379,22 @@ fn probe_cuda_gpu() -> GpuInfo {
                 peak_bandwidth_gbs: ceiling.map(|c| c.peak_bandwidth_gbs),
                 measured_bandwidth_gbs,
                 peak_compute_tops: ceiling.map(|c| c.peak_int8_tops),
-            }
+                sm_count: u32::try_from(i.sm_count).ok(),
+                cuda_version: Some(format!(
+                    "{}.{}",
+                    i.driver_version / 1000,
+                    i.driver_version % 1000 / 10
+                )),
+                driver_version: state.driver_version,
+                vbios_version: state.vbios_version,
+                power_limit_w: state.power_limit_mw.map(|mw| f64::from(mw) / 1e3),
+                max_sm_clock_mhz: state.max_sm_clock_mhz,
+                max_mem_clock_mhz: state.max_mem_clock_mhz,
+                pcie_link,
+            };
+            (gpu, monitor.map(Arc::new))
         }
-        Err(_) => GpuInfo::default(),
+        Err(_) => (GpuInfo::default(), None),
     }
 }
 

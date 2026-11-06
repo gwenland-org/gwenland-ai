@@ -112,6 +112,9 @@ pub struct MeasurementSet {
     /// 100 mean on a multi-core budget). `None` when the OS-level process
     /// CPU-time counters were not readable.
     pub cpu_utilization_pct: Option<f64>,
+    /// What the GPU was doing across the measured iterations. `None` on a CPU
+    /// run, or when NVML could not be opened.
+    pub gpu: Option<crate::measurement::gpu::VLGpuRunStats>,
 }
 
 impl MeasurementSet {
@@ -133,6 +136,13 @@ impl MeasurementSet {
     /// Prefill throughput samples across all iterations, tokens/second.
     pub fn prefill_tps_samples(&self) -> Vec<f64> {
         self.iterations.iter().map(|m| m.prefill_tps()).collect()
+    }
+
+    /// GPU Joules per generated token across the measured iterations.
+    pub fn gpu_joules_per_token(&self) -> Option<f64> {
+        let tokens: u64 = self.iterations.iter().map(|i| i.generated_tokens).sum();
+        let j = self.gpu.as_ref()?.energy_joules?;
+        (tokens > 0).then(|| j / tokens as f64)
     }
 
     /// Time-to-first-token samples across the iterations that have one, ms.
@@ -184,6 +194,7 @@ impl ToJson for MeasurementSet {
             ),
             ("energy_joules", opt_num(self.energy_joules)),
             ("cpu_utilization_pct", opt_num(self.cpu_utilization_pct)),
+            ("gpu", self.gpu.as_ref().map_or(Json::Null, |g| g.to_json())),
         ])
     }
 }
@@ -219,6 +230,10 @@ impl FromJson for MeasurementSet {
             },
             energy_joules: v.get("energy_joules").and_then(|n| n.as_f64()),
             cpu_utilization_pct: v.get("cpu_utilization_pct").and_then(|n| n.as_f64()),
+            gpu: match v.get("gpu") {
+                None | Some(Json::Null) => None,
+                Some(g) => Some(crate::measurement::gpu::VLGpuRunStats::from_json(g)?),
+            },
         })
     }
 }
@@ -287,6 +302,7 @@ mod tests {
             }],
             energy_joules: Some(41.5),
             cpu_utilization_pct: Some(65.5),
+            gpu: None,
         };
         let back = MeasurementSet::from_json(&set.to_json()).unwrap();
         assert_eq!(back.iterations, set.iterations);

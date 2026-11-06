@@ -95,10 +95,27 @@ pub fn validate(session: &BenchmarkSession) -> ValidationReport {
     check_integrity(session, &mut report);
     check_thermal(session, &mut report);
     check_workload_fit(session, &mut report);
+    check_gpu_limits(session, &mut report);
     super::deterministic::check(session, &mut report);
     super::reproducibility::check(session, &mut report);
     super::memory::check(session, &mut report);
     report
+}
+
+/// Flag a GPU that was held back during the run. The numbers are real, but they
+/// describe a limited card, and a comparison against an unlimited run measures
+/// the limit.
+fn check_gpu_limits(session: &BenchmarkSession, report: &mut ValidationReport) {
+    let Some(gpu) = &session.measurements.gpu else {
+        return;
+    };
+    for (reason, samples) in gpu.limiting_reasons() {
+        report.push(
+            Severity::Warning,
+            "gpu",
+            format!("GPU clocks limited by {reason} in {samples} of {} samples", gpu.samples),
+        );
+    }
 }
 
 /// Does the workload measure what its kind claims? A short prompt reports launch

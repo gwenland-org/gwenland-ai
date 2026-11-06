@@ -4,6 +4,7 @@
 
 pub mod bandwidth;
 pub mod cpu;
+pub mod gpu;
 pub mod memory;
 pub mod raw;
 pub mod throughput;
