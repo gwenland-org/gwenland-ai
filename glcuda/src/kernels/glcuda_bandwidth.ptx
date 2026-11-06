@@ -1,0 +1,106 @@
+//
+// glcuda_bandwidth.ptx - device memory read probe for glbench's decode ceiling.
+//
+// Its own module because it is a measuring instrument, not an inference
+// kernel: it is loaded, run and dropped before the engine exists.
+//
+.version 7.0
+.target sm_70
+.address_size 64
+
+// gl_read_bandwidth: stream a buffer through the memory system and do nothing
+// with it, so the elapsed time is the read rate of device memory.
+//
+// launch:  grid = any, block = any; every thread reads rounds * 4 * 16 B.
+//          The buffer must hold exactly grid * block * rounds * 64 bytes.
+// reads:   src, coalesced: adjacent threads read adjacent 16 B vectors, and
+//          the four loads of a round are one whole-grid stride apart so they
+//          stay independent and in flight together.
+// writes:  out, only if the running XOR equals an arbitrary constant. The
+//          branch exists so the loads have an observable use and cannot be
+//          removed; it says nothing about the data, which may be uninitialized.
+// tolerance class: none, no numerical output.
+.visible .entry gl_read_bandwidth(
+    .param .u64 p_src,
+    .param .u64 p_out,
+    .param .u32 p_rounds
+)
+{
+    .reg .pred %p_more;
+    .reg .pred %p_hit;
+    .reg .b32 %r_tid;
+    .reg .b32 %r_cta;
+    .reg .b32 %r_ntid;
+    .reg .b32 %r_ncta;
+    .reg .b32 %r_gtid;
+    .reg .b32 %r_threads;
+    .reg .b32 %r_left;
+    .reg .b32 %r_acc;
+    .reg .b32 %r_v<16>;
+    .reg .b64 %rd_src;
+    .reg .b64 %rd_out;
+    .reg .b64 %rd_off;
+    .reg .b64 %rd_step;
+    .reg .b64 %rd_step4;
+    .reg .b64 %rd_a0;
+    .reg .b64 %rd_a1;
+    .reg .b64 %rd_a2;
+    .reg .b64 %rd_a3;
+
+    ld.param.u64 %rd_src, [p_src];
+    ld.param.u64 %rd_out, [p_out];
+    ld.param.u32 %r_left, [p_rounds];
+    cvta.to.global.u64 %rd_src, %rd_src;
+    cvta.to.global.u64 %rd_out, %rd_out;
+
+    mov.u32 %r_tid, %tid.x;
+    mov.u32 %r_cta, %ctaid.x;
+    mov.u32 %r_ntid, %ntid.x;
+    mov.u32 %r_ncta, %nctaid.x;
+    mad.lo.u32 %r_gtid, %r_cta, %r_ntid, %r_tid;
+    mul.lo.u32 %r_threads, %r_ncta, %r_ntid;
+
+    mul.wide.u32 %rd_off, %r_gtid, 16;
+    mul.wide.u32 %rd_step, %r_threads, 16;
+    shl.b64 %rd_step4, %rd_step, 2;
+    add.u64 %rd_a0, %rd_src, %rd_off;
+    add.u64 %rd_a1, %rd_a0, %rd_step;
+    add.u64 %rd_a2, %rd_a1, %rd_step;
+    add.u64 %rd_a3, %rd_a2, %rd_step;
+    mov.u32 %r_acc, 0;
+
+BW_ROUND:
+    ld.global.v4.u32 {%r_v0, %r_v1, %r_v2, %r_v3}, [%rd_a0];
+    ld.global.v4.u32 {%r_v4, %r_v5, %r_v6, %r_v7}, [%rd_a1];
+    ld.global.v4.u32 {%r_v8, %r_v9, %r_v10, %r_v11}, [%rd_a2];
+    ld.global.v4.u32 {%r_v12, %r_v13, %r_v14, %r_v15}, [%rd_a3];
+    xor.b32 %r_v0, %r_v0, %r_v1;
+    xor.b32 %r_v2, %r_v2, %r_v3;
+    xor.b32 %r_v4, %r_v4, %r_v5;
+    xor.b32 %r_v6, %r_v6, %r_v7;
+    xor.b32 %r_v8, %r_v8, %r_v9;
+    xor.b32 %r_v10, %r_v10, %r_v11;
+    xor.b32 %r_v12, %r_v12, %r_v13;
+    xor.b32 %r_v14, %r_v14, %r_v15;
+    xor.b32 %r_v0, %r_v0, %r_v2;
+    xor.b32 %r_v4, %r_v4, %r_v6;
+    xor.b32 %r_v8, %r_v8, %r_v10;
+    xor.b32 %r_v12, %r_v12, %r_v14;
+    xor.b32 %r_v0, %r_v0, %r_v4;
+    xor.b32 %r_v8, %r_v8, %r_v12;
+    xor.b32 %r_v0, %r_v0, %r_v8;
+    xor.b32 %r_acc, %r_acc, %r_v0;
+    add.u64 %rd_a0, %rd_a0, %rd_step4;
+    add.u64 %rd_a1, %rd_a1, %rd_step4;
+    add.u64 %rd_a2, %rd_a2, %rd_step4;
+    add.u64 %rd_a3, %rd_a3, %rd_step4;
+    sub.u32 %r_left, %r_left, 1;
+    setp.ne.u32 %p_more, %r_left, 0;
+    @%p_more bra BW_ROUND;
+
+    setp.eq.u32 %p_hit, %r_acc, 0x5A17C0DE;
+    @!%p_hit bra BW_DONE;
+    st.global.u32 [%rd_out], %r_acc;
+BW_DONE:
+    ret;
+}

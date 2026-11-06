@@ -21,6 +21,9 @@ pub struct GpuInfo {
     /// This is a *hardware capability*, used later as a ceiling — not a
     /// measured value.
     pub peak_bandwidth_gbs: Option<f64>,
+    /// Device read bandwidth in GB/s, measured on this card at engine load by
+    /// `glcuda::bandwidth`. `None` when the probe could not run.
+    pub measured_bandwidth_gbs: Option<f64>,
     /// Theoretical peak INT8/FP16 compute in TOPS/TFLOPS, if known.
     pub peak_compute_tops: Option<f64>,
 }

@@ -16,7 +16,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use glbench::comparison::runs;
 use glbench::core::workload::{WorkloadKind, WorkloadSpec};
 use glbench::export::{csv, markdown};
 #[cfg(feature = "gllm-bench")]
@@ -59,6 +58,8 @@ fn main() -> ExitCode {
         Some("accuracy-vs-perf") => cmd_accuracy_vs_perf(&args[1..]),
         Some("inspect") => cmd_inspect(&args[1..]),
         Some("export") => cmd_export(&args[1..]),
+        Some("trend") => cmd_trend(&args[1..]),
+        Some("list") => cmd_list(&args[1..]),
         Some("join") => cmd_join(&args[1..]),
         #[cfg(feature = "train-bench")]
         Some("train") => cmd_train(&args[1..], glbench::core::mode::ENSessionMode::TrainingOnly),
@@ -166,6 +167,16 @@ usage:
                    first — sequential on purpose: parallel runs would contend
                    for bandwidth and corrupt every number)
   glbench compare <baseline.json> <candidate.json> [--threshold F]
+                  (a regression verdict only between runs of one setup; two
+                   engines, devices or quantizations are reported as that
+                   comparison instead. Profiled runs also show how each stage
+                   moved. Training archives add a configuration-first section
+                   under --features train-bench)
+  glbench trend   <oldest.json> <...> <newest.json> [--threshold F]
+                  (throughput across an ordered series of archives, with the
+                   first-to-last verdict and the largest drop)
+  glbench list    <dir>
+                  (the session archives in a directory, one line each)
   glbench validate --engine <name> --model <path> --against <oracle>
                   [--prompt <text>] [--tokens N]
                   (runs <engine> and <oracle> on the identical prompt under
@@ -246,6 +257,15 @@ bit profiling (run):
   --bit-scope <scope>         weights (default) | gradients | optimizer.
                               weights needs --features gllm-bench; the two
                               training scopes are Wave 4 and say so.
+
+workload kinds (--kind):
+  end_to_end      prefill then decode, as asked (the default)
+  prefill         generates one token, so only prefill is reported; --tokens
+                  is ignored
+  decode          starts from a short prompt unless --prompt is given, so the
+                  figure is not decode at a long context
+  stress          32 measured iterations unless --iters is given; reports
+                  first-quarter against last-quarter decode and warns on a sag
 
 report verbosity (run, ab, inspect):
   -q, --quiet     one line: prefill/decode medians, authority, ceiling, validation
@@ -340,6 +360,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     let mut models = Vec::new();
     let mut out_path: Option<PathBuf> = None;
     let mut prompt_set = false;
+    let mut iters_set = false;
     let mut null_semantics = ENNullSemantics::default();
     // `--profile bits` and `--bit-scope` are separate flags so the scope can be
     // named before or after the profile is asked for, in either order.
@@ -365,7 +386,10 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
             "--tokens" => spec.max_new_tokens = parse_num(&value(&mut i)?, &flag)?,
             "--cold-iters" => spec.cold_iters = parse_num(&value(&mut i)?, &flag)?,
             "--warmup" => spec.warmup_iters = parse_num(&value(&mut i)?, &flag)?,
-            "--iters" => spec.measure_iters = parse_num(&value(&mut i)?, &flag)?,
+            "--iters" => {
+                spec.measure_iters = parse_num(&value(&mut i)?, &flag)?;
+                iters_set = true;
+            }
             "--temperature" => spec.temperature = parse_f32(&value(&mut i)?, &flag)?,
             "--seed" => spec.seed = parse_num::<u64>(&value(&mut i)?, &flag)?,
             "--kind" => {
@@ -428,8 +452,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, String> {
     };
 
     if !prompt_set {
-        // A representative default prompt (~long enough to exercise prefill).
-        spec.prompt = default_prompt();
+        // A representative default prompt (~long enough to exercise prefill),
+        // except for decode, whose cost grows with the context it starts from.
+        spec.prompt = match spec.kind {
+            WorkloadKind::Decode => glbench::runner::decode::SHORT_PROMPT.to_string(),
+            _ => default_prompt(),
+        };
+    }
+    if spec.kind == WorkloadKind::Stress && !iters_set {
+        spec.measure_iters = glbench::runner::stress::DEFAULT_ITERS;
     }
     Ok(RunArgs { spec, models, out_path, null_semantics, bit_scope, verbosity })
 }
@@ -544,9 +575,9 @@ fn greedy_instrumented_pass(
         let _ = std::fs::remove_file(&instrumented_path);
     }
     print!("{}", greedy_observation_cost(production, &instrumented));
-    if let Some(t) = &instrumented.telemetry {
+    if instrumented.telemetry.is_some() {
         println!("\n== greedy: instrumented pass profile (diagnostic, not production) ==");
-        print!("{}", text::telemetry_report(t, instrumented.environment.hardware.cpu.read_bandwidth_gbs));
+        print!("{}", text::telemetry_report(&instrumented));
     }
     // A kept archive was already announced by the child's own "archived to".
     Ok(())
@@ -709,7 +740,7 @@ fn cmd_ab(args: &[String]) -> Result<(), String> {
     // ... then each candidate against the baseline (the deltas).
     let baseline = &sessions[0];
     for candidate in &sessions[1..] {
-        let report = runs::compare(baseline, candidate, 0.05);
+        let report = glbench::comparison::compare_along_axis(baseline, candidate, 0.05);
         print!("{}", text::comparison(&report));
         println!();
     }
@@ -736,8 +767,84 @@ fn cmd_compare(args: &[String]) -> Result<(), String> {
     }
     let baseline = archive::read(Path::new(positional[0]))?;
     let candidate = archive::read(Path::new(positional[1]))?;
-    let report = runs::compare(&baseline, &candidate, threshold);
+    let report = glbench::comparison::compare_along_axis(&baseline, &candidate, threshold);
     print!("{}", text::comparison(&report));
+    #[cfg(feature = "train-bench")]
+    if let (Some(a), Some(b)) = (&baseline.training, &candidate.training) {
+        print!("{}", render_training_comparison(&glbench::comparison::training::compare(a, b)));
+    }
+    Ok(())
+}
+
+/// Two training runs, configuration first: an outcome delta means nothing until
+/// the reader knows whether the runs were asked to do the same thing.
+#[cfg(feature = "train-bench")]
+fn render_training_comparison(c: &glbench::comparison::training::VLTrainingComparison) -> String {
+    let mut out = String::from("\ntraining comparison\n");
+    if c.config_deltas.is_empty() {
+        out.push_str("  configuration identical: a clean A/B\n");
+    }
+    for d in &c.config_deltas {
+        out.push_str(&format!("  {}: {} -> {}\n", d.field, d.baseline, d.candidate));
+    }
+    for (label, delta) in [
+        ("final loss", &c.final_loss),
+        ("best loss", &c.best_loss),
+        ("loss slope", &c.slope),
+        ("mean step ms", &c.mean_step_ms),
+        ("trainable parameters", &c.trainable_parameters),
+    ] {
+        out.push_str(&format!(
+            "  {label}: {:.6} -> {:.6} ({:+.1}%)\n",
+            delta.baseline,
+            delta.candidate,
+            delta.relative() * 100.0
+        ));
+    }
+    for note in &c.notes {
+        out.push_str(&format!("  - {note}\n"));
+    }
+    out
+}
+
+/// `glbench trend` — decode and prefill across an ordered series of archives.
+fn cmd_trend(args: &[String]) -> Result<(), String> {
+    let mut paths: Vec<&String> = Vec::new();
+    let mut threshold = 0.05;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--threshold" => {
+                i += 1;
+                threshold = parse_f64(args.get(i).ok_or("--threshold needs a value")?, "--threshold")?;
+            }
+            other if other.starts_with('-') => return Err(format!("unknown flag '{other}'")),
+            _ => paths.push(&args[i]),
+        }
+        i += 1;
+    }
+    if paths.len() < 2 {
+        return Err("trend needs at least two archive paths, oldest first".into());
+    }
+    let sessions = paths
+        .iter()
+        .map(|path| archive::read(Path::new(path)))
+        .collect::<Result<Vec<_>, _>>()?;
+    print!("{}", text::trend(&glbench::comparison::trend::trend(&sessions, threshold)));
+    Ok(())
+}
+
+/// `glbench list` — the session archives in a directory.
+fn cmd_list(args: &[String]) -> Result<(), String> {
+    let [dir] = args else {
+        return Err("list needs exactly one directory".into());
+    };
+    let entries = glbench::storage::manifest::list(Path::new(dir))?;
+    if entries.is_empty() {
+        println!("no session archives in {dir}");
+    } else {
+        print!("{}", text::manifest(&entries));
+    }
     Ok(())
 }
 
@@ -835,6 +942,9 @@ fn cmd_scale(args: &[String]) -> Result<(), String> {
         1 => a.spec.model_path = a.models.remove(0),
         _ => return Err("scale takes one --model".into()),
     }
+    if a.spec.kind == WorkloadKind::Prefill {
+        return Err("scale sweeps generated tokens, which --kind prefill pins to one".into());
+    }
 
     let report = scale::run_sweep(&a.spec, &axis_values, &progress).map_err(|e| e.to_string())?;
     print!("{}", text::sweep(&report));
@@ -873,6 +983,9 @@ fn cmd_thread_scale(args: &[String]) -> Result<(), String> {
         0 => return Err("--model is required".into()),
         1 => a.spec.model_path = a.models.remove(0),
         _ => return Err("thread-scale takes one --model".into()),
+    }
+    if a.spec.kind == WorkloadKind::Prefill {
+        return Err("thread-scale reports decode, which --kind prefill does not measure".into());
     }
     if a.spec.engine != "glproc" {
         return Err(format!(

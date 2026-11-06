@@ -12,6 +12,7 @@ pub fn compare_hardware(
     threshold: f64,
 ) -> ComparisonReport {
     let mut report = compare(baseline, candidate, threshold);
+    report.axis = Some("hardware");
     let a = device_label(baseline);
     let b = device_label(candidate);
     report
@@ -22,7 +23,7 @@ pub fn compare_hardware(
 
 /// The best available device label for a session: GPU name, else CPU model,
 /// else the OS/arch.
-fn device_label(s: &BenchmarkSession) -> String {
+pub(crate) fn device_label(s: &BenchmarkSession) -> String {
     let hw = &s.environment.hardware;
     if let Some(name) = &hw.gpu.name {
         name.clone()

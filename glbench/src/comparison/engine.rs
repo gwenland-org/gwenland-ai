@@ -15,6 +15,7 @@ pub fn compare_engines(
     threshold: f64,
 ) -> ComparisonReport {
     let mut report = compare(baseline, candidate, threshold);
+    report.axis = Some("engine");
     let a = &baseline.engine.name;
     let b = &candidate.engine.name;
     report

@@ -11,6 +11,7 @@
 
 use crate::comparison::statistics::Stats;
 use crate::core::session::BenchmarkSession;
+use crate::core::workload::WorkloadKind;
 
 /// Where the bandwidth ceiling number came from — the distinction that
 /// decides how much weight a reader should put on `efficiency`.
@@ -137,6 +138,14 @@ pub fn bandwidth_for_run(session: &BenchmarkSession) -> Option<(f64, CeilingBasi
 pub fn analyze(session: &BenchmarkSession, decode_tps: &Stats) -> Ceiling {
     let mut c = Ceiling::default();
 
+    // One generated token is not a decode rate, and this ceiling describes
+    // weight streaming, which prefill is not limited by.
+    if session.workload.kind == WorkloadKind::Prefill {
+        c.notes.push("Prefill workload: the decode bandwidth ceiling does not apply.".to_string());
+        c.basis = CeilingBasis::Undetermined;
+        return c;
+    }
+
     // Weight bytes decode must stream. The engine's own count comes first: it
     // knows the format it computes on. The file size is only a fallback, and a
     // wrong one whenever the engine repacks -- the 2026-11-05 T4 audit had a
@@ -219,7 +228,10 @@ pub fn analyze(session: &BenchmarkSession, decode_tps: &Stats) -> Ceiling {
             CeilingBasis::Undetermined => unreachable!("efficiency requires a basis"),
         };
         c.notes.push(basis_note);
-        c.notes.push(format!("Weight bytes in that ceiling: {bytes_source}."));
+        c.notes.push(format!(
+            "Weight bytes in that ceiling: {bytes_source}. Decode moved about {:.1} GB/s.",
+            crate::measurement::bandwidth::effective_gbs(bytes, decode_tps.mean)
+        ));
     }
     c
 }
@@ -321,6 +333,30 @@ mod tests {
         let c = analyze(&sess, &dec);
         assert_eq!(c.basis, CeilingBasis::Undetermined);
         assert_eq!(c.efficiency, None);
+    }
+
+    #[test]
+    fn a_measured_device_bandwidth_beats_the_spec_sheet() {
+        let mut sess = sample_gpu(200.0);
+        sess.environment.hardware.gpu.peak_bandwidth_gbs = Some(320.0);
+        sess.measurements.observed_bandwidth_gbs = Some(280.0);
+        assert_eq!(
+            bandwidth_for_run(&sess),
+            Some((280.0, CeilingBasis::Measured)),
+            "a number measured on the card outranks the one printed about it"
+        );
+    }
+
+    #[test]
+    fn a_prefill_workload_has_no_decode_ceiling() {
+        let mut sess = sample_gpu(200.0);
+        sess.environment.hardware.gpu.peak_bandwidth_gbs = Some(320.0);
+        sess.workload.kind = WorkloadKind::Prefill;
+        let dec = Stats::from_samples(&sess.measurements.decode_tps_samples());
+        let c = analyze(&sess, &dec);
+        assert_eq!(c.efficiency, None);
+        assert_eq!(c.decode_tps_ceiling, None);
+        assert_eq!(c.basis, CeilingBasis::Undetermined);
     }
 
     /// Regression for the 2026-11-05 T4 audit: a Q4_K_M file (0.49 GB) that

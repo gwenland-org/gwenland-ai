@@ -13,6 +13,7 @@ use crate::analysis::roofline::RooflineReport;
 use crate::comparison::statistics::Stats;
 use crate::core::schema::ToJson;
 use crate::core::session::BenchmarkSession;
+use crate::core::workload::WorkloadKind;
 use crate::export::json::Json;
 
 /// Derived analysis over one session's measurements.
@@ -141,7 +142,10 @@ pub fn analyze(session: &BenchmarkSession) -> AnalysisReport {
 
     let ceiling = super::ceiling::analyze(session, &decode_tps);
     let bottleneck = super::bottleneck::classify(session, &ceiling);
-    let health = super::health::score(&decode_tps, &prefill_tps, ceiling.efficiency);
+    // A prefill workload's stability is its prefill stability; its one decode
+    // token per iteration has no throughput worth grading.
+    let graded = if session.workload.kind == WorkloadKind::Prefill { &prefill_tps } else { &decode_tps };
+    let health = super::health::score(graded, &prefill_tps, ceiling.efficiency);
 
     // Per-bucket roofline over the engine's stage telemetry, against the
     // bandwidth of the device that actually ran the model; with none known,
@@ -161,8 +165,24 @@ pub fn analyze(session: &BenchmarkSession) -> AnalysisReport {
 
     let mut notes = Vec::new();
     notes.extend(ceiling.notes.clone());
-    notes.push(bottleneck.recommendation().to_string());
-    if decode_tps.coefficient_of_variation() > 0.10 && decode_tps.count > 1 {
+    if session.workload.kind != WorkloadKind::Prefill {
+        notes.push(bottleneck.recommendation().to_string());
+    }
+    if session.workload.kind == WorkloadKind::Stress {
+        notes.push(match crate::runner::stress::stability(m) {
+            Some(s) => format!(
+                "Stress stability: decode {:.1} tok/s in the first quarter, {:.1} in the last ({:+.1}%).",
+                s.early_tps,
+                s.late_tps,
+                s.drift() * 100.0
+            ),
+            None => "Stress stability needs at least four measured iterations.".to_string(),
+        });
+    }
+    if session.workload.kind != WorkloadKind::Prefill
+        && decode_tps.coefficient_of_variation() > 0.10
+        && decode_tps.count > 1
+    {
         notes.push(format!(
             "Decode throughput is noisy across runs (CV {:.0}%); increase measure_iters for a stabler figure.",
             decode_tps.coefficient_of_variation() * 100.0

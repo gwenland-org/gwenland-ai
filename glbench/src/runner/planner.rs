@@ -15,7 +15,7 @@ use crate::behavior::BehaviorReport;
 use crate::core::metrics::MeasurementSet;
 use crate::core::result::SessionMetadata;
 use crate::core::session::BenchmarkSession;
-use crate::core::workload::WorkloadSpec;
+use crate::core::workload::{WorkloadKind, WorkloadSpec};
 use crate::engine::adapter::EngineAdapter;
 use crate::engine::model_probe::ModelProbe;
 use crate::environment::hardware::EnvironmentSnapshot;
@@ -29,6 +29,9 @@ pub type Progress<'a> = &'a dyn Fn(&str, usize, usize);
 /// Execute a full benchmark for `spec` and return the finished session with
 /// analysis + validation attached. `progress` is invoked before each phase/iter.
 pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSession, GlError> {
+    // What `--kind` asks for, applied once so the archive describes what ran.
+    let spec = &spec.effective();
+
     // 1. Environment snapshot (before load, so memory reflects the idle baseline).
     let mut environment = EnvironmentSnapshot::probe(&spec.model_path);
 
@@ -133,6 +136,7 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // 5. Fill in facts known only after the run: the model footprint decode
     //    streams. Prefer the file size the environment probe already captured.
     measurements.model_bytes = environment.hardware.storage.model_file_bytes;
+    measurements.observed_bandwidth_gbs = environment.hardware.gpu.measured_bandwidth_gbs;
 
     // 6. Assemble the session, then run the derived passes.
     let label = default_label(spec);
@@ -185,8 +189,11 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     // in hand — an explicit declaration wins over `classify_null`'s default.
     if let Some(a) = &session.analysis {
         if a.ceiling_efficiency.is_none() {
-            let note = if a.ceiling_basis == CeilingBasis::Undetermined {
-                "no bandwidth figure for the device that ran the model, so there is                  no ceiling to be a fraction of"
+            let note = if session.workload.kind == WorkloadKind::Prefill {
+                "a prefill workload generates one token, and a decode ceiling says nothing \
+                 about it"
+            } else if a.ceiling_basis == CeilingBasis::Undetermined {
+                "no bandwidth figure for the device that ran the model, so there is no ceiling to be a fraction of"
             } else {
                 "a ceiling was computed and rejected as impossible; see analysis.notes"
             };

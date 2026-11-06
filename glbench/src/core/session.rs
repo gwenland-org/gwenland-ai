@@ -1060,6 +1060,9 @@ fn environment_from_json(v: &Json) -> Result<EnvironmentSnapshot, String> {
                 .and_then(|n| n.as_f64())
                 .map(|n| n as u64),
             peak_bandwidth_gbs: gpu.and_then(|g| g.get("peak_bandwidth_gbs")).and_then(|n| n.as_f64()),
+            measured_bandwidth_gbs: gpu
+                .and_then(|g| g.get("measured_bandwidth_gbs"))
+                .and_then(|n| n.as_f64()),
             peak_compute_tops: gpu.and_then(|g| g.get("peak_compute_tops")).and_then(|n| n.as_f64()),
         },
         memory: MemoryInfo::default(),

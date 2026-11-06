@@ -94,10 +94,61 @@ pub fn validate(session: &BenchmarkSession) -> ValidationReport {
     let mut report = ValidationReport::default();
     check_integrity(session, &mut report);
     check_thermal(session, &mut report);
+    check_workload_fit(session, &mut report);
     super::deterministic::check(session, &mut report);
     super::reproducibility::check(session, &mut report);
     super::memory::check(session, &mut report);
     report
+}
+
+/// Does the workload measure what its kind claims? A short prompt reports launch
+/// overhead rather than prefill throughput, a short generation reports edge
+/// effects rather than decode throughput, and a stress run that sagged needs
+/// saying even though every number in it is real.
+fn check_workload_fit(session: &BenchmarkSession, report: &mut ValidationReport) {
+    use crate::core::workload::WorkloadKind;
+    use crate::runner::{decode, prefill, stress};
+
+    let kind = session.workload.kind;
+    let Some(first) = session.measurements.iterations.first() else {
+        return;
+    };
+    if kind != WorkloadKind::Decode && !prefill::is_representative(first.prompt_tokens as usize) {
+        report.push(
+            Severity::Warning,
+            "workload",
+            format!(
+                "prompt is {} tokens, under the {} a prefill figure needs; this mostly measures launch overhead",
+                first.prompt_tokens,
+                prefill::MIN_REPRESENTATIVE_PROMPT
+            ),
+        );
+    }
+    if kind != WorkloadKind::Prefill && !decode::is_stable_budget(first.generated_tokens as usize) {
+        report.push(
+            Severity::Warning,
+            "workload",
+            format!(
+                "generated {} tokens, under the {} a stable decode figure needs",
+                first.generated_tokens,
+                decode::MIN_DECODE_TOKENS
+            ),
+        );
+    }
+    if kind == WorkloadKind::Stress {
+        if let Some(s) = stress::stability(&session.measurements) {
+            if s.drift() < -stress::SAG_THRESHOLD {
+                report.push(
+                    Severity::Warning,
+                    "stress",
+                    format!(
+                        "decode sagged {:.1}% between the first and last quarter of the run",
+                        -s.drift() * 100.0
+                    ),
+                );
+            }
+        }
+    }
 }
 
 /// Flag a CPU clock drop between the start and end of the session — glbench
@@ -209,6 +260,56 @@ mod tests {
             WorkloadSpec::default(),
             m,
         )
+    }
+
+    fn fit_findings(sess: &BenchmarkSession) -> Vec<String> {
+        let mut report = ValidationReport::default();
+        check_workload_fit(sess, &mut report);
+        report.findings.into_iter().map(|f| f.message).collect()
+    }
+
+    #[test]
+    fn each_kind_is_only_held_to_the_phase_it_measures() {
+        use crate::core::workload::WorkloadKind;
+
+        let mut sess = sample();
+        sess.measurements.iterations[0].prompt_tokens = 20;
+        sess.measurements.iterations[0].generated_tokens = 1;
+
+        sess.workload.kind = WorkloadKind::EndToEnd;
+        assert_eq!(fit_findings(&sess).len(), 2);
+
+        sess.workload.kind = WorkloadKind::Prefill;
+        let findings = fit_findings(&sess);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("prompt is 20 tokens"), "{findings:?}");
+
+        sess.workload.kind = WorkloadKind::Decode;
+        let findings = fit_findings(&sess);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("generated 1 tokens"), "{findings:?}");
+    }
+
+    #[test]
+    fn a_sagging_stress_run_warns_and_a_steady_one_does_not() {
+        use crate::core::workload::WorkloadKind;
+
+        let iteration = |decode_ms: f64| IterationMetrics {
+            prompt_tokens: 200,
+            generated_tokens: 128,
+            prefill_ms: 100.0,
+            decode_ms,
+            total_ms: decode_ms + 100.0,
+        };
+        let mut sess = sample();
+        sess.workload.kind = WorkloadKind::Stress;
+        sess.measurements.iterations = [1000.0, 1000.0, 1000.0, 1000.0].map(iteration).to_vec();
+        assert!(fit_findings(&sess).is_empty());
+
+        sess.measurements.iterations = [1000.0, 1000.0, 1000.0, 1200.0].map(iteration).to_vec();
+        let findings = fit_findings(&sess);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert!(findings[0].contains("sagged"), "{findings:?}");
     }
 
     #[test]

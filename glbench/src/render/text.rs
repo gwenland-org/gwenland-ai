@@ -4,11 +4,14 @@
 //! compact, aligned text report. Every renderer in glbench reads the shared data
 //! model; none computes its own facts.
 
+use crate::behavior::performance::PerformanceSignal;
 use crate::comparison::runs::ComparisonReport;
 use crate::comparison::statistics::Stats;
 use crate::core::result::ENMeasurementMode;
 use crate::core::session::BenchmarkSession;
+use crate::core::workload::WorkloadKind;
 use crate::measurement::memory::bytes_to_gib;
+use crate::measurement::timeline::Timeline;
 use crate::environment::bandwidth::CEILING_TOLERANCE;
 use crate::render::table::Table;
 
@@ -113,6 +116,9 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
         if let Some(bw) = hw.gpu.peak_bandwidth_gbs {
             s.push_str(&format!(" | peak {bw:.0} GB/s"));
         }
+        if let Some(bw) = hw.gpu.measured_bandwidth_gbs {
+            s.push_str(&format!(" | measured read {bw:.0} GB/s"));
+        }
         s.push('\n');
     } else if let Some(cpu) = &hw.cpu.model {
         s.push_str(&format!("device {cpu} ("));
@@ -139,15 +145,18 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
         .right_align(5)
         .right_align(6)
         .right_align(7);
+    let prefill_only = session.workload.kind == WorkloadKind::Prefill;
     t.row(&stat_cells("prefill", &pre));
-    t.row(&stat_cells("decode", &dec));
+    if !prefill_only {
+        t.row(&stat_cells("decode", &dec));
+    }
     s.push_str(&t.render());
     // Cold-start iterations, kept out of the warm statistics: they are what
     // a deployment's first few requests pay. Reported as median + range
     // rather than one sample — "always ~500ms" and "usually 90ms but once
     // 900ms" both average to the same number, and only the range tells them
     // apart (the same reasoning `stall_count` uses for inter-token gaps).
-    if !m.cold.is_empty() {
+    if !m.cold.is_empty() && !prefill_only {
         let cold_pre = Stats::from_samples(&m.cold_prefill_tps_samples());
         let cold_dec = Stats::from_samples(&m.cold_decode_tps_samples());
         s.push_str(&format!(
@@ -208,7 +217,7 @@ pub fn session_at(session: &BenchmarkSession, verbosity: ENVerbosity) -> String 
     }
 
     if let Some(t) = session.telemetry.as_ref().filter(|_| full) {
-        s.push_str(&telemetry(t, hw.cpu.read_bandwidth_gbs));
+        s.push_str(&telemetry(t, stage_ceiling(session)));
     }
 
     if let Some(b) = session.behavior.as_ref().filter(|_| full) {
@@ -301,10 +310,11 @@ fn quiet(session: &BenchmarkSession) -> String {
         ENMeasurementMode::Instrumented => "INSTRUMENTED",
         ENMeasurementMode::Unknown => "unknown-authority",
     };
-    let mut line = format!(
-        "{}  prefill {:.1} tok/s  decode {:.1} tok/s  {mode}",
-        session.metadata.label, pre.median, dec.median
-    );
+    let mut line = format!("{}  prefill {:.1} tok/s", session.metadata.label, pre.median);
+    if session.workload.kind != WorkloadKind::Prefill {
+        line.push_str(&format!("  decode {:.1} tok/s", dec.median));
+    }
+    line.push_str(&format!("  {mode}"));
     if let Some(a) = &session.analysis {
         if let Some(eff) = a.ceiling_efficiency {
             let est = match a.ceiling_basis {
@@ -407,7 +417,9 @@ fn greedy(session: &BenchmarkSession) -> String {
     let m = &session.measurements;
     let mut t = Table::new(&[
         "iter", "prompt", "prefill ms", "prefill tok/s", "generated", "decode ms", "decode tok/s",
+        "overhead ms",
     ])
+    .right_align(7)
     .right_align(1)
     .right_align(2)
     .right_align(3)
@@ -432,6 +444,7 @@ fn greedy(session: &BenchmarkSession) -> String {
             it.generated_tokens.to_string(),
             format!("{:.3}", it.decode_ms),
             rate(it.generated_tokens, it.decode_ms),
+            format!("{:.3}", Timeline::from_iteration(it).overhead_ms()),
         ]);
     }
     s.push_str("\niterations (raw)\n");
@@ -499,8 +512,16 @@ fn roofline(r: &crate::analysis::roofline::RooflineReport) -> String {
 /// a zeroed row is a claim and an absent row is an admission.
 /// The engine-telemetry section on its own, for a report that shows a second
 /// session's profile beside the first (`run --greedy`).
-pub fn telemetry_report(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -> String {
-    telemetry(t, ceiling_gbs)
+pub fn telemetry_report(session: &BenchmarkSession) -> String {
+    session.telemetry.as_ref().map_or_else(String::new, |t| telemetry(t, stage_ceiling(session)))
+}
+
+/// The bandwidth stage rows are judged against: the memory of the device that
+/// ran the model, chosen by the same rule as the headline ceiling. This used to
+/// pass the host's read bandwidth, so every stage of a CUDA run was a percentage
+/// of DDR rather than of VRAM.
+fn stage_ceiling(session: &BenchmarkSession) -> Option<f64> {
+    crate::analysis::ceiling::bandwidth_for_run(session).map(|(bw, _)| bw)
 }
 
 fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -> String {
@@ -639,7 +660,7 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
 
         if let Some(c) = ceiling_gbs {
             s.push_str(&format!(
-                "  ceiling {c:.1} GB/s (measured)  |  '!' = under 25%, NOT bandwidth-bound\n"
+                "  ceiling {c:.1} GB/s  |  '!' = under 25%, NOT bandwidth-bound\n"
             ));
             if over_ceiling {
                 // The stage is not impossible; the ruler is. Saying which one is
@@ -661,6 +682,19 @@ fn telemetry(t: &glcore::telemetry::EngineTelemetry, ceiling_gbs: Option<f64>) -
                 "  unattributed {:.2} ms ({:.1}%)\n",
                 un,
                 un / p.total_ms * 100.0
+            ));
+        }
+
+        // share and ms/call answer different questions and can name different
+        // stages; see behavior::performance.
+        if let Some(signal) = PerformanceSignal::compute(p) {
+            s.push_str(&format!(
+                "  hottest {} ({:.1}% of the phase) | costliest call {} ({:.3} ms) | call-cost spread {:.2}\n",
+                signal.hottest_stage,
+                signal.hottest_share * 100.0,
+                signal.costliest_call,
+                signal.costliest_ms_per_call,
+                signal.call_cost_spread,
             ));
         }
 
@@ -837,7 +871,12 @@ pub fn comparison(c: &ComparisonReport) -> String {
         format!("{:.2}x", c.prefill_tps.ratio()),
     ]);
     s.push_str(&t.render());
-    s.push_str(&format!("\nverdict: {}\n", c.regression.as_str()));
+    match c.axis {
+        Some(axis) => s.push_str(&format!(
+            "\nverdict: none, this is a {axis} comparison rather than a regression check\n"
+        )),
+        None => s.push_str(&format!("\nverdict: {}\n", c.regression.as_str())),
+    }
     for note in &c.notes {
         s.push_str(&format!("  - {note}\n"));
     }
@@ -845,6 +884,58 @@ pub fn comparison(c: &ComparisonReport) -> String {
 }
 
 /// Render a numerical-parity report for the terminal.
+/// Render a trend over an ordered series of archives.
+pub fn trend(r: &crate::comparison::trend::TrendReport) -> String {
+    let mut s = format!("glbench trend :: {} sessions, oldest first\n\n", r.points.len());
+    let mut t = Table::new(&["#", "session", "prefill tps", "decode tps", "decode vs previous"])
+        .right_align(0)
+        .right_align(2)
+        .right_align(3)
+        .right_align(4);
+    for (i, p) in r.points.iter().enumerate() {
+        let change = match i.checked_sub(1).map(|prev| &r.points[prev]) {
+            Some(prev) if prev.decode_tps > 0.0 => {
+                format!("{:+.1}%", (p.decode_tps / prev.decode_tps - 1.0) * 100.0)
+            }
+            _ => "-".to_string(),
+        };
+        t.row(&[
+            (i + 1).to_string(),
+            p.label.clone(),
+            format!("{:.1}", p.prefill_tps),
+            format!("{:.1}", p.decode_tps),
+            change,
+        ]);
+    }
+    s.push_str(&t.render());
+    s.push_str(&format!("\nfirst to last: {}\n", r.overall.as_str()));
+    if let Some((i, change)) = r.largest_drop {
+        s.push_str(&format!("largest drop: {:.1}% at #{}\n", change * 100.0, i + 1));
+    }
+    for note in &r.notes {
+        s.push_str(&format!("  - {note}\n"));
+    }
+    s
+}
+
+/// Render the archives found in a directory.
+pub fn manifest(entries: &[crate::storage::manifest::ManifestEntry]) -> String {
+    let mut t = Table::new(&["archive", "label", "engine", "mode", "prefill tps", "decode tps"])
+        .right_align(4)
+        .right_align(5);
+    for e in entries {
+        t.row(&[
+            e.path.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+            e.label.clone(),
+            e.engine.clone(),
+            e.measurement_mode.to_string(),
+            format!("{:.1}", e.prefill_tps),
+            e.decode_tps.map_or("-".to_string(), |v| format!("{v:.1}")),
+        ]);
+    }
+    t.render()
+}
+
 pub fn parity(r: &crate::validation::parity::ParityReport) -> String {
     let mut s = String::new();
     s.push_str(&format!(
@@ -1035,6 +1126,36 @@ mod tests {
         assert!(s.contains(std::env::consts::OS));
         assert!(s.contains(std::env::consts::ARCH));
         assert!(s.contains("run at unix"));
+    }
+
+    #[test]
+    fn a_prefill_workload_reports_no_decode_figure() {
+        let mut sess = sample();
+        sess.workload.kind = WorkloadKind::Prefill;
+        assert!(!session_at(&sess, ENVerbosity::Quiet).contains("decode"));
+        let normal = session_at(&sess, ENVerbosity::Normal);
+        assert!(normal.contains("prefill"), "{normal}");
+        assert!(!normal.lines().any(|l| l.starts_with("decode")), "{normal}");
+    }
+
+    /// A CUDA run's stages are a share of VRAM bandwidth, not of host DDR.
+    #[test]
+    fn stage_rows_are_judged_against_the_device_that_ran() {
+        let mut sess = sample();
+        sess.engine.backend = "cuda".into();
+        sess.environment.hardware.cpu.read_bandwidth_gbs = Some(27.0);
+        sess.environment.hardware.gpu.peak_bandwidth_gbs = Some(320.0);
+        assert_eq!(stage_ceiling(&sess), Some(320.0));
+    }
+
+    #[test]
+    fn a_cross_axis_comparison_gives_no_regression_verdict() {
+        let a = sample();
+        let mut b = sample();
+        b.engine.name = "glcuda".into();
+        let report = comparison(&crate::comparison::compare_along_axis(&a, &b, 0.05));
+        assert!(report.contains("engine comparison"), "{report}");
+        assert!(!report.contains("verdict: neutral"), "{report}");
     }
 
     #[test]

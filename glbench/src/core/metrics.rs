@@ -79,8 +79,10 @@ pub struct MeasurementSet {
     pub iterations: Vec<IterationMetrics>,
     /// Peak process/device memory observed during the run, bytes (if sampled).
     pub peak_memory_bytes: Option<u64>,
-    /// Observed effective memory bandwidth, GB/s (if the engine or a probe
-    /// reported it). A raw number — not a "bound" classification.
+    /// Read bandwidth of the device that ran the model, GB/s, measured by a
+    /// probe rather than taken from a spec sheet. A hardware capability, never
+    /// the rate decode happened to achieve: the ceiling divides by this, and
+    /// feeding it the run's own rate would make every run 100% of itself.
     pub observed_bandwidth_gbs: Option<f64>,
     /// Model file size on disk, bytes — the weight footprint that decode must
     /// stream. Used later as the numerator for a bandwidth-efficiency estimate.

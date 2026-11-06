@@ -20,6 +20,7 @@
 //! * [`sampler`] — engine-owned sampler (ADR-001 duplication of glproc's)
 
 pub mod attention;
+pub mod bandwidth;
 pub mod buffer;
 pub mod cache;
 pub mod dequant;

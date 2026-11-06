@@ -4,9 +4,17 @@
 //! interesting output is not the mean but the *drift* — does throughput sag as
 //! the device heats or memory fragments? This module computes that drift signal
 //! from the per-iteration series the runner already collected. It does not run
-//! anything itself (the planner's measured loop already does the repetition).
+//! anything itself (the planner's measured loop already does the repetition);
+//! the analysis pass reports it for a `--kind stress` session.
 
 use crate::core::metrics::MeasurementSet;
+
+/// Measured iterations `--kind stress` runs when `--iters` is not given. A
+/// sustained load needs enough iterations for the quarters to mean something.
+pub const DEFAULT_ITERS: usize = 32;
+
+/// A late-vs-early throughput drop past this fraction is flagged.
+pub const SAG_THRESHOLD: f64 = 0.05;
 
 /// A stability verdict over a stress run's iteration series.
 #[derive(Debug, Clone, Copy, PartialEq)]

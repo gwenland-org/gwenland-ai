@@ -321,12 +321,23 @@ fn probe_cuda_gpu() -> GpuInfo {
         Ok(cuda) => {
             let i = &cuda.info;
             let ceiling = capability::lookup(&i.name);
+            // Before the engine exists, so it shares the device with nothing.
+            // A failed probe is not a failed run: the ceiling falls back to
+            // the published figure and says so.
+            let measured_bandwidth_gbs = match glcuda::bandwidth::measure_read_gbs(&cuda) {
+                Ok(gbs) => Some(gbs),
+                Err(error) => {
+                    eprintln!("glbench: device bandwidth probe skipped: {error}");
+                    None
+                }
+            };
             GpuInfo {
                 name: Some(i.name.clone()),
                 backend: Some("cuda".to_string()),
                 compute: Some(format!("sm_{}{}", i.sm_major, i.sm_minor)),
                 total_memory_bytes: Some(i.total_mem as u64),
                 peak_bandwidth_gbs: ceiling.map(|c| c.peak_bandwidth_gbs),
+                measured_bandwidth_gbs,
                 peak_compute_tops: ceiling.map(|c| c.peak_int8_tops),
             }
         }

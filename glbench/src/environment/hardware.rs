@@ -111,6 +111,7 @@ impl ToJson for HardwareSnapshot {
                         opt_num(self.gpu.total_memory_bytes.map(|b| b as f64)),
                     ),
                     ("peak_bandwidth_gbs", opt_num(self.gpu.peak_bandwidth_gbs)),
+                    ("measured_bandwidth_gbs", opt_num(self.gpu.measured_bandwidth_gbs)),
                     ("peak_compute_tops", opt_num(self.gpu.peak_compute_tops)),
                 ]),
             ),

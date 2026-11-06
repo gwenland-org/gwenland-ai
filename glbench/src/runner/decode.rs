@@ -10,6 +10,10 @@
 /// and last-token edge effects.
 pub const MIN_DECODE_TOKENS: usize = 32;
 
+/// The prompt `--kind decode` uses when none is given. Short on purpose: decode
+/// cost grows with context, so a long prompt measures decode at a long context.
+pub const SHORT_PROMPT: &str = "Hello.";
+
 /// Whether `generated_tokens` is enough for a stable decode throughput figure.
 pub fn is_stable_budget(generated_tokens: usize) -> bool {
     generated_tokens >= MIN_DECODE_TOKENS

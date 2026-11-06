@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::comparison::regression::Regression;
-use crate::comparison::runs::{self, ComparisonReport, Delta};
+use crate::comparison::runs::{ComparisonReport, Delta};
 use crate::core::availability::{self, ENAvailability, VLAvailabilityMap};
 use crate::core::mode::ENSessionMode;
 use crate::core::schema::{ToJson, GLBENCH_VERSION, SCHEMA_VERSION};
@@ -187,7 +187,16 @@ fn comparison_from_json(v: Option<&Json>) -> Result<ComparisonReport, String> {
         .and_then(Regression::from_str)
         .unwrap_or(Regression::Neutral);
 
+    // Absent in joins written before the axis existed, which read as none.
+    let axis = match v.get("axis").and_then(|a| a.as_str()) {
+        Some("engine") => Some("engine"),
+        Some("hardware") => Some("hardware"),
+        Some("quantization") => Some("quantization"),
+        _ => None,
+    };
+
     Ok(ComparisonReport {
+        axis,
         baseline_label: v
             .get("baseline_label")
             .and_then(|s| s.as_str())
@@ -225,7 +234,7 @@ pub fn build(
     let (a_session, a_source) = read_source(a_path, &mut report)?;
     let (b_session, b_source) = read_source(b_path, &mut report)?;
 
-    let comparison = runs::compare(&a_session, &b_session, threshold);
+    let comparison = crate::comparison::compare_along_axis(&a_session, &b_session, threshold);
     let label = label
         .map(String::from)
         .unwrap_or_else(|| format!("{} vs {}", a_source.label, b_source.label));

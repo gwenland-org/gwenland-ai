@@ -13,6 +13,7 @@ pub fn compare_quantization(
     threshold: f64,
 ) -> ComparisonReport {
     let mut report = compare(baseline, candidate, threshold);
+    report.axis = Some("quantization");
     let qa = baseline.engine.quantization.as_deref().unwrap_or("?");
     let qb = candidate.engine.quantization.as_deref().unwrap_or("?");
     report

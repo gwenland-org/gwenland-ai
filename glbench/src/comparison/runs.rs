@@ -5,6 +5,7 @@
 //! [`crate::comparison`] (engine, quantization, hardware comparisons) is this
 //! same delta viewed along a particular axis.
 
+use crate::behavior::drift::DriftSignal;
 use crate::comparison::regression::{regression_verdict, Regression};
 use crate::comparison::statistics::Stats;
 use crate::core::result::ENMeasurementMode;
@@ -62,6 +63,10 @@ pub struct ComparisonReport {
     pub prefill_tps: Delta,
     /// Regression verdict on the headline (decode) metric.
     pub regression: Regression,
+    /// What the two sides differ in, when that is more than a change to the
+    /// same setup: "engine", "hardware" or "quantization". `Some` means the
+    /// delta is a comparison of two things, and `regression` is not a finding.
+    pub axis: Option<&'static str>,
     /// Observations.
     pub notes: Vec<String>,
 }
@@ -74,6 +79,7 @@ impl ToJson for ComparisonReport {
             ("decode_tps", self.decode_tps.to_json()),
             ("prefill_tps", self.prefill_tps.to_json()),
             ("regression", Json::s(self.regression.as_str())),
+            ("axis", Json::s(self.axis.unwrap_or("none"))),
             (
                 "notes",
                 Json::Arr(self.notes.iter().map(|n| Json::s(n.clone())).collect()),
@@ -139,14 +145,49 @@ pub fn compare(
         prefill_tps.candidate,
     ));
 
+    // Which stages moved says what a single tok/s delta cannot: every stage by
+    // the same factor is the clock, one stage alone is the code. Only for the
+    // same engine, whose stages are the same stages, and only when both runs
+    // were profiled.
+    if baseline.engine.name == candidate.engine.name {
+        if let (Some(a), Some(b)) = (&baseline.telemetry, &candidate.telemetry) {
+            for (label, x, y) in [("decode", &a.decode, &b.decode), ("prefill", &a.prefill, &b.prefill)] {
+                let drift = match (x, y) {
+                    (Some(x), Some(y)) => DriftSignal::compute(x, y),
+                    _ => None,
+                };
+                if let Some(d) = drift {
+                    notes.push(drift_note(label, &d));
+                }
+            }
+        }
+    }
+
     ComparisonReport {
         baseline_label: baseline.metadata.label.clone(),
         candidate_label: candidate.metadata.label.clone(),
         decode_tps,
         prefill_tps,
         regression,
+        axis: None,
         notes,
     }
+}
+
+/// One line on how a phase's stages moved between the two runs.
+fn drift_note(label: &str, d: &DriftSignal) -> String {
+    let mut note = format!(
+        "{label} stages: ms/call x{:.2} on average, spread {:.2}",
+        d.mean_ratio, d.ratio_spread
+    );
+    if let Some(worst) = &d.worst_stage {
+        note.push_str(&format!(", worst {worst} x{:.2}", d.worst_ratio));
+    }
+    if d.looks_like_clock_change() {
+        note.push_str("; every stage moved alike, consistent with a clock change, not code");
+    }
+    note.push('.');
+    note
 }
 
 #[cfg(test)]
@@ -181,6 +222,72 @@ mod tests {
             WorkloadSpec::default(),
             measurements,
         )
+    }
+
+    #[test]
+    fn the_strongest_difference_names_the_comparison() {
+        use crate::comparison::compare_along_axis;
+
+        let a = session("a");
+        assert_eq!(compare_along_axis(&a, &session("b"), 0.05).axis, None);
+
+        let mut quant = session("b");
+        quant.engine.quantization = Some("Q4_K_M".into());
+        assert_eq!(compare_along_axis(&a, &quant, 0.05).axis, Some("quantization"));
+
+        let mut device = session("b");
+        device.environment.hardware.gpu.name = Some("Tesla T4".into());
+        assert_eq!(compare_along_axis(&a, &device, 0.05).axis, Some("hardware"));
+
+        let mut engine = session("b");
+        engine.engine.name = "glcuda".into();
+        engine.engine.quantization = Some("Q4_K_M".into());
+        let report = compare_along_axis(&a, &engine, 0.05);
+        assert_eq!(report.axis, Some("engine"));
+        assert!(
+            report.notes.iter().any(|n| n.contains("Also differs in quantization")),
+            "a second difference must be named: {:?}",
+            report.notes
+        );
+    }
+
+    fn with_decode_stages(mut s: BenchmarkSession, stages: &[(&str, f64)]) -> BenchmarkSession {
+        use glcore::telemetry::{EngineTelemetry, PhaseProfile, StageTiming};
+        let stages: Vec<StageTiming> = stages
+            .iter()
+            .map(|&(name, total_ms)| StageTiming {
+                name: name.into(),
+                total_ms,
+                calls: 10,
+                bytes_read: None,
+                macs: None,
+            })
+            .collect();
+        let total_ms = stages.iter().map(|st| st.total_ms).sum();
+        s.telemetry = Some(EngineTelemetry {
+            decode: Some(PhaseProfile { stages, total_ms }),
+            ..Default::default()
+        });
+        s
+    }
+
+    #[test]
+    fn profiled_runs_say_how_their_stages_moved() {
+        let base = with_decode_stages(session("a"), &[("ffn", 100.0), ("attn", 50.0)]);
+
+        let uniform = with_decode_stages(session("b"), &[("ffn", 120.0), ("attn", 60.0)]);
+        let report = compare(&base, &uniform, 0.05);
+        assert!(
+            report.notes.iter().any(|n| n.contains("consistent with a clock change")),
+            "{:?}",
+            report.notes
+        );
+
+        let one_stage = with_decode_stages(session("b"), &[("ffn", 100.0), ("attn", 100.0)]);
+        let report = compare(&base, &one_stage, 0.05);
+        let note = report.notes.iter().find(|n| n.contains("decode stages")).unwrap();
+        assert!(note.contains("worst attn x2.00"), "{note}");
+        assert!(!note.contains("clock change"), "{note}");
     }
 
     #[test]

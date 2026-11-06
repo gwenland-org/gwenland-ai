@@ -94,6 +94,22 @@ pub struct WorkloadSpec {
     pub instrument_engine: bool,
 }
 
+impl WorkloadSpec {
+    /// The spec that actually runs once the workload kind is applied.
+    ///
+    /// A prefill workload generates a single token: the engine needs one to
+    /// finish a request, and any more would be decode time on a bill that says
+    /// prefill. The other kinds shape the prompt and iteration count, which
+    /// only the CLI can default because only it knows what the user set.
+    pub fn effective(&self) -> WorkloadSpec {
+        let mut spec = self.clone();
+        if spec.kind == WorkloadKind::Prefill {
+            spec.max_new_tokens = 1;
+        }
+        spec
+    }
+}
+
 impl Default for WorkloadSpec {
     fn default() -> Self {
         WorkloadSpec {
@@ -184,6 +200,17 @@ impl FromJson for WorkloadSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_prefill_workload_generates_one_token_and_the_others_keep_their_budget() {
+        let mut spec = WorkloadSpec { max_new_tokens: 128, ..WorkloadSpec::default() };
+        for kind in [WorkloadKind::EndToEnd, WorkloadKind::Decode, WorkloadKind::Stress] {
+            spec.kind = kind;
+            assert_eq!(spec.effective().max_new_tokens, 128, "{}", kind.as_str());
+        }
+        spec.kind = WorkloadKind::Prefill;
+        assert_eq!(spec.effective().max_new_tokens, 1);
+    }
 
     #[test]
     fn default_cold_iters_is_five() {
