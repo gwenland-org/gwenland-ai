@@ -12,7 +12,9 @@ pub const MIN_DECODE_TOKENS: usize = 32;
 
 /// The prompt `--kind decode` uses when none is given. Short on purpose: decode
 /// cost grows with context, so a long prompt measures decode at a long context.
-pub const SHORT_PROMPT: &str = "Hello.";
+/// It asks for a long answer because the budget is a limit, not a promise: on a
+/// T4, "Hello." reached end-of-sequence after 9 of 64 tokens.
+pub const SHORT_PROMPT: &str = "Write a long, detailed essay on the history of computing.";
 
 /// Whether `generated_tokens` is enough for a stable decode throughput figure.
 pub fn is_stable_budget(generated_tokens: usize) -> bool {

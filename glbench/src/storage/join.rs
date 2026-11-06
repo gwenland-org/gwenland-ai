@@ -192,6 +192,7 @@ fn comparison_from_json(v: Option<&Json>) -> Result<ComparisonReport, String> {
         Some("engine") => Some("engine"),
         Some("hardware") => Some("hardware"),
         Some("quantization") => Some("quantization"),
+        Some("workload") => Some("workload"),
         _ => None,
     };
 

@@ -185,13 +185,19 @@ impl EngineAdapter {
         // Tracing OFF: this is the timed path, and tracing costs an O(vocab)
         // sweep per token. Taxing the measurement with the instrument is
         // exactly the mistake this split exists to avoid.
+        //
+        // The wall clock is read here rather than taken from the engine, whose
+        // own total is whole milliseconds and is built from the same phases.
+        // Only an outside clock can show time spent in neither phase.
+        let start = std::time::Instant::now();
         let out = self.run_request(spec, false)?;
+        let total_ms = start.elapsed().as_secs_f64() * 1e3;
         Ok(IterationMetrics {
             prompt_tokens: out.prompt_tokens as u64,
             generated_tokens: out.tokens_generated as u64,
             prefill_ms: out.prefill_ms,
             decode_ms: out.generation_ms,
-            total_ms: out.elapsed_ms as f64,
+            total_ms,
         })
     }
 

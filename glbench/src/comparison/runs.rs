@@ -64,7 +64,7 @@ pub struct ComparisonReport {
     /// Regression verdict on the headline (decode) metric.
     pub regression: Regression,
     /// What the two sides differ in, when that is more than a change to the
-    /// same setup: "engine", "hardware" or "quantization". `Some` means the
+    /// same setup: "engine", "hardware", "quantization" or "workload". `Some` means the
     /// delta is a comparison of two things, and `regression` is not a finding.
     pub axis: Option<&'static str>,
     /// Observations.
@@ -249,6 +249,19 @@ mod tests {
             "a second difference must be named: {:?}",
             report.notes
         );
+
+        // One machine: the GPU run names the card and the CPU run the CPU, and
+        // that is the engine difference, not a second axis.
+        let mut cuda = session("b");
+        cuda.engine.name = "glcuda".into();
+        cuda.environment.hardware.gpu.name = Some("Tesla T4".into());
+        let report = compare_along_axis(&a, &cuda, 0.05);
+        assert_eq!(report.axis, Some("engine"));
+        assert!(!report.notes.iter().any(|n| n.contains("Also differs")), "{:?}", report.notes);
+
+        let mut kind = session("b");
+        kind.workload.kind = crate::core::workload::WorkloadKind::Decode;
+        assert_eq!(compare_along_axis(&a, &kind, 0.05).axis, Some("workload"));
     }
 
     fn with_decode_stages(mut s: BenchmarkSession, stages: &[(&str, f64)]) -> BenchmarkSession {

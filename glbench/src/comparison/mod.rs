@@ -30,7 +30,13 @@ pub fn compare_along_axis(
     threshold: f64,
 ) -> ComparisonReport {
     let engine = baseline.engine.name != candidate.engine.name;
-    let device = hardware::device_label(baseline) != hardware::device_label(candidate);
+    // Two engines on one machine report different devices, a GPU and a CPU, so
+    // across engines the machine is what can differ: its CPU is on both sides.
+    let device = if engine {
+        baseline.environment.hardware.cpu.model != candidate.environment.hardware.cpu.model
+    } else {
+        hardware::device_label(baseline) != hardware::device_label(candidate)
+    };
     let quant = baseline.engine.quantization != candidate.engine.quantization;
 
     let mut report = if engine {
@@ -55,6 +61,7 @@ pub fn compare_along_axis(
         ));
     }
     if baseline.workload.kind != candidate.workload.kind {
+        report.axis = report.axis.or(Some("workload"));
         report.notes.push(format!(
             "Workload kinds differ ({} vs {}), so these runs measured different things.",
             baseline.workload.kind.as_str(),

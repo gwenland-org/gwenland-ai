@@ -873,7 +873,7 @@ pub fn comparison(c: &ComparisonReport) -> String {
     s.push_str(&t.render());
     match c.axis {
         Some(axis) => s.push_str(&format!(
-            "\nverdict: none, this is a {axis} comparison rather than a regression check\n"
+            "\nverdict: none ({axis} comparison, not a regression check)\n"
         )),
         None => s.push_str(&format!("\nverdict: {}\n", c.regression.as_str())),
     }

@@ -68,9 +68,16 @@ pub fn run(spec: &WorkloadSpec, progress: Progress<'_>) -> Result<BenchmarkSessi
     //     before measuring. Distinct from cold-start: warmup's numbers are
     //     never recorded at all, because its entire purpose is to leave the
     //     machine in the warm state the measured phase assumes.
+    let warmup_start = std::time::Instant::now();
     for i in 0..spec.warmup_iters {
         progress("warmup", i, spec.warmup_iters);
         adapter.run_once(spec)?;
+    }
+    // `--warmup 0` still means none: a user asking for cold numbers gets them.
+    if spec.kind == WorkloadKind::Prefill && spec.warmup_iters > 0 {
+        while warmup_start.elapsed() < crate::runner::prefill::MIN_WARMUP {
+            adapter.run_once(spec)?;
+        }
     }
 
     // Cold and warmup inference intentionally exercise the same engine, but
